@@ -71,7 +71,7 @@ Eigen::Matrix<double, 24, 23> df_dx(state_ikfom &s, const input_ikfom &in)
 	Eigen::Matrix<state_ikfom::scalar, 2, 1> vec = Eigen::Matrix<state_ikfom::scalar, 2, 1>::Zero();
 	Eigen::Matrix<state_ikfom::scalar, 3, 2> grav_matrix;
 	s.S2_Mx(grav_matrix, vec, 21);
-	cov.template block<3, 2>(12, 21) =  grav_matrix; 
+	cov.template block<3, 2>(12, 21) =  grav_matrix;
 	cov.template block<3, 3>(3, 15) = -Eigen::Matrix3d::Identity(); 
 	return cov;
 }

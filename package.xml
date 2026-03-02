@@ -25,7 +25,6 @@
   <depend>sensor_msgs</depend>
   <depend>common_interfaces</depend>
   <depend>tf2</depend>
-  <depend>pcl_ros</depend>
   <depend>pcl_conversions</depend>
   <depend>livox_ros_driver2</depend>
 

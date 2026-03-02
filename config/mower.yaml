@@ -1,0 +1,52 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: true
+        map_file_path: "/data/fast_lio_map.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 1                # 1 for Livox serials LiDAR
+            scan_line:  4
+            blind: 0.3
+            timestamp_unit: 3            # ns for livox_ros_driver2
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.003993957088823881
+            gyr_cov: 0.0015636343949698187
+            b_acc_cov: 6.435665935353257e-05
+            b_gyr_cov: 3.564031869636761e-05
+            fov_degree:    360.0
+            det_range:     20.0
+            extrinsic_est_en:  false      # use fixed extrinsic from LIO-SAM calibration
+            # R_imu_lidar: rotates LiDAR frame → IMU frame
+            # Derived from static IMU gravity measurement: up_imu = [-0.406386, -0.024164, 0.913382]
+            # indicating ~24° pitch tilt of IMU relative to LiDAR
+            # T = -R_imu_lidar * t_lidar_imu where t_lidar_imu = [0.13045, -0.01, 0.0149]
+            extrinsic_T: [ -0.113187, 0.011027, -0.066381 ]
+            extrinsic_R: [ 0.913687, -0.005132, -0.406386,
+                          -0.005132,  0.999695, -0.024164,
+                           0.406386,  0.024164,  0.913382]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: true
+            scan_publish_en:  true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1

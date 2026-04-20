@@ -7,19 +7,16 @@
         filter_size_map: 0.5
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
-        diagnostics:
-            latency_enable: false
-            latency_log_period_sec: 1.0
         map_file_path: "/data/fast_lio_map.pcd"
 
         common:
-            lid_topic:  "/livox/points"
+            lid_topic:  "/livox/lidar"
             imu_topic:  "/livox/imu"
             time_sync_en: false
             time_offset_lidar_to_imu: 0.0
 
         preprocess:
-            lidar_type: 1                # 1 for Livox serials LiDAR
+            lidar_type: 4                # 4 = MID360 PointCloud2 path
             scan_line:  4
             blind: 0.3
             timestamp_unit: 3            # ns for livox_ros_driver2
@@ -32,13 +29,13 @@
             b_gyr_cov: 3.564031869636761e-05
             fov_degree:    360.0
             det_range:     20.0
-            extrinsic_est_en:  false       # online estimation, refines from initial
-            # FP IMU extrinsic (LiDAR-in-IMU): normal path-bag estimate center
-            # Tail-mean across stable bags ≈ pitch 19.4-19.8 deg, T ≈ [0.009, 0.025, 0.056]
-            extrinsic_T: [ 0.009, 0.025, 0.056 ]
-            extrinsic_R: [ 0.9426, 0.0, 0.3338,
-                           0.0,    1.0, 0.0,
-                          -0.3338, 0.0, 0.9426 ]
+            extrinsic_est_en:  true       # online estimation, refines from initial
+            # Mower: LiDAR and FP IMU nearly parallel (~0.1° pitch difference)
+            # Initial guess = identity + small translation TBD
+            extrinsic_T: [ 0.0, 0.0, 0.0 ]
+            extrinsic_R: [ 1.0, 0.0, 0.0,
+                           0.0, 1.0, 0.0,
+                           0.0, 0.0, 1.0 ]
 
         publish:
             path_en: true
@@ -52,16 +49,17 @@
         prior_map_pcd: ""                    # PCD file path, empty=disabled
         initial_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # x,y,z,roll°,pitch°,yaw°
 
-        # Wheel odometry velocity injection (after ICP, constrains along-track drift)
+        # Wheel odometry velocity injection
         wheel_odom_en: false
         wheel_topic: "/robot/twist"
         wheel_speed_scale: 1.0
-        wheel_vel_noise_vx: 0.05     # m/s stddev, forward
-        wheel_vel_noise_vy: 0.02     # m/s stddev, lateral (non-holonomic, heading constraint)
-        wheel_vel_noise_vz: 0.10     # m/s stddev, vertical
-        wheel_extrinsic_R: [0.9426, 0.0, -0.3338,
-                            0.0,    1.0,  0.0,
-                            0.3338, 0.0,  0.9426]  # R_{IMU←robot} = Ry(-19.5°)
+        wheel_vel_noise_vx: 0.05
+        wheel_vel_noise_vy: 0.02
+        wheel_vel_noise_vz: 0.10
+        # Mower: LiDAR/IMU near-level, robot frame ≈ IMU frame
+        wheel_extrinsic_R: [1.0, 0.0, 0.0,
+                            0.0, 1.0, 0.0,
+                            0.0, 0.0, 1.0]
 
         pcd_save:
             pcd_save_en: true

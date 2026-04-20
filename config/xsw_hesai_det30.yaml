@@ -1,0 +1,65 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 2
+        filter_size_surf: 0.3
+        filter_size_map: 0.3
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        diagnostics:
+            latency_enable: false
+            latency_log_period_sec: 1.0
+        map_file_path: "/data/fast_lio_map.pcd"
+
+        common:
+            lid_topic:  "/hesai210/original"
+            imu_topic:  "/fp_standard/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            # Hesai PointCloud2: x/y/z/intensity/ring/timestamp
+            lidar_type: 5
+            scan_line:  32
+            blind: 0.1
+            timestamp_unit: 0
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.003993957088823881
+            gyr_cov: 0.0015636343949698187
+            b_acc_cov: 6.435665935353257e-05
+            b_gyr_cov: 3.564031869636761e-05
+            fov_degree:    360.0
+            det_range:     30.0
+            extrinsic_est_en:  true
+            extrinsic_T: [ -0.023944, 0.001915, -0.004262 ]
+            extrinsic_R: [ 0.999629161, 0.027169026, 0.001839893,
+                           -0.027217621, 0.998983238, 0.035940112,
+                           -0.000861564, -0.035976861, 0.999352252 ]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: true
+            scan_publish_en:  true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        prior_map_pcd: ""
+        initial_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        wheel_odom_en: false
+        wheel_topic: "/robot/twist"
+        wheel_speed_scale: 1.0
+        wheel_vel_noise_vx: 0.05
+        wheel_vel_noise_vy: 0.02
+        wheel_vel_noise_vz: 0.10
+        wheel_extrinsic_R: [1.0, 0.0, 0.0,
+                            0.0, 1.0, 0.0,
+                            0.0, 0.0, 1.0]
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1

@@ -85,6 +85,10 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
       mid360_handler(msg);
       break;
 
+    case HESAI32:
+      hesai_handler(msg);
+      break;
+
     default:
       default_handler(msg);
       break;
@@ -516,10 +520,13 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     added_pt.x = pl_orig.points[i].x;
     added_pt.y = pl_orig.points[i].y;
     added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = pl_orig.points[i].reflectivity;
+    added_pt.intensity = pl_orig.points[i].intensity;
     added_pt.curvature = 0.;
 
     int layer = pl_orig.points[i].line;
+    if (layer < 0 || layer >= N_SCANS)
+      continue;
+
     double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
     if (is_first[layer])
@@ -548,6 +555,48 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
 
     yaw_last[layer] = yaw_angle;
     time_last[layer] = added_pt.curvature;
+
+    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+    {
+      pl_surf.push_back(std::move(added_pt));
+    }
+  }
+}
+
+void Preprocess::hesai_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  pcl::PointCloud<hesai_ros::Point> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  int plsize = pl_orig.points.size();
+  if (plsize == 0)
+    return;
+  pl_surf.reserve(plsize);
+
+  const double scan_start_time = rclcpp::Time(msg->header.stamp).seconds();
+  const bool has_absolute_point_time = pl_orig.points[plsize - 1].timestamp > 1e6;
+
+  for (int i = 0; i < plsize; ++i)
+  {
+    if (i % point_filter_num != 0)
+      continue;
+
+    PointType added_pt;
+    added_pt.normal_x = 0;
+    added_pt.normal_y = 0;
+    added_pt.normal_z = 0;
+    added_pt.x = pl_orig.points[i].x;
+    added_pt.y = pl_orig.points[i].y;
+    added_pt.z = pl_orig.points[i].z;
+    added_pt.intensity = pl_orig.points[i].intensity;
+
+    double point_time = pl_orig.points[i].timestamp;
+    if (has_absolute_point_time)
+      point_time -= scan_start_time;
+    added_pt.curvature = point_time * time_unit_scale;
 
     if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
     {

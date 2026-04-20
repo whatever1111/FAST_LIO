@@ -1930,6 +1930,22 @@ public:
 		}
 	}
 
+	// Non-iterated EKF update with full-width H matrix (for velocity/external observations).
+	// H: (m x n) Jacobian over full state, r: (m x 1) residual, R_diag: (m x 1) diagonal noise variances.
+	void update_simple(
+		const Eigen::Matrix<scalar_type, Eigen::Dynamic, n>& H,
+		const Eigen::Matrix<scalar_type, Eigen::Dynamic, 1>& r,
+		const Eigen::Matrix<scalar_type, Eigen::Dynamic, 1>& R_diag)
+	{
+		int m = H.rows();
+		Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> S = H * P_ * H.transpose();
+		for (int i = 0; i < m; i++) S(i, i) += R_diag(i);
+		Eigen::Matrix<scalar_type, n, Eigen::Dynamic> K = P_ * H.transpose() * S.inverse();
+		vectorized_state dx = K * r;
+		x_.boxplus(dx);
+		P_ = (cov::Identity() - K * H) * P_;
+	}
+
 	void change_x(state &input_state)
 	{
 		x_ = input_state;

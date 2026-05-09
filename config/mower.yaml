@@ -15,8 +15,11 @@
         common:
             lid_topic:  "/livox/points"
             imu_topic:  "/livox/imu"
+            imu_input_type: "sensor_msgs"
+            imu_bias_topic: "/fixposition/fpa/imubias"
             time_sync_en: false
             time_offset_lidar_to_imu: 0.0
+            imu_time_offset: 0.0
 
         preprocess:
             lidar_type: 1                # 1 for Livox serials LiDAR

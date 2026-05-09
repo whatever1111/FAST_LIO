@@ -62,6 +62,7 @@ find_package(visualization_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
+find_package(fixposition_driver_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 set(dependencies
@@ -76,6 +77,7 @@ set(dependencies
   pcl_conversions
   tf2_ros
   livox_ros_driver2
+  fixposition_driver_msgs
 )
 
 # Thirdparty libraries

@@ -44,6 +44,8 @@
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
+#include <fixposition_driver_msgs/msg/fpa_imu.hpp>
+#include <fixposition_driver_msgs/msg/fpa_imubias.hpp>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -81,12 +83,19 @@ float res_last[100000] = {0.0};
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
+double imu_time_offset = 0.0;
+constexpr int kFixpositionBiasStatusThresh = 2;
+Eigen::Vector3d fixposition_bias_acc = Eigen::Vector3d::Zero();
+Eigen::Vector3d fixposition_bias_gyr = Eigen::Vector3d::Zero();
+bool fixposition_has_bias = false;
+int fixposition_bias_status = -1;
+std::mutex mtx_fixposition_bias;
 
 mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = string(ROOT_DIR);
-string map_file_path, lid_topic, imu_topic;
+string map_file_path, lid_topic, imu_topic, imu_input_type = "sensor_msgs", imu_bias_topic = "/fixposition/fpa/imubias";
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -101,6 +110,8 @@ bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool    is_first_lidar = true;
 bool   diag_first_lidar_cb_logged = false;
 bool   diag_first_imu_cb_logged = false;
+bool   diag_first_fixposition_bias_logged = false;
+bool   diag_first_fixposition_bias_applied_logged = false;
 bool   diag_first_sync_logged = false;
 bool   diag_first_valid_scan_logged = false;
 bool   diag_first_no_point_logged = false;
@@ -410,25 +421,15 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     sig_buffer.notify_all();
 }
 
-void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stamp)
 {
     publish_count ++;
     if (!diag_first_imu_cb_logged) {
         RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
                     "[STARTUP][FAST_LIO] first imu cb raw_stamp=%.3f adjusted_stamp=%.3f",
-                    get_time_sec(msg_in->header.stamp),
-                    get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
+                    debug_raw_stamp,
+                    get_time_sec(msg->header.stamp));
         diag_first_imu_cb_logged = true;
-    }
-    // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
-    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
-    
-
-    msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
-    if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
-    {
-        msg->header.stamp = \
-        rclcpp::Time(timediff_lidar_wrt_imu + get_time_sec(msg_in->header.stamp));
     }
 
     double timestamp = get_time_sec(msg->header.stamp);
@@ -446,6 +447,66 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+}
+
+void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+{
+    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+    msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
+    if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
+    {
+        msg->header.stamp = rclcpp::Time(timediff_lidar_wrt_imu + get_time_sec(msg_in->header.stamp));
+    }
+    enqueue_imu_msg(msg, get_time_sec(msg_in->header.stamp));
+}
+
+void imu_bias_cbk(const fixposition_driver_msgs::msg::FpaImubias::UniquePtr msg_in)
+{
+    std::lock_guard<std::mutex> lock(mtx_fixposition_bias);
+    fixposition_bias_acc = Eigen::Vector3d(msg_in->bias_acc.x, msg_in->bias_acc.y, msg_in->bias_acc.z);
+    fixposition_bias_gyr = Eigen::Vector3d(msg_in->bias_gyr.x, msg_in->bias_gyr.y, msg_in->bias_gyr.z);
+    fixposition_bias_status = msg_in->imu_status;
+    fixposition_has_bias = true;
+    if (!diag_first_fixposition_bias_logged) {
+        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                    "[STARTUP][FAST_LIO] first bias status=%d acc=[%.5f %.5f %.5f] gyr=[%.6f %.6f %.6f]",
+                    fixposition_bias_status,
+                    fixposition_bias_acc.x(),
+                    fixposition_bias_acc.y(),
+                    fixposition_bias_acc.z(),
+                    fixposition_bias_gyr.x(),
+                    fixposition_bias_gyr.y(),
+                    fixposition_bias_gyr.z());
+        diag_first_fixposition_bias_logged = true;
+    }
+}
+
+void imu_fpa_cbk(const fixposition_driver_msgs::msg::FpaImu::UniquePtr msg_in)
+{
+    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(msg_in->data));
+    msg->header.stamp = get_ros_time(get_time_sec(msg_in->data.header.stamp) + imu_time_offset);
+
+    bool apply_bias = false;
+    {
+        std::lock_guard<std::mutex> lock(mtx_fixposition_bias);
+        apply_bias = fixposition_has_bias && fixposition_bias_status >= kFixpositionBiasStatusThresh;
+        if (apply_bias) {
+            msg->linear_acceleration.x -= fixposition_bias_acc.x();
+            msg->linear_acceleration.y -= fixposition_bias_acc.y();
+            msg->linear_acceleration.z -= fixposition_bias_acc.z();
+            msg->angular_velocity.x -= fixposition_bias_gyr.x();
+            msg->angular_velocity.y -= fixposition_bias_gyr.y();
+            msg->angular_velocity.z -= fixposition_bias_gyr.z();
+        }
+    }
+    if (apply_bias && !diag_first_fixposition_bias_applied_logged) {
+        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                    "[STARTUP][FAST_LIO] first bias-corrected FPA imu raw_stamp=%.3f adjusted_stamp=%.3f",
+                    get_time_sec(msg_in->data.header.stamp),
+                    get_time_sec(msg->header.stamp));
+        diag_first_fixposition_bias_applied_logged = true;
+    }
+    enqueue_imu_msg(msg, get_time_sec(msg_in->data.header.stamp));
 }
 
 void twist_cbk(const geometry_msgs::msg::Twist::UniquePtr msg_in)
@@ -922,8 +983,11 @@ public:
         this->declare_parameter<string>("data_dir", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
+        this->declare_parameter<string>("common.imu_input_type", "sensor_msgs");
+        this->declare_parameter<string>("common.imu_bias_topic", "/fixposition/fpa/imubias");
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
+        this->declare_parameter<double>("common.imu_time_offset", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
         this->declare_parameter<double>("filter_size_surf", 0.5);
         this->declare_parameter<double>("filter_size_map", 0.5);
@@ -951,6 +1015,7 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
         this->declare_parameter<string>("prior_map_pcd", "");
         this->declare_parameter<vector<double>>("initial_pose", vector<double>());
+        this->declare_parameter<bool>("initial_pose_apply_roll_pitch", false);
         this->declare_parameter<bool>("wheel_odom_en", false);
         this->declare_parameter<string>("wheel_topic", "/robot/twist");
         this->declare_parameter<double>("wheel_speed_scale", 1.0);
@@ -974,8 +1039,11 @@ public:
         }
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
+        this->get_parameter_or<string>("common.imu_input_type", imu_input_type, string("sensor_msgs"));
+        this->get_parameter_or<string>("common.imu_bias_topic", imu_bias_topic, string("/fixposition/fpa/imubias"));
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
+        this->get_parameter_or<double>("common.imu_time_offset", imu_time_offset, 0.0);
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
         this->get_parameter_or<double>("filter_size_surf",filter_size_surf_min,0.5);
         this->get_parameter_or<double>("filter_size_map",filter_size_map_min,0.5);
@@ -1003,6 +1071,7 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
         this->get_parameter_or<string>("prior_map_pcd", prior_map_pcd_, string(""));
         this->get_parameter_or<vector<double>>("initial_pose", initial_pose_vec_, vector<double>());
+        this->get_parameter_or<bool>("initial_pose_apply_roll_pitch", initial_pose_apply_roll_pitch_, false);
         this->get_parameter_or<bool>("wheel_odom_en", wheel_odom_en, false);
         this->get_parameter_or<string>("wheel_topic", wheel_topic, string("/robot/twist"));
         this->get_parameter_or<double>("wheel_speed_scale", wheel_speed_scale, 1.0);
@@ -1070,7 +1139,18 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
+        if (imu_input_type == "fixposition_fpa")
+        {
+            auto imu_qos = rclcpp::SensorDataQoS();
+            sub_imu_fpa_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImu>(imu_topic, imu_qos, imu_fpa_cbk);
+            sub_imu_bias_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImubias>(imu_bias_topic, imu_qos, imu_bias_cbk);
+            RCLCPP_INFO(this->get_logger(), "Fixposition IMU direct mode: topic=%s bias_topic=%s imu_time_offset=%.3f", imu_topic.c_str(), imu_bias_topic.c_str(), imu_time_offset);
+        }
+        else
+        {
+            sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
+            RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", imu_topic.c_str());
+        }
         if (wheel_odom_en)
         {
             sub_twist_ = this->create_subscription<geometry_msgs::msg::Twist>(wheel_topic, 2000, twist_cbk);
@@ -1179,20 +1259,22 @@ private:
                             double roll_rad  = initial_pose_vec_[3] * M_PI / 180.0;
                             double pitch_rad = initial_pose_vec_[4] * M_PI / 180.0;
                             double yaw_rad   = initial_pose_vec_[5] * M_PI / 180.0;
-                            // Preserve gravity-aligned roll/pitch from IMU init,
-                            // apply user-specified yaw only when roll/pitch are zero
-                            Eigen::AngleAxisd rollAngle(roll_rad,  Eigen::Vector3d::UnitX());
-                            Eigen::AngleAxisd pitchAngle(pitch_rad, Eigen::Vector3d::UnitY());
-                            Eigen::AngleAxisd yawAngle(yaw_rad,   Eigen::Vector3d::UnitZ());
+                            Eigen::Quaterniond q_current(new_state.rot.matrix());
+                            Eigen::Vector3d current_rpy = q_current.toRotationMatrix().eulerAngles(0, 1, 2);
+                            double applied_roll = initial_pose_apply_roll_pitch_ ? roll_rad : current_rpy.x();
+                            double applied_pitch = initial_pose_apply_roll_pitch_ ? pitch_rad : current_rpy.y();
+                            Eigen::AngleAxisd rollAngle(applied_roll, Eigen::Vector3d::UnitX());
+                            Eigen::AngleAxisd pitchAngle(applied_pitch, Eigen::Vector3d::UnitY());
+                            Eigen::AngleAxisd yawAngle(yaw_rad, Eigen::Vector3d::UnitZ());
                             Eigen::Quaterniond q_init = yawAngle * pitchAngle * rollAngle;
                             new_state.rot = SO3(q_init);
                             kf.change_x(new_state);
                             state_point = kf.get_x();
                             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
                             RCLCPP_INFO(this->get_logger(),
-                                "Injected initial pose: [%.3f, %.3f, %.3f] rpy_deg=[%.1f, %.1f, %.1f]",
+                                "Injected initial pose: [%.3f, %.3f, %.3f] yaw_deg=%.1f apply_roll_pitch=%s",
                                 initial_pose_vec_[0], initial_pose_vec_[1], initial_pose_vec_[2],
-                                initial_pose_vec_[3], initial_pose_vec_[4], initial_pose_vec_[5]);
+                                initial_pose_vec_[5], initial_pose_apply_roll_pitch_ ? "true" : "false");
                         }
 
                         // 2. Load prior PCD
@@ -1459,6 +1541,8 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+    rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImu>::SharedPtr sub_imu_fpa_;
+    rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImubias>::SharedPtr sub_imu_bias_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_twist_;
@@ -1479,6 +1563,7 @@ private:
 
     std::string prior_map_pcd_;
     std::vector<double> initial_pose_vec_;
+    bool initial_pose_apply_roll_pitch_ = false;
 };
 
 int main(int argc, char** argv)

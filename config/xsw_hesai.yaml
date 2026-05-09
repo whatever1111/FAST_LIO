@@ -32,7 +32,7 @@
             b_acc_cov: 6.435665935353257e-05
             b_gyr_cov: 3.564031869636761e-05
             fov_degree:    360.0
-            det_range:     20.0
+            det_range:     100.0
             extrinsic_est_en:  true
             extrinsic_T: [ -0.023944, 0.001915, -0.004262 ]
             extrinsic_R: [ 0.999629161, 0.027169026, 0.001839893,

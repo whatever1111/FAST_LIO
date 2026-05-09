@@ -1,5 +1,9 @@
 #include "preprocess.h"
 
+#include <cmath>
+#include <cstring>
+#include <limits>
+
 #include <pcl/common/common.h>
 
 #define RETURN0 0x00
@@ -569,40 +573,90 @@ void Preprocess::hesai_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &m
   pl_corn.clear();
   pl_full.clear();
 
-  pcl::PointCloud<hesai_ros::Point> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
+  const int plsize = static_cast<int>(msg->width * msg->height);
   if (plsize == 0)
     return;
-  pl_surf.reserve(plsize);
 
+  // Resolve field byte offsets once per scan; avoids pcl::fromROSMsg full copy
+  // (~64K points × 32B = 2 MB) and lets us read msg->data in place.
+  int off_x = -1, off_y = -1, off_z = -1, off_i = -1, off_ts = -1;
+  for (const auto &f : msg->fields) {
+    if (f.name == "x") off_x = f.offset;
+    else if (f.name == "y") off_y = f.offset;
+    else if (f.name == "z") off_z = f.offset;
+    else if (f.name == "intensity") off_i = f.offset;
+    else if (f.name == "timestamp") off_ts = f.offset;
+  }
+  if (off_x < 0 || off_y < 0 || off_z < 0 || off_ts < 0)
+    return;
+
+  const uint8_t * base = msg->data.data();
+  const uint32_t step = msg->point_step;
   const double scan_start_time = rclcpp::Time(msg->header.stamp).seconds();
-  const bool has_absolute_point_time = pl_orig.points[plsize - 1].timestamp > 1e6;
 
-  for (int i = 0; i < plsize; ++i)
-  {
-    if (i % point_filter_num != 0)
+  double last_ts;
+  std::memcpy(&last_ts, base + (plsize - 1) * step + off_ts, sizeof(double));
+  const double ts_origin = (last_ts > 1e6) ? scan_start_time : 0.0;
+
+  const float blind_sq = static_cast<float>(blind * blind);
+  const int stride = std::max(1, point_filter_num);
+  const int n_candidates = (plsize + stride - 1) / stride;
+
+  // Worst case: all candidates pass blind filter. Pre-size to skip per-point grow.
+  pl_surf.resize(n_candidates);
+
+  // Parallel scan: each thread runs a contiguous chunk of candidate indices,
+  // writes pl_surf[idx] only for kept points, marks dropped points by NaN, then
+  // we compact in one serial pass.
+  constexpr float kDropMarker = std::numeric_limits<float>::quiet_NaN();
+
+#ifdef MP_EN
+  #pragma omp parallel for num_threads(MP_PROC_NUM) schedule(static)
+#endif
+  for (int j = 0; j < n_candidates; ++j) {
+    const int i = j * stride;
+    if (i >= plsize) {
+      pl_surf.points[j].x = kDropMarker;
       continue;
+    }
+    const uint8_t * p = base + i * step;
 
-    PointType added_pt;
-    added_pt.normal_x = 0;
-    added_pt.normal_y = 0;
-    added_pt.normal_z = 0;
-    added_pt.x = pl_orig.points[i].x;
-    added_pt.y = pl_orig.points[i].y;
-    added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = pl_orig.points[i].intensity;
+    float x, y, z, intensity = 0.0f;
+    double ts;
+    std::memcpy(&x, p + off_x, sizeof(float));
+    std::memcpy(&y, p + off_y, sizeof(float));
+    std::memcpy(&z, p + off_z, sizeof(float));
+    if (off_i >= 0) std::memcpy(&intensity, p + off_i, sizeof(float));
+    std::memcpy(&ts, p + off_ts, sizeof(double));
 
-    double point_time = pl_orig.points[i].timestamp;
-    if (has_absolute_point_time)
-      point_time -= scan_start_time;
-    added_pt.curvature = point_time * time_unit_scale;
+    if (x * x + y * y + z * z <= blind_sq) {
+      pl_surf.points[j].x = kDropMarker;
+      continue;
+    }
 
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
-    {
-      pl_surf.push_back(std::move(added_pt));
+    PointType & pt = pl_surf.points[j];
+    pt.x = x;
+    pt.y = y;
+    pt.z = z;
+    pt.intensity = intensity;
+    pt.normal_x = 0.0f;
+    pt.normal_y = 0.0f;
+    pt.normal_z = 0.0f;
+    pt.curvature = static_cast<float>((ts - ts_origin) * time_unit_scale);
+  }
+
+  // Compact: drop NaN-marked entries. Single pass, sequential, cache-friendly.
+  size_t out = 0;
+  for (size_t k = 0; k < pl_surf.points.size(); ++k) {
+    const auto & pt = pl_surf.points[k];
+    if (!std::isnan(pt.x)) {
+      if (out != k) pl_surf.points[out] = pt;
+      ++out;
     }
   }
+  pl_surf.points.resize(out);
+  pl_surf.width = out;
+  pl_surf.height = 1;
 }
 
 void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)

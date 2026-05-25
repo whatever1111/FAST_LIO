@@ -33,6 +33,9 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <mutex>
 #include <math.h>
 #include <thread>
@@ -1311,6 +1314,39 @@ private:
                             RCLCPP_INFO(this->get_logger(),
                                 "Loaded prior map: %s (%zu points)",
                                 prior_map_pcd_.c_str(), prior_cloud->size());
+
+                            // AABB self-check: helps diagnose wrong-frame PCDs
+                            // (e.g. a UTM map loaded where ENU was expected).
+                            // center→origin > ~10 km strongly suggests a global frame.
+                            if (!prior_cloud->empty()) {
+                                float xmin = std::numeric_limits<float>::max();
+                                float ymin = xmin;
+                                float zmin = xmin;
+                                float xmax = -xmin;
+                                float ymax = -xmin;
+                                float zmax = -xmin;
+                                for (const auto & pt : prior_cloud->points) {
+                                    xmin = std::min(xmin, pt.x);
+                                    ymin = std::min(ymin, pt.y);
+                                    zmin = std::min(zmin, pt.z);
+                                    xmax = std::max(xmax, pt.x);
+                                    ymax = std::max(ymax, pt.y);
+                                    zmax = std::max(zmax, pt.z);
+                                }
+                                const double cx = 0.5 * (xmin + xmax);
+                                const double cy = 0.5 * (ymin + ymax);
+                                const double cz = 0.5 * (zmin + zmax);
+                                const double dist_to_origin =
+                                    std::sqrt(cx * cx + cy * cy + cz * cz);
+                                RCLCPP_INFO(this->get_logger(),
+                                    "Prior map bbox: x=[%.2f..%.2f] y=[%.2f..%.2f] "
+                                    "z=[%.2f..%.2f] center→origin=%.1f m%s",
+                                    xmin, xmax, ymin, ymax, zmin, zmax, dist_to_origin,
+                                    dist_to_origin > 10000.0
+                                      ? "  (large offset — likely UTM/global frame, "
+                                        "check coordinate system!)"
+                                      : "");
+                            }
 
                             // 3. Downsample prior map
                             pcl::VoxelGrid<PointType> voxel;

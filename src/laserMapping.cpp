@@ -1015,6 +1015,15 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
         this->declare_parameter<string>("prior_map_pcd", "");
         this->declare_parameter<vector<double>>("initial_pose", vector<double>());
+        // initial_pose_full_rpy_override:
+        //   false (default) — inject only XYZ + yaw from initial_pose; keep
+        //     roll/pitch from the IMU-derived gravity-aligned current state.
+        //   true            — fully overwrite roll/pitch from initial_pose. The
+        //     caller MUST guarantee these match gravity (accel along -Z),
+        //     otherwise point cloud transforms will be incorrect.
+        this->declare_parameter<bool>("initial_pose_full_rpy_override", false);
+        // Deprecated alias for initial_pose_full_rpy_override. Kept for
+        // backward compatibility; will emit a warning if set to true.
         this->declare_parameter<bool>("initial_pose_apply_roll_pitch", false);
         this->declare_parameter<bool>("wheel_odom_en", false);
         this->declare_parameter<string>("wheel_topic", "/robot/twist");
@@ -1071,7 +1080,25 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
         this->get_parameter_or<string>("prior_map_pcd", prior_map_pcd_, string(""));
         this->get_parameter_or<vector<double>>("initial_pose", initial_pose_vec_, vector<double>());
-        this->get_parameter_or<bool>("initial_pose_apply_roll_pitch", initial_pose_apply_roll_pitch_, false);
+        {
+            bool full_rpy_override = false;
+            bool legacy_apply_rp = false;
+            this->get_parameter_or<bool>("initial_pose_full_rpy_override", full_rpy_override, false);
+            this->get_parameter_or<bool>("initial_pose_apply_roll_pitch", legacy_apply_rp, false);
+            if (legacy_apply_rp) {
+                RCLCPP_WARN(this->get_logger(),
+                    "Parameter 'initial_pose_apply_roll_pitch' is deprecated; "
+                    "use 'initial_pose_full_rpy_override' instead.");
+            }
+            initial_pose_full_rpy_override_ = full_rpy_override || legacy_apply_rp;
+            if (initial_pose_full_rpy_override_) {
+                RCLCPP_WARN(this->get_logger(),
+                    "initial_pose_full_rpy_override=true: overriding IMU-aligned "
+                    "roll/pitch with values from initial_pose. Caller must ensure "
+                    "these match gravity (accel along -Z), else point cloud "
+                    "transforms will be incorrect.");
+            }
+        }
         this->get_parameter_or<bool>("wheel_odom_en", wheel_odom_en, false);
         this->get_parameter_or<string>("wheel_topic", wheel_topic, string("/robot/twist"));
         this->get_parameter_or<double>("wheel_speed_scale", wheel_speed_scale, 1.0);
@@ -1261,8 +1288,8 @@ private:
                             double yaw_rad   = initial_pose_vec_[5] * M_PI / 180.0;
                             Eigen::Quaterniond q_current(new_state.rot.matrix());
                             Eigen::Vector3d current_rpy = q_current.toRotationMatrix().eulerAngles(0, 1, 2);
-                            double applied_roll = initial_pose_apply_roll_pitch_ ? roll_rad : current_rpy.x();
-                            double applied_pitch = initial_pose_apply_roll_pitch_ ? pitch_rad : current_rpy.y();
+                            double applied_roll = initial_pose_full_rpy_override_ ? roll_rad : current_rpy.x();
+                            double applied_pitch = initial_pose_full_rpy_override_ ? pitch_rad : current_rpy.y();
                             Eigen::AngleAxisd rollAngle(applied_roll, Eigen::Vector3d::UnitX());
                             Eigen::AngleAxisd pitchAngle(applied_pitch, Eigen::Vector3d::UnitY());
                             Eigen::AngleAxisd yawAngle(yaw_rad, Eigen::Vector3d::UnitZ());
@@ -1272,9 +1299,9 @@ private:
                             state_point = kf.get_x();
                             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
                             RCLCPP_INFO(this->get_logger(),
-                                "Injected initial pose: [%.3f, %.3f, %.3f] yaw_deg=%.1f apply_roll_pitch=%s",
+                                "Injected initial pose: [%.3f, %.3f, %.3f] yaw_deg=%.1f full_rpy_override=%s",
                                 initial_pose_vec_[0], initial_pose_vec_[1], initial_pose_vec_[2],
-                                initial_pose_vec_[5], initial_pose_apply_roll_pitch_ ? "true" : "false");
+                                initial_pose_vec_[5], initial_pose_full_rpy_override_ ? "true" : "false");
                         }
 
                         // 2. Load prior PCD
@@ -1563,7 +1590,7 @@ private:
 
     std::string prior_map_pcd_;
     std::vector<double> initial_pose_vec_;
-    bool initial_pose_apply_roll_pitch_ = false;
+    bool initial_pose_full_rpy_override_ = false;
 };
 
 int main(int argc, char** argv)

@@ -34,6 +34,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <mutex>
@@ -52,6 +53,7 @@
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
@@ -80,6 +82,13 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_pl
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+// Mapping pause/resume gate. Owned by PGO node (lio_slam_fastLioPGO publishes
+// /lio_slam/mapping_enabled with transient_local QoS); we mirror it here.
+// When false: skip ikd-tree updates and skip pcl_wait_save accumulation, so the
+// saved PCD doesn't contain frames captured while operator had mapping paused.
+// EKF prediction, ICP and /Odometry publishing keep running so pose continuity
+// is preserved.
+std::atomic<bool> mapping_enabled{true};
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -107,6 +116,26 @@ double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
+// Position-observability metric, refreshed each h_share_model call: eigenvalues
+// of the normal information matrix M = sum(n n^T) over the matched plane normals.
+// pos_obs_z_weak = |Z component| of the weakest eigenvector; →1 means Z is the
+// least-constrained direction (degenerate Z), the root trigger of the bag2
+// divergence (see memory bag2-divergence-is-flio2-frontend).
+double pos_obs_eig_min = 0.0, pos_obs_eig_max = 0.0, pos_obs_z_weak = 0.0;
+bool   degeneracy_debug = false;     // verbose per-frame [DEGEN] diagnostics
+
+// Planar-motion (zero body-vertical-velocity) soft constraint — the A'-2 fix.
+//   When LiDAR loses Z observability (pos_obs_z_weak high), the iEKF dumps the
+//   unexplained residual into the accel bias and the state flies off. This adds a
+//   soft pseudo-measurement "body-frame vertical velocity ≈ 0" (a ground-robot
+//   non-holonomic prior, like the wheel-odom update) that supplies the missing
+//   vertical information and bounds the runaway at its source.
+//   BODY frame → it does NOT fight legitimate slope motion: world-frame vertical
+//   velocity on a ramp comes from the robot's pitch (rotation state), not from
+//   body-frame vz. Gated on z_weak so it has zero effect when Z is well observed.
+bool   planar_constraint_en = false;
+double planar_constraint_noise = 0.1;          // m/s, soft (larger = weaker prior)
+double planar_constraint_z_weak_thresh = 0.5;  // apply only when pos_obs_z_weak exceeds this
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
@@ -665,7 +694,9 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     }
 
     /**************** save map ****************/
-    if (pcd_save_en)
+    // Same pause gate: skip accumulation when mapping is disabled, so the
+    // exported scans.pcd doesn't contain operator-suppressed frames.
+    if (pcd_save_en && mapping_enabled.load(std::memory_order_relaxed))
     {
         int size = feats_undistort->points.size();
         PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
@@ -920,11 +951,28 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
     }
 
+    // Position-observability metric (degeneracy detector): eigenvalues of the
+    // normal information matrix M = sum(n n^T) over effective points. The min
+    // eigenvalue is the weakest-constrained position direction; if its
+    // eigenvector points along Z, the Z update is ill-conditioned.
+    {
+        Eigen::Matrix3d M = Eigen::Matrix3d::Zero();
+        for (int i = 0; i < effct_feat_num; i++)
+        {
+            const PointType &np = corr_normvect->points[i];
+            Eigen::Vector3d n(np.x, np.y, np.z);
+            M.noalias() += n * n.transpose();
+        }
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
+        pos_obs_eig_min = es.eigenvalues()(0);
+        pos_obs_eig_max = es.eigenvalues()(2);
+        pos_obs_z_weak = std::abs(es.eigenvectors()(2, 0));  // |Z| of weakest eigenvector
+    }
+
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
         std::cerr << "No Effective Points!" << std::endl;
-        // ROS_WARN("No Effective Points! \n");
         return;
     }
 
@@ -982,6 +1030,10 @@ public:
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
         this->declare_parameter<int>("max_iteration", 4);
+        this->declare_parameter<bool>("degeneracy_debug", false);
+        this->declare_parameter<bool>("planar_constraint_en", false);
+        this->declare_parameter<double>("planar_constraint_noise", 0.1);
+        this->declare_parameter<double>("planar_constraint_z_weak_thresh", 0.5);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("data_dir", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -1042,6 +1094,10 @@ public:
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
+        this->get_parameter_or<bool>("degeneracy_debug", degeneracy_debug, false);
+        this->get_parameter_or<bool>("planar_constraint_en", planar_constraint_en, false);
+        this->get_parameter_or<double>("planar_constraint_noise", planar_constraint_noise, 0.1);
+        this->get_parameter_or<double>("planar_constraint_z_weak_thresh", planar_constraint_z_weak_thresh, 0.5);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         string data_dir_param;
         this->get_parameter_or<string>("data_dir", data_dir_param, "");
@@ -1202,6 +1258,22 @@ public:
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+
+        // Mapping pause/resume: latched (transient_local) subscription so we
+        // pick up the most recent state even if PGO published before we
+        // started.  The PGO node is the sole publisher; we only read.
+        auto mapping_qos = rclcpp::QoS(1).transient_local();
+        mapping_enabled_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+            "/lio_slam/mapping_enabled", mapping_qos,
+            [this](std_msgs::msg::Bool::SharedPtr msg) {
+                const bool prev = mapping_enabled.exchange(msg->data, std::memory_order_relaxed);
+                if (prev != msg->data) {
+                    RCLCPP_WARN(this->get_logger(),
+                                "[MAPPING] %s — ikd-tree updates %s.",
+                                msg->data ? "RESUMED" : "PAUSED",
+                                msg->data ? "re-enabled" : "suspended");
+                }
+            });
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -1453,6 +1525,49 @@ private:
 
             state_point = kf.get_x();
 
+            /*** A'-2 planar-motion soft constraint: pseudo-measurement that the
+             *   BODY-frame vertical velocity is ~0 (a ground-robot non-holonomic
+             *   prior, same mechanism as the wheel-odom update below). Applied only
+             *   when LiDAR Z is degenerate (pos_obs_z_weak high), so it is inert
+             *   during normal operation. Body-frame → it does NOT fight slope
+             *   motion: world-frame vertical velocity on a ramp is produced by the
+             *   robot's pitch (rotation state), not by body-frame vz. This supplies
+             *   the missing vertical information that the degenerate iEKF otherwise
+             *   dumps into the accel bias, flying the state off (bag2 km-runaway). ***/
+            if (planar_constraint_en && pos_obs_z_weak > planar_constraint_z_weak_thresh)
+            {
+                state_ikfom st = kf.get_x();
+                M3D Rw = st.rot.toRotationMatrix();
+                V3D v_body = Rw.transpose() * st.vel;   // velocity in IMU/body frame
+                // Measurement: body velocity = 0, but only the vertical (z) row is
+                // enforced — x/y get huge noise so forward/lateral motion is untouched.
+                V3D residual = -v_body;
+                Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
+                H.block<3,3>(0, 3)  = skew_sym_mat(v_body);   // dh/d(rot)
+                H.block<3,3>(0, 12) = Rw.transpose();          // dh/d(vel)
+                Eigen::Vector3d R_diag(1e6, 1e6, planar_constraint_noise * planar_constraint_noise);
+                kf.update_simple(H, residual, R_diag);
+                state_point = kf.get_x();
+            }
+
+            /*** Optional degeneracy diagnostics ***/
+            if (degeneracy_debug)
+            {
+                const double lidar_correction = (state_point.pos - pos_before_update).norm();
+                const double body_speed = state_point.vel.norm();
+                const double dvel = (state_point.vel - state_before_update.vel).norm();
+                const double dba  = (state_point.ba  - state_before_update.ba ).norm();
+                const double dbg  = (state_point.bg  - state_before_update.bg ).norm();
+                if (lidar_correction > 0.2 || body_speed > 1.5 || dvel > 0.3 ||
+                    dba > 0.05 || dbg > 0.01 || effct_feat_num < 200 || pos_obs_z_weak > 0.7)
+                {
+                    std::cerr << "[DEGEN] effct=" << effct_feat_num
+                              << " corr=" << lidar_correction << "m speed=" << body_speed
+                              << " dvel=" << dvel << " dba=" << dba << " dbg=" << dbg
+                              << " z_weak=" << pos_obs_z_weak << " posZ=" << state_point.pos[2] << "m" << std::endl;
+                }
+            }
+
             /*** Wheel velocity update (after ICP, constrains along-track drift) ***/
             if (wheel_odom_en)
             {
@@ -1509,7 +1624,14 @@ private:
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
-            map_incremental();
+            // Mapping pause gate: when operator has disabled mapping (via
+            // /lio_slam/set_mapping_enabled in the PGO node), skip ikd-tree
+            // growth so the prior map isn't polluted by stationary frames or
+            // teleport segments (elevator).  EKF and odometry publishing
+            // above continue normally.
+            if (mapping_enabled.load(std::memory_order_relaxed)) {
+                map_incremental();
+            }
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
@@ -1614,6 +1736,7 @@ private:
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mapping_enabled_sub_;
 
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;

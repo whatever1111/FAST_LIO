@@ -3,12 +3,15 @@
         feature_extract_enable: false
         point_filter_num: 3
         max_iteration: 2
+        planar_constraint_en: true
+        planar_constraint_noise: 0.02         # m/s, tighter = stronger vz≈0 authority
+        planar_constraint_z_weak_thresh: 0.3  # engage earlier (before the dump)
         filter_size_surf: 0.3
         filter_size_map: 0.3
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
         diagnostics:
-            latency_enable: false
+            latency_enable: true
             latency_log_period_sec: 1.0
         map_file_path: "/data/fast_lio_map.pcd"
 

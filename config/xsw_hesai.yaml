@@ -6,6 +6,7 @@
         planar_constraint_en: true
         planar_constraint_noise: 0.02         # m/s, tighter = stronger vz≈0 authority
         planar_constraint_z_weak_thresh: 0.3  # engage earlier (before the dump)
+        degeneracy_debug: false
         filter_size_surf: 0.3
         filter_size_map: 0.3
         cube_side_length: 1000.0

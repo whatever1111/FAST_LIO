@@ -33,6 +33,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -890,7 +891,17 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
     /** closest surface search and residual computation **/
     #ifdef MP_EN
-        omp_set_num_threads(MP_PROC_NUM);
+        // Respect OMP_NUM_THREADS when set so the runtime CPU budget (cgroup
+        // --cpus) can be honoured; the compile-time MP_PROC_NUM (8 on x86) would
+        // otherwise spawn 8 OMP threads and oversubscribe a 4-CPU container,
+        // starving the PGO node it shares cores with.
+        {
+            static const int omp_threads = []() {
+                const char * e = std::getenv("OMP_NUM_THREADS");
+                return (e && std::atoi(e) > 0) ? std::atoi(e) : MP_PROC_NUM;
+            }();
+            omp_set_num_threads(omp_threads);
+        }
         #pragma omp parallel for
     #endif
     for (int i = 0; i < feats_down_size; i++)

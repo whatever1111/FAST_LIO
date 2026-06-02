@@ -37,6 +37,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <math.h>
@@ -670,6 +672,80 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
+
+// --- Asynchronous PCD accumulator (off the LiDAR processing thread) ---
+// `*pcl_wait_save += *scan` reallocates the whole (multi-hundred-MB, growing) cloud at
+// std::vector capacity doublings; profiling showed this stalled the single processing
+// thread for up to ~750ms as the map grew, overflowing the best-effort LiDAR buffer and
+// dropping bursts of input scans. The hot path now only transforms the scan and ENQUEUES
+// it; this dedicated writer thread owns the accumulation, so the realloc/copy cost no
+// longer blocks scan intake. Output is byte-identical (same full-res scans.pcd at shutdown).
+// pcl_wait_save is touched ONLY by the writer thread and by readers (save_to_pcd / final
+// save) — guarded by pcl_wait_save_mtx since those readers run on the executor thread.
+std::mutex pcl_wait_save_mtx;
+std::mutex pcd_queue_mtx;
+std::condition_variable pcd_queue_cv;
+std::deque<PointCloudXYZI::Ptr> pcd_queue;
+std::atomic<bool> pcd_writer_running{false};
+std::atomic<uint64_t> pcd_enqueued{0};  // scans handed to the writer
+std::atomic<uint64_t> pcd_accumulated{0};  // scans folded into pcl_wait_save
+std::thread pcd_writer_thread;
+
+void pcdWriterLoop()
+{
+    while (true) {
+        PointCloudXYZI::Ptr cloud;
+        {
+            std::unique_lock<std::mutex> lk(pcd_queue_mtx);
+            pcd_queue_cv.wait(lk, [] { return !pcd_queue.empty() || !pcd_writer_running.load(); });
+            if (pcd_queue.empty() && !pcd_writer_running.load()) break;  // drained + asked to stop
+            cloud = pcd_queue.front();
+            pcd_queue.pop_front();
+        }
+        if (!cloud || cloud->empty()) { pcd_accumulated.fetch_add(1); continue; }
+        {
+            std::lock_guard<std::mutex> save_lk(pcl_wait_save_mtx);
+            *pcl_wait_save += *cloud;  // realloc/copy happens HERE, off the processing thread
+            if (pcd_save_interval > 0) {
+                static int scan_wait_num = 0;
+                if (++scan_wait_num >= pcd_save_interval && !pcl_wait_save->empty()) {
+                    pcd_index++;
+                    string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
+                    pcl::PCDWriter pcd_writer;
+                    pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+                    pcl_wait_save->clear();
+                    scan_wait_num = 0;
+                }
+            }
+        }
+        pcd_accumulated.fetch_add(1);  // signal flushPcdQueue() that this scan is folded in
+    }
+}
+
+// Block until the writer has folded in every scan enqueued so far. Used by the readers
+// (map_save service / save_to_pcd) so a mid-run save can't miss still-queued scans.
+void flushPcdQueue()
+{
+    const uint64_t target = pcd_enqueued.load();
+    while (pcd_writer_running.load() && pcd_accumulated.load() < target) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+void startPcdWriter()
+{
+    bool expected = false;
+    if (pcd_writer_running.compare_exchange_strong(expected, true)) {
+        pcd_writer_thread = std::thread(pcdWriterLoop);
+    }
+}
+
+void stopPcdWriter()  // drain queue + join; idempotent, call once at shutdown
+{
+    if (!pcd_writer_running.exchange(false)) return;
+    pcd_queue_cv.notify_all();
+    if (pcd_writer_thread.joinable()) pcd_writer_thread.join();
+}
 void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
 {
     if(scan_pub_en)
@@ -707,20 +783,14 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
             RGBpointBodyToWorld(&feats_undistort->points[i],
                                 &laserCloudWorld->points[i]);
         }
-        *pcl_wait_save += *laserCloudWorld;
-
-        static int scan_wait_num = 0;
-        scan_wait_num ++;
-        if (pcl_wait_save->size() > 0 && pcd_save_interval > 0 && scan_wait_num >= pcd_save_interval)
+        // Hand the transformed scan to the writer thread; accumulation + any interval
+        // flush now run there (see pcdWriterLoop), off this LiDAR processing thread.
         {
-            pcd_index ++;
-            string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
-            pcl::PCDWriter pcd_writer;
-            cout << "current scan saved to /PCD/" << all_points_dir << endl;
-            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-            pcl_wait_save->clear();
-            scan_wait_num = 0;
+            std::lock_guard<std::mutex> lk(pcd_queue_mtx);
+            pcd_queue.push_back(laserCloudWorld);
         }
+        pcd_enqueued.fetch_add(1);
+        pcd_queue_cv.notify_one();
     }
 }
 
@@ -792,6 +862,10 @@ void save_to_pcd()
     pcl::PCDWriter pcd_writer;
     // pcl_wait_save accumulates full-resolution feats_undistort every scan (when pcd_save_en=true).
     // pcl_wait_pub only has ~1/10 frames from the 1Hz publish_map timer with downsampled points.
+    // Make sure every enqueued scan is folded in, then lock against the async writer
+    // thread (the other accessor of pcl_wait_save) for the write itself.
+    flushPcdQueue();
+    std::lock_guard<std::mutex> lk(pcl_wait_save_mtx);
     pcd_writer.writeBinary(map_file_path, *pcl_wait_save);
 }
 
@@ -1269,6 +1343,9 @@ public:
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+
+        // Spin up the async PCD writer so the hot path never blocks on accumulation.
+        if (pcd_save_en) startPcdWriter();
 
         // Mapping pause/resume: latched (transient_local) subscription so we
         // pick up the most recent state even if PGO published before we
@@ -1777,6 +1854,9 @@ int main(int argc, char** argv)
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. pcd save will largely influence the real-time performences **/
+    // Drain the async writer queue and join before reading pcl_wait_save, so the final
+    // map contains every enqueued scan and there is no race with the writer thread.
+    stopPcdWriter();
     if (pcl_wait_save->size() > 0 && pcd_save_en)
     {
         string file_name = string("scans.pcd");

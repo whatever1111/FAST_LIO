@@ -46,7 +46,7 @@
         publish:
             path_en: true
             effect_map_en: false
-            map_en: true
+            map_en: false   # /Laser_map cumulative cloud (RViz-only): publish_map() appends to pcl_wait_pub WITHOUT ever clearing it and re-serializes the whole growing cloud every 1s on the single processing thread → starves 10Hz scan intake. Off reclaims front-end throughput; PCD save uses pcl_wait_save (unaffected).
             scan_publish_en:  true
             dense_publish_en: false
             scan_bodyframe_pub_en: true

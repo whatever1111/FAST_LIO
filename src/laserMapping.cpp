@@ -85,6 +85,7 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_pl
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool   ikd_profile = false;  // [ikd-profile] per-scan rebuild-split line, gated by env FLIO_IKD_PROFILE
 // Mapping pause/resume gate. Owned by PGO node (lio_slam_fastLioPGO publishes
 // /lio_slam/mapping_enabled with transient_local QoS); we mirror it here.
 // When false: skip ikd-tree updates and skip pcl_wait_save accumulation, so the
@@ -621,6 +622,100 @@ bool sync_packages(MeasureGroup &meas)
 }
 
 int process_increments = 0;
+// --- Asynchronous ikd-tree map update (off the LiDAR processing thread) -----------------
+// The ikd-tree is single-operator: at most ONE thread may mutate/read it at a time (its
+// background rebuild thread is the only sanctioned exception, guarded internally by
+// search_flag_mutex). map_incremental()'s Add_Points is the second-largest per-scan tree
+// cost and ~94% of its spikes are background-rebuild lock-wait (measured). We move it off
+// the spin thread WITHOUT breaking the single-operator invariant by TIME-SLICING:
+//
+//   scan N:   [main] fov -> search -> publish -> build add-lists -> dispatchMapAdd(N) --,
+//             [main] publish clouds, return from timer_callback                         | worker
+//             [exec] services IMU/LiDAR cbks (buffer push only, NO tree access)         |  runs
+//   scan N+1: [main] joinMapAdd()  <-- blocks iff Add(N) not yet done -------------------'  Add(N)
+//             [main] fov -> search -> ...                                                    here
+//
+// Add(N) overlaps only the main thread's NON-tree work (wait-for-scan + IMU undistort), so
+// it never runs concurrently with Nearest_Search. The background rebuild it may trigger
+// runs concurrently exactly as in the synchronous path. Net: the Add cost (~16ms steady,
+// spikes to ~78ms) leaves the per-scan critical path and hides in the inter-scan idle gap.
+bool                    async_map_en = true;   // gated by env FLIO_ASYNC_MAP ("0" disables)
+std::mutex              map_add_mtx;
+std::condition_variable map_add_cv;
+PointVector             map_add_ds_;            // handoff: points to add WITH downsample
+PointVector             map_add_nods_;          // handoff: points to add WITHOUT downsample
+bool                    map_add_ready_   = false;  // a job is queued, not yet taken
+bool                    map_add_running_ = false;  // worker is executing a job
+bool                    map_worker_stop_ = false;
+std::thread             map_worker_thread;
+std::atomic<uint64_t>   g_async_add_us{0};      // last completed worker Add() wall time (us)
+double                  g_map_join_wait_ms = 0; // last joinMapAdd() block time (main-only)
+
+void mapWorkerLoop()
+{
+    std::unique_lock<std::mutex> lk(map_add_mtx);
+    while (true)
+    {
+        map_add_cv.wait(lk, [] { return map_add_ready_ || map_worker_stop_; });
+        if (map_worker_stop_ && !map_add_ready_) break;
+        PointVector toAdd, noDS;
+        toAdd.swap(map_add_ds_);
+        noDS.swap(map_add_nods_);
+        map_add_ready_   = false;
+        map_add_running_ = true;
+        lk.unlock();
+
+        const double st = omp_get_wtime();
+        ikdtree.Add_Points(toAdd, true);
+        ikdtree.Add_Points(noDS, false);
+        g_async_add_us.store((uint64_t)((omp_get_wtime() - st) * 1e6), std::memory_order_relaxed);
+
+        lk.lock();
+        map_add_running_ = false;
+        map_add_cv.notify_all();
+    }
+}
+
+void startMapWorker()
+{
+    map_worker_stop_ = false;
+    if (!map_worker_thread.joinable())
+        map_worker_thread = std::thread(mapWorkerLoop);
+}
+
+void stopMapWorker()  // drain any in-flight Add + join; idempotent
+{
+    {
+        std::lock_guard<std::mutex> lk(map_add_mtx);
+        map_worker_stop_ = true;
+    }
+    map_add_cv.notify_all();
+    if (map_worker_thread.joinable()) map_worker_thread.join();
+}
+
+// Hand the two add-lists to the worker. Precondition: worker idle (caller joined this
+// scan's predecessor). Moves the vectors so the hot path does no point copy.
+void dispatchMapAdd(PointVector &toAdd, PointVector &noDS)
+{
+    {
+        std::lock_guard<std::mutex> lk(map_add_mtx);
+        map_add_ds_.swap(toAdd);
+        map_add_nods_.swap(noDS);
+        map_add_ready_ = true;
+    }
+    map_add_cv.notify_one();
+}
+
+// Block until the worker has finished the in-flight Add. Called before the next scan's
+// first tree op (lasermap_fov_segment) to restore the single-operator invariant.
+void joinMapAdd()
+{
+    const double t0 = omp_get_wtime();
+    std::unique_lock<std::mutex> lk(map_add_mtx);
+    map_add_cv.wait(lk, [] { return !map_add_ready_ && !map_add_running_; });
+    g_map_join_wait_ms = (omp_get_wtime() - t0) * 1000.0;
+}
+
 void map_incremental()
 {
     PointVector PointToAdd;
@@ -663,11 +758,24 @@ void map_incremental()
         }
     }
 
-    double st_time = omp_get_wtime();
-    add_point_size = ikdtree.Add_Points(PointToAdd, true);
-    ikdtree.Add_Points(PointNoNeedDownsample, false); 
-    add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
-    kdtree_incremental_time = omp_get_wtime() - st_time;
+    if (async_map_en)
+    {
+        // Off-thread: the worker calls Add_Points during the inter-scan gap; joined before
+        // the next scan's first tree op. add_point_size is known here (sizes); the Add wall
+        // time lands in g_async_add_us (see mapWorkerLoop). kdtree_incremental_time is left
+        // untouched in this path — it is a main-thread debug stat and the worker must not
+        // write plain globals the main thread reads.
+        add_point_size = (int)(PointToAdd.size() + PointNoNeedDownsample.size());
+        dispatchMapAdd(PointToAdd, PointNoNeedDownsample);
+    }
+    else
+    {
+        double st_time = omp_get_wtime();
+        add_point_size = ikdtree.Add_Points(PointToAdd, true);
+        ikdtree.Add_Points(PointNoNeedDownsample, false);
+        add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
+        kdtree_incremental_time = omp_get_wtime() - st_time;
+    }
 }
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
@@ -1215,6 +1323,8 @@ public:
         this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
+        ikd_profile = (getenv("FLIO_IKD_PROFILE") != nullptr);  // [ikd-profile] opt-in via env
+        { const char *am = getenv("FLIO_ASYNC_MAP"); if (am && std::string(am) == "0") async_map_en = false; }
         this->get_parameter_or<bool>("diagnostics.latency_enable", latency_diag_en, true);
         this->get_parameter_or<double>("diagnostics.latency_log_period_sec", latency_log_period_sec, 1.0);
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
@@ -1347,6 +1457,13 @@ public:
         // Spin up the async PCD writer so the hot path never blocks on accumulation.
         if (pcd_save_en) startPcdWriter();
 
+        // Spin up the off-thread ikd-tree map-update worker (option A). Idempotent.
+        if (async_map_en) {
+            startMapWorker();
+            RCLCPP_INFO(this->get_logger(),
+                        "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0).");
+        }
+
         // Mapping pause/resume: latched (transient_local) subscription so we
         // pick up the most recent state even if PGO published before we
         // started.  The PGO node is the sole publisher; we only read.
@@ -1422,6 +1539,10 @@ private:
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
+            /*** Restore the ikd-tree single-operator invariant: wait for the previous
+             *   scan's off-thread map Add to finish before this scan touches the tree. ***/
+            if (async_map_en) joinMapAdd();
+
             /*** Segment the map in lidar FOV ***/
             lasermap_fov_segment();
 
@@ -1608,6 +1729,10 @@ private:
             const V3D euler_before_update = SO3ToEuler(state_before_update.rot);
             const V3D pos_before_update = state_before_update.pos;
             double t_update_start = omp_get_wtime();
+            // [ikd-profile] snapshot background/inline rebuild work spanning iEKF + map_incre
+            const uint64_t prof_rb_us0  = g_ikd_rebuild_us.load(std::memory_order_relaxed);
+            const uint64_t prof_rb_cnt0 = g_ikd_rebuild_count.load(std::memory_order_relaxed);
+            const uint64_t prof_inl_us0 = g_ikd_inline_rebuild_us.load(std::memory_order_relaxed);
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
 
@@ -1721,7 +1846,36 @@ private:
                 map_incremental();
             }
             t5 = omp_get_wtime();
-            
+
+            // [ikd-profile] per-scan split: iEKF (search-bound) vs map_incre Add vs transform
+            // loop, correlated with concurrent background-rebuild work + inline rebuild.
+            if (ikd_profile) {
+                const double iekf_ms = (t_update_end - t_update_start) * 1000.0;
+                // Under async, the Add runs off-thread: report its last completed wall time
+                // (g_async_add_us, == previous scan's Add) and the join-wait this scan paid
+                // (the residual Add cost the inter-scan gap could NOT hide). loop_ms is then
+                // just the on-thread decision loop + dispatch.
+                const double add_ms  = async_map_en ? (g_async_add_us.load(std::memory_order_relaxed) / 1000.0)
+                                                    : (kdtree_incremental_time * 1000.0);
+                const double join_ms = async_map_en ? g_map_join_wait_ms : 0.0;
+                const double loop_ms = async_map_en ? ((t5 - t3) * 1000.0)
+                                                    : ((t5 - t3) * 1000.0 - add_ms);
+                const uint64_t d_rb_us  = g_ikd_rebuild_us.load(std::memory_order_relaxed)        - prof_rb_us0;
+                const uint64_t d_rb_cnt = g_ikd_rebuild_count.load(std::memory_order_relaxed)     - prof_rb_cnt0;
+                const uint64_t d_inl_us = g_ikd_inline_rebuild_us.load(std::memory_order_relaxed) - prof_inl_us0;
+                // tree= uses kdtree_size_st (captured at scan start, worker idle) — calling
+                // ikdtree.size() here would race the worker's in-flight Add under async.
+                printf("[IKDPROF] tree=%d feats=%d iekf_ms=%.1f add_ms=%.1f join_ms=%.1f loop_ms=%.1f | "
+                       "rb_dcnt=%llu rb_dus_ms=%.1f inl_dus_ms=%.1f rb_active=%d "
+                       "rb_maxus_ms=%.1f rb_maxsz=%llu rootreb=%llu\n",
+                       kdtree_size_st, feats_down_size, iekf_ms, add_ms, join_ms, loop_ms,
+                       (unsigned long long)d_rb_cnt, d_rb_us / 1000.0, d_inl_us / 1000.0,
+                       (int)g_ikd_rebuild_active.load(std::memory_order_relaxed),
+                       g_ikd_rebuild_max_us.load(std::memory_order_relaxed) / 1000.0,
+                       (unsigned long long)g_ikd_rebuild_max_size.load(std::memory_order_relaxed),
+                       (unsigned long long)g_ikd_root_rebuild_count.load(std::memory_order_relaxed));
+            }
+
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
@@ -1733,7 +1887,9 @@ private:
             if (runtime_pos_log)
             {
                 frame_num ++;
-                kdtree_size_end = ikdtree.size();
+                // Under async the worker may be mid-Add; reading ikdtree.size() here would
+                // race it. Estimate from the scan-start size + this scan's add count.
+                kdtree_size_end = async_map_en ? (kdtree_size_st + add_point_size) : ikdtree.size();
                 aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t5 - t0) / frame_num;
                 aver_time_icp = aver_time_icp * (frame_num - 1)/frame_num + (t_update_end - t_update_start) / frame_num;
                 aver_time_match = aver_time_match * (frame_num - 1)/frame_num + (match_time)/frame_num;
@@ -1787,7 +1943,13 @@ private:
 
     void map_publish_callback()
     {
-        if (map_pub_en) publish_map(pubLaserCloudMap_);
+        // publish_map() flattens the ikd-tree (a tree read). This 1 Hz timer shares the
+        // single executor thread with timer_callback, so it can fire BETWEEN scans while
+        // the off-thread Add is in flight — join first to keep the single-operator invariant.
+        if (map_pub_en) {
+            if (async_map_en) joinMapAdd();
+            publish_map(pubLaserCloudMap_);
+        }
     }
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
@@ -1851,6 +2013,9 @@ int main(int argc, char** argv)
 
     if (rclcpp::ok())
         rclcpp::shutdown();
+    // Drain any in-flight off-thread ikd-tree Add and join the worker before the final
+    // map read/save, so the tree is quiescent and the worker thread exits cleanly.
+    stopMapWorker();
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. pcd save will largely influence the real-time performences **/

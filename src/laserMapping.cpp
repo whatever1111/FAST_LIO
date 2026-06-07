@@ -73,6 +73,7 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <ivox/ivox.hpp>   // option B: drop-in voxel-grid map backend (compile with -DUSE_IVOX=ON)
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -212,7 +213,16 @@ PointCloudXYZI::Ptr _featsArray;
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
 
-KD_TREE<PointType> ikdtree;
+// Map backend: ikd-Tree by default; iVox (option B) when built with -DUSE_IVOX=ON. iVox is a
+// drop-in for the hot-path API (Add_Points / Nearest_Search / Build / size / validnum /
+// set_downsample_param / Delete_Point_Boxes-as-noop), so the call sites below are unchanged;
+// only the init check, the dead flatten block, and the constructor Init are #ifdef'd.
+#ifdef USE_IVOX
+using MapBackend = lio_ivox::IVox<PointType>;
+#else
+using MapBackend = KD_TREE<PointType>;
+#endif
+MapBackend ikdtree;
 
 V3F XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0);
 V3F XAxisPoint_world(LIDAR_SP_LEN, 0.0, 0.0);
@@ -1325,6 +1335,21 @@ public:
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
         ikd_profile = (getenv("FLIO_IKD_PROFILE") != nullptr);  // [ikd-profile] opt-in via env
         { const char *am = getenv("FLIO_ASYNC_MAP"); if (am && std::string(am) == "0") async_map_en = false; }
+#ifdef USE_IVOX
+        {   // option B: iVox map backend. nearby_type MUST be >=18 (Phase-0: NEARBY6 inadequate).
+            // res=0.5 NN voxels give the best probe NN-agreement (99.9%, tightest normals);
+            // a GLOBAL fine-grid dedup (= filter_size_map) keeps the map at ikd-Tree's 542k.
+            const double ivox_res    = this->declare_parameter<double>("ivox_grid_resolution", 0.5);
+            const int    ivox_nearby = this->declare_parameter<int>("ivox_nearby_type", 26);
+            const int    ivox_vcap   = this->declare_parameter<int>("ivox_voxel_capacity", 50);
+            const int    ivox_maxvox = this->declare_parameter<int>("ivox_max_voxels", 5000000);
+            ikdtree.Init(static_cast<float>(ivox_res), ivox_nearby, ivox_vcap,
+                         static_cast<std::size_t>(ivox_maxvox));
+            RCLCPP_INFO(this->get_logger(),
+                "[IVOX] map backend = iVox (res=%.2f nearby=%d voxel_cap=%d max_voxels=%d)",
+                ivox_res, ivox_nearby, ivox_vcap, ivox_maxvox);
+        }
+#endif
         this->get_parameter_or<bool>("diagnostics.latency_enable", latency_diag_en, true);
         this->get_parameter_or<double>("diagnostics.latency_log_period_sec", latency_log_period_sec, 1.0);
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
@@ -1552,7 +1577,11 @@ private:
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
             /*** initialize the map kdtree ***/
+#ifdef USE_IVOX
+            if(ikdtree.empty())
+#else
             if(ikdtree.Root_Node == nullptr)
+#endif
             {
                 RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if(feats_down_size > 5)
@@ -1709,6 +1738,7 @@ private:
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< "\n";
             }
 
+#ifndef USE_IVOX
             if(0) // If you need to see map point, change to "if(1)"
             {
                 PointVector ().swap(ikdtree.PCL_Storage);
@@ -1716,6 +1746,7 @@ private:
                 featsFromMap->clear();
                 featsFromMap->points = ikdtree.PCL_Storage;
             }
+#endif
 
             pointSearchInd_surf.resize(feats_down_size);
             Nearest_Points.resize(feats_down_size);

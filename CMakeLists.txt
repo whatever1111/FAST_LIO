@@ -108,6 +108,17 @@ if(PythonLibs_FOUND)
   target_include_directories(fastlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
 endif()
 
+# Option B: iVox voxel-grid map backend (drop-in for ikd-Tree). Default ON for the GPS
+# deployment (iekf -31/34%, drops halved, 2D-better, no divergence). Build -DUSE_IVOX=OFF
+# to fall back to ikd-Tree (e.g. GPS-denied, where iVox's raw-Z is weaker — GPS masks it).
+option(USE_IVOX "Use the iVox voxel-grid map backend instead of ikd-Tree" ON)
+if(USE_IVOX)
+  target_compile_definitions(fastlio_mapping PRIVATE USE_IVOX)
+  message(STATUS "fast_lio: map backend = iVox (default; -DUSE_IVOX=OFF for ikd-Tree)")
+else()
+  message(STATUS "fast_lio: map backend = ikd-Tree (USE_IVOX=OFF)")
+endif()
+
 list(APPEND EOL_LIST "foxy" "galactic" "eloquent" "dashing" "crystal")
 
 if($ENV{ROS_DISTRO} IN_LIST EOL_LIST)

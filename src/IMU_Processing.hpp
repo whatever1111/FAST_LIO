@@ -58,6 +58,12 @@ class ImuProcess
   V3D cov_bias_acc;
   double first_lidar_time;
 
+  // Magnitude of gravity in the raw IMU-message accel units (||mean_acc|| frozen
+  // after init). Used by the gravity-alignment leveling prior in laserMapping to
+  // gate "linear acceleration ≈ 0" (|‖a_raw‖ − g_raw| small) in a scale-agnostic
+  // way, regardless of whether the IMU reports in m/s² or g.
+  double gravity_norm() const { return mean_acc.norm(); }
+
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);

@@ -6,6 +6,19 @@
         planar_constraint_en: true
         planar_constraint_noise: 0.02         # m/s, tighter = stronger vz≈0 authority
         planar_constraint_z_weak_thresh: 0.3  # engage earlier (before the dump)
+        # A1 gravity-alignment leveling prior (accelerometer gravity dir = absolute
+        # roll/pitch anchor, yaw untouched; with ω×v centripetal compensation).
+        # DEFAULT OFF — proven NEUTRAL on bag2: distribution study (pcd-off, N=5) gives
+        # A1-off raw-Z median 5.89 m vs A1-comp 5.61 m (within noise, 0 runaways each).
+        # bag2's ~6 m Z excursion is a chaotic metastable dead-reckoning balloon on the
+        # "No Effective Points" stretch — NOT the systematic pitch bias A1 corrects, so A1
+        # neither fixes nor worsens it. Kept for a genuinely tilt-drift-prone GPS-denied
+        # dataset (sustained real slopes). See memory a1_gravity_align_unproven.
+        gravity_align_en: false
+        gravity_align_noise: 0.05             # unit-vector (≈rad) std; smaller = stronger leveling
+        gravity_align_z_weak_thresh: 0.3      # engage on the same degenerate-Z scans as planar
+        gravity_align_accel_tol: 0.05         # |‖a‖−g|/g ≤ this → trust accel as gravity (low-accel gate)
+        gravity_align_gyro_tol: 0.5            # rad/s; skip the prior during fast turns
         degeneracy_debug: false
         filter_size_surf: 0.3
         filter_size_map: 0.3

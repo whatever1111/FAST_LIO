@@ -141,6 +141,42 @@ bool   degeneracy_debug = false;     // verbose per-frame [DEGEN] diagnostics
 bool   planar_constraint_en = false;
 double planar_constraint_noise = 0.1;          // m/s, soft (larger = weaker prior)
 double planar_constraint_z_weak_thresh = 0.5;  // apply only when pos_obs_z_weak exceeds this
+
+// Gravity-alignment leveling prior (A1) — the ROOT-CAUSE fix for the iVox pitch-
+// coupled Z drift. The planar (body-vz≈0) constraint above pins a R↔vel CONSISTENCY
+// relation the iEKF already satisfies, so it carries no absolute-pitch information and
+// cannot catch a biased pitch (world-Z drift = forward_distance × sin(pitch_err)) —
+// proven by zero effect from 4× strengthening it. This supplies the missing ABSOLUTE
+// reference: when LiDAR Z is degenerate AND the IMU is in low-linear-accel motion
+// (|‖a‖−g| small), the accelerometer's specific-force direction IS world-up expressed
+// in the body frame. A soft pseudo-measurement pulls the grav-state up-axis onto it,
+// constraining roll/pitch only — yaw lies in the measurement null space (gravity is
+// yaw-invariant), so the LiDAR-excellent heading is never touched.
+bool   gravity_align_en = false;
+double gravity_align_noise = 0.05;            // unit-vector (≈rad) std of the leveling prior
+double gravity_align_z_weak_thresh = 0.3;     // engage only when pos_obs_z_weak exceeds this
+double gravity_align_accel_tol = 0.05;        // |‖a‖−g|/g must be below this (low-linear-accel gate)
+double gravity_align_gyro_tol = 0.35;         // rad/s; skip during fast turns (lever-arm safety)
+
+// Divergence guard (P1): when LiDAR correspondences collapse (scan starvation
+// under CPU/IO load, or feature-poor geometry), the iEKF runs on IMU
+// dead-reckoning and the state — especially Z — runs away to ±km and never
+// re-locks (scan leaves the map → permanent "No Effective Points"). This guard
+// detects the sustained collapse and BOUNDS the runaway: it pins body-vz≈0,
+// clamps an implausible body speed, freezes the map so dead-reckoned scans do
+// not corrupt it, and flags the odometry degraded. It is INERT in normal
+// operation (only fires after divergence_guard_streak consecutive scans whose
+// effective-point count falls below divergence_guard_min_eff). Recovery is
+// automatic: once correspondences return, the streak resets and the front end
+// re-locks against the (uncorrupted) map.
+bool   divergence_guard_en = true;
+int    divergence_guard_min_eff = 50;      // effct_feat_num below this = degenerate scan
+int    divergence_guard_streak = 5;        // consecutive degenerate scans → enter degraded
+double divergence_guard_max_speed = 10.0;  // m/s; body-speed clamp while degraded
+int    consec_low_eff = 0;                 // running degenerate-scan streak counter
+bool   flio_map_frozen = false;            // degraded: skip map_incremental (no garbage)
+bool   flio_degraded_odom = false;         // degraded: inflate published pose covariance
+
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
@@ -1044,6 +1080,18 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
+    // Divergence guard (P1): while the front end is dead-reckoning (LiDAR
+    // starved), advertise large position variance on the ROS pose covariance
+    // (x,y,z diagonal) so the PGO back-end down-weights these poses instead of
+    // trusting a bounded-but-uncertain dead-reckoned estimate.
+    if (flio_degraded_odom)
+    {
+        constexpr double kDegradedPosVar = 100.0;  // (10 m)^2
+        odomAftMapped.pose.covariance[0]  += kDegradedPosVar;   // x
+        odomAftMapped.pose.covariance[7]  += kDegradedPosVar;   // y
+        odomAftMapped.pose.covariance[14] += kDegradedPosVar;   // z
+    }
+
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
     trans.child_frame_id = "body";
@@ -1237,6 +1285,15 @@ public:
         this->declare_parameter<bool>("planar_constraint_en", false);
         this->declare_parameter<double>("planar_constraint_noise", 0.1);
         this->declare_parameter<double>("planar_constraint_z_weak_thresh", 0.5);
+        this->declare_parameter<bool>("gravity_align_en", false);
+        this->declare_parameter<double>("gravity_align_noise", 0.05);
+        this->declare_parameter<double>("gravity_align_z_weak_thresh", 0.3);
+        this->declare_parameter<double>("gravity_align_accel_tol", 0.05);
+        this->declare_parameter<double>("gravity_align_gyro_tol", 0.35);
+        this->declare_parameter<bool>("divergence_guard_en", true);
+        this->declare_parameter<int>("divergence_guard_min_eff", 50);
+        this->declare_parameter<int>("divergence_guard_streak", 5);
+        this->declare_parameter<double>("divergence_guard_max_speed", 10.0);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("data_dir", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -1301,6 +1358,15 @@ public:
         this->get_parameter_or<bool>("planar_constraint_en", planar_constraint_en, false);
         this->get_parameter_or<double>("planar_constraint_noise", planar_constraint_noise, 0.1);
         this->get_parameter_or<double>("planar_constraint_z_weak_thresh", planar_constraint_z_weak_thresh, 0.5);
+        this->get_parameter_or<bool>("gravity_align_en", gravity_align_en, false);
+        this->get_parameter_or<double>("gravity_align_noise", gravity_align_noise, 0.05);
+        this->get_parameter_or<double>("gravity_align_z_weak_thresh", gravity_align_z_weak_thresh, 0.3);
+        this->get_parameter_or<double>("gravity_align_accel_tol", gravity_align_accel_tol, 0.05);
+        this->get_parameter_or<double>("gravity_align_gyro_tol", gravity_align_gyro_tol, 0.35);
+        this->get_parameter_or<bool>("divergence_guard_en", divergence_guard_en, true);
+        this->get_parameter_or<int>("divergence_guard_min_eff", divergence_guard_min_eff, 50);
+        this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
+        this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 10.0);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         string data_dir_param;
         this->get_parameter_or<string>("data_dir", data_dir_param, "");
@@ -1443,7 +1509,18 @@ public:
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+            // Diagnostic knob (env FLIO_LIDAR_QDEPTH): a deep best-effort LiDAR queue so
+            // the single-thread executor's processing spikes buffer scans instead of
+            // dropping them. Eliminating real-time scan drops makes the front-end process
+            // an identical scan sequence every run — required to turn the metastable bag2
+            // raw-Z into a repeatable, measurable metric. Unset → SensorDataQoS (depth 5),
+            // the production default. best_effort stays compatible with the bag publisher.
+            const char* qd = std::getenv("FLIO_LIDAR_QDEPTH");
+            const int qdepth = (qd && std::atoi(qd) > 0) ? std::atoi(qd) : 0;
+            rclcpp::QoS pc_qos = qdepth > 0
+                ? rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(qdepth))).best_effort()
+                : rclcpp::QoS(rclcpp::SensorDataQoS());
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, pc_qos, standard_pcl_cbk);
         }
         if (imu_input_type == "fixposition_fpa")
         {
@@ -1769,6 +1846,112 @@ private:
 
             state_point = kf.get_x();
 
+            /*** Divergence guard (P1) — two independent divergence signals:
+             *   (1) effective-correspondence collapse streak: effct_feat_num (the
+             *       matched-plane count from the final iEKF iteration) staying low
+             *       for several scans means the scan no longer overlaps the map
+             *       (starvation / featureless) — the slow-drift onset.
+             *   (2) velocity runaway: a ground vehicle cannot physically exceed a
+             *       few m/s, so a body speed above divergence_guard_max_speed is
+             *       unambiguous IMU-dead-reckoning blow-up — catches the fast mode
+             *       (big IMU-integration jumps after dropped scans) that signal (1)
+             *       can miss because the post-gap scan may still match.
+             *   Either signal arms the degraded response below (force planar-Z,
+             *   clamp the speed, freeze the map). Both are inert in healthy
+             *   operation, so the guard is accuracy-neutral when undisturbed. ***/
+            flio_map_frozen = false;
+            flio_degraded_odom = false;
+            bool flio_vel_runaway = false;
+            if (divergence_guard_en)
+            {
+                if (effct_feat_num < divergence_guard_min_eff) ++consec_low_eff;
+                else                                           consec_low_eff = 0;
+                flio_vel_runaway = (state_point.vel.norm() > divergence_guard_max_speed);
+            }
+            const bool flio_in_degraded =
+                divergence_guard_en &&
+                (consec_low_eff >= divergence_guard_streak || flio_vel_runaway);
+
+            /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
+             *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll
+             *   reference the body-vz planar constraint below structurally lacks.
+             *   When LiDAR Z is degenerate, and only when the IMU is in low-linear-
+             *   acceleration motion (|‖a‖−g| small, so specific force ≈ gravity) and
+             *   not turning hard (lever-arm safety), the bias-free accelerometer
+             *   direction equals world-up expressed in the body frame. Pull the
+             *   grav-state up-axis onto it with a soft pseudo-measurement. Constrains
+             *   roll/pitch ONLY: yaw lies in the measurement null space (skew(g_body)
+             *   sends a yaw-axis δθ to 0), so the LiDAR-excellent heading is untouched.
+             *   h(x)=Rᵀ·u_world, right-perturbation R=R̂·Exp(δθ) ⇒ ∂h/∂δθ=skew(g_body),
+             *   the same form as the planar/wheel updates. ***/
+            if (gravity_align_en && !Measures.imu.empty() &&
+                (pos_obs_z_weak > gravity_align_z_weak_thresh || flio_in_degraded))
+            {
+                const auto &imu_last = Measures.imu.back();
+                V3D a_raw(imu_last->linear_acceleration.x,
+                          imu_last->linear_acceleration.y,
+                          imu_last->linear_acceleration.z);
+                V3D w_raw(imu_last->angular_velocity.x,
+                          imu_last->angular_velocity.y,
+                          imu_last->angular_velocity.z);
+                const double g_raw  = p_imu->gravity_norm();   // gravity magnitude, raw units
+                state_ikfom st = kf.get_x();
+                M3D Rw = st.rot.toRotationMatrix();
+                // Kinematic-acceleration compensation. The measured specific force is
+                // f = a_kinematic − g. On the open-area row-end turns that coincide with
+                // weak-Z, a_kinematic is dominated by centripetal ω×v_body, which tilts
+                // the raw accelerometer (mostly in ROLL) and, left uncorrected, drove a
+                // ~5 m upward Z drift. Subtract it (transport theorem; tangential dv/dt
+                // neglected, caught by the magnitude gate below) to recover clean gravity
+                // even mid-turn. Scaled into the IMU's accel units so it is g-unit safe.
+                V3D omega  = w_raw - V3D(st.bg[0], st.bg[1], st.bg[2]);  // true body rate
+                V3D v_body = Rw.transpose() * st.vel;                    // velocity in IMU frame
+                V3D a_kin  = omega.cross(v_body) * (g_raw / G_m_s2);     // centripetal, IMU units
+                V3D a_grav = a_raw - a_kin;                             // specific force − motion
+                const double a_norm = a_grav.norm();
+                // Validity gate: compensated magnitude ≈ gravity (rejects residual
+                // tangential accel) AND not spinning absurdly fast (ω×v single-sample
+                // approximation breaks down; magnitude gate is the primary guard).
+                if (g_raw > 1e-3 && a_norm > 1e-6 &&
+                    std::abs(a_norm - g_raw) <= gravity_align_accel_tol * g_raw &&
+                    w_raw.norm() <= gravity_align_gyro_tol)
+                {
+                    V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
+                    V3D u_world  = -grav_w.normalized();             // world up (unit)
+                    V3D g_body   = Rw.transpose() * u_world;         // predicted up in body (unit)
+                    V3D m_body   = a_grav / a_norm;                  // measured up in body (unit)
+                    V3D residual = m_body - g_body;                  // z − h(x)
+                    Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
+                    H.block<3,3>(0, 3) = skew_sym_mat(g_body);       // ∂h/∂(rot); yaw in null space
+                    const double n2 = gravity_align_noise * gravity_align_noise;
+                    Eigen::Vector3d R_diag(n2, n2, n2);
+                    if (degeneracy_debug)
+                    {
+                        // Leveling error the prior sees, BEFORE applying it: signed
+                        // tilt of measured-up vs predicted-up, decomposed so we can see
+                        // which way (and how hard) it will rotate pitch/roll.
+                        V3D tilt = g_body.cross(m_body);   // axis*sin(angle), body frame
+                        const double ang_deg = std::asin(std::min(1.0, tilt.norm())) * 57.2958;
+                        V3D eul_before = SO3ToEuler(st.rot);
+                        kf.update_simple(H, residual, R_diag);
+                        state_point = kf.get_x();
+                        V3D eul_after = SO3ToEuler(state_point.rot);
+                        V3D deul = eul_after - eul_before;
+                        std::cerr << "[GALIGN] z_weak=" << pos_obs_z_weak
+                                  << " degr=" << flio_in_degraded
+                                  << " tilt_deg=" << ang_deg
+                                  << " tiltAxisB=[" << tilt.x() << "," << tilt.y() << "," << tilt.z() << "]"
+                                  << " dRPY_deg=[" << deul.x()*57.2958 << "," << deul.y()*57.2958 << "," << deul.z()*57.2958 << "]"
+                                  << " posZ=" << state_point.pos[2] << "m" << std::endl;
+                    }
+                    else
+                    {
+                        kf.update_simple(H, residual, R_diag);
+                        state_point = kf.get_x();
+                    }
+                }
+            }
+
             /*** A'-2 planar-motion soft constraint: pseudo-measurement that the
              *   BODY-frame vertical velocity is ~0 (a ground-robot non-holonomic
              *   prior, same mechanism as the wheel-odom update below). Applied only
@@ -1778,7 +1961,8 @@ private:
              *   robot's pitch (rotation state), not by body-frame vz. This supplies
              *   the missing vertical information that the degenerate iEKF otherwise
              *   dumps into the accel bias, flying the state off (bag2 km-runaway). ***/
-            if (planar_constraint_en && pos_obs_z_weak > planar_constraint_z_weak_thresh)
+            if (planar_constraint_en &&
+                (pos_obs_z_weak > planar_constraint_z_weak_thresh || flio_in_degraded))
             {
                 state_ikfom st = kf.get_x();
                 M3D Rw = st.rot.toRotationMatrix();
@@ -1792,6 +1976,30 @@ private:
                 Eigen::Vector3d R_diag(1e6, 1e6, planar_constraint_noise * planar_constraint_noise);
                 kf.update_simple(H, residual, R_diag);
                 state_point = kf.get_x();
+            }
+
+            /*** Divergence guard (P1) — bound the runaway while degraded. A ground
+             *   vehicle cannot exceed a few m/s; a larger body speed here is
+             *   IMU-dead-reckoning blow-up, so clamp it (direction preserved) to keep
+             *   position growth linear and recoverable instead of exponential. Freeze
+             *   the map so dead-reckoned scans do not corrupt it, and flag the
+             *   odometry degraded so downstream (PGO) down-weights these poses. ***/
+            if (flio_in_degraded)
+            {
+                state_ikfom st = kf.get_x();
+                const double spd = st.vel.norm();
+                if (spd > divergence_guard_max_speed)
+                {
+                    st.vel *= divergence_guard_max_speed / spd;
+                    kf.change_x(st);
+                    state_point = kf.get_x();
+                }
+                flio_map_frozen = true;
+                flio_degraded_odom = true;
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "[DIVERGENCE-GUARD] LiDAR starved %d scans (effct=%d): planar-Z pinned, "
+                    "speed clamped, map frozen; posZ=%.1fm spd=%.2fm/s",
+                    consec_low_eff, effct_feat_num, state_point.pos[2], state_point.vel.norm());
             }
 
             /*** Optional degeneracy diagnostics ***/
@@ -1873,7 +2081,7 @@ private:
             // growth so the prior map isn't polluted by stationary frames or
             // teleport segments (elevator).  EKF and odometry publishing
             // above continue normally.
-            if (mapping_enabled.load(std::memory_order_relaxed)) {
+            if (mapping_enabled.load(std::memory_order_relaxed) && !flio_map_frozen) {
                 map_incremental();
             }
             t5 = omp_get_wtime();

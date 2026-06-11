@@ -172,7 +172,7 @@ double gravity_align_gyro_tol = 0.35;         // rad/s; skip during fast turns (
 bool   divergence_guard_en = true;
 int    divergence_guard_min_eff = 50;      // effct_feat_num below this = degenerate scan
 int    divergence_guard_streak = 5;        // consecutive degenerate scans → enter degraded
-double divergence_guard_max_speed = 10.0;  // m/s; body-speed clamp while degraded
+double divergence_guard_max_speed = 30.0;  // m/s; body-speed clamp while degraded (headroom over any platform speed)
 int    consec_low_eff = 0;                 // running degenerate-scan streak counter
 bool   flio_map_frozen = false;            // degraded: skip map_incremental (no garbage)
 bool   flio_degraded_odom = false;         // degraded: inflate published pose covariance
@@ -1293,7 +1293,7 @@ public:
         this->declare_parameter<bool>("divergence_guard_en", true);
         this->declare_parameter<int>("divergence_guard_min_eff", 50);
         this->declare_parameter<int>("divergence_guard_streak", 5);
-        this->declare_parameter<double>("divergence_guard_max_speed", 10.0);
+        this->declare_parameter<double>("divergence_guard_max_speed", 30.0);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("data_dir", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -1366,7 +1366,7 @@ public:
         this->get_parameter_or<bool>("divergence_guard_en", divergence_guard_en, true);
         this->get_parameter_or<int>("divergence_guard_min_eff", divergence_guard_min_eff, 50);
         this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
-        this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 10.0);
+        this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         string data_dir_param;
         this->get_parameter_or<string>("data_dir", data_dir_param, "");

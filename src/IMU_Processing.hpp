@@ -50,6 +50,11 @@ class ImuProcess
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
   ofstream fout_imu;
+  // When true, dump per-sample IMU (bias-corrected, as fed to the filter) to
+  // Log/imu.txt: "t angvel(xyz) acc(xyz)". Mirrors laserMapping runtime_pos_log
+  // so the raw IMU stream is available for offline drift/gravity analysis. Set by
+  // laserMapping from the runtime_pos_log_enable param before the first Process().
+  bool runtime_log_en = false;
   V3D cov_acc;
   V3D cov_gyr;
   V3D cov_acc_scale;
@@ -269,7 +274,10 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
                 0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
                 0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
 
-    // fout_imu << setw(10) << head->header.stamp.toSec() - first_lidar_time << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
+    if (runtime_log_en && fout_imu.is_open()) {
+      fout_imu << setw(10) << rclcpp::Time(head->header.stamp).seconds() - first_lidar_time
+               << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
+    }
 
     acc_avr     = acc_avr * G_m_s2 / mean_acc.norm(); // - state_inout.ba;
 
@@ -378,7 +386,7 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
       std::cout << "IMU Initial Done" << std::endl;
       // ROS_INFO("IMU Initial Done: Gravity: %.4f %.4f %.4f %.4f; state.bias_g: %.4f %.4f %.4f; acc covarience: %.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f",\
       //          imu_state.grav[0], imu_state.grav[1], imu_state.grav[2], mean_acc.norm(), cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2], cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1], cov_gyr[2]);
-      fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
+      if (runtime_log_en) fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
     }
 
     return;

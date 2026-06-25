@@ -1399,6 +1399,7 @@ public:
         this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
+        p_imu->runtime_log_en = runtime_pos_log;  // mirror to ImuProcess so Log/imu.txt is written
         ikd_profile = (getenv("FLIO_IKD_PROFILE") != nullptr);  // [ikd-profile] opt-in via env
         { const char *am = getenv("FLIO_ASYNC_MAP"); if (am && std::string(am) == "0") async_map_en = false; }
 #ifdef USE_IVOX

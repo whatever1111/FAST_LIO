@@ -57,7 +57,7 @@
 
         # Wheel odometry velocity injection (after ICP, constrains along-track drift)
         wheel_odom_en: false
-        wheel_topic: "/robot/twist"
+        wheel_topic: "/lio/twist"
         wheel_speed_scale: 1.0
         wheel_vel_noise_vx: 0.05     # m/s stddev, forward
         wheel_vel_noise_vy: 0.02     # m/s stddev, lateral (non-holonomic, heading constraint)

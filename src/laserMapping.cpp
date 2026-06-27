@@ -69,7 +69,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
-#include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
@@ -228,7 +228,7 @@ SteadyTimePoint last_latency_log_time;
 LatencyStats sensor_to_odom_latency_stats;
 
 bool   wheel_odom_en = false;
-string wheel_topic = "/robot/twist";
+string wheel_topic = "/lio/twist";
 double wheel_speed_scale = 1.0;
 double wheel_vel_noise_vx = 0.10;
 double wheel_vel_noise_vy = 0.05;
@@ -591,9 +591,9 @@ void imu_fpa_cbk(const fixposition_driver_msgs::msg::FpaImu::UniquePtr msg_in)
     enqueue_imu_msg(msg, get_time_sec(msg_in->data.header.stamp));
 }
 
-void twist_cbk(const geometry_msgs::msg::Twist::UniquePtr msg_in)
+void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
 {
-    Eigen::Vector3d v(msg_in->linear.x, msg_in->linear.y, msg_in->linear.z);
+    Eigen::Vector3d v(msg_in->twist.linear.x, msg_in->twist.linear.y, msg_in->twist.linear.z);
     std::lock_guard<std::mutex> lk(mtx_twist);
     twist_buffer.push_back(v);
     while (twist_buffer.size() > 100) twist_buffer.pop_front();
@@ -1341,7 +1341,7 @@ public:
         // backward compatibility; will emit a warning if set to true.
         this->declare_parameter<bool>("initial_pose_apply_roll_pitch", false);
         this->declare_parameter<bool>("wheel_odom_en", false);
-        this->declare_parameter<string>("wheel_topic", "/robot/twist");
+        this->declare_parameter<string>("wheel_topic", "/lio/twist");
         this->declare_parameter<double>("wheel_speed_scale", 1.0);
         this->declare_parameter<double>("wheel_vel_noise_vx", 0.10);
         this->declare_parameter<double>("wheel_vel_noise_vy", 0.05);
@@ -1446,7 +1446,7 @@ public:
             }
         }
         this->get_parameter_or<bool>("wheel_odom_en", wheel_odom_en, false);
-        this->get_parameter_or<string>("wheel_topic", wheel_topic, string("/robot/twist"));
+        this->get_parameter_or<string>("wheel_topic", wheel_topic, string("/lio/twist"));
         this->get_parameter_or<double>("wheel_speed_scale", wheel_speed_scale, 1.0);
         this->get_parameter_or<double>("wheel_vel_noise_vx", wheel_vel_noise_vx, 0.10);
         this->get_parameter_or<double>("wheel_vel_noise_vy", wheel_vel_noise_vy, 0.05);
@@ -1537,7 +1537,7 @@ public:
         }
         if (wheel_odom_en)
         {
-            sub_twist_ = this->create_subscription<geometry_msgs::msg::Twist>(wheel_topic, 2000, twist_cbk);
+            sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(wheel_topic, 2000, twist_cbk);
             RCLCPP_INFO(this->get_logger(), "Wheel odom enabled, topic: %s, scale: %.3f", wheel_topic.c_str(), wheel_speed_scale);
         }
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
@@ -2220,7 +2220,7 @@ private:
     rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImubias>::SharedPtr sub_imu_bias_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_twist_;
+    rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr sub_twist_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;

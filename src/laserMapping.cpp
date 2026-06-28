@@ -53,6 +53,7 @@
 #include <Eigen/Core>
 #include <fixposition_driver_msgs/msg/fpa_imu.hpp>
 #include <fixposition_driver_msgs/msg/fpa_imubias.hpp>
+#include <shm_msgs/msg/point_cloud8m_and_pose.hpp>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -157,6 +158,26 @@ double gravity_align_noise = 0.05;            // unit-vector (≈rad) std of the
 double gravity_align_z_weak_thresh = 0.3;     // engage only when pos_obs_z_weak exceeds this
 double gravity_align_accel_tol = 0.05;        // |‖a‖−g|/g must be below this (low-linear-accel gate)
 double gravity_align_gyro_tol = 0.35;         // rad/s; skip during fast turns (lever-arm safety)
+
+// Ground-return reweighting (A'-3) — the LiDAR-geometry fix, complementary to the
+// IMU/motion priors above. In open, planar scenes the few, far, grazing-incidence
+// GROUND returns are out-voted in the iEKF information matrix by abundant near-
+// VERTICAL wall returns, so the vertical (z/roll/pitch) DOFs are weakly constrained
+// and Z random-walks (the metastable "balloon"). Unlike the planar/gravity priors —
+// which add a motion/IMU pseudo-measurement and were proven NEUTRAL here because the
+// drift is a metastable random walk, not a systematic bias — this redistributes
+// weight among the REAL point-to-plane measurements: surfaces whose matched normal
+// is near-vertical (|n_z| ≥ ground_constraint_normal_z_min, i.e. horizontal ground)
+// get their information scaled by ground_constraint_weight². Both the h_x row and
+// the residual are scaled — R is a uniform scalar in the IKFoM update, so this is an
+// effective per-measurement noise of R/w². Gated on pos_obs_z_weak so it is inert
+// when Z is well observed, and only ground-normal points are touched, so horizontal
+// (x/y/yaw) constraints from walls are never weakened. Default OFF.
+bool   ground_constraint_en = false;
+double ground_constraint_weight = 6.0;          // info scales by weight^2 (>1 = stronger)
+double ground_constraint_normal_z_min = 0.966;  // |n_z| ≥ cos(15°) ⇒ treat as ground/horizontal
+double ground_constraint_z_weak_thresh = 0.5;   // apply only when pos_obs_z_weak exceeds this
+int    ground_constraint_boosted = 0;           // diag: # boosted ground points last h_share call
 
 // Divergence guard (P1): when LiDAR correspondences collapse (scan starvation
 // under CPU/IO load, or feature-poor geometry), the iEKF runs on IMU
@@ -424,6 +445,44 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     if (!diag_first_lidar_cb_logged) {
         RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
                     "[STARTUP][FAST_LIO] first lidar cb (PointCloud2) stamp=%.3f",
+                    get_time_sec(msg->header.stamp));
+        diag_first_lidar_cb_logged = true;
+    }
+    mtx_buffer.lock();
+    scan_count ++;
+    double cur_time = get_time_sec(msg->header.stamp);
+    double preprocess_start_time = omp_get_wtime();
+    if (!is_first_lidar && cur_time < last_timestamp_lidar)
+    {
+        std::cerr << "lidar loop back, clear buffer" << std::endl;
+        lidar_buffer.clear();
+        lidar_receive_time_buffer.clear();
+    }
+    if (is_first_lidar)
+    {
+        is_first_lidar = false;
+    }
+
+    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
+    p_pre->process(msg, ptr);
+    lidar_buffer.push_back(ptr);
+    time_buffer.push_back(cur_time);
+    lidar_receive_time_buffer.push_back(receive_time);
+    last_timestamp_lidar = cur_time;
+    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+}
+
+// Direct subscriber for shm_msgs/PointCloud8mAndPose (/pre/all_point). Decodes the
+// fixed 8MB buffer in place (no relay node, no extra DDS hop) — same buffering path
+// as standard_pcl_cbk, just a different message type handed to Preprocess.
+void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
+{
+    const auto receive_time = SteadyClock::now();
+    if (!diag_first_lidar_cb_logged) {
+        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                    "[STARTUP][FAST_LIO] first lidar cb (shm PointCloud8mAndPose) stamp=%.3f",
                     get_time_sec(msg->header.stamp));
         diag_first_lidar_cb_logged = true;
     }
@@ -997,6 +1056,25 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     }
     *pcl_wait_pub += *laserCloudWorld;
 
+    // Voxel-downsample + hard cap so the accumulated /Laser_map stays bounded and
+    // renderable. publish_map otherwise just appends a scan per tick and grows
+    // without limit. Start at a 0.3 m leaf and coarsen until under ~100k points.
+    {
+        constexpr size_t kMapPubMaxPoints = 100000;
+        float leaf = 0.3f;
+        for (int pass = 0; pass < 8; ++pass)
+        {
+            pcl::VoxelGrid<PointType> vg;
+            vg.setLeafSize(leaf, leaf, leaf);
+            vg.setInputCloud(pcl_wait_pub);
+            PointCloudXYZI::Ptr ds(new PointCloudXYZI());
+            vg.filter(*ds);
+            pcl_wait_pub = ds;
+            if (pcl_wait_pub->size() <= kMapPubMaxPoints) break;
+            leaf *= 1.5f;
+        }
+    }
+
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
@@ -1234,6 +1312,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
     ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12); //23
     ekfom_data.h.resize(effct_feat_num);
+    ground_constraint_boosted = 0;
 
     for (int i = 0; i < effct_feat_num; i++)
     {
@@ -1264,6 +1343,20 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
+
+        /*** Ground-return reweighting (A'-3): when Z is weakly observable, boost
+         *   near-horizontal (ground) surfaces so they are not out-voted by the
+         *   abundant vertical-wall returns. Scaling this row of h_x AND its residual
+         *   by w scales the measurement's information by w² (R is a uniform scalar in
+         *   the IKFoM update — see update_iterated_dyn_share_modified). Only
+         *   ground-normal points are touched, so wall-borne x/y/yaw is untouched. ***/
+        if (ground_constraint_en && pos_obs_z_weak > ground_constraint_z_weak_thresh &&
+            std::fabs(norm_p.z) >= ground_constraint_normal_z_min)
+        {
+            ekfom_data.h_x.block<1, 12>(i, 0) *= ground_constraint_weight;
+            ekfom_data.h(i) *= ground_constraint_weight;
+            ++ground_constraint_boosted;
+        }
     }
 
     solve_time += omp_get_wtime() - solve_start_;
@@ -1277,6 +1370,7 @@ public:
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
+        this->declare_parameter<double>("publish.map_period_sec", 5.0);  // /Laser_map publish period (s); 5s = 0.2Hz
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
@@ -1290,6 +1384,10 @@ public:
         this->declare_parameter<double>("gravity_align_z_weak_thresh", 0.3);
         this->declare_parameter<double>("gravity_align_accel_tol", 0.05);
         this->declare_parameter<double>("gravity_align_gyro_tol", 0.35);
+        this->declare_parameter<bool>("ground_constraint_en", false);
+        this->declare_parameter<double>("ground_constraint_weight", 6.0);
+        this->declare_parameter<double>("ground_constraint_normal_z_min", 0.966);
+        this->declare_parameter<double>("ground_constraint_z_weak_thresh", 0.5);
         this->declare_parameter<bool>("divergence_guard_en", true);
         this->declare_parameter<int>("divergence_guard_min_eff", 50);
         this->declare_parameter<int>("divergence_guard_streak", 5);
@@ -1363,6 +1461,10 @@ public:
         this->get_parameter_or<double>("gravity_align_z_weak_thresh", gravity_align_z_weak_thresh, 0.3);
         this->get_parameter_or<double>("gravity_align_accel_tol", gravity_align_accel_tol, 0.05);
         this->get_parameter_or<double>("gravity_align_gyro_tol", gravity_align_gyro_tol, 0.35);
+        this->get_parameter_or<bool>("ground_constraint_en", ground_constraint_en, false);
+        this->get_parameter_or<double>("ground_constraint_weight", ground_constraint_weight, 6.0);
+        this->get_parameter_or<double>("ground_constraint_normal_z_min", ground_constraint_normal_z_min, 0.966);
+        this->get_parameter_or<double>("ground_constraint_z_weak_thresh", ground_constraint_z_weak_thresh, 0.5);
         this->get_parameter_or<bool>("divergence_guard_en", divergence_guard_en, true);
         this->get_parameter_or<int>("divergence_guard_min_eff", divergence_guard_min_eff, 50);
         this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
@@ -1508,6 +1610,15 @@ public:
         {
             sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
         }
+        else if (p_pre->lidar_type == ALLPOINT)
+        {
+            // /pre/all_point is published RELIABLE with fixed 8MB messages; a small
+            // reliable KeepLast queue matches the bag publisher and bounds memory
+            // (a few buffered scans) while avoiding silent drops of whole scans.
+            rclcpp::QoS shm_qos(rclcpp::KeepLast(5));
+            sub_pcl_shm_ = this->create_subscription<shm_msgs::msg::PointCloud8mAndPose>(lid_topic, shm_qos, shm_allpoint_cbk);
+            RCLCPP_INFO(this->get_logger(), "shm allpoint mode: subscribing %s (shm_msgs/PointCloud8mAndPose)", lid_topic.c_str());
+        }
         else
         {
             // Diagnostic knob (env FLIO_LIDAR_QDEPTH): a deep best-effort LiDAR queue so
@@ -1518,9 +1629,15 @@ public:
             // the production default. best_effort stays compatible with the bag publisher.
             const char* qd = std::getenv("FLIO_LIDAR_QDEPTH");
             const int qdepth = (qd && std::atoi(qd) > 0) ? std::atoi(qd) : 0;
+            // Default RELIABLE KeepLast(5) to MATCH the lidar_adapter publisher
+            // (it publishes canonical /lio/points reliable so no 8MB scan is silently
+            // dropped). The matched reliable+volatile+keep_last pair is also what lets
+            // the intra-process manager do the zero-copy unique_ptr handoff when this
+            // node is co-composed with the adapter. FLIO_LIDAR_QDEPTH keeps the
+            // best-effort deep-queue diagnostic override.
             rclcpp::QoS pc_qos = qdepth > 0
                 ? rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(qdepth))).best_effort()
-                : rclcpp::QoS(rclcpp::SensorDataQoS());
+                : rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, pc_qos, standard_pcl_cbk);
         }
         if (imu_input_type == "fixposition_fpa")
@@ -1552,7 +1669,12 @@ public:
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
 
-        auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
+        // The voxel-capped /Laser_map is a coarse global map, not a live feed, so it
+        // publishes slowly (default 0.2 Hz). Period is configurable via publish.map_period_sec.
+        double map_pub_period_sec = 5.0;
+        this->get_parameter_or<double>("publish.map_period_sec", map_pub_period_sec, 5.0);
+        if (map_pub_period_sec <= 0.0) map_pub_period_sec = 5.0;
+        auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(map_pub_period_sec * 1000.0));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
@@ -1571,6 +1693,12 @@ public:
         // pick up the most recent state even if PGO published before we
         // started.  The PGO node is the sole publisher; we only read.
         auto mapping_qos = rclcpp::QoS(1).transient_local();
+        // transient_local durability is incompatible with intra-process comms, which
+        // this node enables for the point-cloud zero-copy path. This latched gate is a
+        // tiny, low-rate Bool from the (separate-process) PGO node, so force it onto the
+        // normal inter-process path; node-level intra-process stays on for /lio/points.
+        rclcpp::SubscriptionOptions mapping_sub_opts;
+        mapping_sub_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
         mapping_enabled_sub_ = this->create_subscription<std_msgs::msg::Bool>(
             "/lio_slam/mapping_enabled", mapping_qos,
             [this](std_msgs::msg::Bool::SharedPtr msg) {
@@ -1581,7 +1709,8 @@ public:
                                 msg->data ? "RESUMED" : "PAUSED",
                                 msg->data ? "re-enabled" : "suspended");
                 }
-            });
+            },
+            mapping_sub_opts);
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -2017,7 +2146,8 @@ private:
                     std::cerr << "[DEGEN] effct=" << effct_feat_num
                               << " corr=" << lidar_correction << "m speed=" << body_speed
                               << " dvel=" << dvel << " dba=" << dba << " dbg=" << dbg
-                              << " z_weak=" << pos_obs_z_weak << " posZ=" << state_point.pos[2] << "m" << std::endl;
+                              << " z_weak=" << pos_obs_z_weak << " posZ=" << state_point.pos[2] << "m"
+                              << " gnd_boost=" << ground_constraint_boosted << std::endl;
                 }
             }
 
@@ -2220,6 +2350,7 @@ private:
     rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImubias>::SharedPtr sub_imu_bias_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+    rclcpp::Subscription<shm_msgs::msg::PointCloud8mAndPose>::SharedPtr sub_pcl_shm_;
     rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr sub_twist_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
@@ -2242,6 +2373,7 @@ private:
     bool initial_pose_full_rpy_override_ = false;
 };
 
+#ifndef FASTLIO_AS_COMPONENT
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
@@ -2291,3 +2423,14 @@ int main(int argc, char** argv)
 
     return 0;
 }
+#endif  // FASTLIO_AS_COMPONENT
+
+#ifdef FASTLIO_AS_COMPONENT
+// Built as a SHARED rclcpp component (see CMakeLists) so LaserMappingNode can load
+// into the shared input_adapters MT container and receive /lio/points via an
+// intra-process pointer move instead of an 8 MB cross-process DDS copy. main() is
+// excluded in this build; the container owns the spin loop. The node's many
+// file-scope globals are safe here because exactly ONE LaserMappingNode is loaded.
+#include "rclcpp_components/register_node_macro.hpp"
+RCLCPP_COMPONENTS_REGISTER_NODE(LaserMappingNode)
+#endif  // FASTLIO_AS_COMPONENT

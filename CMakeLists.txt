@@ -63,6 +63,7 @@ find_package(pcl_conversions REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
 find_package(fixposition_driver_msgs REQUIRED)
+find_package(shm_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 set(dependencies
@@ -78,6 +79,7 @@ set(dependencies
   tf2_ros
   livox_ros_driver2
   fixposition_driver_msgs
+  shm_msgs
 )
 
 # Thirdparty libraries
@@ -133,9 +135,44 @@ endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
 
+# ─────────── Composable component (intra-process zero-copy) ───────────────────
+# Built from the SAME sources as the standalone executable but with
+# FASTLIO_AS_COMPONENT, which excludes main() and registers LaserMappingNode as an
+# rclcpp component. This lets FAST-LIO load into the shared input_adapters MT
+# container, where the lidar_adapter hands it /lio/points via an intra-process
+# unique_ptr move instead of an ~8 MB cross-process DDS copy. The node's file-scope
+# globals are safe because exactly ONE LaserMappingNode is ever loaded.
+add_library(fastlio_mapping_component SHARED
+  src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
+target_compile_definitions(fastlio_mapping_component PRIVATE FASTLIO_AS_COMPONENT)
+target_include_directories(fastlio_mapping_component PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
+)
+target_link_libraries(fastlio_mapping_component ${PCL_LIBRARIES} Eigen3::Eigen)
+if(PythonLibs_FOUND)
+  target_link_libraries(fastlio_mapping_component ${PYTHON_LIBRARIES})
+  target_include_directories(fastlio_mapping_component PRIVATE ${PYTHON_INCLUDE_DIRS})
+endif()
+if(USE_IVOX)
+  target_compile_definitions(fastlio_mapping_component PRIVATE USE_IVOX)
+endif()
+if(cpp_typesupport_target)  # set by rosidl_get_typesupport_target above (non-EOL distros)
+  target_link_libraries(fastlio_mapping_component ${cpp_typesupport_target})
+endif()
+ament_target_dependencies(fastlio_mapping_component ${dependencies})
+rclcpp_components_register_nodes(fastlio_mapping_component "LaserMappingNode")
+
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(TARGETS fastlio_mapping_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
 )
 
 install(

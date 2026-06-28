@@ -3,6 +3,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
+#include <shm_msgs/msg/point_cloud8m_and_pose.hpp>
 
 using namespace std;
 
@@ -17,8 +18,9 @@ enum LID_TYPE
   VELO16,
   OUST64,
   MID360,
-  HESAI32
-};  // {1, 2, 3, 4, 5}
+  HESAI32,
+  ALLPOINT   // shm_msgs/PointCloud8mAndPose on /pre/all_point (RoboSense layout, fixed 8MB buffer)
+};  // {1, 2, 3, 4, 5, 6}
 enum TIME_UNIT
 {
   SEC = 0,
@@ -162,6 +164,7 @@ class Preprocess
   
   void process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out);
   void process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out);
+  void process(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out);
   void set(bool feat_en, int lid_type, double bld, int pfilt_num);
 
   // sensor_msgs::PointCloud2::ConstPtr pointcloud;
@@ -180,6 +183,7 @@ private:
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void hesai_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
+  void allpoint_handler(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr &msg);
   void default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
   void pub_func(PointCloudXYZI &pl, const rclcpp::Time &ct);

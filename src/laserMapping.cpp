@@ -35,6 +35,7 @@
 #include <omp.h>
 #include <cstdlib>
 #include <algorithm>
+#include <iomanip>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -197,6 +198,73 @@ double divergence_guard_max_speed = 30.0;  // m/s; body-speed clamp while degrad
 int    consec_low_eff = 0;                 // running degenerate-scan streak counter
 bool   flio_map_frozen = false;            // degraded: skip map_incremental (no garbage)
 bool   flio_degraded_odom = false;         // degraded: inflate published pose covariance
+
+// Canopy detector — a SCENE detector, orthogonal to pos_obs_z_weak. Inside tall
+// crop the matched normals stay directionally diverse (the canopy is volumetric
+// and self-similar), so the Σnnᵀ observability metric reads HEALTHY while the Z
+// constraint is physically false: each scan's small Z error is baked into the
+// map and the next scan matches that freshly-laid layer (a map-mediated ratchet
+// — the measured −60 m in-canopy dive is R²≈0.997 smooth). The reliable
+// signature is the collapse of NEAR-FIELD GROUND returns (measured on the giant
+// 0702 bag: 79–99 % healthy → 42–60 % in canopy) plus elevated near-field point
+// height. Both statistics use the LiDAR/cloud BODY frame so they are immune to
+// the very Z drift they must detect. Hysteresis + debounce below.
+bool   canopy_detect_en = false;
+bool   canopy_debug = false;            // per-scan [CANOPY] stderr line
+double canopy_near_range = 20.0;        // near-field horizontal radius, cloud frame (m)
+double canopy_ground_z = -0.47;         // ground height in the CLOUD frame (giant rig measured)
+double canopy_ground_halfband = 0.8;    // ± band around canopy_ground_z counted as ground (m)
+double canopy_normal_z_min = 0.966;     // |n_z| ≥ cos(15°) ⇒ horizontal surface
+double canopy_frac_enter = 0.65;        // ground fraction below this (AND zp95 above) → enter vote
+double canopy_frac_exit = 0.75;         // ground fraction above this → exit vote
+double canopy_zp95_enter = 1.5;         // near-field body-z p95 must exceed this to enter (m)
+int    canopy_min_near = 50;            // fewer near-field points than this = neutral scan
+int    canopy_enter_scans = 10;         // consecutive enter votes to switch on (~1 s at 10 Hz)
+int    canopy_exit_scans = 30;          // consecutive exit votes to switch off (~3 s)
+// per-scan raw statistics (written by h_share_model, consumed once per scan in the main loop)
+double canopy_ground_frac = 1.0, canopy_zp95 = 0.0;
+int    canopy_near_count = 0;
+bool   canopy_mode = false;
+int    canopy_enter_streak = 0, canopy_exit_streak = 0, canopy_deweighted = 0;
+
+// Canopy LiDAR-Z de-weighting — ⚠ MEASURED INEFFECTIVE ALONE (0702 B2 arm,
+// 2026-07-06: FE Z max 61.1 m vs 61.4 m baseline). In deep canopy most false
+// rows carry tilted normals (|n_z| < 0.7) and escape the filter; lowering the
+// threshold would also starve the (good) horizontal information. Kept for
+// experimentation only.
+double canopy_z_deweight = 1.0;         // <1 enables; info scales by value² (0.2 ⇒ ×0.04)
+double canopy_deweight_normal_z_min = 0.7;  // |n_z| ≥ this AND outside ground band ⇒ de-weight
+
+// GPS-Z anchor — ⚠ NEGATIVE RESULT, DO NOT ENABLE without the deep-canopy
+// coasting design (see memory canopy_z_fe_anchor_negative, 2026-07-06). Four-arm
+// A/B on 0702: (B) without gpsz_p_floor the per-scan LiDAR update crushes P_zz
+// to ~1e-4 → anchor gain ~4e-3 → 564 applied updates moved Z millimetres against
+// the −60 m dive. (B3) with gpsz_p_floor=0.25 the anchor DID hold Z (±1 m where
+// baseline was −59 m) but pins POSITION only: the dive pressure accumulated
+// unobserved in vz and released as a −1133 m vertical runaway when matching
+// weakened (FE 2D max 5.2 km). (B4) adding the planar body-vz constraint in
+// canopy plugged vz — and the pressure redirected into HORIZONTAL velocity
+// (0→30 m/s in <4 s at the t≈173 region-boundary event; FE 2D max 3.7 km).
+// Structural lesson: while the filter keeps CONSUMING the canopy's false
+// matches, blocking the state from following them just reroutes the residual
+// into whichever channel is left unconstrained (z → vz → vxy/attitude). A
+// stable fix must stop consuming the false information (deep-canopy GNSS/INS
+// coasting + map freeze), not out-vote it. Mechanism below kept for that
+// future design; the offset-c learning and stamp/χ² disciplines are validated.
+bool   gpsz_aid_en = false;
+string gpsz_topic = "/lio/gps_odom";
+double gpsz_noise_floor = 0.5;          // σ floor (m): soft anchor, absorbs frozen-offset error
+double gpsz_max_sigma = 0.30;           // skip update/learning when GPS σ_z exceeds this (m)
+double gpsz_chi2_gate = 9.0;            // (r²/S) gate, 3σ
+double gpsz_p_floor = 0.0;              // P_zz floor before the anchor update (m²); 0 = off
+double gpsz_offset_tau = 60.0;          // offset-learning time constant (s)
+double gpsz_stamp_tol = 0.10;           // max |gps stamp − lidar_end_time| pairing tolerance (s)
+double gpsz_offset = 0.0;               // learned c = z_gps − p_z
+bool   gpsz_offset_init = false;
+int    gpsz_applied = 0, gpsz_rejected = 0;   // running diag counters
+struct GpszSample { double t, z, var; };
+deque<GpszSample> gpsz_buffer;
+mutex  mtx_gpsz;
 
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
@@ -656,6 +724,20 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
     std::lock_guard<std::mutex> lk(mtx_twist);
     twist_buffer.push_back(v);
     while (twist_buffer.size() > 100) twist_buffer.pop_front();
+}
+
+// GPS-Z anchor feed: canonical ENU odometry (/lio/gps_odom). Keeps (stamp, z,
+// var_zz) only; consumed stamp-paired against lidar_end_time in the main loop.
+void gpsz_cbk(const nav_msgs::msg::Odometry::UniquePtr msg_in)
+{
+    GpszSample s;
+    s.t = msg_in->header.stamp.sec + msg_in->header.stamp.nanosec * 1e-9;
+    s.z = msg_in->pose.pose.position.z;
+    s.var = msg_in->pose.covariance[14];  // (z,z)
+    if (!std::isfinite(s.z) || !std::isfinite(s.var) || s.var < 0.0) return;
+    std::lock_guard<std::mutex> lk(mtx_gpsz);
+    gpsz_buffer.push_back(s);
+    while (gpsz_buffer.size() > 200) gpsz_buffer.pop_front();
 }
 
 double lidar_mean_scantime = 0.0;
@@ -1298,6 +1380,35 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         pos_obs_z_weak = std::abs(es.eigenvectors()(2, 0));  // |Z| of weakest eigenvector
     }
 
+    // Canopy detector raw statistics over the near-field effective points, all in
+    // the LiDAR/cloud BODY frame (drift-immune). Ground = horizontal-normal match
+    // whose height sits in the physical ground band. The debounced mode switch is
+    // in the main loop (once per scan); this just refreshes the raw numbers.
+    if (canopy_detect_en)
+    {
+        static std::vector<float> near_z;   // h_share_model is single-threaded here
+        near_z.clear();
+        int ground_cnt = 0;
+        for (int i = 0; i < feats_down_size; i++)
+        {
+            if (!point_selected_surf[i]) continue;
+            const PointType &pb = feats_down_body->points[i];
+            if (std::hypot(pb.x, pb.y) > canopy_near_range) continue;
+            near_z.push_back(pb.z);
+            if (std::fabs(normvec->points[i].z) >= canopy_normal_z_min &&
+                std::fabs(pb.z - canopy_ground_z) <= canopy_ground_halfband)
+                ++ground_cnt;
+        }
+        canopy_near_count = static_cast<int>(near_z.size());
+        if (canopy_near_count > 0)
+        {
+            canopy_ground_frac = static_cast<double>(ground_cnt) / canopy_near_count;
+            const size_t k = static_cast<size_t>(0.95 * (near_z.size() - 1));
+            std::nth_element(near_z.begin(), near_z.begin() + k, near_z.end());
+            canopy_zp95 = near_z[k];
+        }
+    }
+
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
@@ -1313,6 +1424,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12); //23
     ekfom_data.h.resize(effct_feat_num);
     ground_constraint_boosted = 0;
+    canopy_deweighted = 0;
 
     for (int i = 0; i < effct_feat_num; i++)
     {
@@ -1357,6 +1469,21 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             ekfom_data.h(i) *= ground_constraint_weight;
             ++ground_constraint_boosted;
         }
+
+        /*** Canopy false-floor de-weighting: while in detected canopy, a
+         *   horizontal-normal match whose body height is OUTSIDE the ground band
+         *   is canopy matter posing as floor — attenuate its information (row and
+         *   residual scaled ⇒ info × canopy_z_deweight²). Ground-band returns and
+         *   all wall-borne x/y/yaw information are untouched. See the knob block
+         *   at the top of the file for why this only SLOWS the map ratchet. ***/
+        if (canopy_detect_en && canopy_mode && canopy_z_deweight < 1.0 &&
+            std::fabs(norm_p.z) >= canopy_deweight_normal_z_min &&
+            std::fabs(laser_p.z - canopy_ground_z) > canopy_ground_halfband)
+        {
+            ekfom_data.h_x.block<1, 12>(i, 0) *= canopy_z_deweight;
+            ekfom_data.h(i) *= canopy_z_deweight;
+            ++canopy_deweighted;
+        }
     }
 
     solve_time += omp_get_wtime() - solve_start_;
@@ -1392,6 +1519,28 @@ public:
         this->declare_parameter<int>("divergence_guard_min_eff", 50);
         this->declare_parameter<int>("divergence_guard_streak", 5);
         this->declare_parameter<double>("divergence_guard_max_speed", 30.0);
+        this->declare_parameter<bool>("canopy_detect_en", false);
+        this->declare_parameter<bool>("canopy_debug", false);
+        this->declare_parameter<double>("canopy_near_range", 20.0);
+        this->declare_parameter<double>("canopy_ground_z", -0.47);
+        this->declare_parameter<double>("canopy_ground_halfband", 0.8);
+        this->declare_parameter<double>("canopy_normal_z_min", 0.966);
+        this->declare_parameter<double>("canopy_frac_enter", 0.65);
+        this->declare_parameter<double>("canopy_frac_exit", 0.75);
+        this->declare_parameter<double>("canopy_zp95_enter", 1.5);
+        this->declare_parameter<int>("canopy_min_near", 50);
+        this->declare_parameter<int>("canopy_enter_scans", 10);
+        this->declare_parameter<int>("canopy_exit_scans", 30);
+        this->declare_parameter<double>("canopy_z_deweight", 1.0);
+        this->declare_parameter<double>("canopy_deweight_normal_z_min", 0.7);
+        this->declare_parameter<bool>("gpsz_aid_en", false);
+        this->declare_parameter<string>("gpsz_topic", "/lio/gps_odom");
+        this->declare_parameter<double>("gpsz_noise_floor", 0.5);
+        this->declare_parameter<double>("gpsz_max_sigma", 0.30);
+        this->declare_parameter<double>("gpsz_chi2_gate", 9.0);
+        this->declare_parameter<double>("gpsz_p_floor", 0.0);
+        this->declare_parameter<double>("gpsz_offset_tau", 60.0);
+        this->declare_parameter<double>("gpsz_stamp_tol", 0.10);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("data_dir", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -1469,6 +1618,28 @@ public:
         this->get_parameter_or<int>("divergence_guard_min_eff", divergence_guard_min_eff, 50);
         this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
         this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
+        this->get_parameter_or<bool>("canopy_detect_en", canopy_detect_en, false);
+        this->get_parameter_or<bool>("canopy_debug", canopy_debug, false);
+        this->get_parameter_or<double>("canopy_near_range", canopy_near_range, 20.0);
+        this->get_parameter_or<double>("canopy_ground_z", canopy_ground_z, -0.47);
+        this->get_parameter_or<double>("canopy_ground_halfband", canopy_ground_halfband, 0.8);
+        this->get_parameter_or<double>("canopy_normal_z_min", canopy_normal_z_min, 0.966);
+        this->get_parameter_or<double>("canopy_frac_enter", canopy_frac_enter, 0.65);
+        this->get_parameter_or<double>("canopy_frac_exit", canopy_frac_exit, 0.75);
+        this->get_parameter_or<double>("canopy_zp95_enter", canopy_zp95_enter, 1.5);
+        this->get_parameter_or<int>("canopy_min_near", canopy_min_near, 50);
+        this->get_parameter_or<int>("canopy_enter_scans", canopy_enter_scans, 10);
+        this->get_parameter_or<int>("canopy_exit_scans", canopy_exit_scans, 30);
+        this->get_parameter_or<double>("canopy_z_deweight", canopy_z_deweight, 1.0);
+        this->get_parameter_or<double>("canopy_deweight_normal_z_min", canopy_deweight_normal_z_min, 0.7);
+        this->get_parameter_or<bool>("gpsz_aid_en", gpsz_aid_en, false);
+        this->get_parameter_or<string>("gpsz_topic", gpsz_topic, string("/lio/gps_odom"));
+        this->get_parameter_or<double>("gpsz_noise_floor", gpsz_noise_floor, 0.5);
+        this->get_parameter_or<double>("gpsz_max_sigma", gpsz_max_sigma, 0.30);
+        this->get_parameter_or<double>("gpsz_chi2_gate", gpsz_chi2_gate, 9.0);
+        this->get_parameter_or<double>("gpsz_p_floor", gpsz_p_floor, 0.0);
+        this->get_parameter_or<double>("gpsz_offset_tau", gpsz_offset_tau, 60.0);
+        this->get_parameter_or<double>("gpsz_stamp_tol", gpsz_stamp_tol, 0.10);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         string data_dir_param;
         this->get_parameter_or<string>("data_dir", data_dir_param, "");
@@ -1656,6 +1827,15 @@ public:
         {
             sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(wheel_topic, 2000, twist_cbk);
             RCLCPP_INFO(this->get_logger(), "Wheel odom enabled, topic: %s, scale: %.3f", wheel_topic.c_str(), wheel_speed_scale);
+        }
+        if (gpsz_aid_en)
+        {
+            // /lio/gps_odom publishes best-effort — the sub must match or it silently gets nothing.
+            sub_gpsz_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                gpsz_topic, rclcpp::SensorDataQoS(), gpsz_cbk);
+            RCLCPP_INFO(this->get_logger(),
+                "GPS-Z anchor enabled: topic=%s floor=%.2fm max_sigma=%.2fm tau=%.0fs (canopy_detect_en=%d)",
+                gpsz_topic.c_str(), gpsz_noise_floor, gpsz_max_sigma, gpsz_offset_tau, (int)canopy_detect_en);
         }
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
@@ -2002,6 +2182,52 @@ private:
                 divergence_guard_en &&
                 (consec_low_eff >= divergence_guard_streak || flio_vel_runaway);
 
+            /*** Canopy mode debounce (once per scan, on the h_share_model raw
+             *   stats). Enter needs BOTH signals (ground fraction collapsed AND
+             *   near-field points tall) for canopy_enter_scans consecutive scans;
+             *   exit needs the ground fraction healthy for canopy_exit_scans.
+             *   Scans with too few near-field points are neutral: hold state,
+             *   reset both streaks (no drift toward either decision). ***/
+            if (canopy_detect_en)
+            {
+                const bool measurable = canopy_near_count >= canopy_min_near;
+                const bool vote_enter = measurable &&
+                    canopy_ground_frac < canopy_frac_enter && canopy_zp95 > canopy_zp95_enter;
+                const bool vote_exit = measurable && canopy_ground_frac > canopy_frac_exit;
+                if (!canopy_mode)
+                {
+                    canopy_enter_streak = vote_enter ? canopy_enter_streak + 1 : 0;
+                    if (canopy_enter_streak >= canopy_enter_scans)
+                    {
+                        canopy_mode = true;
+                        canopy_enter_streak = 0;
+                        RCLCPP_WARN(this->get_logger(),
+                            "[CANOPY] ENTER ground_frac=%.2f zp95=%.2f near=%d posZ=%.2f (gpsz offset %s %.3f)",
+                            canopy_ground_frac, canopy_zp95, canopy_near_count, state_point.pos[2],
+                            gpsz_offset_init ? "frozen at" : "NOT LEARNED", gpsz_offset);
+                    }
+                }
+                else
+                {
+                    canopy_exit_streak = vote_exit ? canopy_exit_streak + 1 : 0;
+                    if (canopy_exit_streak >= canopy_exit_scans)
+                    {
+                        canopy_mode = false;
+                        canopy_exit_streak = 0;
+                        RCLCPP_WARN(this->get_logger(),
+                            "[CANOPY] EXIT ground_frac=%.2f zp95=%.2f near=%d posZ=%.2f gpsz applied=%d rejected=%d",
+                            canopy_ground_frac, canopy_zp95, canopy_near_count, state_point.pos[2],
+                            gpsz_applied, gpsz_rejected);
+                    }
+                }
+                if (canopy_debug)
+                    std::cerr << "[CANOPY] t=" << std::fixed << std::setprecision(3) << lidar_end_time
+                              << " frac=" << canopy_ground_frac << " zp95=" << canopy_zp95
+                              << " near=" << canopy_near_count << " mode=" << canopy_mode
+                              << " dew=" << canopy_deweighted << " posZ=" << state_point.pos[2]
+                              << " c=" << gpsz_offset << std::endl;
+            }
+
             /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
              *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll
              *   reference the body-vz planar constraint below structurally lacks.
@@ -2091,8 +2317,14 @@ private:
              *   robot's pitch (rotation state), not by body-frame vz. This supplies
              *   the missing vertical information that the degenerate iEKF otherwise
              *   dumps into the accel bias, flying the state off (bag2 km-runaway). ***/
+            // canopy_mode joins the gate: the Σnnᵀ z_weak metric is blind in canopy
+            // (normals stay diverse while the Z info is false), and the GPS-Z anchor
+            // alone pins POSITION only — without a velocity constraint the dive
+            // pressure accumulates unobserved in vz and releases as a vertical
+            // runaway the moment matching weakens (measured −1133 m, 0702 B3 arm).
             if (planar_constraint_en &&
-                (pos_obs_z_weak > planar_constraint_z_weak_thresh || flio_in_degraded))
+                (pos_obs_z_weak > planar_constraint_z_weak_thresh || flio_in_degraded ||
+                 (canopy_detect_en && canopy_mode)))
             {
                 state_ikfom st = kf.get_x();
                 M3D Rw = st.rot.toRotationMatrix();
@@ -2190,6 +2422,84 @@ private:
 
                     kf.update_simple(H, residual, R_diag);
                     state_point = kf.get_x();  // re-read corrected state
+                }
+            }
+
+            /*** GPS-Z anchor (canopy): stamp-paired 1-row p_z pseudo-measurement.
+             *   Healthy → learn the ENU→odom z offset c (slow EMA); canopy → hold
+             *   c frozen and anchor p_z to (z_gps − c) through a χ² gate. See the
+             *   knob block at the top of the file for the full rationale. ***/
+            if (gpsz_aid_en)
+            {
+                GpszSample best{0.0, 0.0, -1.0};
+                {
+                    std::lock_guard<std::mutex> lk(mtx_gpsz);
+                    while (!gpsz_buffer.empty() && gpsz_buffer.front().t < lidar_end_time - 1.0)
+                        gpsz_buffer.pop_front();
+                    double best_dt = gpsz_stamp_tol;
+                    for (const auto &s : gpsz_buffer)
+                    {
+                        const double dt = std::fabs(s.t - lidar_end_time);
+                        if (dt <= best_dt) { best_dt = dt; best = s; }
+                        if (s.t > lidar_end_time + gpsz_stamp_tol) break;
+                    }
+                }
+                if (best.var >= 0.0 && std::isfinite(best.z) &&
+                    std::sqrt(best.var) <= gpsz_max_sigma)
+                {
+                    state_ikfom st = kf.get_x();
+                    const double c_meas = best.z - st.pos[2];
+                    if (!canopy_mode)
+                    {
+                        if (!gpsz_offset_init) { gpsz_offset = c_meas; gpsz_offset_init = true; }
+                        else
+                        {
+                            // per-scan EMA toward c_meas with time constant gpsz_offset_tau
+                            const double alpha = std::min(1.0, 0.1 / gpsz_offset_tau);
+                            gpsz_offset += alpha * (c_meas - gpsz_offset);
+                        }
+                    }
+                    else if (gpsz_offset_init)
+                    {
+                        /* The per-scan LiDAR update crushes P_zz to ~1e-4 even when its
+                         * Z information is FALSE (canopy self-similarity) — measured on
+                         * 0702: 564 anchor updates moved Z by millimetres against a −60 m
+                         * dive (K ≈ 4e-3). Restore honest gain by flooring P_zz for THIS
+                         * update only: (I−KH)P re-collapses it immediately after, so the
+                         * LiDAR update's own authority is untouched. Adding a non-negative
+                         * diagonal increment keeps P PSD. The map is the memory — one
+                         * anchored correction ≥ the per-scan ratchet step (~0.1 m) breaks
+                         * the dive; equilibrium residual ≈ ratchet_step·R/(P_floor+R). */
+                        if (gpsz_p_floor > 0.0)
+                        {
+                            auto P = kf.get_P();
+                            if (P(2, 2) < gpsz_p_floor)
+                            {
+                                P(2, 2) = gpsz_p_floor;
+                                kf.change_P(P);
+                            }
+                        }
+                        const double r = (best.z - gpsz_offset) - st.pos[2];
+                        const double R = std::max(best.var, gpsz_noise_floor * gpsz_noise_floor);
+                        const double S = kf.get_P()(2, 2) + R;
+                        if (r * r / S <= gpsz_chi2_gate)
+                        {
+                            Eigen::Matrix<double, 1, 23> H = Eigen::Matrix<double, 1, 23>::Zero();
+                            H(0, 2) = 1.0;
+                            Eigen::Matrix<double, 1, 1> res; res(0) = r;
+                            Eigen::Matrix<double, 1, 1> Rd;  Rd(0) = R;
+                            kf.update_simple(H, res, Rd);
+                            state_point = kf.get_x();
+                            ++gpsz_applied;
+                        }
+                        else
+                        {
+                            ++gpsz_rejected;
+                            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                "[GPSZ] innovation gated: r=%.2fm S=%.3f (applied=%d rejected=%d)",
+                                r, S, gpsz_applied, gpsz_rejected);
+                        }
+                    }
                 }
             }
 
@@ -2352,6 +2662,7 @@ private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
     rclcpp::Subscription<shm_msgs::msg::PointCloud8mAndPose>::SharedPtr sub_pcl_shm_;
     rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr sub_twist_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_gpsz_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;

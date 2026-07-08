@@ -42,6 +42,7 @@
 #include <deque>
 #include <limits>
 #include <mutex>
+#include <unordered_map>
 #include <math.h>
 #include <thread>
 #include <fstream>
@@ -220,6 +221,95 @@ double ground_recover_sector_tol = 0.25;  // sector-vs-global plane height agree
 int    ground_recover_max_rows = 4000;    // per-scan cap on recovered rows
 int    canopy_ground_recovered = 0;       // diag: rows recovered last h_share call
 
+// TEM (Terrain Elevation Memory): the ground-recovery rows above still measure
+// their residual against the SELF-BUILT map's lower envelope — a reference that
+// drifts with the vehicle, so the map-mediated Z ratchet is only slowed, never
+// stopped (measured: −54 m class remains). TEM swaps that reference for a
+// world-frame terrain height grid that is LEARNED while Z observability is
+// healthy and FROZEN while it is degraded, exploiting the one physical
+// invariant available without external aiding: terrain does not move within a
+// session. Continuous quality weighting (no scene classifier): the learning
+// rate is a dead-banded ramp of the effective-set vertical-normal ground share
+// (egf — the very statistic whose collapse IS the pathology, computed before
+// the recovery pass so recovered rows cannot vouch for themselves). The dead
+// band is a physical requirement, not a tuning nicety: canopy dwell is ~700 s
+// at ~0.1 m/s drift, so any nonzero learning rate there eventually hands the
+// memory to the drift. Cells store a height variance fed by intra-cell spread
+// AND frame-to-frame disagreement — slopes and residual drift inflate it, and
+// the row weight collapses with it (online slope statistics; no fixed slope
+// prior, no site-specific extents: hashed grid). Rows keep every existing
+// recovery gate; only the residual reference and the row weight change, and
+// rows fall back to the lower envelope wherever TEM has no served coverage.
+bool   tem_en = false;
+double tem_cell = 5.0;        // grid cell size (m); terrain is smooth at this scale
+double tem_tau = 2.0;         // s, per-cell EMA time constant at full health (q=1)
+double tem_egf_floor = 0.30;  // egf at/below this → learning fully frozen
+double tem_egf_ref = 0.60;    // egf at/above this → full learning rate
+double tem_sigma0 = 0.15;     // m, row weight = sigma0/(sigma0 + cell std)
+struct TemCell { double z; double var; double w; };
+std::unordered_map<int64_t, TemCell> tem_grid;
+std::vector<Eigen::Vector3d> tem_samples;  // this scan's fit-band inliers (body frame)
+double tem_egf_ema = 1.0;     // smoothed egf (starts healthy: cold start must not freeze)
+int    tem_rows = 0, tem_ext_rows = 0, tem_env_rows = 0;  // diag: rows per residual reference
+// Slope-clamped extrapolation (measured first-visit failure: a mission that
+// enters a degraded area it never covered while healthy has no served cells
+// there — every row fell back to the drifting envelope and the −55 m ratchet
+// survived TEM v1 untouched). The honest information terrain smoothness still
+// carries: height at distance d from the anchored network lies within
+// slope_hi * d of the anchor, where slope_hi is an ONLINE statistic of the
+// anchored cells' own gradients (no fixed site prior). A small fraction of
+// recovered rows uses that envelope as a weak absolute reference with a
+// trust-region clamp (degraded-RTK lesson: unclamped absolute pulls run away)
+// while the rest keep the envelope reference for local Z observability — the
+// absolute channel fights secular drift, it must not cannibalize the local
+// restoration that is the recovery channel's primary job.
+double tem_slope_mean = 0.01, tem_slope_var = 1e-4;  // online |dz|/dxy statistic (healthy pairs)
+bool   tem_ext_ok = false;   // per-scan extrapolation anchor (nearest served cells)
+double tem_ext_z = 0.0, tem_ext_sigma = 1.0;
+
+inline int64_t temKeyIdx(int64_t kx, int64_t ky) { return (kx << 32) ^ (ky & 0xffffffff); }
+
+inline int64_t temKey(double x, double y)
+{
+    return temKeyIdx(static_cast<int64_t>(std::floor(x / tem_cell)),
+                     static_cast<int64_t>(std::floor(y / tem_cell)));
+}
+
+// Recover the cell indices from a key (valid for |k| < 2^31; low half carries
+// ky's low 32 bits, high half kx's — the XOR never mixes them).
+inline void temKeyToIdx(int64_t key, int64_t &kx, int64_t &ky)
+{
+    ky = static_cast<int32_t>(key & 0xffffffff);
+    kx = key >> 32;
+}
+
+// Bilinear height lookup over the 2x2 cell-center neighborhood; cells below the
+// serving weight are skipped and the coefficients renormalized. Requires at
+// least half the interpolation mass to be served — partial coverage degrades
+// gracefully instead of extrapolating.
+inline bool temLookup(double x, double y, double &z_out, double &std_out)
+{
+    constexpr double kTemMinServeW = 2.0;  // ~2 healthy scans before a cell serves
+    const double u = x / tem_cell - 0.5, v = y / tem_cell - 0.5;
+    const double bu = std::floor(u), bv = std::floor(v);
+    const double fx = u - bu, fy = v - bv;
+    double csum = 0.0, zsum = 0.0, vsum = 0.0;
+    for (int di = 0; di < 2; di++)
+        for (int dj = 0; dj < 2; dj++)
+        {
+            const double cx = (bu + di + 0.5) * tem_cell, cy = (bv + dj + 0.5) * tem_cell;
+            const auto it = tem_grid.find(temKey(cx, cy));
+            if (it == tem_grid.end() || it->second.w < kTemMinServeW) continue;
+            const double c = (di ? fx : 1.0 - fx) * (dj ? fy : 1.0 - fy);
+            csum += c;
+            zsum += c * it->second.z;
+            vsum += c * it->second.var;
+        }
+    if (csum < 0.5) return false;
+    z_out = zsum / csum;
+    std_out = std::sqrt(std::max(vsum / csum, 0.0));
+    return true;
+}
 
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
@@ -1295,7 +1385,9 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     // (drift-immune). MUST run BEFORE the ground recovery pass below so the
     // statistic reflects the unmodified selection, not the recovery's own output.
     // The debounced mode switch in the main loop is telemetry/diagnostics too.
-    if (canopy_detect_en)
+    // TEM consumes canopy_ground_frac as its anchor-quality signal (egf), so the
+    // statistic is also computed when tem_en.
+    if (canopy_detect_en || tem_en)
     {
         static std::vector<float> near_z;   // h_share_model is single-threaded here
         near_z.clear();
@@ -1349,6 +1441,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
      *   matched rows (NEGATIVE result); this restores SELECTION of discarded
      *   true ground. ***/
     canopy_ground_recovered = 0;
+    tem_rows = tem_ext_rows = tem_env_rows = 0;
     if (ground_recover_en)
     {
         // Per-sector ground planes, cached per scan (body cloud is fixed across
@@ -1445,6 +1538,27 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 if (own_ok)      { sec_ok[s] = true; sec_n[s] = n;  sec_d[s] = d;  }
                 else if (glob_ok) { sec_ok[s] = true; sec_n[s] = gn; sec_d[s] = gd; }
             }
+            // TEM observation samples: this scan's fit-band inliers (raw geometry
+            // only — recovered rows are downstream of TEM and must never feed it).
+            // Consumed once per scan in the main loop with the CONVERGED pose.
+            if (tem_en)
+            {
+                tem_samples.clear();
+                size_t total = 0;
+                for (int s = 0; s < kGndSectors; s++)
+                    if (sec_ok[s]) total += cand[s].size();
+                const size_t stride = std::max<size_t>(1, total / 2000);
+                size_t idx = 0;
+                for (int s = 0; s < kGndSectors; s++)
+                {
+                    if (!sec_ok[s]) continue;
+                    for (const auto &p : cand[s])
+                    {
+                        if (std::fabs(sec_n[s].dot(p) + sec_d[s]) > ground_recover_scan_band) continue;
+                        if (idx++ % stride == 0) tem_samples.push_back(p);
+                    }
+                }
+            }
         }
         for (int i = 0; i < feats_down_size; i++)
         {
@@ -1465,24 +1579,60 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             // the normal path's 5th-neighbor sqdist gate).
             const double dx0 = pn[0].x - pw.x, dy0 = pn[0].y - pw.y, dz0 = pn[0].z - pw.z;
             if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 > 5.0) continue;
-            // Map-side local ground height = lower envelope of the neighbors
-            // (mean of the two lowest z) — robust to clutter fuzz above the ground.
-            float z1 = pn[0].z, z2 = std::numeric_limits<float>::max();
-            for (size_t k = 1; k < pn.size(); k++)
+            // Residual reference, best available first: TEM terrain memory
+            // (drift-independent — learned while healthy, frozen while not),
+            // weighted down by the interpolated cell std so slopes / disagreeing
+            // observations pull weakly; else the map-neighbor lower envelope
+            // (mean of the two lowest z — robust to clutter fuzz, but it DRIFTS
+            // with the vehicle: ratchet-slowing only).
+            double pd2, w_row = 1.0;
+            int ref_kind = 2;  // 0 = TEM direct, 1 = TEM extrapolated, 2 = envelope
+            double z_tem, std_tem;
+            if (tem_en && temLookup(pw.x, pw.y, z_tem, std_tem))
             {
-                const float z = pn[k].z;
-                if (z < z1) { z2 = z1; z1 = z; }
-                else if (z < z2) { z2 = z; }
+                pd2 = pw.z - z_tem;
+                w_row = tem_sigma0 / (tem_sigma0 + std_tem);
+                ref_kind = 0;
+                if (std::fabs(pd2) > ground_recover_max_residual) continue;
             }
-            const double z_ground_map = 0.5 * (z1 + (z2 == std::numeric_limits<float>::max() ? z1 : z2));
-            const double pd2 = pw.z - z_ground_map;
-            if (std::fabs(pd2) > ground_recover_max_residual) continue;
+            else if (tem_en && tem_ext_ok && (canopy_ground_recovered % 4) == 3)
+            {
+                // Every 4th row: weak ABSOLUTE reference extrapolated from the
+                // nearest anchored cells under the online slope envelope, with a
+                // trust-region clamp (unclamped absolute pulls run away). No
+                // max_residual gate — the clamp bounds the residual by
+                // construction, and gating here would drop exactly the rows that
+                // must fight a multi-metre secular drift. The other 3/4 keep the
+                // envelope reference: local Z observability stays restored.
+                constexpr double kTemExtClampSigma = 3.0;
+                const double lim = kTemExtClampSigma * tem_ext_sigma;
+                pd2 = std::clamp(pw.z - tem_ext_z, -lim, lim);
+                w_row = tem_sigma0 / (tem_sigma0 + tem_ext_sigma);
+                ref_kind = 1;
+            }
+            else
+            {
+                float z1 = pn[0].z, z2 = std::numeric_limits<float>::max();
+                for (size_t k = 1; k < pn.size(); k++)
+                {
+                    const float z = pn[k].z;
+                    if (z < z1) { z2 = z1; z1 = z; }
+                    else if (z < z2) { z2 = z; }
+                }
+                const double z_ground_map = 0.5 * (z1 + (z2 == std::numeric_limits<float>::max() ? z1 : z2));
+                pd2 = pw.z - z_ground_map;
+                if (std::fabs(pd2) > ground_recover_max_residual) continue;
+            }
             point_selected_surf[i] = true;
             normvec->points[i].x = 0.0f;
             normvec->points[i].y = 0.0f;
-            normvec->points[i].z = 1.0f;
-            normvec->points[i].intensity = static_cast<float>(pd2);
+            // Row weight rides on the normal + residual scaling (information
+            // scales as w_row^2 in the point-to-plane H) — same mechanism as an
+            // ordinary row, no new plumbing.
+            normvec->points[i].z = static_cast<float>(w_row);
+            normvec->points[i].intensity = static_cast<float>(w_row * pd2);
             res_last[i] = std::fabs(pd2);
+            ++(ref_kind == 0 ? tem_rows : ref_kind == 1 ? tem_ext_rows : tem_env_rows);
             ++canopy_ground_recovered;
         }
     }
@@ -1613,6 +1763,12 @@ public:
         this->declare_parameter<double>("ground_recover_max_residual", 1.0);
         this->declare_parameter<double>("ground_recover_sector_tol", 0.25);
         this->declare_parameter<int>("ground_recover_max_rows", 4000);
+        this->declare_parameter<bool>("tem_en", false);
+        this->declare_parameter<double>("tem_cell", 5.0);
+        this->declare_parameter<double>("tem_tau", 2.0);
+        this->declare_parameter<double>("tem_egf_floor", 0.30);
+        this->declare_parameter<double>("tem_egf_ref", 0.60);
+        this->declare_parameter<double>("tem_sigma0", 0.15);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("data_dir", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -1704,6 +1860,12 @@ public:
         this->get_parameter_or<double>("ground_recover_max_residual", ground_recover_max_residual, 1.0);
         this->get_parameter_or<double>("ground_recover_sector_tol", ground_recover_sector_tol, 0.25);
         this->get_parameter_or<int>("ground_recover_max_rows", ground_recover_max_rows, 4000);
+        this->get_parameter_or<bool>("tem_en", tem_en, false);
+        this->get_parameter_or<double>("tem_cell", tem_cell, 5.0);
+        this->get_parameter_or<double>("tem_tau", tem_tau, 2.0);
+        this->get_parameter_or<double>("tem_egf_floor", tem_egf_floor, 0.30);
+        this->get_parameter_or<double>("tem_egf_ref", tem_egf_ref, 0.60);
+        this->get_parameter_or<double>("tem_sigma0", tem_sigma0, 0.15);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         string data_dir_param;
         this->get_parameter_or<string>("data_dir", data_dir_param, "");
@@ -2279,6 +2441,129 @@ private:
                               << " near=" << canopy_near_count << " mode=" << canopy_mode
                               << " rec=" << canopy_ground_recovered << " posZ=" << state_point.pos[2]
                               << std::endl;
+            }
+
+            /*** TEM update (once per scan, CONVERGED pose — h_share iterations
+             *   only read the grid). Learning rate = alpha0(tem_tau) x q where
+             *   q is the dead-banded, squared ramp of the smoothed egf: fully
+             *   frozen at/below tem_egf_floor (any nonzero rate would hand the
+             *   memory to the drift over a ~700 s canopy dwell), full rate
+             *   at/above tem_egf_ref. Samples are the scan's fit-band inliers —
+             *   never recovered rows, so TEM cannot vouch for itself. ***/
+            if (tem_en)
+            {
+                static double tem_last_t = -1.0;
+                const double dt = (tem_last_t > 0.0 && lidar_end_time > tem_last_t)
+                                      ? std::min(lidar_end_time - tem_last_t, 0.5) : 0.1;
+                tem_last_t = lidar_end_time;
+                // Smoothed egf (~1 s at 10 Hz); unmeasurable scans hold the estimate.
+                if (canopy_near_count >= canopy_min_near)
+                    tem_egf_ema += 0.1 * (canopy_ground_frac - tem_egf_ema);
+                double q = (tem_egf_ema - tem_egf_floor) / std::max(tem_egf_ref - tem_egf_floor, 1e-6);
+                q = std::clamp(q, 0.0, 1.0);
+                q *= q;
+                if (q > 0.0 && !tem_samples.empty())
+                {
+                    struct TemAcc { double n = 0.0, sz = 0.0, szz = 0.0; };
+                    static std::unordered_map<int64_t, TemAcc> acc;
+                    acc.clear();
+                    for (const auto &pb : tem_samples)
+                    {
+                        const V3D pw = state_point.rot *
+                                           (state_point.offset_R_L_I * pb + state_point.offset_T_L_I) +
+                                       state_point.pos;
+                        TemAcc &a = acc[temKey(pw.x(), pw.y())];
+                        a.n += 1.0;
+                        a.sz += pw.z();
+                        a.szz += pw.z() * pw.z();
+                    }
+                    const double alpha0 = 1.0 - std::exp(-dt / std::max(tem_tau, 1e-3));
+                    constexpr double kTemMinCellSamples = 5.0;  // one-point cells carry no spread info
+                    constexpr double kTemWMax = 30.0;           // confidence cap (~30 healthy scans)
+                    constexpr double kTemVarPrior = 0.01;       // (0.1 m)^2 until frames disagree
+                    for (const auto &kv : acc)
+                    {
+                        const TemAcc &a = kv.second;
+                        if (a.n < kTemMinCellSamples) continue;
+                        const double mean_s = a.sz / a.n;
+                        const double var_s = std::max(a.szz / a.n - mean_s * mean_s, 0.0);
+                        auto it = tem_grid.find(kv.first);
+                        if (it == tem_grid.end())
+                        {
+                            tem_grid.emplace(kv.first, TemCell{mean_s, var_s + kTemVarPrior, q});
+                            continue;
+                        }
+                        TemCell &c = it->second;
+                        const double alpha = alpha0 * q;
+                        const double dz = mean_s - c.z;
+                        c.z += alpha * dz;
+                        // Variance sees intra-cell spread AND frame-to-frame
+                        // disagreement: slopes and residual drift inflate it, and
+                        // the recovery row weight collapses with it.
+                        c.var += alpha * (dz * dz + var_s - c.var);
+                        c.w = std::min(c.w + q, kTemWMax);
+                        // Online slope statistic from served-neighbor gradients:
+                        // the extrapolation envelope's only terrain prior, learned
+                        // on site. HIGH-QUALITY updates only — at low q a cell
+                        // freshly touched by a drifting estimate sits metres from
+                        // its pre-drift neighbor and the gradient samples poison
+                        // the statistic (measured: 0.014 → 0.05-0.11 through the
+                        // 0702 canopy edge, blowing sigma_ext to 20-35 m).
+                        if (q < 0.5) continue;
+                        constexpr double kTemMinServeW = 2.0;
+                        int64_t ckx, cky;
+                        temKeyToIdx(kv.first, ckx, cky);
+                        const int64_t nkeys[4] = {temKeyIdx(ckx - 1, cky), temKeyIdx(ckx + 1, cky),
+                                                  temKeyIdx(ckx, cky - 1), temKeyIdx(ckx, cky + 1)};
+                        for (const int64_t nk : nkeys)
+                        {
+                            const auto nit = tem_grid.find(nk);
+                            if (nit == tem_grid.end() || nit->second.w < kTemMinServeW) continue;
+                            const double slope = std::fabs(c.z - nit->second.z) / tem_cell;
+                            const double ds = slope - tem_slope_mean;
+                            tem_slope_mean += 0.02 * ds;
+                            tem_slope_var += 0.02 * (ds * ds - tem_slope_var);
+                        }
+                    }
+                }
+                // Per-scan extrapolation anchor: nearest served cells to the
+                // vehicle (expanding ring search). Runs precisely when q == 0 too
+                // — first-visit degraded terrain is where it is needed.
+                tem_ext_ok = false;
+                if (!tem_grid.empty())
+                {
+                    constexpr double kTemMinServeW = 2.0;
+                    constexpr int kTemExtMaxRing = 60;  // x tem_cell = 300 m reach
+                    const int64_t vx = static_cast<int64_t>(std::floor(state_point.pos(0) / tem_cell));
+                    const int64_t vy = static_cast<int64_t>(std::floor(state_point.pos(1) / tem_cell));
+                    for (int r = 0; r <= kTemExtMaxRing && !tem_ext_ok; r++)
+                    {
+                        double zsum = 0.0, vsum = 0.0, n = 0.0;
+                        for (int dx = -r; dx <= r; dx++)
+                            for (int dy = -r; dy <= r; dy++)
+                            {
+                                if (std::max(std::abs(dx), std::abs(dy)) != r) continue;  // ring only
+                                const auto it = tem_grid.find(temKeyIdx(vx + dx, vy + dy));
+                                if (it == tem_grid.end() || it->second.w < kTemMinServeW) continue;
+                                zsum += it->second.z;
+                                vsum += it->second.var;
+                                n += 1.0;
+                            }
+                        if (n < 1.0) continue;
+                        const double slope_hi =
+                            std::max(tem_slope_mean + 2.0 * std::sqrt(std::max(tem_slope_var, 0.0)), 0.003);
+                        const double dist = (r + 4.0) * tem_cell;  // +4 cells: row spread allowance (~20 m)
+                        tem_ext_z = zsum / n;
+                        tem_ext_sigma = std::sqrt(std::max(vsum / n, 0.0)) + slope_hi * dist;
+                        tem_ext_ok = true;
+                    }
+                }
+                if (canopy_debug)
+                    std::cerr << "[TEM] t=" << std::fixed << std::setprecision(3) << lidar_end_time
+                              << " egf=" << tem_egf_ema << " q=" << q << " cells=" << tem_grid.size()
+                              << " rows=" << tem_rows << "/" << tem_ext_rows << "/" << tem_env_rows
+                              << " ext=" << (tem_ext_ok ? tem_ext_sigma : -1.0)
+                              << " slope=" << tem_slope_mean << std::endl;
             }
 
             /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the

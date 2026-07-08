@@ -208,13 +208,15 @@ bool   canopy_mode = false;
 int    canopy_enter_streak = 0, canopy_exit_streak = 0;
 
 // Ground recovery (selection-layer repair): re-admit true-ground returns that
-// the 5-NN plane gates reject in canopy (grass-contaminated normals) — see the
-// block comment in h_share_model. Default OFF; inert unless canopy_detect_en
-// AND canopy_mode are also active.
+// the 5-NN plane gates reject under ground-hugging clutter (grass, crops,
+// debris — content-agnostic) — see the block comment in h_share_model.
+// SELF-GATED by per-sector fit quality + the sensor-height sanity gate; no
+// scene classifier involved (the canopy detector is telemetry only). Default OFF.
 bool   ground_recover_en = false;
-double ground_recover_scan_band = 0.15;   // |dist to whole-scan ground plane| accept band (m)
-int    ground_recover_min_inliers = 300;  // whole-scan fit support gate
+double ground_recover_scan_band = 0.15;   // |dist to sector ground plane| accept band (m)
+int    ground_recover_min_inliers = 100;  // PER-SECTOR fit support gate (8 sectors)
 double ground_recover_max_residual = 1.0; // |z - map lower envelope| accept gate (m)
+double ground_recover_sector_tol = 0.25;  // sector-vs-global plane height agreement (m)
 int    ground_recover_max_rows = 4000;    // per-scan cap on recovered rows
 int    canopy_ground_recovered = 0;       // diag: rows recovered last h_share call
 
@@ -1288,11 +1290,11 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
     }
     
-    // Canopy detector raw statistics over the near-field effective points, all in
-    // the LiDAR/cloud BODY frame (drift-immune). Ground = horizontal-normal match
-    // whose height sits in the physical ground band. MUST run BEFORE the ground
-    // recovery pass below — recovered rows would feed the detector its own output
-    // and flap the mode. The debounced switch is in the main loop (once per scan).
+    // Canopy/clutter TELEMETRY (does not gate any behavior): near-field effective
+    // ground fraction + height p95, both in the LiDAR/cloud BODY frame
+    // (drift-immune). MUST run BEFORE the ground recovery pass below so the
+    // statistic reflects the unmodified selection, not the recovery's own output.
+    // The debounced mode switch in the main loop is telemetry/diagnostics too.
     if (canopy_detect_en)
     {
         static std::vector<float> near_z;   // h_share_model is single-threaded here
@@ -1318,48 +1320,74 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
     }
 
-    /*** Ground recovery (selection-layer repair, 2026-07-06 forensics): in canopy
-     *   the 5-NN esti_plane + s>0.9 gates REJECT grass-contaminated true-ground
-     *   returns while accepting fluffy-canopy micro-patches, inverting the
-     *   effective-point population (raw ground 62-70 % → ~10 % effective) even
-     *   though the raw scan-to-scan Z valley stays sharp (measured). Repair at the
-     *   same layer: (1) fit ONE robust whole-scan ground plane in the body frame
-     *   (iterative shrinking-band LS — grass sits above the dominant plane and gets
-     *   trimmed); (2) re-admit rejected near-field returns that lie on that plane,
-     *   with an imposed vertical world normal and the residual measured against the
-     *   LOWER ENVELOPE of their map neighbors (median of the lowest z's — robust to
-     *   grass fuzz in the map). Rows flow into the standard point-to-plane H. Only
-     *   points the normal path rejected are touched; healthy scenes (canopy_mode
-     *   off) are bit-identical. NOTE: distinct from the removed A'-3 boost, which
-     *   amplified already-matched rows in healthy scenes (NEGATIVE result); this
-     *   restores SELECTION of discarded true ground inside a detected canopy scene.
-     ***/
+    /*** Ground recovery (selection-layer repair, 2026-07-06 forensics): ANY
+     *   ground-hugging clutter (grass, crops, debris — content-agnostic) pollutes
+     *   the 5-NN esti_plane + s>0.9 gates: true-ground returns get REJECTED while
+     *   clutter micro-patches get accepted, depleting the vertical-normal share of
+     *   the effective set even though the raw scan-to-scan Z valley stays sharp
+     *   (measured: raw ground 62-70 % → ~10 % effective on the giant 0702 bag).
+     *   Repair at the same layer, SELF-GATED (no scene classifier): (1) fit robust
+     *   ground planes HYBRID global+sector in the body frame (shrinking-band LS —
+     *   anything above the dominant surface is trimmed regardless of what it is).
+     *   The whole-scan GLOBAL fit pools every candidate: maximum support, hardest
+     *   to bias (in deep clutter a per-sector fit can latch onto a locally
+     *   consistent clutter shelf that the pooled fit rejects — measured: sector-
+     *   only was ~2x weaker than whole-scan in the 0702 canopy). Per-SECTOR fits
+     *   refine it for crowned/rutted/partially-occupied terrain, but a sector
+     *   plane is used only where it AGREES with the global plane (normal dot +
+     *   height at the sector centroid); a sector that fails its own gates or
+     *   disagrees falls back to the global plane, and without a valid global fit
+     *   the surviving sector fits stand alone. The height-sanity gate (plane at
+     *   the known sensor mount height) guarantees the dominant surface IS what
+     *   the vehicle stands on, without scene semantics.
+     *   (2) re-admit rejected near-field returns lying on their sector's plane,
+     *   with an imposed vertical world normal and the residual measured against
+     *   the LOWER ENVELOPE of their map neighbors (mean of the two lowest z —
+     *   robust to clutter fuzz in the map). Rows flow into the standard
+     *   point-to-plane H. Only points the normal path rejected are touched.
+     *   NOTE: distinct from the removed A'-3 boost, which amplified already-
+     *   matched rows (NEGATIVE result); this restores SELECTION of discarded
+     *   true ground. ***/
     canopy_ground_recovered = 0;
-    if (ground_recover_en && canopy_detect_en && canopy_mode)
+    if (ground_recover_en)
     {
-        // Whole-scan ground plane, cached per scan (body cloud is fixed across iEKF
-        // iterations). n·p + d = 0 with unit n, n_z > 0.
+        // Per-sector ground planes, cached per scan (body cloud is fixed across
+        // iEKF iterations). n·p + d = 0 with unit n, n_z > 0.
+        constexpr int kGndSectors = 8;
         static double fit_time = -1.0;
-        static bool   fit_ok = false;
-        static Eigen::Vector3d fit_n(0, 0, 1);
-        static double fit_d = 0.0;
+        static bool   sec_ok[kGndSectors];
+        static Eigen::Vector3d sec_n[kGndSectors];
+        static double sec_d[kGndSectors];
         if (lidar_end_time != fit_time)
         {
             fit_time = lidar_end_time;
-            fit_ok = false;
-            static std::vector<Eigen::Vector3d> cand;
-            cand.clear();
+            static std::vector<Eigen::Vector3d> cand[kGndSectors];
+            for (int s = 0; s < kGndSectors; s++) { cand[s].clear(); sec_ok[s] = false; }
             for (int i = 0; i < feats_down_size; i++)
             {
                 const PointType &pb = feats_down_body->points[i];
                 if (std::hypot(pb.x, pb.y) > canopy_near_range) continue;
                 if (std::fabs(pb.z - canopy_ground_z) > canopy_ground_halfband) continue;
-                cand.emplace_back(pb.x, pb.y, pb.z);
+                const int s = std::min(kGndSectors - 1,
+                    static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
+                cand[s].emplace_back(pb.x, pb.y, pb.z);
             }
-            if (static_cast<int>(cand.size()) >= ground_recover_min_inliers)
-            {
+            // Shrinking-band iterative LS over one or more candidate sets.
+            // Gates: enough support, near-horizontal (terrain + vehicle tilt stay
+            // within a few degrees), sane height under the sensor. The height gate
+            // is what makes always-on safe: the accepted surface must sit where
+            // the vehicle's own ground sits.
+            auto fit_ground = [](const std::vector<Eigen::Vector3d> *sets, int nsets, int min_in,
+                                 Eigen::Vector3d &n_out, double &d_out) -> bool {
+                static std::vector<float> zs;
+                zs.clear();
+                for (int k = 0; k < nsets; k++)
+                    for (const auto &p : sets[k]) zs.push_back(static_cast<float>(p.z()));
+                if (static_cast<int>(zs.size()) < min_in) return false;
+                // Init: horizontal plane at the pooled median candidate height.
+                std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
                 Eigen::Vector3d n(0, 0, 1);
-                double d = -canopy_ground_z;
+                double d = -static_cast<double>(zs[zs.size() / 2]);
                 int n_in = 0;
                 const double bands[3] = {0.4, 0.25, 0.15};
                 for (double band : bands)
@@ -1367,67 +1395,95 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                     Eigen::Vector3d mean = Eigen::Vector3d::Zero();
                     Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
                     n_in = 0;
-                    for (const auto &p : cand)
-                        if (std::fabs(n.dot(p) + d) <= band) { mean += p; ++n_in; }
-                    if (n_in < ground_recover_min_inliers) break;
+                    for (int k = 0; k < nsets; k++)
+                        for (const auto &p : sets[k])
+                            if (std::fabs(n.dot(p) + d) <= band) { mean += p; ++n_in; }
+                    if (n_in < min_in) break;
                     mean /= n_in;
-                    for (const auto &p : cand)
-                        if (std::fabs(n.dot(p) + d) <= band)
-                        {
-                            const Eigen::Vector3d q = p - mean;
-                            cov.noalias() += q * q.transpose();
-                        }
+                    for (int k = 0; k < nsets; k++)
+                        for (const auto &p : sets[k])
+                            if (std::fabs(n.dot(p) + d) <= band)
+                            {
+                                const Eigen::Vector3d q = p - mean;
+                                cov.noalias() += q * q.transpose();
+                            }
                     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
                     n = es.eigenvectors().col(0);
                     if (n.z() < 0) n = -n;
                     d = -n.dot(mean);
                 }
-                // Gates: enough support, near-horizontal (terrain + vehicle tilt
-                // stay within a few degrees), sane height under the sensor.
-                fit_ok = n_in >= ground_recover_min_inliers && n.z() >= 0.95 &&
-                         std::fabs(-d / std::max(n.z(), 1e-6) - canopy_ground_z) <= canopy_ground_halfband;
-                fit_n = n;
-                fit_d = d;
+                n_out = n;
+                d_out = d;
+                return n_in >= min_in && n.z() >= 0.95 &&
+                       std::fabs(-d / std::max(n.z(), 1e-6) - canopy_ground_z) <= canopy_ground_halfband;
+            };
+            // Global whole-scan fit: pooled support is the hardest to bias — the
+            // prior every sector must agree with, and the fallback plane.
+            Eigen::Vector3d gn(0, 0, 1);
+            double gd = 0.0;
+            const bool glob_ok = fit_ground(cand, kGndSectors, ground_recover_min_inliers, gn, gd);
+            for (int s = 0; s < kGndSectors; s++)
+            {
+                Eigen::Vector3d n;
+                double d;
+                bool own_ok = fit_ground(&cand[s], 1, ground_recover_min_inliers, n, d);
+                if (own_ok && glob_ok)
+                {
+                    // A sector plane may only REFINE the global one: normals must
+                    // agree and the plane heights at the sector centroid must match
+                    // within ground_recover_sector_tol; otherwise the sector fit
+                    // latched onto something the pooled fit rejected.
+                    Eigen::Vector3d c = Eigen::Vector3d::Zero();
+                    for (const auto &p : cand[s]) c += p;
+                    c /= static_cast<double>(cand[s].size());
+                    const double z_sec = -(d + n.x() * c.x() + n.y() * c.y()) / std::max(n.z(), 1e-6);
+                    const double z_glob = -(gd + gn.x() * c.x() + gn.y() * c.y()) / std::max(gn.z(), 1e-6);
+                    constexpr double kSectorNormalDotMin = 0.985;  // ~10 deg relative tilt
+                    own_ok = n.dot(gn) >= kSectorNormalDotMin &&
+                             std::fabs(z_sec - z_glob) <= ground_recover_sector_tol;
+                }
+                if (own_ok)      { sec_ok[s] = true; sec_n[s] = n;  sec_d[s] = d;  }
+                else if (glob_ok) { sec_ok[s] = true; sec_n[s] = gn; sec_d[s] = gd; }
             }
         }
-        if (fit_ok)
+        for (int i = 0; i < feats_down_size; i++)
         {
-            for (int i = 0; i < feats_down_size; i++)
+            if (point_selected_surf[i]) continue;
+            if (canopy_ground_recovered >= ground_recover_max_rows) break;
+            const PointType &pb = feats_down_body->points[i];
+            if (std::hypot(pb.x, pb.y) > canopy_near_range) continue;
+            const int s = std::min(kGndSectors - 1,
+                static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
+            if (!sec_ok[s]) continue;
+            // Scan side: on this sector's ground plane (clutter trimmed by the fit band).
+            if (std::fabs(sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s]) >
+                ground_recover_scan_band) continue;
+            auto &pn = Nearest_Points[i];
+            if (static_cast<int>(pn.size()) < NUM_MATCH_POINTS) continue;
+            const PointType &pw = feats_down_world->points[i];
+            // Map neighborhood must actually be nearby (same criterion class as
+            // the normal path's 5th-neighbor sqdist gate).
+            const double dx0 = pn[0].x - pw.x, dy0 = pn[0].y - pw.y, dz0 = pn[0].z - pw.z;
+            if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 > 5.0) continue;
+            // Map-side local ground height = lower envelope of the neighbors
+            // (mean of the two lowest z) — robust to clutter fuzz above the ground.
+            float z1 = pn[0].z, z2 = std::numeric_limits<float>::max();
+            for (size_t k = 1; k < pn.size(); k++)
             {
-                if (point_selected_surf[i]) continue;
-                if (canopy_ground_recovered >= ground_recover_max_rows) break;
-                const PointType &pb = feats_down_body->points[i];
-                if (std::hypot(pb.x, pb.y) > canopy_near_range) continue;
-                // Scan side: on the dominant ground plane (grass trimmed by the fit band).
-                if (std::fabs(fit_n.dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + fit_d) >
-                    ground_recover_scan_band) continue;
-                auto &pn = Nearest_Points[i];
-                if (static_cast<int>(pn.size()) < NUM_MATCH_POINTS) continue;
-                const PointType &pw = feats_down_world->points[i];
-                // Map neighborhood must actually be nearby (same criterion class as
-                // the normal path's 5th-neighbor sqdist gate).
-                const double dx0 = pn[0].x - pw.x, dy0 = pn[0].y - pw.y, dz0 = pn[0].z - pw.z;
-                if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 > 5.0) continue;
-                // Map-side local ground height = lower envelope of the neighbors
-                // (mean of the two lowest z) — robust to grass fuzz above the ground.
-                float z1 = pn[0].z, z2 = std::numeric_limits<float>::max();
-                for (size_t k = 1; k < pn.size(); k++)
-                {
-                    const float z = pn[k].z;
-                    if (z < z1) { z2 = z1; z1 = z; }
-                    else if (z < z2) { z2 = z; }
-                }
-                const double z_ground_map = 0.5 * (z1 + (z2 == std::numeric_limits<float>::max() ? z1 : z2));
-                const double pd2 = pw.z - z_ground_map;
-                if (std::fabs(pd2) > ground_recover_max_residual) continue;
-                point_selected_surf[i] = true;
-                normvec->points[i].x = 0.0f;
-                normvec->points[i].y = 0.0f;
-                normvec->points[i].z = 1.0f;
-                normvec->points[i].intensity = static_cast<float>(pd2);
-                res_last[i] = std::fabs(pd2);
-                ++canopy_ground_recovered;
+                const float z = pn[k].z;
+                if (z < z1) { z2 = z1; z1 = z; }
+                else if (z < z2) { z2 = z; }
             }
+            const double z_ground_map = 0.5 * (z1 + (z2 == std::numeric_limits<float>::max() ? z1 : z2));
+            const double pd2 = pw.z - z_ground_map;
+            if (std::fabs(pd2) > ground_recover_max_residual) continue;
+            point_selected_surf[i] = true;
+            normvec->points[i].x = 0.0f;
+            normvec->points[i].y = 0.0f;
+            normvec->points[i].z = 1.0f;
+            normvec->points[i].intensity = static_cast<float>(pd2);
+            res_last[i] = std::fabs(pd2);
+            ++canopy_ground_recovered;
         }
     }
 
@@ -1553,8 +1609,9 @@ public:
         this->declare_parameter<int>("canopy_exit_scans", 30);
         this->declare_parameter<bool>("ground_recover_en", false);
         this->declare_parameter<double>("ground_recover_scan_band", 0.15);
-        this->declare_parameter<int>("ground_recover_min_inliers", 300);
+        this->declare_parameter<int>("ground_recover_min_inliers", 100);
         this->declare_parameter<double>("ground_recover_max_residual", 1.0);
+        this->declare_parameter<double>("ground_recover_sector_tol", 0.25);
         this->declare_parameter<int>("ground_recover_max_rows", 4000);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("data_dir", "");
@@ -1643,8 +1700,9 @@ public:
         this->get_parameter_or<int>("canopy_exit_scans", canopy_exit_scans, 30);
         this->get_parameter_or<bool>("ground_recover_en", ground_recover_en, false);
         this->get_parameter_or<double>("ground_recover_scan_band", ground_recover_scan_band, 0.15);
-        this->get_parameter_or<int>("ground_recover_min_inliers", ground_recover_min_inliers, 300);
+        this->get_parameter_or<int>("ground_recover_min_inliers", ground_recover_min_inliers, 100);
         this->get_parameter_or<double>("ground_recover_max_residual", ground_recover_max_residual, 1.0);
+        this->get_parameter_or<double>("ground_recover_sector_tol", ground_recover_sector_tol, 0.25);
         this->get_parameter_or<int>("ground_recover_max_rows", ground_recover_max_rows, 4000);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         string data_dir_param;

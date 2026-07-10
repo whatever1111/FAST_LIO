@@ -266,6 +266,21 @@ int    tem_rows = 0, tem_ext_rows = 0, tem_env_rows = 0;  // diag: rows per resi
 double tem_slope_mean = 0.01, tem_slope_var = 1e-4;  // online |dz|/dxy statistic (healthy pairs)
 bool   tem_ext_ok = false;   // per-scan extrapolation anchor (nearest served cells)
 double tem_ext_z = 0.0, tem_ext_sigma = 1.0;
+// Graph-side drift feedback (terrain anchoring, experimental — default OFF).
+// The graph (GPS-pinned) publishes d = how far this front-end's Z has drifted
+// since its epoch (/lio_slam/fe_z_drift, gated on GPS-factor freshness). With a
+// FRESH d the TEM learns from DRIFT-CORRECTED samples (z + d) at a high fixed
+// rate even where egf says the scene is degraded — the reason egf had to
+// freeze learning (drift poisoning) is being measured and removed upstream.
+// This is what closes the first-visit gap the self-memory cannot: cells get
+// anchored along the vehicle's own trail in real time. Model anchoring only —
+// the state is still constrained exclusively through observed ground returns.
+// Stale d (graph following the front-end in GPS-degraded stretches) degrades
+// to the plain egf-gated self-learning.
+bool   tem_anchor_en = false;
+double tem_anchor_max_age = 3.0;  // s, drift note older than this = stale ("no anchor")
+std::mutex tem_anchor_mtx;        // handler (executor thread) vs main-loop consumer
+double tem_anchor_d = 0.0, tem_anchor_sigma = 0.2, tem_anchor_stamp = -1.0;
 
 inline int64_t temKeyIdx(int64_t kx, int64_t ky) { return (kx << 32) ^ (ky & 0xffffffff); }
 
@@ -1337,8 +1352,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     #endif
     for (int i = 0; i < feats_down_size; i++)
     {
-        PointType &point_body  = feats_down_body->points[i]; 
-        PointType &point_world = feats_down_world->points[i]; 
+        PointType &point_body  = feats_down_body->points[i];
+        PointType &point_world = feats_down_world->points[i];
 
         /* transform to world frame */
         V3D p_body(point_body.x, point_body.y, point_body.z);
@@ -1585,29 +1600,50 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             // observations pull weakly; else the map-neighbor lower envelope
             // (mean of the two lowest z — robust to clutter fuzz, but it DRIFTS
             // with the vehicle: ratchet-slowing only).
+            // Reference split by JOB, not by availability. 3/4 of the rows keep
+            // the map lower envelope at weight 1 — local Z observability
+            // restoration, the validated hybrid behavior, untouched. Every 4th
+            // row is the ABSOLUTE channel: residual against the TEM (direct
+            // where served, slope-envelope extrapolation otherwise) with a
+            // trust-region clamp and a sigma-collapsed weight. The absolute
+            // channel is NEVER gated by max_residual — a multi-metre secular
+            // drift is exactly what it exists to fight (measured failure: hard-
+            // gating TEM rows at 1 m gutted the whole recovery channel once the
+            // drift passed 1 m, and the raw pathology returned worse, -64.6 m).
+            constexpr double kTemClampSigma = 3.0;
+            constexpr double kTemStdFloor = 0.1;  // weight floor: never trust a cell below 10 cm
+            // AUTHORITY IS PINNED AT THE SAFE-NEUTRAL LEVEL (~0.07 m/s counter-
+            // drift) — the full dose-response of pushing harder is measured and
+            // closed. (a) A 2.5 m clamp floor + sigma0 0.5 reaches parity with
+            // the worst dive (~0.5 m/s) and does cut the Z ratchet (-55 -> -43),
+            // but the point-plane Jacobian's attitude columns turn the pull into
+            // torque and the error reroutes into XY in attitude-degenerate
+            // clutter (FE 2D 150 -> 327 m, alignment bent 8 deg). (b) Zeroing
+            // the attitude/extrinsic columns (translation-only rows) makes the
+            // filter's measurement model inconsistent and Z diverges
+            // exponentially (measured -12 km; healthy scenes also damaged).
+            // The B3 lesson holds at every level tried: while degraded clutter
+            // still pollutes the constraint set, absolute-Z injection strong
+            // enough to matter always finds another channel to blow. Do NOT
+            // raise the authority again — fix the constraint set instead.
             double pd2, w_row = 1.0;
             int ref_kind = 2;  // 0 = TEM direct, 1 = TEM extrapolated, 2 = envelope
             double z_tem, std_tem;
-            if (tem_en && temLookup(pw.x, pw.y, z_tem, std_tem))
+            const bool abs_slot = tem_en && (canopy_ground_recovered % 4) == 3;
+            if (abs_slot && temLookup(pw.x, pw.y, z_tem, std_tem))
             {
-                pd2 = pw.z - z_tem;
-                w_row = tem_sigma0 / (tem_sigma0 + std_tem);
+                const double sig = std::max(std_tem, kTemStdFloor);
+                const double lim = kTemClampSigma * sig;
+                pd2 = std::clamp(pw.z - z_tem, -lim, lim);
+                w_row = tem_sigma0 / (tem_sigma0 + sig);
                 ref_kind = 0;
-                if (std::fabs(pd2) > ground_recover_max_residual) continue;
             }
-            else if (tem_en && tem_ext_ok && (canopy_ground_recovered % 4) == 3)
+            else if (abs_slot && tem_ext_ok)
             {
-                // Every 4th row: weak ABSOLUTE reference extrapolated from the
-                // nearest anchored cells under the online slope envelope, with a
-                // trust-region clamp (unclamped absolute pulls run away). No
-                // max_residual gate — the clamp bounds the residual by
-                // construction, and gating here would drop exactly the rows that
-                // must fight a multi-metre secular drift. The other 3/4 keep the
-                // envelope reference: local Z observability stays restored.
-                constexpr double kTemExtClampSigma = 3.0;
-                const double lim = kTemExtClampSigma * tem_ext_sigma;
+                const double sig = std::max(tem_ext_sigma, kTemStdFloor);
+                const double lim = kTemClampSigma * sig;
                 pd2 = std::clamp(pw.z - tem_ext_z, -lim, lim);
-                w_row = tem_sigma0 / (tem_sigma0 + tem_ext_sigma);
+                w_row = tem_sigma0 / (tem_sigma0 + sig);
                 ref_kind = 1;
             }
             else
@@ -1769,6 +1805,8 @@ public:
         this->declare_parameter<double>("tem_egf_floor", 0.30);
         this->declare_parameter<double>("tem_egf_ref", 0.60);
         this->declare_parameter<double>("tem_sigma0", 0.15);
+        this->declare_parameter<bool>("tem_anchor_en", false);
+        this->declare_parameter<double>("tem_anchor_max_age", 3.0);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("data_dir", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -1866,6 +1904,8 @@ public:
         this->get_parameter_or<double>("tem_egf_floor", tem_egf_floor, 0.30);
         this->get_parameter_or<double>("tem_egf_ref", tem_egf_ref, 0.60);
         this->get_parameter_or<double>("tem_sigma0", tem_sigma0, 0.15);
+        this->get_parameter_or<bool>("tem_anchor_en", tem_anchor_en, false);
+        this->get_parameter_or<double>("tem_anchor_max_age", tem_anchor_max_age, 3.0);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         string data_dir_param;
         this->get_parameter_or<string>("data_dir", data_dir_param, "");
@@ -2108,6 +2148,26 @@ public:
                 }
             },
             mapping_sub_opts);
+
+        // Graph-side FE Z-drift feedback for the TEM (terrain anchoring). Tiny
+        // low-rate scalar stream from the PGO node; inter-process only.
+        if (tem_en && tem_anchor_en)
+        {
+            rclcpp::SubscriptionOptions drift_opts;
+            drift_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+            fe_z_drift_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                "/lio_slam/fe_z_drift", rclcpp::QoS(1).best_effort(),
+                [](nav_msgs::msg::Odometry::SharedPtr msg) {
+                    std::lock_guard<std::mutex> lk(tem_anchor_mtx);
+                    tem_anchor_d = msg->pose.pose.position.z;
+                    tem_anchor_sigma = std::sqrt(std::max(msg->pose.covariance[14], 1e-4));
+                    tem_anchor_stamp = rclcpp::Time(msg->header.stamp).seconds();
+                },
+                drift_opts);
+            RCLCPP_INFO(this->get_logger(),
+                        "[TEM] graph drift anchoring ON (/lio_slam/fe_z_drift, max_age=%.1fs)",
+                        tem_anchor_max_age);
+        }
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -2462,7 +2522,26 @@ private:
                 double q = (tem_egf_ema - tem_egf_floor) / std::max(tem_egf_ref - tem_egf_floor, 1e-6);
                 q = std::clamp(q, 0.0, 1.0);
                 q *= q;
-                if (q > 0.0 && !tem_samples.empty())
+                // Graph-side drift note: while FRESH, samples are drift-corrected
+                // (z + d) and learning runs at a high fixed rate regardless of
+                // egf — the poisoning egf guarded against is measured and removed
+                // upstream. Stale note = plain egf-gated self-learning.
+                double d_use = 0.0, d_sig2 = 0.0;
+                bool anchored = false;
+                if (tem_anchor_en)
+                {
+                    std::lock_guard<std::mutex> lk(tem_anchor_mtx);
+                    if (tem_anchor_stamp > 0.0 &&
+                        std::fabs(lidar_end_time - tem_anchor_stamp) < tem_anchor_max_age)
+                    {
+                        d_use = tem_anchor_d;
+                        d_sig2 = tem_anchor_sigma * tem_anchor_sigma;
+                        anchored = true;
+                    }
+                }
+                constexpr double kTemAnchorQ = 0.8;
+                const double q_eff = anchored ? std::max(q, kTemAnchorQ) : q;
+                if (q_eff > 0.0 && !tem_samples.empty())
                 {
                     struct TemAcc { double n = 0.0, sz = 0.0, szz = 0.0; };
                     static std::unordered_map<int64_t, TemAcc> acc;
@@ -2472,10 +2551,11 @@ private:
                         const V3D pw = state_point.rot *
                                            (state_point.offset_R_L_I * pb + state_point.offset_T_L_I) +
                                        state_point.pos;
+                        const double zc = pw.z() + d_use;  // drift-corrected (epoch-frame) height
                         TemAcc &a = acc[temKey(pw.x(), pw.y())];
                         a.n += 1.0;
-                        a.sz += pw.z();
-                        a.szz += pw.z() * pw.z();
+                        a.sz += zc;
+                        a.szz += zc * zc;
                     }
                     const double alpha0 = 1.0 - std::exp(-dt / std::max(tem_tau, 1e-3));
                     constexpr double kTemMinCellSamples = 5.0;  // one-point cells carry no spread info
@@ -2486,22 +2566,22 @@ private:
                         const TemAcc &a = kv.second;
                         if (a.n < kTemMinCellSamples) continue;
                         const double mean_s = a.sz / a.n;
-                        const double var_s = std::max(a.szz / a.n - mean_s * mean_s, 0.0);
+                        const double var_s = std::max(a.szz / a.n - mean_s * mean_s, 0.0) + d_sig2;
                         auto it = tem_grid.find(kv.first);
                         if (it == tem_grid.end())
                         {
-                            tem_grid.emplace(kv.first, TemCell{mean_s, var_s + kTemVarPrior, q});
+                            tem_grid.emplace(kv.first, TemCell{mean_s, var_s + kTemVarPrior, q_eff});
                             continue;
                         }
                         TemCell &c = it->second;
-                        const double alpha = alpha0 * q;
+                        const double alpha = alpha0 * q_eff;
                         const double dz = mean_s - c.z;
                         c.z += alpha * dz;
                         // Variance sees intra-cell spread AND frame-to-frame
                         // disagreement: slopes and residual drift inflate it, and
                         // the recovery row weight collapses with it.
                         c.var += alpha * (dz * dz + var_s - c.var);
-                        c.w = std::min(c.w + q, kTemWMax);
+                        c.w = std::min(c.w + q_eff, kTemWMax);
                         // Online slope statistic from served-neighbor gradients:
                         // the extrapolation envelope's only terrain prior, learned
                         // on site. HIGH-QUALITY updates only — at low q a cell
@@ -2509,7 +2589,7 @@ private:
                         // its pre-drift neighbor and the gradient samples poison
                         // the statistic (measured: 0.014 → 0.05-0.11 through the
                         // 0702 canopy edge, blowing sigma_ext to 20-35 m).
-                        if (q < 0.5) continue;
+                        if (q_eff < 0.5) continue;
                         constexpr double kTemMinServeW = 2.0;
                         int64_t ckx, cky;
                         temKeyToIdx(kv.first, ckx, cky);
@@ -2560,10 +2640,11 @@ private:
                 }
                 if (canopy_debug)
                     std::cerr << "[TEM] t=" << std::fixed << std::setprecision(3) << lidar_end_time
-                              << " egf=" << tem_egf_ema << " q=" << q << " cells=" << tem_grid.size()
+                              << " egf=" << tem_egf_ema << " q=" << q_eff << " cells=" << tem_grid.size()
                               << " rows=" << tem_rows << "/" << tem_ext_rows << "/" << tem_env_rows
                               << " ext=" << (tem_ext_ok ? tem_ext_sigma : -1.0)
-                              << " slope=" << tem_slope_mean << std::endl;
+                              << " slope=" << tem_slope_mean
+                              << " d=" << (anchored ? d_use : std::nan("")) << std::endl;
             }
 
             /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
@@ -2920,6 +3001,7 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr fe_z_drift_sub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mapping_enabled_sub_;
 

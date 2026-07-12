@@ -348,6 +348,60 @@ inline bool temLookup(double x, double y, double &z_out, double &std_out)
     return true;
 }
 
+// P2 VoxelMap-lite: anisotropic per-voxel surface statistics (EXPERIMENTAL,
+// default OFF, content-agnostic — no scene gate, no band membership). Successor
+// to the clutter-band deweight after its measured verdict: the remaining Z bias
+// COHABITS with the load-bearing Z constraints in the 0.15-0.5 m layer above
+// ground, so any per-row keep/cut decision keyed on layer membership either
+// misses the bias (band lo 0.5) or guts the constraint (band lo 0.25 -> FE
+// 796 m). This decomposes WITHIN the constraint instead: a world-frame voxel
+// hash accumulates first/second moments of the matched cloud across scans
+// (online replica of the offline probe's 20-scan accumulation — the density at
+// which thickness IS measurable, 12x ground/clutter separation), and each
+// accepted row is reweighted by the measured surface spread ALONG ITS OWN
+// FITTED NORMAL: sigma_dir^2 = n^T Cov(voxel) n,
+//   m = sigma_r / sqrt(sigma_r^2 + sigma_dir^2)   (information ~ m^2)
+// i.e. the implicit per-row noise is inflated to the surface's measured
+// roughness in the constraint direction. Thin ground keeps m~1; a fluffy
+// grass/canopy voxel collapses its VERTICAL-normal rows toward the honest
+// ~0.15 m sigma while HORIZONTAL-normal rows through the same voxel keep their
+// lateral information (n^T Cov n is small sideways) — the direction-resolved
+// split that row-level granularity could not express. Safety properties vs the
+// measured failures: evidence-based per voxel per direction (not layer
+// membership), continuous with a floor (rows never removed), voxels below
+// vxl_min_pts observations are untouched (first visit = baseline behavior),
+// recovery rows are never rescaled (their vertical channel is the load-bearing
+// counterweight). Cell moments freeze at vxl_freeze_pts so a later secular
+// drift cannot smear the statistics it is being judged against.
+struct VxlCell
+{
+    float   mean[3];  // world-frame mean (float ok: ~1e-4 m precision at 1 km)
+    float   m2[6];    // centered comoment sums, upper triangle xx,xy,xz,yy,yz,zz
+    int32_t n;
+};
+std::unordered_map<int64_t, VxlCell> vxl_grid;
+bool   vxl_en = false;
+double vxl_size_xy = 1.0;      // m; XY footprint pools enough returns per cell
+double vxl_size_z = 0.25;      // m; thin Z slabs separate soil from the grass layer above
+double vxl_sigma_r = 0.05;     // m; nominal point-to-plane noise a clean row carries
+double vxl_min_weight = 0.10;  // floor: never remove a row outright (conditioning)
+double vxl_max_range = 30.0;   // m body range for both learning and weighting (bounds memory)
+int    vxl_min_pts = 8;        // below this: no verdict, row untouched
+int    vxl_freeze_pts = 300;   // cell moments freeze here (drift-smear cap)
+int    vxl_tested = 0, vxl_cut = 0;  // diag, last h_share call
+double vxl_msum = 0.0, vxl_sd_sum = 0.0;
+double vxl_vert_msum = 0.0;    // diag: m over |n_z|>0.8 rows (the Z-bias carriers)
+int    vxl_vert_cnt = 0;
+
+// 21 bits per axis (±2^20 cells; at 0.25 m Z that is ±262 km — ample).
+inline int64_t vxlKey(double x, double y, double z)
+{
+    const int64_t kx = static_cast<int64_t>(std::floor(x / vxl_size_xy));
+    const int64_t ky = static_cast<int64_t>(std::floor(y / vxl_size_xy));
+    const int64_t kz = static_cast<int64_t>(std::floor(z / vxl_size_z));
+    return ((kx & 0x1FFFFF) << 42) | ((ky & 0x1FFFFF) << 21) | (kz & 0x1FFFFF);
+}
+
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
@@ -1033,6 +1087,47 @@ void map_incremental()
     }
 }
 
+// P2 VoxelMap-lite: fold the converged scan into the per-voxel Welford moments
+// (see the vxl_en block comment). Called from the main thread once per scan,
+// right after map_incremental — the same "converged pose, map grew" event, so
+// the statistics stay consistent with what the matcher will see. Transforms
+// into a local point instead of trusting feats_down_world (under async map the
+// world cloud may be rewritten off-thread). Cells past vxl_freeze_pts stop
+// updating; delta arithmetic in double, storage in float.
+void vxl_update()
+{
+    if (!vxl_en) return;
+    if (vxl_grid.empty()) vxl_grid.reserve(1 << 20);
+    for (int i = 0; i < feats_down_size; i++)
+    {
+        const PointType &pb = feats_down_body->points[i];
+        if (std::hypot(pb.x, pb.y) > vxl_max_range) continue;
+        PointType pw;
+        pointBodyToWorld(&feats_down_body->points[i], &pw);
+        VxlCell &c = vxl_grid[vxlKey(pw.x, pw.y, pw.z)];
+        if (c.n >= vxl_freeze_pts) continue;
+        if (c.n == 0)
+        {
+            c.mean[0] = pw.x; c.mean[1] = pw.y; c.mean[2] = pw.z;
+            c.n = 1;
+            continue;
+        }
+        ++c.n;
+        const double d0 = pw.x - c.mean[0], d1 = pw.y - c.mean[1], d2 = pw.z - c.mean[2];
+        const double inv_n = 1.0 / static_cast<double>(c.n);
+        c.mean[0] += static_cast<float>(d0 * inv_n);
+        c.mean[1] += static_cast<float>(d1 * inv_n);
+        c.mean[2] += static_cast<float>(d2 * inv_n);
+        const double e0 = pw.x - c.mean[0], e1 = pw.y - c.mean[1], e2 = pw.z - c.mean[2];
+        c.m2[0] += static_cast<float>(d0 * e0);
+        c.m2[1] += static_cast<float>(d0 * e1);
+        c.m2[2] += static_cast<float>(d0 * e2);
+        c.m2[3] += static_cast<float>(d1 * e1);
+        c.m2[4] += static_cast<float>(d1 * e2);
+        c.m2[5] += static_cast<float>(d2 * e2);
+    }
+}
+
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 
@@ -1447,6 +1542,61 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             std::nth_element(near_z.begin(), near_z.begin() + k, near_z.end());
             canopy_zp95 = near_z[k];
         }
+    }
+
+    // P2 VoxelMap-lite anisotropic deweight (see the flag's block comment).
+    // Runs on the ACCEPTED rows BEFORE ground recovery, so recovery rows (added
+    // below with fabricated vertical normals — the load-bearing counterweight)
+    // are never rescaled. esti_plane rewrites the organic normals every iEKF
+    // iteration, so the scaling is applied fresh each call — no compounding.
+    // The grid is only written from the main thread between scans; this pass
+    // is read-only and safe under OMP.
+    vxl_tested = vxl_cut = vxl_vert_cnt = 0;
+    vxl_msum = vxl_sd_sum = vxl_vert_msum = 0.0;
+    if (vxl_en)
+    {
+        int tested = 0, cut = 0, vert_cnt = 0;
+        double msum = 0.0, sdsum = 0.0, vert_msum = 0.0;
+        #ifdef MP_EN
+            #pragma omp parallel for reduction(+:tested,cut,vert_cnt,msum,sdsum,vert_msum)
+        #endif
+        for (int i = 0; i < feats_down_size; i++)
+        {
+            if (!point_selected_surf[i]) continue;
+            const PointType &pb = feats_down_body->points[i];
+            if (std::hypot(pb.x, pb.y) > vxl_max_range) continue;
+            const PointType &pw = feats_down_world->points[i];
+            const auto it = vxl_grid.find(vxlKey(pw.x, pw.y, pw.z));
+            if (it == vxl_grid.end() || it->second.n < vxl_min_pts) continue;
+            const VxlCell &c = it->second;
+            const double inv_n = 1.0 / static_cast<double>(c.n);
+            const double nx = normvec->points[i].x, ny = normvec->points[i].y,
+                         nz = normvec->points[i].z;  // unit normal from esti_plane
+            // sigma_dir^2 = n^T Cov n from the upper-triangle comoment sums
+            const double sd2 = std::max(0.0,
+                (nx * nx * c.m2[0] + ny * ny * c.m2[3] + nz * nz * c.m2[5] +
+                 2.0 * (nx * ny * c.m2[1] + nx * nz * c.m2[2] + ny * nz * c.m2[4])) * inv_n);
+            const double m = std::clamp(
+                vxl_sigma_r / std::sqrt(vxl_sigma_r * vxl_sigma_r + sd2), vxl_min_weight, 1.0);
+            ++tested;
+            msum += m;
+            sdsum += std::sqrt(sd2);
+            if (std::fabs(nz) > 0.8) { ++vert_cnt; vert_msum += m; }
+            if (m < 0.999)
+            {
+                ++cut;
+                normvec->points[i].x *= static_cast<float>(m);
+                normvec->points[i].y *= static_cast<float>(m);
+                normvec->points[i].z *= static_cast<float>(m);
+                normvec->points[i].intensity *= static_cast<float>(m);
+            }
+        }
+        vxl_tested = tested;
+        vxl_cut = cut;
+        vxl_msum = msum;
+        vxl_sd_sum = sdsum;
+        vxl_vert_cnt = vert_cnt;
+        vxl_vert_msum = vert_msum;
     }
 
     /*** Ground recovery (selection-layer repair, 2026-07-06 forensics): ANY
@@ -1918,6 +2068,14 @@ public:
         this->declare_parameter<double>("clutter_th_lo", 0.05);
         this->declare_parameter<double>("clutter_th_hi", 0.20);
         this->declare_parameter<double>("clutter_min_weight", 0.15);
+        this->declare_parameter<bool>("vxl_en", false);
+        this->declare_parameter<double>("vxl_size_xy", 1.0);
+        this->declare_parameter<double>("vxl_size_z", 0.25);
+        this->declare_parameter<double>("vxl_sigma_r", 0.05);
+        this->declare_parameter<double>("vxl_min_weight", 0.10);
+        this->declare_parameter<double>("vxl_max_range", 30.0);
+        this->declare_parameter<int>("vxl_min_pts", 8);
+        this->declare_parameter<int>("vxl_freeze_pts", 300);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("data_dir", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -2021,6 +2179,14 @@ public:
         this->get_parameter_or<double>("clutter_th_lo", clutter_th_lo, 0.05);
         this->get_parameter_or<double>("clutter_th_hi", clutter_th_hi, 0.20);
         this->get_parameter_or<double>("clutter_min_weight", clutter_min_weight, 0.15);
+        this->get_parameter_or<bool>("vxl_en", vxl_en, false);
+        this->get_parameter_or<double>("vxl_size_xy", vxl_size_xy, 1.0);
+        this->get_parameter_or<double>("vxl_size_z", vxl_size_z, 0.25);
+        this->get_parameter_or<double>("vxl_sigma_r", vxl_sigma_r, 0.05);
+        this->get_parameter_or<double>("vxl_min_weight", vxl_min_weight, 0.10);
+        this->get_parameter_or<double>("vxl_max_range", vxl_max_range, 30.0);
+        this->get_parameter_or<int>("vxl_min_pts", vxl_min_pts, 8);
+        this->get_parameter_or<int>("vxl_freeze_pts", vxl_freeze_pts, 300);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         string data_dir_param;
         this->get_parameter_or<string>("data_dir", data_dir_param, "");
@@ -2768,6 +2934,15 @@ private:
                           << " m_avg=" << (clut_tested > 0 ? clut_msum / clut_tested : 1.0)
                           << " eigmin=" << pos_obs_eig_min << " zweak=" << pos_obs_z_weak << std::endl;
 
+            if (vxl_en && canopy_debug)
+                std::cerr << "[VXL] t=" << std::fixed << std::setprecision(3) << lidar_end_time
+                          << " cells=" << vxl_grid.size()
+                          << " tested=" << vxl_tested << " cut=" << vxl_cut
+                          << " m_avg=" << (vxl_tested > 0 ? vxl_msum / vxl_tested : 1.0)
+                          << " mv_avg=" << (vxl_vert_cnt > 0 ? vxl_vert_msum / vxl_vert_cnt : 1.0)
+                          << " sd_avg=" << (vxl_tested > 0 ? vxl_sd_sum / vxl_tested : 0.0)
+                          << " eigmin=" << pos_obs_eig_min << " zweak=" << pos_obs_z_weak << std::endl;
+
             /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
              *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll
              *   reference the body-vz planar constraint below structurally lacks.
@@ -2980,6 +3155,10 @@ private:
             // above continue normally.
             if (mapping_enabled.load(std::memory_order_relaxed) && !flio_map_frozen) {
                 map_incremental();
+                // Same gate as map growth: a frozen/paused map means "don't
+                // learn from this state" — that applies to the voxel surface
+                // statistics as much as to the ikd-tree.
+                vxl_update();
             }
             t5 = omp_get_wtime();
 

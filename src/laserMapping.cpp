@@ -282,6 +282,28 @@ double tem_anchor_max_age = 3.0;  // s, drift note older than this = stale ("no 
 std::mutex tem_anchor_mtx;        // handler (executor thread) vs main-loop consumer
 double tem_anchor_d = 0.0, tem_anchor_sigma = 0.2, tem_anchor_stamp = -1.0;
 
+// Constraint-set cleaning (clutter deweight; EXPERIMENTAL, default OFF, needs
+// ground_recover_en for the sector ground planes). The Z ratchet lives in the
+// ACCEPTED pseudo-plane rows: 5 map points cannot measure planarity (measured
+// at map density: 5-NN thickness p50 0.004/0.005 ground vs clutter — blind;
+// 15-NN separates 12x, 0.011 vs 0.139-0.165). For accepted near-field rows in
+// the CLUTTER BAND above the fitted ground plane (the band itself is the
+// classifier — the canopy-area ground band is a ~0.16 m grass layer where a
+// thickness test would hurt true ground, so ground-band rows are never
+// touched), a one-off k=15 map query measures neighborhood thickness and the
+// row weight collapses continuously with it. Two protections from the
+// measured dose-response failures: (a) |n_z| taper — horizontal-normal rows
+// (hedge walls) carry the lateral information that keeps clutter scenes
+// conditioned, so only vertical-normal rows (the Z-bias carriers) take the
+// full cut; (b) a weight floor — rows are never removed, and the scaled
+// normals make the pos-observability metric quality-weighted for free.
+bool   clutter_deweight_en = false;
+double clutter_th_lo = 0.05;      // m, 15-NN thickness below this = real plane, no cut
+double clutter_th_hi = 0.20;      // m, thickness at/above this = full cut
+double clutter_min_weight = 0.15; // floor: never remove a row outright (conditioning)
+int    clut_tested = 0, clut_cut = 0;  // diag, last h_share call
+double clut_msum = 0.0;
+
 inline int64_t temKeyIdx(int64_t kx, int64_t ky) { return (kx << 32) ^ (ky & 0xffffffff); }
 
 inline int64_t temKey(double x, double y)
@@ -1575,6 +1597,91 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 }
             }
         }
+        // Clutter deweight pass (see the flag's block comment). Runs on the
+        // ACCEPTED rows before recovery; the expensive k=15 thickness is cached
+        // per scan (band membership is body-frame = iteration-invariant, the
+        // organic normals are rewritten by esti_plane every iteration so the
+        // scaling below is applied fresh each call — no compounding).
+        if (clutter_deweight_en)
+        {
+            // Band lower edge 0.5 m is a HARD boundary: the 0.15-0.5 m grass
+            // layer just above the fitted plane carries Z bias BUT is also the
+            // bulk of the effective Z constraint in deep clutter (half of it is
+            // true ground in mixed grass) — lowering the edge to 0.25 m
+            // re-opened the raw pathology worse than baseline (FE 2D 796 m,
+            // Z -105, /odom breached 8.8 m). Do not lower it again.
+            constexpr double kClutBandLo = 0.5, kClutBandHi = 3.0;  // m above the sector plane
+            constexpr int kClutK = 15;             // measured: 5 is blind, 15 separates 12x
+            constexpr int kClutMinNeighbors = 12;  // sparse map neighborhood = no verdict
+            constexpr double kClutNzLo = 0.3, kClutNzHi = 0.8;  // |n_z| taper (lateral carriers spared)
+            static double clut_time = -1.0;
+            static float clut_thick[100000];
+            if (lidar_end_time != clut_time)
+            {
+                clut_time = lidar_end_time;
+                std::fill_n(clut_thick, feats_down_size, -1.0f);
+            }
+            int tested = 0, cut = 0;
+            double msum = 0.0;
+            #ifdef MP_EN
+                #pragma omp parallel for reduction(+:tested,cut,msum)
+            #endif
+            for (int i = 0; i < feats_down_size; i++)
+            {
+                if (!point_selected_surf[i]) continue;
+                const PointType &pb = feats_down_body->points[i];
+                if (std::hypot(pb.x, pb.y) > canopy_near_range) continue;
+                const int s = std::min(kGndSectors - 1,
+                    static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
+                if (!sec_ok[s]) continue;
+                const double h = sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s];
+                if (h < kClutBandLo || h > kClutBandHi) continue;
+                ++tested;
+                if (clut_thick[i] < 0.0f)
+                {
+                    PointVector nb;
+                    std::vector<float> sq;
+                    ikdtree.Nearest_Search(feats_down_world->points[i], kClutK, nb, sq);
+                    if (static_cast<int>(nb.size()) < kClutMinNeighbors)
+                    {
+                        clut_thick[i] = 0.0f;  // no verdict — leave the row alone
+                    }
+                    else
+                    {
+                        Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+                        for (const auto &p : nb) mean += Eigen::Vector3d(p.x, p.y, p.z);
+                        mean /= static_cast<double>(nb.size());
+                        Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+                        for (const auto &p : nb)
+                        {
+                            const Eigen::Vector3d q = Eigen::Vector3d(p.x, p.y, p.z) - mean;
+                            cov.noalias() += q * q.transpose();
+                        }
+                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov / static_cast<double>(nb.size()));
+                        clut_thick[i] = static_cast<float>(std::sqrt(std::max(es.eigenvalues()(0), 0.0)));
+                    }
+                }
+                // f: planar at map scale -> 1, fuzzy -> 0 (linear ramp).
+                const double f = std::clamp(
+                    (clutter_th_hi - clut_thick[i]) / std::max(clutter_th_hi - clutter_th_lo, 1e-6), 0.0, 1.0);
+                // g: only vertical-normal rows (Z-bias carriers) take the cut.
+                const double nz = std::fabs(normvec->points[i].z);
+                const double g = std::clamp((nz - kClutNzLo) / (kClutNzHi - kClutNzLo), 0.0, 1.0);
+                const double m = std::max(1.0 - (1.0 - f) * g, clutter_min_weight);
+                msum += m;
+                if (m < 0.999)
+                {
+                    ++cut;
+                    normvec->points[i].x *= static_cast<float>(m);
+                    normvec->points[i].y *= static_cast<float>(m);
+                    normvec->points[i].z *= static_cast<float>(m);
+                    normvec->points[i].intensity *= static_cast<float>(m);
+                }
+            }
+            clut_tested = tested;
+            clut_cut = cut;
+            clut_msum = msum;
+        }
         for (int i = 0; i < feats_down_size; i++)
         {
             if (point_selected_surf[i]) continue;
@@ -1807,6 +1914,10 @@ public:
         this->declare_parameter<double>("tem_sigma0", 0.15);
         this->declare_parameter<bool>("tem_anchor_en", false);
         this->declare_parameter<double>("tem_anchor_max_age", 3.0);
+        this->declare_parameter<bool>("clutter_deweight_en", false);
+        this->declare_parameter<double>("clutter_th_lo", 0.05);
+        this->declare_parameter<double>("clutter_th_hi", 0.20);
+        this->declare_parameter<double>("clutter_min_weight", 0.15);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("data_dir", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -1906,6 +2017,10 @@ public:
         this->get_parameter_or<double>("tem_sigma0", tem_sigma0, 0.15);
         this->get_parameter_or<bool>("tem_anchor_en", tem_anchor_en, false);
         this->get_parameter_or<double>("tem_anchor_max_age", tem_anchor_max_age, 3.0);
+        this->get_parameter_or<bool>("clutter_deweight_en", clutter_deweight_en, false);
+        this->get_parameter_or<double>("clutter_th_lo", clutter_th_lo, 0.05);
+        this->get_parameter_or<double>("clutter_th_hi", clutter_th_hi, 0.20);
+        this->get_parameter_or<double>("clutter_min_weight", clutter_min_weight, 0.15);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         string data_dir_param;
         this->get_parameter_or<string>("data_dir", data_dir_param, "");
@@ -2646,6 +2761,12 @@ private:
                               << " slope=" << tem_slope_mean
                               << " d=" << (anchored ? d_use : std::nan("")) << std::endl;
             }
+
+            if (clutter_deweight_en && canopy_debug)
+                std::cerr << "[CLUT] t=" << std::fixed << std::setprecision(3) << lidar_end_time
+                          << " tested=" << clut_tested << " cut=" << clut_cut
+                          << " m_avg=" << (clut_tested > 0 ? clut_msum / clut_tested : 1.0)
+                          << " eigmin=" << pos_obs_eig_min << " zweak=" << pos_obs_z_weak << std::endl;
 
             /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
              *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll

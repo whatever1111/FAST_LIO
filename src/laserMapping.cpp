@@ -377,6 +377,7 @@ struct VxlCell
 {
     float   mean[3];  // world-frame mean (float ok: ~1e-4 m precision at 1 km)
     float   m2[6];    // centered comoment sums, upper triangle xx,xy,xz,yy,yz,zz
+    float   zq;       // SGD 10th-percentile tracker of z (cell lower mode)
     int32_t n;
 };
 std::unordered_map<int64_t, VxlCell> vxl_grid;
@@ -393,13 +394,42 @@ double vxl_msum = 0.0, vxl_sd_sum = 0.0;
 double vxl_vert_msum = 0.0;    // diag: m over |n_z|>0.8 rows (the Z-bias carriers)
 int    vxl_vert_cnt = 0;
 
+// P3 within-voxel decomposition (NEGATIVE — measured; keep OFF, needs vxl_en):
+// residual-reference swap for ground-class rows onto the voxel column's lower
+// envelope (zq = 10th-pct of the lowest mature cell). Design intent was to
+// break the per-scan re-manufacturing of the ratchet's reference. MEASURED
+// (0702): the swap MANUFACTURES A STRONGER RATCHET INSTEAD — with ~1500
+// near-field rows/scan a cell reaches min_pts within <1 s, so the envelope
+// follows the drift by cell turnover with near-zero lag, and a LOWER-quantile
+// estimator has a built-in positive residual offset against the ground return
+// population (telemetry: h_avg +0.03..0.06 every scan, never decaying) =
+// constant downward pull. P2's natural post-dive recovery (-47 -> +3) was
+// replaced by a monotonic second-half grind (-20 -> -33), tail divergence to
+// -156 (3x worse than doing nothing), /odom breached 16 m. The dilemma is
+// structural, not a tuning miss: serve-fast = co-drifting reference with a
+// quantile offset (this failure); serve-frozen-only = absolute injection =
+// the closed B3 line, at ~6x tema's row authority (do NOT try); symmetric
+// median = no offset but no resistance either (residual ~0 against a
+// co-drifting median by construction). No reprocessing of the self-built data
+// stream can create the independent information the ratchet requires.
+bool   vxl_env_en = false;
+int    vxl_env_min_pts = 20;   // cell mass before it can serve as envelope
+double vxl_env_band = 0.12;    // m, |z - env| within this = ground-class row
+double vxl_env_nz_min = 0.5;   // fitted |n_z| below this = lateral carrier, never swapped
+int    vxl_env_cnt = 0;        // diag, last h_share call
+double vxl_env_habs = 0.0;
+
+inline int64_t vxlKeyIdx(int64_t kx, int64_t ky, int64_t kz)
+{
+    return ((kx & 0x1FFFFF) << 42) | ((ky & 0x1FFFFF) << 21) | (kz & 0x1FFFFF);
+}
+
 // 21 bits per axis (±2^20 cells; at 0.25 m Z that is ±262 km — ample).
 inline int64_t vxlKey(double x, double y, double z)
 {
-    const int64_t kx = static_cast<int64_t>(std::floor(x / vxl_size_xy));
-    const int64_t ky = static_cast<int64_t>(std::floor(y / vxl_size_xy));
-    const int64_t kz = static_cast<int64_t>(std::floor(z / vxl_size_z));
-    return ((kx & 0x1FFFFF) << 42) | ((ky & 0x1FFFFF) << 21) | (kz & 0x1FFFFF);
+    return vxlKeyIdx(static_cast<int64_t>(std::floor(x / vxl_size_xy)),
+                     static_cast<int64_t>(std::floor(y / vxl_size_xy)),
+                     static_cast<int64_t>(std::floor(z / vxl_size_z)));
 }
 
 bool   point_selected_surf[100000] = {0};
@@ -1109,10 +1139,15 @@ void vxl_update()
         if (c.n == 0)
         {
             c.mean[0] = pw.x; c.mean[1] = pw.y; c.mean[2] = pw.z;
+            c.zq = pw.z;
             c.n = 1;
             continue;
         }
         ++c.n;
+        // SGD quantile step toward the 10th percentile: down-moves 9x faster
+        // than up-moves, so zq settles on the cell's lower mode.
+        constexpr float kVxlZqEta = 0.02f;
+        c.zq += kVxlZqEta * (0.1f - (pw.z < c.zq ? 1.0f : 0.0f));
         const double d0 = pw.x - c.mean[0], d1 = pw.y - c.mean[1], d2 = pw.z - c.mean[2];
         const double inv_n = 1.0 / static_cast<double>(c.n);
         c.mean[0] += static_cast<float>(d0 * inv_n);
@@ -1551,14 +1586,25 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     // iteration, so the scaling is applied fresh each call — no compounding.
     // The grid is only written from the main thread between scans; this pass
     // is read-only and safe under OMP.
-    vxl_tested = vxl_cut = vxl_vert_cnt = 0;
-    vxl_msum = vxl_sd_sum = vxl_vert_msum = 0.0;
+    vxl_tested = vxl_cut = vxl_vert_cnt = vxl_env_cnt = 0;
+    vxl_msum = vxl_sd_sum = vxl_vert_msum = vxl_env_habs = 0.0;
     if (vxl_en)
     {
-        int tested = 0, cut = 0, vert_cnt = 0;
-        double msum = 0.0, sdsum = 0.0, vert_msum = 0.0;
+        // P3 envelope cache, per scan per row (the column's mature-cell set only
+        // moves with map growth, not with iEKF iterations; the residual itself
+        // is recomputed each iteration from the fresh world point).
+        static double env_time = -1.0;
+        static int8_t env_state[100000];  // 0 = not computed, 1 = served, 2 = none
+        static float  env_z[100000], env_sig[100000];
+        if (vxl_env_en && lidar_end_time != env_time)
+        {
+            env_time = lidar_end_time;
+            std::fill_n(env_state, feats_down_size, static_cast<int8_t>(0));
+        }
+        int tested = 0, cut = 0, vert_cnt = 0, env_cnt = 0;
+        double msum = 0.0, sdsum = 0.0, vert_msum = 0.0, env_habs = 0.0;
         #ifdef MP_EN
-            #pragma omp parallel for reduction(+:tested,cut,vert_cnt,msum,sdsum,vert_msum)
+            #pragma omp parallel for reduction(+:tested,cut,vert_cnt,msum,sdsum,vert_msum,env_cnt,env_habs)
         #endif
         for (int i = 0; i < feats_down_size; i++)
         {
@@ -1566,12 +1612,58 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             const PointType &pb = feats_down_body->points[i];
             if (std::hypot(pb.x, pb.y) > vxl_max_range) continue;
             const PointType &pw = feats_down_world->points[i];
+            const double nx = normvec->points[i].x, ny = normvec->points[i].y,
+                         nz = normvec->points[i].z;  // unit normal from esti_plane
+            // P3 residual-reference swap for ground-class rows (see the
+            // vxl_env_en block comment). Evidence is per point: its height
+            // against the column's lower envelope, not the (possibly bent)
+            // fitted normal — but strong lateral carriers are never swapped.
+            if (vxl_env_en && std::fabs(nz) >= vxl_env_nz_min)
+            {
+                if (env_state[i] == 0)
+                {
+                    // Lowest mature cell in this column, from one slab above the
+                    // point down to 2 m below (kVxlEnvScanDown slabs).
+                    constexpr int kVxlEnvScanDown = 8;
+                    const int64_t kx = static_cast<int64_t>(std::floor(pw.x / vxl_size_xy));
+                    const int64_t ky = static_cast<int64_t>(std::floor(pw.y / vxl_size_xy));
+                    const int64_t kz0 = static_cast<int64_t>(std::floor(pw.z / vxl_size_z));
+                    env_state[i] = 2;
+                    for (int64_t kz = kz0 - kVxlEnvScanDown; kz <= kz0 + 1; kz++)
+                    {
+                        const auto ite = vxl_grid.find(vxlKeyIdx(kx, ky, kz));
+                        if (ite == vxl_grid.end() || ite->second.n < vxl_env_min_pts) continue;
+                        env_state[i] = 1;
+                        env_z[i] = ite->second.zq;
+                        env_sig[i] = std::max(
+                            std::sqrt(std::max(ite->second.m2[5] / ite->second.n, 0.0f)), 0.05f);
+                        break;  // lowest first: kz ascends from the bottom
+                    }
+                }
+                if (env_state[i] == 1 &&
+                    std::fabs(pw.z - env_z[i]) <= vxl_env_band)
+                {
+                    // Same row shape as a recovery row: forced vertical normal,
+                    // envelope residual, trust-region clamp (never hard-gated),
+                    // honest weight from the envelope cell's own thickness.
+                    const double sig = env_sig[i];
+                    const double pd2 = std::clamp(static_cast<double>(pw.z - env_z[i]),
+                                                  -3.0 * sig, 3.0 * sig);
+                    const double w = vxl_sigma_r / std::sqrt(vxl_sigma_r * vxl_sigma_r + sig * sig);
+                    normvec->points[i].x = 0.0f;
+                    normvec->points[i].y = 0.0f;
+                    normvec->points[i].z = static_cast<float>(w);
+                    normvec->points[i].intensity = static_cast<float>(w * pd2);
+                    res_last[i] = std::fabs(pd2);
+                    ++env_cnt;
+                    env_habs += std::fabs(pd2);
+                    continue;  // re-referenced: the P2 plane deweight no longer applies
+                }
+            }
             const auto it = vxl_grid.find(vxlKey(pw.x, pw.y, pw.z));
             if (it == vxl_grid.end() || it->second.n < vxl_min_pts) continue;
             const VxlCell &c = it->second;
             const double inv_n = 1.0 / static_cast<double>(c.n);
-            const double nx = normvec->points[i].x, ny = normvec->points[i].y,
-                         nz = normvec->points[i].z;  // unit normal from esti_plane
             // sigma_dir^2 = n^T Cov n from the upper-triangle comoment sums
             const double sd2 = std::max(0.0,
                 (nx * nx * c.m2[0] + ny * ny * c.m2[3] + nz * nz * c.m2[5] +
@@ -1597,6 +1689,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         vxl_sd_sum = sdsum;
         vxl_vert_cnt = vert_cnt;
         vxl_vert_msum = vert_msum;
+        vxl_env_cnt = env_cnt;
+        vxl_env_habs = env_habs;
     }
 
     /*** Ground recovery (selection-layer repair, 2026-07-06 forensics): ANY
@@ -2076,6 +2170,10 @@ public:
         this->declare_parameter<double>("vxl_max_range", 30.0);
         this->declare_parameter<int>("vxl_min_pts", 8);
         this->declare_parameter<int>("vxl_freeze_pts", 300);
+        this->declare_parameter<bool>("vxl_env_en", false);
+        this->declare_parameter<int>("vxl_env_min_pts", 20);
+        this->declare_parameter<double>("vxl_env_band", 0.12);
+        this->declare_parameter<double>("vxl_env_nz_min", 0.5);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("data_dir", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -2187,6 +2285,10 @@ public:
         this->get_parameter_or<double>("vxl_max_range", vxl_max_range, 30.0);
         this->get_parameter_or<int>("vxl_min_pts", vxl_min_pts, 8);
         this->get_parameter_or<int>("vxl_freeze_pts", vxl_freeze_pts, 300);
+        this->get_parameter_or<bool>("vxl_env_en", vxl_env_en, false);
+        this->get_parameter_or<int>("vxl_env_min_pts", vxl_env_min_pts, 20);
+        this->get_parameter_or<double>("vxl_env_band", vxl_env_band, 0.12);
+        this->get_parameter_or<double>("vxl_env_nz_min", vxl_env_nz_min, 0.5);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         string data_dir_param;
         this->get_parameter_or<string>("data_dir", data_dir_param, "");
@@ -2941,6 +3043,8 @@ private:
                           << " m_avg=" << (vxl_tested > 0 ? vxl_msum / vxl_tested : 1.0)
                           << " mv_avg=" << (vxl_vert_cnt > 0 ? vxl_vert_msum / vxl_vert_cnt : 1.0)
                           << " sd_avg=" << (vxl_tested > 0 ? vxl_sd_sum / vxl_tested : 0.0)
+                          << " env=" << vxl_env_cnt
+                          << " h_avg=" << (vxl_env_cnt > 0 ? vxl_env_habs / vxl_env_cnt : 0.0)
                           << " eigmin=" << pos_obs_eig_min << " zweak=" << pos_obs_z_weak << std::endl;
 
             /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the

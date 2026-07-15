@@ -320,41 +320,62 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
 
-  /*** undistort each lidar point (backward propagation) ***/
-  if (pcl_out.points.begin() == pcl_out.points.end()) return;
-  auto it_pcl = pcl_out.points.end() - 1;
-  for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
+  /*** undistort each lidar point (backward propagation). Restructured from
+   * the original shared tail-cursor walk into per-segment constants + a
+   * parallel point loop: every point evaluates the exact same expression with
+   * the same segment inputs as before and is touched exactly once, so the
+   * output is bit-identical to the serial walk — but the ~50k-point scans of
+   * the allpoint chain no longer serialize the biggest slice of t1-t0.
+   * Ownership mapping preserved from the serial walk: segment with head
+   * offset o_{j-1} owns points with o_{j-1} < t <= o_j, the last segment is
+   * unbounded above (extrapolation past the final IMU sample), and points at
+   * or before the scan-start pose (t <= 0) are left untouched. ***/
+  const int n_pts = static_cast<int>(pcl_out.points.size());
+  if (n_pts == 0) return;
+  const int n_seg = static_cast<int>(IMUpose.size()) - 1;
+  if (n_seg < 1) return;
+  std::vector<double> seg_head_t(IMUpose.size());
+  for (size_t j = 0; j < IMUpose.size(); j++) seg_head_t[j] = IMUpose[j].offset_time;
+  std::vector<M3D, Eigen::aligned_allocator<M3D>> seg_R(n_seg);
+  std::vector<V3D, Eigen::aligned_allocator<V3D>> seg_vel(n_seg), seg_pos(n_seg), seg_acc(n_seg), seg_gyr(n_seg);
+  for (int j = 0; j < n_seg; j++)
   {
-    auto head = it_kp - 1;
-    auto tail = it_kp;
-    R_imu<<MAT_FROM_ARRAY(head->rot);
-    // cout<<"head imu acc: "<<acc_imu.transpose()<<endl;
-    vel_imu<<VEC_FROM_ARRAY(head->vel);
-    pos_imu<<VEC_FROM_ARRAY(head->pos);
-    acc_imu<<VEC_FROM_ARRAY(tail->acc);
-    angvel_avr<<VEC_FROM_ARRAY(tail->gyr);
+    const auto &head = IMUpose[j];
+    const auto &tail = IMUpose[j + 1];
+    seg_R[j] << MAT_FROM_ARRAY(head.rot);
+    seg_vel[j] << VEC_FROM_ARRAY(head.vel);
+    seg_pos[j] << VEC_FROM_ARRAY(head.pos);
+    seg_acc[j] << VEC_FROM_ARRAY(tail.acc);
+    seg_gyr[j] << VEC_FROM_ARRAY(tail.gyr);
+  }
+#ifdef MP_EN
+  #pragma omp parallel for
+#endif
+  for (int i = 0; i < n_pts; i++)
+  {
+    auto &pt = pcl_out.points[i];
+    const double t = pt.curvature / double(1000);
+    // First head offset >= t = the serial walk's owning segment (boundary
+    // t == o_j belongs to segment j, exactly as the strict '>' walk had it).
+    int j = static_cast<int>(std::lower_bound(seg_head_t.begin(), seg_head_t.end(), t) - seg_head_t.begin());
+    if (j < 1) continue;
+    if (j > n_seg) j = n_seg;
+    const int s = j - 1;
+    const double dt_i = t - seg_head_t[s];
 
-    for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
-    {
-      dt = it_pcl->curvature / double(1000) - head->offset_time;
+    /* Transform to the 'end' frame, using only the rotation
+     * Note: Compensation direction is INVERSE of Frame's moving direction
+     * So if we want to compensate a point at timestamp-i to the frame-e
+     * P_compensate = R_imu_e ^ T * (R_i * P_i + T_ei) where T_ei is represented in global frame */
+    M3D R_i(seg_R[s] * Exp(seg_gyr[s], dt_i));
 
-      /* Transform to the 'end' frame, using only the rotation
-       * Note: Compensation direction is INVERSE of Frame's moving direction
-       * So if we want to compensate a point at timestamp-i to the frame-e
-       * P_compensate = R_imu_e ^ T * (R_i * P_i + T_ei) where T_ei is represented in global frame */
-      M3D R_i(R_imu * Exp(angvel_avr, dt));
-      
-      V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);
-      V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - imu_state.pos);
-      V3D P_compensate = imu_state.offset_R_L_I.conjugate() * (imu_state.rot.conjugate() * (R_i * (imu_state.offset_R_L_I * P_i + imu_state.offset_T_L_I) + T_ei) - imu_state.offset_T_L_I);// not accurate!
-      
-      // save Undistorted points and their rotation
-      it_pcl->x = P_compensate(0);
-      it_pcl->y = P_compensate(1);
-      it_pcl->z = P_compensate(2);
+    V3D P_i(pt.x, pt.y, pt.z);
+    V3D T_ei(seg_pos[s] + seg_vel[s] * dt_i + 0.5 * seg_acc[s] * dt_i * dt_i - imu_state.pos);
+    V3D P_compensate = imu_state.offset_R_L_I.conjugate() * (imu_state.rot.conjugate() * (R_i * (imu_state.offset_R_L_I * P_i + imu_state.offset_T_L_I) + T_ei) - imu_state.offset_T_L_I);// not accurate!
 
-      if (it_pcl == pcl_out.points.begin()) break;
-    }
+    pt.x = P_compensate(0);
+    pt.y = P_compensate(1);
+    pt.z = P_compensate(2);
   }
 }
 

@@ -348,19 +348,38 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     seg_acc[j] << VEC_FROM_ARRAY(tail.acc);
     seg_gyr[j] << VEC_FROM_ARRAY(tail.gyr);
   }
+  // Ownership must replicate the serial tail-cursor walk EXACTLY — a
+  // lower_bound over head offsets is WRONG here: IMUpose offsets are NOT
+  // monotonic (the 0.0 seed is followed by NEGATIVE offsets for IMU samples
+  // falling in the previous-scan-end .. scan-begin gap, 2-3 per scan at
+  // 200 Hz), and binary search over that sequence misassigns the early-scan
+  // points to wrong segments (measured: sub-cm noise on most bags, but 72
+  // "No Effective Points" collapses and a 607 m FE dive on the 0702 canopy
+  // bag). The two-pointer backward sweep below performs the SAME comparisons
+  // in the SAME order as the serial walk, for any head sequence.
+  std::vector<int> seg_of(n_pts);
+  {
+    int p = n_pts - 1;
+    for (int j = n_seg; j >= 1 && p >= 0; j--)
+    {
+      const double head_t = seg_head_t[j - 1];
+      while (p >= 0 && pcl_out.points[p].curvature / double(1000) > head_t)
+      {
+        seg_of[p] = j - 1;
+        --p;
+      }
+    }
+    for (; p >= 0; --p) seg_of[p] = -1;  // at/before the scan-start pose: untouched
+  }
 #ifdef MP_EN
   #pragma omp parallel for
 #endif
   for (int i = 0; i < n_pts; i++)
   {
     auto &pt = pcl_out.points[i];
+    const int s = seg_of[i];
+    if (s < 0) continue;
     const double t = pt.curvature / double(1000);
-    // First head offset >= t = the serial walk's owning segment (boundary
-    // t == o_j belongs to segment j, exactly as the strict '>' walk had it).
-    int j = static_cast<int>(std::lower_bound(seg_head_t.begin(), seg_head_t.end(), t) - seg_head_t.begin());
-    if (j < 1) continue;
-    if (j > n_seg) j = n_seg;
-    const int s = j - 1;
     const double dt_i = t - seg_head_t[s];
 
     /* Transform to the 'end' frame, using only the rotation

@@ -1,0 +1,111 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: true   # TEMP: imu.txt + mat logs for 3deg source-localization
+        # Root cause of the raw front-end Z "drift" here is a ~3 deg world-frame/gravity
+        # tilt (posZ ~ plane(x,y) with R^2=0.997; state grav horiz tilt ~3.6 deg), driven
+        # by an in-run accel-bias<->gravity-direction estimation drift on this low-maneuver
+        # flat yard. Tried ungating gravity_align (the roll/pitch leveling prior): NEGATIVE
+        # — it follows the RAW accelerometer (does NOT subtract estimated ba), so on a
+        # bias-tilted accel it reinforces the tilt (raw-Z mean 3.7->6.7m) instead of fixing
+        # it, and the soft prior only applies ~0.4 deg total vs a 3 deg tilt. The tilt is a
+        # cosmetic front-end artifact: /odom (PGO+GPS) Z stays <3cm regardless. Left OFF.
+        # Ground-return reweighting (A'-3) is available (ground_constraint_en) but
+        # left OFF here: on this open, flat yard it does NOT fix the raw front-end Z
+        # drift. The drift is a metastable random walk that occurs while Z is already
+        # well-observed (pos_obs_z_weak ~0.05, ground normals abundant), so boosting
+        # ground measurements only reshapes the balloon (raw-Z mean 3.9->5.8m) — there
+        # is no observability deficit to fix. The drift has no absolute Z anchor in
+        # the front end and is correctly absorbed downstream by PGO+GPS (/odom Z<3cm).
+        diagnostics:
+            latency_enable: false
+            latency_log_period_sec: 1.0
+        map_file_path: "/data/fast_lio_map.pcd"
+
+        common:
+            # /pre/all_point is shm_msgs/PointCloud8mAndPose, decoded in place by
+            # FAST-LIO's allpoint_handler (lidar_type=6). No relay node.
+            lid_topic:  "/pre/all_point"
+            # Fixposition raw IMU (m/s², gravity-included, ~200Hz) consumed directly
+            # via the fixposition_fpa path; bias applied from /fixposition/fpa/imubias.
+            imu_topic:  "/fixposition/fpa/rawimu"
+            imu_input_type: "fixposition_fpa"
+            imu_bias_topic: "/fixposition/fpa/imubias"
+            time_sync_en: false
+            # NOTE: the LiDAR cloud header lags the FP IMU/RTK clock by ~0.13s (the
+            # /odom output leads RTK by that much at offset 0). Correcting it HERE is
+            # ineffective: FAST-LIO is self-referential (it registers scans into its own
+            # map on its own clock), so shifting the cloud stamp moves the map/pose AND
+            # the /Odometry stamp together — only ~1/3 of the shift nets out as an
+            # output-vs-RTK correction (measured: 0.137s → only 0.05s of lead removed).
+            # The offset is instead corrected at the OUTPUT (fusion output_time_offset
+            # in params_fast_lio_pgo_giant_baselink.yaml), which re-times the published
+            # pose directly. Leave this at 0.
+            time_offset_lidar_to_imu: 0.0
+            imu_time_offset: 0.0
+
+        preprocess:
+            # shm cloud carries a RoboSense-style layout: x,y,z,intensity float32,
+            # ring uint16 (32 rings), timestamp float64 ABSOLUTE seconds, point_step=32.
+            # allpoint_handler reads it in place and derives per-point relative time.
+            lidar_type: 6               # ALLPOINT (shm_msgs/PointCloud8mAndPose)
+            scan_line:  32
+            blind: 0.5
+            timestamp_unit: 0           # 0=s: timestamps are absolute seconds
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.01
+            gyr_cov: 0.005
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     60.0
+            extrinsic_est_en:  false       # LOCKED: 9.36m lever-arm is real (FP_POI/IMU ~9m from baselink, verified); online estimation of a large lever is ill-conditioned — it drifts yaw +22° (non-converging) and makes results worse
+            # LiDAR-in-IMU extrinsic. The cloud is in the `baselink` frame, so
+            #   T_imu_lidar = T_imu_baselink = (T_baselink_imu)^-1
+            # where T_baselink_imu comes from calib.txt imu_to_baselink
+            #   t = (-8.887, -0.180, -2.935) m, rpy = (-1.038, 0.732, -90.137) deg.
+            # NOTE: this yields a ~9.36 m lever-arm — unusually large; if the run is
+            # poor this is the prime suspect (verify calib / frame convention).
+            extrinsic_T: [-8.887630, -0.179893, -2.934305]
+            # 2026-07-03: yaw corrected by 180deg -- see LIO-SLAM profiles/giant_allpoint/fast_lio.yaml.
+            extrinsic_R: [-0.002439,  0.999832,  0.018160,
+                          -0.999916, -0.002207, -0.012775,
+                          -0.012733, -0.018190,  0.999753]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            # /Laser_map (front-end, live-pose, on the EKF thread) is retired in the full
+            # pipeline: the PGO node publishes the globally-consistent /lio_slam/global_map
+            # (optimized poses, off-thread) and the live leading edge is the single-frame
+            # /cloud_registered. Re-enable (map_en: true) only for standalone FLIO+RViz runs
+            # (no PGO node) — then the voxel-capped /Laser_map is the only accumulated map.
+            map_en: false
+            map_period_sec: 5.0          # /Laser_map publish period (s); 5s = 0.2Hz, voxel-capped ~100k pts
+            scan_publish_en:  true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        prior_map_pcd: ""
+        initial_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        wheel_odom_en: true
+        wheel_topic: "/lio/twist"
+        wheel_speed_scale: 1.018
+        wheel_vel_noise_vx: 0.10
+        wheel_vel_noise_vy: 0.10
+        wheel_vel_noise_vz: 0.30
+        wheel_extrinsic_R: [ -1.0,  0.0, 0.0,
+                              0.0, -1.0, 0.0,
+                              0.0,  0.0, 1.0 ]
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1

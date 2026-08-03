@@ -1,0 +1,78 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        diagnostics:
+            latency_enable: false
+            latency_log_period_sec: 1.0
+        map_file_path: "/data/fast_lio_map.pcd"
+
+        common:
+            lid_topic:  "/rs_velo/points"   # re-stamped by tools/rs_to_velodyne_relay.py
+            imu_topic:  "/dkt/imu"
+            imu_input_type: "sensor_msgs"
+            imu_bias_topic: ""
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+            imu_time_offset: 0.0
+
+        preprocess:
+            # /rsm1_1 is a 5-ring solid-state RoboSense RSM1 with FLOAT64
+            # absolute `timestamp` (not Velodyne `time` float32 relative).
+            # tools/rs_to_velodyne_relay.py converts it to Velodyne layout and
+            # publishes on /rs_velo/points, so lidar_type=2 (VELO16) works.
+            lidar_type: 2
+            scan_line:  5
+            blind: 0.5
+            timestamp_unit: 0           # 0=s (relay outputs seconds since scan start)
+            scan_rate: 10
+
+        mapping:
+            # IMU noise: leave Livox-tuned values until characterised against
+            # the CGI-610 unit. They are conservative for an automotive-grade
+            # MEMS but should still let the iEKF converge.
+            acc_cov: 0.01
+            gyr_cov: 0.005
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     60.0
+            extrinsic_est_en:  true        # online refine — recommended for first-pass tuning
+            # LiDAR-in-IMU extrinsic — computed from camera_lidar_baselink.txt:
+            #   T_imu_lidar = T_baselink_imu^-1 * T_baselink_lidar
+            #   translation ≈ (-0.0001, 1.368, 0.9503) m
+            #   RPY ≈ (1.44°, 13.01°, 90.84°)
+            extrinsic_T: [-0.000083, 1.367967, 0.950319]
+            extrinsic_R: [ -0.014289, -0.999660,  0.021795,
+                            0.974220, -0.009010,  0.225422,
+                           -0.225149,  0.024454,  0.974017 ]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: true
+            scan_publish_en:  true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        prior_map_pcd: ""
+        initial_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        wheel_odom_en: false
+        wheel_topic: "/lio/twist"
+        wheel_speed_scale: 1.0
+        wheel_vel_noise_vx: 0.10
+        wheel_vel_noise_vy: 0.05
+        wheel_vel_noise_vz: 0.20
+        wheel_extrinsic_R: [ 1.0, 0.0, 0.0,
+                             0.0, 1.0, 0.0,
+                             0.0, 0.0, 1.0 ]
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1

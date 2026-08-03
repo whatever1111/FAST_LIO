@@ -32,64 +32,69 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
-#include <omp.h>
-#include <cstdlib>
-#include <algorithm>
-#include <iomanip>
-#include <atomic>
-#include <cmath>
-#include <condition_variable>
-#include <deque>
-#include <limits>
-#include <mutex>
-#include <unordered_map>
-#include <math.h>
-#include <thread>
-#include <fstream>
-#include <csignal>
-#include <chrono>
-#include <unistd.h>
-#include <Python.h>
-#include <so3_math.h>
-#include <rclcpp/rclcpp.hpp>
-#include <Eigen/Core>
-#include <fixposition_driver_msgs/msg/fpa_imu.hpp>
-#include <fixposition_driver_msgs/msg/fpa_imubias.hpp>
-#include <shm_msgs/msg/point_cloud8m_and_pose.hpp>
-#include "IMU_Processing.hpp"
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+
 #include <pcl_conversions/pcl_conversions.h>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
+#include <rclcpp/rclcpp.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+
+#include <Eigen/Core>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/msg/imu.hpp>
-#include <std_srvs/srv/trigger.hpp>
-#include <tf2_ros/transform_broadcaster.h>
-#include <geometry_msgs/msg/transform_stamped.hpp>
-#include <geometry_msgs/msg/vector3.hpp>
-#include <geometry_msgs/msg/twist_stamped.hpp>
-#include <livox_ros_driver2/msg/custom_msg.hpp>
-#include "preprocess.h"
-#include <ikd-Tree/ikd_Tree.h>
-#include <ivox/ivox.hpp>   // option B: drop-in voxel-grid map backend (compile with -DUSE_IVOX=ON)
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
 
-#define INIT_TIME           (0.1)
-#define LASER_POINT_COV     (0.001)
-#define MAXN                (720000)
-#define PUBFRAME_PERIOD     (20)
+#include <Python.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <csignal>
+#include <cstdlib>
+#include <deque>
+#include <fixposition_driver_msgs/msg/fpa_imu.hpp>
+#include <fixposition_driver_msgs/msg/fpa_imubias.hpp>
+#include <fstream>
+#include <ikd-Tree/ikd_Tree.h>
+#include <iomanip>
+#include <ivox/ivox.hpp>  // option B: drop-in voxel-grid map backend (compile with -DUSE_IVOX=ON)
+#include <limits>
+#include <livox_ros_driver2/msg/custom_msg.hpp>
+#include <math.h>
+#include <mutex>
+#include <omp.h>
+#include <shm_msgs/msg/point_cloud8m_and_pose.hpp>
+#include <so3_math.h>
+#include <thread>
+#include <unistd.h>
+#include <unordered_map>
+
+#include "IMU_Processing.hpp"
+#include "preprocess.h"
+
+#define INIT_TIME (0.1)
+#define LASER_POINT_COV (0.001)
+#define MAXN (720000)
+#define PUBFRAME_PERIOD (20)
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
-double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN], s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
+double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN],
+  s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
-int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
-bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
-bool   ikd_profile = false;  // [ikd-profile] per-scan rebuild-split line, gated by env FLIO_IKD_PROFILE
+int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
+bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool ikd_profile = false;  // [ikd-profile] per-scan rebuild-split line, gated by env FLIO_IKD_PROFILE
 // Mapping pause/resume gate. Owned by PGO node (lio_slam_fastLioPGO publishes
 // /lio_slam/mapping_enabled with transient_local QoS); we mirror it here.
 // When false: skip ikd-tree updates and skip pcl_wait_save accumulation, so the
@@ -122,15 +127,16 @@ double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
-int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
-int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
+int effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
+int iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1,
+    pcd_index = 0;
 // Position-observability metric, refreshed each h_share_model call: eigenvalues
 // of the normal information matrix M = sum(n n^T) over the matched plane normals.
 // pos_obs_z_weak = |Z component| of the weakest eigenvector; →1 means Z is the
 // least-constrained direction (degenerate Z), the root trigger of the bag2
 // divergence (see memory bag2-divergence-is-flio2-frontend).
 double pos_obs_eig_min = 0.0, pos_obs_eig_max = 0.0, pos_obs_z_weak = 0.0;
-bool   degeneracy_debug = false;     // verbose per-frame [DEGEN] diagnostics
+bool degeneracy_debug = false;  // verbose per-frame [DEGEN] diagnostics
 
 // Planar-motion (zero body-vertical-velocity) soft constraint — the A'-2 fix.
 //   When LiDAR loses Z observability (pos_obs_z_weak high), the iEKF dumps the
@@ -141,7 +147,7 @@ bool   degeneracy_debug = false;     // verbose per-frame [DEGEN] diagnostics
 //   BODY frame → it does NOT fight legitimate slope motion: world-frame vertical
 //   velocity on a ramp comes from the robot's pitch (rotation state), not from
 //   body-frame vz. Gated on z_weak so it has zero effect when Z is well observed.
-bool   planar_constraint_en = false;
+bool planar_constraint_en = false;
 double planar_constraint_noise = 0.1;          // m/s, soft (larger = weaker prior)
 double planar_constraint_z_weak_thresh = 0.5;  // apply only when pos_obs_z_weak exceeds this
 
@@ -155,11 +161,11 @@ double planar_constraint_z_weak_thresh = 0.5;  // apply only when pos_obs_z_weak
 // in the body frame. A soft pseudo-measurement pulls the grav-state up-axis onto it,
 // constraining roll/pitch only — yaw lies in the measurement null space (gravity is
 // yaw-invariant), so the LiDAR-excellent heading is never touched.
-bool   gravity_align_en = false;
-double gravity_align_noise = 0.05;            // unit-vector (≈rad) std of the leveling prior
-double gravity_align_z_weak_thresh = 0.3;     // engage only when pos_obs_z_weak exceeds this
-double gravity_align_accel_tol = 0.05;        // |‖a‖−g|/g must be below this (low-linear-accel gate)
-double gravity_align_gyro_tol = 0.35;         // rad/s; skip during fast turns (lever-arm safety)
+bool gravity_align_en = false;
+double gravity_align_noise = 0.05;         // unit-vector (≈rad) std of the leveling prior
+double gravity_align_z_weak_thresh = 0.3;  // engage only when pos_obs_z_weak exceeds this
+double gravity_align_accel_tol = 0.05;     // |‖a‖−g|/g must be below this (low-linear-accel gate)
+double gravity_align_gyro_tol = 0.35;      // rad/s; skip during fast turns (lever-arm safety)
 
 // Divergence guard (P1): when LiDAR correspondences collapse (scan starvation
 // under CPU/IO load, or feature-poor geometry), the iEKF runs on IMU
@@ -172,13 +178,13 @@ double gravity_align_gyro_tol = 0.35;         // rad/s; skip during fast turns (
 // effective-point count falls below divergence_guard_min_eff). Recovery is
 // automatic: once correspondences return, the streak resets and the front end
 // re-locks against the (uncorrupted) map.
-bool   divergence_guard_en = true;
-int    divergence_guard_min_eff = 50;      // effct_feat_num below this = degenerate scan
-int    divergence_guard_streak = 5;        // consecutive degenerate scans → enter degraded
+bool divergence_guard_en = true;
+int divergence_guard_min_eff = 50;         // effct_feat_num below this = degenerate scan
+int divergence_guard_streak = 5;           // consecutive degenerate scans → enter degraded
 double divergence_guard_max_speed = 30.0;  // m/s; body-speed clamp while degraded (headroom over any platform speed)
-int    consec_low_eff = 0;                 // running degenerate-scan streak counter
-bool   flio_map_frozen = false;            // degraded: skip map_incremental (no garbage)
-bool   flio_degraded_odom = false;         // degraded: inflate published pose covariance
+int consec_low_eff = 0;                    // running degenerate-scan streak counter
+bool flio_map_frozen = false;              // degraded: skip map_incremental (no garbage)
+bool flio_degraded_odom = false;           // degraded: inflate published pose covariance
 
 // Canopy detector — a SCENE detector, orthogonal to pos_obs_z_weak. Inside tall
 // crop the matched normals stay directionally diverse (the canopy is volumetric
@@ -190,36 +196,36 @@ bool   flio_degraded_odom = false;         // degraded: inflate published pose c
 // 0702 bag: 79–99 % healthy → 42–60 % in canopy) plus elevated near-field point
 // height. Both statistics use the LiDAR/cloud BODY frame so they are immune to
 // the very Z drift they must detect. Hysteresis + debounce below.
-bool   canopy_detect_en = false;
-bool   canopy_debug = false;            // per-scan [CANOPY] stderr line
-double canopy_near_range = 20.0;        // near-field horizontal radius, cloud frame (m)
-double canopy_ground_z = -0.47;         // ground height in the CLOUD frame (giant rig measured)
-double canopy_ground_halfband = 0.8;    // ± band around canopy_ground_z counted as ground (m)
-double canopy_normal_z_min = 0.966;     // |n_z| ≥ cos(15°) ⇒ horizontal surface
-double canopy_frac_enter = 0.65;        // ground fraction below this (AND zp95 above) → enter vote
-double canopy_frac_exit = 0.75;         // ground fraction above this → exit vote
-double canopy_zp95_enter = 1.5;         // near-field body-z p95 must exceed this to enter (m)
-int    canopy_min_near = 50;            // fewer near-field points than this = neutral scan
-int    canopy_enter_scans = 10;         // consecutive enter votes to switch on (~1 s at 10 Hz)
-int    canopy_exit_scans = 30;          // consecutive exit votes to switch off (~3 s)
+bool canopy_detect_en = false;
+bool canopy_debug = false;            // per-scan [CANOPY] stderr line
+double canopy_near_range = 20.0;      // near-field horizontal radius, cloud frame (m)
+double canopy_ground_z = -0.47;       // ground height in the CLOUD frame (giant rig measured)
+double canopy_ground_halfband = 0.8;  // ± band around canopy_ground_z counted as ground (m)
+double canopy_normal_z_min = 0.966;   // |n_z| ≥ cos(15°) ⇒ horizontal surface
+double canopy_frac_enter = 0.65;      // ground fraction below this (AND zp95 above) → enter vote
+double canopy_frac_exit = 0.75;       // ground fraction above this → exit vote
+double canopy_zp95_enter = 1.5;       // near-field body-z p95 must exceed this to enter (m)
+int canopy_min_near = 50;             // fewer near-field points than this = neutral scan
+int canopy_enter_scans = 10;          // consecutive enter votes to switch on (~1 s at 10 Hz)
+int canopy_exit_scans = 30;           // consecutive exit votes to switch off (~3 s)
 // per-scan raw statistics (written by h_share_model, consumed once per scan in the main loop)
 double canopy_ground_frac = 1.0, canopy_zp95 = 0.0;
-int    canopy_near_count = 0;
-bool   canopy_mode = false;
-int    canopy_enter_streak = 0, canopy_exit_streak = 0;
+int canopy_near_count = 0;
+bool canopy_mode = false;
+int canopy_enter_streak = 0, canopy_exit_streak = 0;
 
 // Ground recovery (selection-layer repair): re-admit true-ground returns that
 // the 5-NN plane gates reject under ground-hugging clutter (grass, crops,
 // debris — content-agnostic) — see the block comment in h_share_model.
 // SELF-GATED by per-sector fit quality + the sensor-height sanity gate; no
 // scene classifier involved (the canopy detector is telemetry only). Default OFF.
-bool   ground_recover_en = false;
-double ground_recover_scan_band = 0.15;   // |dist to sector ground plane| accept band (m)
-int    ground_recover_min_inliers = 100;  // PER-SECTOR fit support gate (8 sectors)
-double ground_recover_max_residual = 1.0; // |z - map lower envelope| accept gate (m)
-double ground_recover_sector_tol = 0.25;  // sector-vs-global plane height agreement (m)
-int    ground_recover_max_rows = 4000;    // per-scan cap on recovered rows
-int    canopy_ground_recovered = 0;       // diag: rows recovered last h_share call
+bool ground_recover_en = false;
+double ground_recover_scan_band = 0.15;    // |dist to sector ground plane| accept band (m)
+int ground_recover_min_inliers = 100;      // PER-SECTOR fit support gate (8 sectors)
+double ground_recover_max_residual = 1.0;  // |z - map lower envelope| accept gate (m)
+double ground_recover_sector_tol = 0.25;   // sector-vs-global plane height agreement (m)
+int ground_recover_max_rows = 4000;        // per-scan cap on recovered rows
+int canopy_ground_recovered = 0;           // diag: rows recovered last h_share call
 
 // TEM (Terrain Elevation Memory): the ground-recovery rows above still measure
 // their residual against the SELF-BUILT map's lower envelope — a reference that
@@ -240,17 +246,22 @@ int    canopy_ground_recovered = 0;       // diag: rows recovered last h_share c
 // prior, no site-specific extents: hashed grid). Rows keep every existing
 // recovery gate; only the residual reference and the row weight change, and
 // rows fall back to the lower envelope wherever TEM has no served coverage.
-bool   tem_en = false;
+bool tem_en = false;
 double tem_cell = 5.0;        // grid cell size (m); terrain is smooth at this scale
 double tem_tau = 2.0;         // s, per-cell EMA time constant at full health (q=1)
 double tem_egf_floor = 0.30;  // egf at/below this → learning fully frozen
 double tem_egf_ref = 0.60;    // egf at/above this → full learning rate
 double tem_sigma0 = 0.15;     // m, row weight = sigma0/(sigma0 + cell std)
-struct TemCell { double z; double var; double w; };
+struct TemCell
+{
+  double z;
+  double var;
+  double w;
+};
 std::unordered_map<int64_t, TemCell> tem_grid;
-std::vector<Eigen::Vector3d> tem_samples;  // this scan's fit-band inliers (body frame)
-double tem_egf_ema = 1.0;     // smoothed egf (starts healthy: cold start must not freeze)
-int    tem_rows = 0, tem_ext_rows = 0, tem_env_rows = 0;  // diag: rows per residual reference
+std::vector<Eigen::Vector3d> tem_samples;              // this scan's fit-band inliers (body frame)
+double tem_egf_ema = 1.0;                              // smoothed egf (starts healthy: cold start must not freeze)
+int tem_rows = 0, tem_ext_rows = 0, tem_env_rows = 0;  // diag: rows per residual reference
 // Slope-clamped extrapolation (measured first-visit failure: a mission that
 // enters a degraded area it never covered while healthy has no served cells
 // there — every row fell back to the drifting envelope and the −55 m ratchet
@@ -264,7 +275,7 @@ int    tem_rows = 0, tem_ext_rows = 0, tem_env_rows = 0;  // diag: rows per resi
 // absolute channel fights secular drift, it must not cannibalize the local
 // restoration that is the recovery channel's primary job.
 double tem_slope_mean = 0.01, tem_slope_var = 1e-4;  // online |dz|/dxy statistic (healthy pairs)
-bool   tem_ext_ok = false;   // per-scan extrapolation anchor (nearest served cells)
+bool tem_ext_ok = false;                             // per-scan extrapolation anchor (nearest served cells)
 double tem_ext_z = 0.0, tem_ext_sigma = 1.0;
 // Graph-side drift feedback (terrain anchoring, experimental — default OFF).
 // The graph (GPS-pinned) publishes d = how far this front-end's Z has drifted
@@ -277,7 +288,7 @@ double tem_ext_z = 0.0, tem_ext_sigma = 1.0;
 // the state is still constrained exclusively through observed ground returns.
 // Stale d (graph following the front-end in GPS-degraded stretches) degrades
 // to the plain egf-gated self-learning.
-bool   tem_anchor_en = false;
+bool tem_anchor_en = false;
 double tem_anchor_max_age = 3.0;  // s, drift note older than this = stale ("no anchor")
 std::mutex tem_anchor_mtx;        // handler (executor thread) vs main-loop consumer
 double tem_anchor_d = 0.0, tem_anchor_sigma = 0.2, tem_anchor_stamp = -1.0;
@@ -297,55 +308,58 @@ double tem_anchor_d = 0.0, tem_anchor_sigma = 0.2, tem_anchor_stamp = -1.0;
 // conditioned, so only vertical-normal rows (the Z-bias carriers) take the
 // full cut; (b) a weight floor — rows are never removed, and the scaled
 // normals make the pos-observability metric quality-weighted for free.
-bool   clutter_deweight_en = false;
-double clutter_th_lo = 0.05;      // m, 15-NN thickness below this = real plane, no cut
-double clutter_th_hi = 0.20;      // m, thickness at/above this = full cut
-double clutter_min_weight = 0.15; // floor: never remove a row outright (conditioning)
-int    clut_tested = 0, clut_cut = 0;  // diag, last h_share call
+bool clutter_deweight_en = false;
+double clutter_th_lo = 0.05;        // m, 15-NN thickness below this = real plane, no cut
+double clutter_th_hi = 0.20;        // m, thickness at/above this = full cut
+double clutter_min_weight = 0.15;   // floor: never remove a row outright (conditioning)
+int clut_tested = 0, clut_cut = 0;  // diag, last h_share call
 double clut_msum = 0.0;
 
-inline int64_t temKeyIdx(int64_t kx, int64_t ky) { return (kx << 32) ^ (ky & 0xffffffff); }
+inline int64_t temKeyIdx(int64_t kx, int64_t ky)
+{
+  return (kx << 32) ^ (ky & 0xffffffff);
+}
 
 inline int64_t temKey(double x, double y)
 {
-    return temKeyIdx(static_cast<int64_t>(std::floor(x / tem_cell)),
-                     static_cast<int64_t>(std::floor(y / tem_cell)));
+  return temKeyIdx(static_cast<int64_t>(std::floor(x / tem_cell)), static_cast<int64_t>(std::floor(y / tem_cell)));
 }
 
 // Recover the cell indices from a key (valid for |k| < 2^31; low half carries
 // ky's low 32 bits, high half kx's — the XOR never mixes them).
-inline void temKeyToIdx(int64_t key, int64_t &kx, int64_t &ky)
+inline void temKeyToIdx(int64_t key, int64_t & kx, int64_t & ky)
 {
-    ky = static_cast<int32_t>(key & 0xffffffff);
-    kx = key >> 32;
+  ky = static_cast<int32_t>(key & 0xffffffff);
+  kx = key >> 32;
 }
 
 // Bilinear height lookup over the 2x2 cell-center neighborhood; cells below the
 // serving weight are skipped and the coefficients renormalized. Requires at
 // least half the interpolation mass to be served — partial coverage degrades
 // gracefully instead of extrapolating.
-inline bool temLookup(double x, double y, double &z_out, double &std_out)
+inline bool temLookup(double x, double y, double & z_out, double & std_out)
 {
-    constexpr double kTemMinServeW = 2.0;  // ~2 healthy scans before a cell serves
-    const double u = x / tem_cell - 0.5, v = y / tem_cell - 0.5;
-    const double bu = std::floor(u), bv = std::floor(v);
-    const double fx = u - bu, fy = v - bv;
-    double csum = 0.0, zsum = 0.0, vsum = 0.0;
-    for (int di = 0; di < 2; di++)
-        for (int dj = 0; dj < 2; dj++)
-        {
-            const double cx = (bu + di + 0.5) * tem_cell, cy = (bv + dj + 0.5) * tem_cell;
-            const auto it = tem_grid.find(temKey(cx, cy));
-            if (it == tem_grid.end() || it->second.w < kTemMinServeW) continue;
-            const double c = (di ? fx : 1.0 - fx) * (dj ? fy : 1.0 - fy);
-            csum += c;
-            zsum += c * it->second.z;
-            vsum += c * it->second.var;
-        }
-    if (csum < 0.5) return false;
-    z_out = zsum / csum;
-    std_out = std::sqrt(std::max(vsum / csum, 0.0));
-    return true;
+  constexpr double kTemMinServeW = 2.0;  // ~2 healthy scans before a cell serves
+  const double u = x / tem_cell - 0.5, v = y / tem_cell - 0.5;
+  const double bu = std::floor(u), bv = std::floor(v);
+  const double fx = u - bu, fy = v - bv;
+  double csum = 0.0, zsum = 0.0, vsum = 0.0;
+  for (int di = 0; di < 2; di++)
+    for (int dj = 0; dj < 2; dj++) {
+      const double cx = (bu + di + 0.5) * tem_cell, cy = (bv + dj + 0.5) * tem_cell;
+      const auto it = tem_grid.find(temKey(cx, cy));
+      if (it == tem_grid.end() || it->second.w < kTemMinServeW)
+        continue;
+      const double c = (di ? fx : 1.0 - fx) * (dj ? fy : 1.0 - fy);
+      csum += c;
+      zsum += c * it->second.z;
+      vsum += c * it->second.var;
+    }
+  if (csum < 0.5)
+    return false;
+  z_out = zsum / csum;
+  std_out = std::sqrt(std::max(vsum / csum, 0.0));
+  return true;
 }
 
 // P2 VoxelMap-lite: anisotropic per-voxel surface statistics (EXPERIMENTAL,
@@ -375,24 +389,24 @@ inline bool temLookup(double x, double y, double &z_out, double &std_out)
 // drift cannot smear the statistics it is being judged against.
 struct VxlCell
 {
-    float   mean[3];  // world-frame mean (float ok: ~1e-4 m precision at 1 km)
-    float   m2[6];    // centered comoment sums, upper triangle xx,xy,xz,yy,yz,zz
-    float   zq;       // SGD 10th-percentile tracker of z (cell lower mode)
-    int32_t n;
+  float mean[3];  // world-frame mean (float ok: ~1e-4 m precision at 1 km)
+  float m2[6];    // centered comoment sums, upper triangle xx,xy,xz,yy,yz,zz
+  float zq;       // SGD 10th-percentile tracker of z (cell lower mode)
+  int32_t n;
 };
 std::unordered_map<int64_t, VxlCell> vxl_grid;
-bool   vxl_en = false;
-double vxl_size_xy = 1.0;      // m; XY footprint pools enough returns per cell
-double vxl_size_z = 0.25;      // m; thin Z slabs separate soil from the grass layer above
-double vxl_sigma_r = 0.05;     // m; nominal point-to-plane noise a clean row carries
-double vxl_min_weight = 0.10;  // floor: never remove a row outright (conditioning)
-double vxl_max_range = 30.0;   // m body range for both learning and weighting (bounds memory)
-int    vxl_min_pts = 8;        // below this: no verdict, row untouched
-int    vxl_freeze_pts = 300;   // cell moments freeze here (drift-smear cap)
-int    vxl_tested = 0, vxl_cut = 0;  // diag, last h_share call
+bool vxl_en = false;
+double vxl_size_xy = 1.0;         // m; XY footprint pools enough returns per cell
+double vxl_size_z = 0.25;         // m; thin Z slabs separate soil from the grass layer above
+double vxl_sigma_r = 0.05;        // m; nominal point-to-plane noise a clean row carries
+double vxl_min_weight = 0.10;     // floor: never remove a row outright (conditioning)
+double vxl_max_range = 30.0;      // m body range for both learning and weighting (bounds memory)
+int vxl_min_pts = 8;              // below this: no verdict, row untouched
+int vxl_freeze_pts = 300;         // cell moments freeze here (drift-smear cap)
+int vxl_tested = 0, vxl_cut = 0;  // diag, last h_share call
 double vxl_msum = 0.0, vxl_sd_sum = 0.0;
-double vxl_vert_msum = 0.0;    // diag: m over |n_z|>0.8 rows (the Z-bias carriers)
-int    vxl_vert_cnt = 0;
+double vxl_vert_msum = 0.0;  // diag: m over |n_z|>0.8 rows (the Z-bias carriers)
+int vxl_vert_cnt = 0;
 
 // P3 within-voxel decomposition (NEGATIVE — measured; keep OFF, needs vxl_en):
 // residual-reference swap for ground-class rows onto the voxel column's lower
@@ -412,85 +426,88 @@ int    vxl_vert_cnt = 0;
 // median = no offset but no resistance either (residual ~0 against a
 // co-drifting median by construction). No reprocessing of the self-built data
 // stream can create the independent information the ratchet requires.
-bool   vxl_env_en = false;
-int    vxl_env_min_pts = 20;   // cell mass before it can serve as envelope
-double vxl_env_band = 0.12;    // m, |z - env| within this = ground-class row
-double vxl_env_nz_min = 0.5;   // fitted |n_z| below this = lateral carrier, never swapped
-int    vxl_env_cnt = 0;        // diag, last h_share call
+bool vxl_env_en = false;
+int vxl_env_min_pts = 20;     // cell mass before it can serve as envelope
+double vxl_env_band = 0.12;   // m, |z - env| within this = ground-class row
+double vxl_env_nz_min = 0.5;  // fitted |n_z| below this = lateral carrier, never swapped
+int vxl_env_cnt = 0;          // diag, last h_share call
 double vxl_env_habs = 0.0;
 
 inline int64_t vxlKeyIdx(int64_t kx, int64_t ky, int64_t kz)
 {
-    return ((kx & 0x1FFFFF) << 42) | ((ky & 0x1FFFFF) << 21) | (kz & 0x1FFFFF);
+  return ((kx & 0x1FFFFF) << 42) | ((ky & 0x1FFFFF) << 21) | (kz & 0x1FFFFF);
 }
 
 // 21 bits per axis (±2^20 cells; at 0.25 m Z that is ±262 km — ample).
 inline int64_t vxlKey(double x, double y, double z)
 {
-    return vxlKeyIdx(static_cast<int64_t>(std::floor(x / vxl_size_xy)),
-                     static_cast<int64_t>(std::floor(y / vxl_size_xy)),
-                     static_cast<int64_t>(std::floor(z / vxl_size_z)));
+  return vxlKeyIdx(static_cast<int64_t>(std::floor(x / vxl_size_xy)),
+                   static_cast<int64_t>(std::floor(y / vxl_size_xy)),
+                   static_cast<int64_t>(std::floor(z / vxl_size_z)));
 }
 
-bool   point_selected_surf[100000] = {0};
-bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
-bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
-bool    is_first_lidar = true;
-bool   diag_first_lidar_cb_logged = false;
-bool   diag_first_imu_cb_logged = false;
-bool   diag_first_fixposition_bias_logged = false;
-bool   diag_first_fixposition_bias_applied_logged = false;
-bool   diag_first_sync_logged = false;
-bool   diag_first_valid_scan_logged = false;
-bool   diag_first_no_point_logged = false;
-bool   diag_first_odom_pub_logged = false;
+bool point_selected_surf[100000] = {0};
+bool lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
+bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool is_first_lidar = true;
+bool diag_first_lidar_cb_logged = false;
+bool diag_first_imu_cb_logged = false;
+bool diag_first_fixposition_bias_logged = false;
+bool diag_first_fixposition_bias_applied_logged = false;
+bool diag_first_sync_logged = false;
+bool diag_first_valid_scan_logged = false;
+bool diag_first_no_point_logged = false;
+bool diag_first_odom_pub_logged = false;
 
-vector<vector<int>>  pointSearchInd_surf; 
+vector<vector<int>> pointSearchInd_surf;
 vector<BoxPointType> cub_needrm;
-vector<PointVector>  Nearest_Points; 
-vector<double>       extrinT(3, 0.0);
-vector<double>       extrinR(9, 0.0);
+vector<PointVector> Nearest_Points;
+vector<double> extrinT(3, 0.0);
+vector<double> extrinR(9, 0.0);
 using SteadyClock = std::chrono::steady_clock;
 using SteadyTimePoint = std::chrono::time_point<SteadyClock>;
 
 struct LatencyStats
 {
-    int count = 0;
-    double sum_ms = 0.0;
-    double min_ms = 1e18;
-    double max_ms = 0.0;
+  int count = 0;
+  double sum_ms = 0.0;
+  double min_ms = 1e18;
+  double max_ms = 0.0;
 
-    void add(double ms)
-    {
-        ++count;
-        sum_ms += ms;
-        if (ms < min_ms) min_ms = ms;
-        if (ms > max_ms) max_ms = ms;
-    }
+  void add(double ms)
+  {
+    ++count;
+    sum_ms += ms;
+    if (ms < min_ms)
+      min_ms = ms;
+    if (ms > max_ms)
+      max_ms = ms;
+  }
 
-    double mean() const { return count > 0 ? sum_ms / static_cast<double>(count) : 0.0; }
+  double mean() const { return count > 0 ? sum_ms / static_cast<double>(count) : 0.0; }
 };
 
-deque<double>                     time_buffer;
-deque<PointCloudXYZI::Ptr>        lidar_buffer;
-deque<SteadyTimePoint>            lidar_receive_time_buffer;
+deque<double> time_buffer;
+deque<PointCloudXYZI::Ptr> lidar_buffer;
+deque<SteadyTimePoint> lidar_receive_time_buffer;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 
 bool latency_diag_en = true;
 double latency_log_period_sec = 1.0;
+bool kalman_channel_diag_en = false;
 SteadyTimePoint current_lidar_receive_time;
 SteadyTimePoint last_latency_log_time;
 LatencyStats sensor_to_odom_latency_stats;
 
-bool   wheel_odom_en = false;
+bool wheel_odom_en = false;
 string wheel_topic = "/lio/twist";
 double wheel_speed_scale = 1.0;
 double wheel_vel_noise_vx = 0.10;
 double wheel_vel_noise_vy = 0.05;
 double wheel_vel_noise_vz = 0.10;
-M3D    R_robot_to_imu = Eye3d;
+M3D R_robot_to_imu = Eye3d;
 deque<Eigen::Vector3d> twist_buffer;
-mutex  mtx_twist;
+mutex mtx_twist;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -538,174 +555,175 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
 void SigHandle(int sig)
 {
-    flg_exit = true;
-    std::cout << "catch sig %d" << sig << std::endl;
-    sig_buffer.notify_all();
-    rclcpp::shutdown();
+  flg_exit = true;
+  std::cout << "catch sig %d" << sig << std::endl;
+  sig_buffer.notify_all();
+  rclcpp::shutdown();
 }
 
-inline void dump_lio_state_to_log(FILE *fp)  
+inline void dump_lio_state_to_log(FILE * fp)
 {
-    V3D rot_ang(Log(state_point.rot.toRotationMatrix()));
-    fprintf(fp, "%lf ", Measures.lidar_beg_time - first_lidar_time);
-    fprintf(fp, "%lf %lf %lf ", rot_ang(0), rot_ang(1), rot_ang(2));                   // Angle
-    fprintf(fp, "%lf %lf %lf ", state_point.pos(0), state_point.pos(1), state_point.pos(2)); // Pos  
-    fprintf(fp, "%lf %lf %lf ", 0.0, 0.0, 0.0);                                        // omega  
-    fprintf(fp, "%lf %lf %lf ", state_point.vel(0), state_point.vel(1), state_point.vel(2)); // Vel  
-    fprintf(fp, "%lf %lf %lf ", 0.0, 0.0, 0.0);                                        // Acc  
-    fprintf(fp, "%lf %lf %lf ", state_point.bg(0), state_point.bg(1), state_point.bg(2));    // Bias_g  
-    fprintf(fp, "%lf %lf %lf ", state_point.ba(0), state_point.ba(1), state_point.ba(2));    // Bias_a  
-    fprintf(fp, "%lf %lf %lf ", state_point.grav[0], state_point.grav[1], state_point.grav[2]); // Bias_a  
-    fprintf(fp, "\r\n");  
-    fflush(fp);
+  V3D rot_ang(Log(state_point.rot.toRotationMatrix()));
+  fprintf(fp, "%lf ", Measures.lidar_beg_time - first_lidar_time);
+  fprintf(fp, "%lf %lf %lf ", rot_ang(0), rot_ang(1), rot_ang(2));                             // Angle
+  fprintf(fp, "%lf %lf %lf ", state_point.pos(0), state_point.pos(1), state_point.pos(2));     // Pos
+  fprintf(fp, "%lf %lf %lf ", 0.0, 0.0, 0.0);                                                  // omega
+  fprintf(fp, "%lf %lf %lf ", state_point.vel(0), state_point.vel(1), state_point.vel(2));     // Vel
+  fprintf(fp, "%lf %lf %lf ", 0.0, 0.0, 0.0);                                                  // Acc
+  fprintf(fp, "%lf %lf %lf ", state_point.bg(0), state_point.bg(1), state_point.bg(2));        // Bias_g
+  fprintf(fp, "%lf %lf %lf ", state_point.ba(0), state_point.ba(1), state_point.ba(2));        // Bias_a
+  fprintf(fp, "%lf %lf %lf ", state_point.grav[0], state_point.grav[1], state_point.grav[2]);  // Bias_a
+  fprintf(fp, "\r\n");
+  fflush(fp);
 }
 
-void pointBodyToWorld_ikfom(PointType const * const pi, PointType * const po, state_ikfom &s)
+void pointBodyToWorld_ikfom(PointType const * const pi, PointType * const po, state_ikfom & s)
 {
-    V3D p_body(pi->x, pi->y, pi->z);
-    V3D p_global(s.rot * (s.offset_R_L_I*p_body + s.offset_T_L_I) + s.pos);
+  V3D p_body(pi->x, pi->y, pi->z);
+  V3D p_global(s.rot * (s.offset_R_L_I * p_body + s.offset_T_L_I) + s.pos);
 
-    po->x = p_global(0);
-    po->y = p_global(1);
-    po->z = p_global(2);
-    po->intensity = pi->intensity;
+  po->x = p_global(0);
+  po->y = p_global(1);
+  po->z = p_global(2);
+  po->intensity = pi->intensity;
 }
-
 
 void pointBodyToWorld(PointType const * const pi, PointType * const po)
 {
-    V3D p_body(pi->x, pi->y, pi->z);
-    V3D p_global(state_point.rot * (state_point.offset_R_L_I*p_body + state_point.offset_T_L_I) + state_point.pos);
+  V3D p_body(pi->x, pi->y, pi->z);
+  V3D p_global(state_point.rot * (state_point.offset_R_L_I * p_body + state_point.offset_T_L_I) + state_point.pos);
 
-    po->x = p_global(0);
-    po->y = p_global(1);
-    po->z = p_global(2);
-    po->intensity = pi->intensity;
+  po->x = p_global(0);
+  po->y = p_global(1);
+  po->z = p_global(2);
+  po->intensity = pi->intensity;
 }
 
 template<typename T>
-void pointBodyToWorld(const Matrix<T, 3, 1> &pi, Matrix<T, 3, 1> &po)
+void pointBodyToWorld(const Matrix<T, 3, 1> & pi, Matrix<T, 3, 1> & po)
 {
-    V3D p_body(pi[0], pi[1], pi[2]);
-    V3D p_global(state_point.rot * (state_point.offset_R_L_I*p_body + state_point.offset_T_L_I) + state_point.pos);
+  V3D p_body(pi[0], pi[1], pi[2]);
+  V3D p_global(state_point.rot * (state_point.offset_R_L_I * p_body + state_point.offset_T_L_I) + state_point.pos);
 
-    po[0] = p_global(0);
-    po[1] = p_global(1);
-    po[2] = p_global(2);
+  po[0] = p_global(0);
+  po[1] = p_global(1);
+  po[2] = p_global(2);
 }
 
 void RGBpointBodyToWorld(PointType const * const pi, PointType * const po)
 {
-    V3D p_body(pi->x, pi->y, pi->z);
-    V3D p_global(state_point.rot * (state_point.offset_R_L_I*p_body + state_point.offset_T_L_I) + state_point.pos);
+  V3D p_body(pi->x, pi->y, pi->z);
+  V3D p_global(state_point.rot * (state_point.offset_R_L_I * p_body + state_point.offset_T_L_I) + state_point.pos);
 
-    po->x = p_global(0);
-    po->y = p_global(1);
-    po->z = p_global(2);
-    po->intensity = pi->intensity;
+  po->x = p_global(0);
+  po->y = p_global(1);
+  po->z = p_global(2);
+  po->intensity = pi->intensity;
 }
 
 void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
 {
-    V3D p_body_lidar(pi->x, pi->y, pi->z);
-    V3D p_body_imu(state_point.offset_R_L_I*p_body_lidar + state_point.offset_T_L_I);
+  V3D p_body_lidar(pi->x, pi->y, pi->z);
+  V3D p_body_imu(state_point.offset_R_L_I * p_body_lidar + state_point.offset_T_L_I);
 
-    po->x = p_body_imu(0);
-    po->y = p_body_imu(1);
-    po->z = p_body_imu(2);
-    po->intensity = pi->intensity;
+  po->x = p_body_imu(0);
+  po->y = p_body_imu(1);
+  po->z = p_body_imu(2);
+  po->intensity = pi->intensity;
 }
 
 void points_cache_collect()
 {
-    PointVector points_history;
-    ikdtree.acquire_removed_points(points_history);
-    // for (int i = 0; i < points_history.size(); i++) _featsArray->push_back(points_history[i]);
+  PointVector points_history;
+  ikdtree.acquire_removed_points(points_history);
+  // for (int i = 0; i < points_history.size(); i++) _featsArray->push_back(points_history[i]);
 }
 
 BoxPointType LocalMap_Points;
 bool Localmap_Initialized = false;
 void lasermap_fov_segment()
 {
-    cub_needrm.clear();
-    kdtree_delete_counter = 0;
-    kdtree_delete_time = 0.0;    
-    pointBodyToWorld(XAxisPoint_body, XAxisPoint_world);
-    V3D pos_LiD = pos_lid;
-    if (!Localmap_Initialized){
-        for (int i = 0; i < 3; i++){
-            LocalMap_Points.vertex_min[i] = pos_LiD(i) - cube_len / 2.0;
-            LocalMap_Points.vertex_max[i] = pos_LiD(i) + cube_len / 2.0;
-        }
-        Localmap_Initialized = true;
-        return;
+  cub_needrm.clear();
+  kdtree_delete_counter = 0;
+  kdtree_delete_time = 0.0;
+  pointBodyToWorld(XAxisPoint_body, XAxisPoint_world);
+  V3D pos_LiD = pos_lid;
+  if (!Localmap_Initialized) {
+    for (int i = 0; i < 3; i++) {
+      LocalMap_Points.vertex_min[i] = pos_LiD(i) - cube_len / 2.0;
+      LocalMap_Points.vertex_max[i] = pos_LiD(i) + cube_len / 2.0;
     }
-    float dist_to_map_edge[3][2];
-    bool need_move = false;
-    for (int i = 0; i < 3; i++){
-        dist_to_map_edge[i][0] = fabs(pos_LiD(i) - LocalMap_Points.vertex_min[i]);
-        dist_to_map_edge[i][1] = fabs(pos_LiD(i) - LocalMap_Points.vertex_max[i]);
-        if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * DET_RANGE || dist_to_map_edge[i][1] <= MOV_THRESHOLD * DET_RANGE) need_move = true;
+    Localmap_Initialized = true;
+    return;
+  }
+  float dist_to_map_edge[3][2];
+  bool need_move = false;
+  for (int i = 0; i < 3; i++) {
+    dist_to_map_edge[i][0] = fabs(pos_LiD(i) - LocalMap_Points.vertex_min[i]);
+    dist_to_map_edge[i][1] = fabs(pos_LiD(i) - LocalMap_Points.vertex_max[i]);
+    if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * DET_RANGE || dist_to_map_edge[i][1] <= MOV_THRESHOLD * DET_RANGE)
+      need_move = true;
+  }
+  if (!need_move)
+    return;
+  BoxPointType New_LocalMap_Points, tmp_boxpoints;
+  New_LocalMap_Points = LocalMap_Points;
+  float mov_dist =
+    max((cube_len - 2.0 * MOV_THRESHOLD * DET_RANGE) * 0.5 * 0.9, double(DET_RANGE * (MOV_THRESHOLD - 1)));
+  for (int i = 0; i < 3; i++) {
+    tmp_boxpoints = LocalMap_Points;
+    if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * DET_RANGE) {
+      New_LocalMap_Points.vertex_max[i] -= mov_dist;
+      New_LocalMap_Points.vertex_min[i] -= mov_dist;
+      tmp_boxpoints.vertex_min[i] = LocalMap_Points.vertex_max[i] - mov_dist;
+      cub_needrm.push_back(tmp_boxpoints);
+    } else if (dist_to_map_edge[i][1] <= MOV_THRESHOLD * DET_RANGE) {
+      New_LocalMap_Points.vertex_max[i] += mov_dist;
+      New_LocalMap_Points.vertex_min[i] += mov_dist;
+      tmp_boxpoints.vertex_max[i] = LocalMap_Points.vertex_min[i] + mov_dist;
+      cub_needrm.push_back(tmp_boxpoints);
     }
-    if (!need_move) return;
-    BoxPointType New_LocalMap_Points, tmp_boxpoints;
-    New_LocalMap_Points = LocalMap_Points;
-    float mov_dist = max((cube_len - 2.0 * MOV_THRESHOLD * DET_RANGE) * 0.5 * 0.9, double(DET_RANGE * (MOV_THRESHOLD -1)));
-    for (int i = 0; i < 3; i++){
-        tmp_boxpoints = LocalMap_Points;
-        if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * DET_RANGE){
-            New_LocalMap_Points.vertex_max[i] -= mov_dist;
-            New_LocalMap_Points.vertex_min[i] -= mov_dist;
-            tmp_boxpoints.vertex_min[i] = LocalMap_Points.vertex_max[i] - mov_dist;
-            cub_needrm.push_back(tmp_boxpoints);
-        } else if (dist_to_map_edge[i][1] <= MOV_THRESHOLD * DET_RANGE){
-            New_LocalMap_Points.vertex_max[i] += mov_dist;
-            New_LocalMap_Points.vertex_min[i] += mov_dist;
-            tmp_boxpoints.vertex_max[i] = LocalMap_Points.vertex_min[i] + mov_dist;
-            cub_needrm.push_back(tmp_boxpoints);
-        }
-    }
-    LocalMap_Points = New_LocalMap_Points;
+  }
+  LocalMap_Points = New_LocalMap_Points;
 
-    points_cache_collect();
-    double delete_begin = omp_get_wtime();
-    if(cub_needrm.size() > 0) kdtree_delete_counter = ikdtree.Delete_Point_Boxes(cub_needrm);
-    kdtree_delete_time = omp_get_wtime() - delete_begin;
+  points_cache_collect();
+  double delete_begin = omp_get_wtime();
+  if (cub_needrm.size() > 0)
+    kdtree_delete_counter = ikdtree.Delete_Point_Boxes(cub_needrm);
+  kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
-    const auto receive_time = SteadyClock::now();
-    if (!diag_first_lidar_cb_logged) {
-        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                    "[STARTUP][FAST_LIO] first lidar cb (PointCloud2) stamp=%.3f",
-                    get_time_sec(msg->header.stamp));
-        diag_first_lidar_cb_logged = true;
-    }
-    mtx_buffer.lock();
-    scan_count ++;
-    double cur_time = get_time_sec(msg->header.stamp);
-    double preprocess_start_time = omp_get_wtime();
-    if (!is_first_lidar && cur_time < last_timestamp_lidar)
-    {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
-        lidar_receive_time_buffer.clear();
-    }
-    if (is_first_lidar)
-    {
-        is_first_lidar = false;
-    }
+  const auto receive_time = SteadyClock::now();
+  if (!diag_first_lidar_cb_logged) {
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[STARTUP][FAST_LIO] first lidar cb (PointCloud2) stamp=%.3f",
+                get_time_sec(msg->header.stamp));
+    diag_first_lidar_cb_logged = true;
+  }
+  mtx_buffer.lock();
+  scan_count++;
+  double cur_time = get_time_sec(msg->header.stamp);
+  double preprocess_start_time = omp_get_wtime();
+  if (!is_first_lidar && cur_time < last_timestamp_lidar) {
+    std::cerr << "lidar loop back, clear buffer" << std::endl;
+    lidar_buffer.clear();
+    lidar_receive_time_buffer.clear();
+  }
+  if (is_first_lidar) {
+    is_first_lidar = false;
+  }
 
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
-    lidar_buffer.push_back(ptr);
-    time_buffer.push_back(cur_time);
-    lidar_receive_time_buffer.push_back(receive_time);
-    last_timestamp_lidar = cur_time;
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
-    mtx_buffer.unlock();
-    sig_buffer.notify_all();
+  PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+  p_pre->process(msg, ptr);
+  lidar_buffer.push_back(ptr);
+  time_buffer.push_back(cur_time);
+  lidar_receive_time_buffer.push_back(receive_time);
+  last_timestamp_lidar = cur_time;
+  s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+  mtx_buffer.unlock();
+  sig_buffer.notify_all();
 }
 
 // Direct subscriber for shm_msgs/PointCloud8mAndPose (/pre/all_point). Decodes the
@@ -713,251 +731,241 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 // as standard_pcl_cbk, just a different message type handed to Preprocess.
 void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
 {
-    const auto receive_time = SteadyClock::now();
-    if (!diag_first_lidar_cb_logged) {
-        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                    "[STARTUP][FAST_LIO] first lidar cb (shm PointCloud8mAndPose) stamp=%.3f",
-                    get_time_sec(msg->header.stamp));
-        diag_first_lidar_cb_logged = true;
-    }
-    mtx_buffer.lock();
-    scan_count ++;
-    double cur_time = get_time_sec(msg->header.stamp);
-    double preprocess_start_time = omp_get_wtime();
-    if (!is_first_lidar && cur_time < last_timestamp_lidar)
-    {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
-        lidar_receive_time_buffer.clear();
-    }
-    if (is_first_lidar)
-    {
-        is_first_lidar = false;
-    }
+  const auto receive_time = SteadyClock::now();
+  if (!diag_first_lidar_cb_logged) {
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[STARTUP][FAST_LIO] first lidar cb (shm PointCloud8mAndPose) stamp=%.3f",
+                get_time_sec(msg->header.stamp));
+    diag_first_lidar_cb_logged = true;
+  }
+  mtx_buffer.lock();
+  scan_count++;
+  double cur_time = get_time_sec(msg->header.stamp);
+  double preprocess_start_time = omp_get_wtime();
+  if (!is_first_lidar && cur_time < last_timestamp_lidar) {
+    std::cerr << "lidar loop back, clear buffer" << std::endl;
+    lidar_buffer.clear();
+    lidar_receive_time_buffer.clear();
+  }
+  if (is_first_lidar) {
+    is_first_lidar = false;
+  }
 
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
-    lidar_buffer.push_back(ptr);
-    time_buffer.push_back(cur_time);
-    lidar_receive_time_buffer.push_back(receive_time);
-    last_timestamp_lidar = cur_time;
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
-    mtx_buffer.unlock();
-    sig_buffer.notify_all();
+  PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+  p_pre->process(msg, ptr);
+  lidar_buffer.push_back(ptr);
+  time_buffer.push_back(cur_time);
+  lidar_receive_time_buffer.push_back(receive_time);
+  last_timestamp_lidar = cur_time;
+  s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+  mtx_buffer.unlock();
+  sig_buffer.notify_all();
 }
 
 double timediff_lidar_wrt_imu = 0.0;
-bool   timediff_set_flg = false;
+bool timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 {
-    const auto receive_time = SteadyClock::now();
-    if (!diag_first_lidar_cb_logged) {
-        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                    "[STARTUP][FAST_LIO] first lidar cb (Livox) stamp=%.3f",
-                    get_time_sec(msg->header.stamp));
-        diag_first_lidar_cb_logged = true;
-    }
-    mtx_buffer.lock();
-    double cur_time = get_time_sec(msg->header.stamp);
-    double preprocess_start_time = omp_get_wtime();
-    scan_count ++;
-    if (!is_first_lidar && cur_time < last_timestamp_lidar)
-    {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
-        lidar_receive_time_buffer.clear();
-    }
-    if(is_first_lidar)
-    {
-        is_first_lidar = false;
-    }
-    last_timestamp_lidar = cur_time;
+  const auto receive_time = SteadyClock::now();
+  if (!diag_first_lidar_cb_logged) {
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[STARTUP][FAST_LIO] first lidar cb (Livox) stamp=%.3f",
+                get_time_sec(msg->header.stamp));
+    diag_first_lidar_cb_logged = true;
+  }
+  mtx_buffer.lock();
+  double cur_time = get_time_sec(msg->header.stamp);
+  double preprocess_start_time = omp_get_wtime();
+  scan_count++;
+  if (!is_first_lidar && cur_time < last_timestamp_lidar) {
+    std::cerr << "lidar loop back, clear buffer" << std::endl;
+    lidar_buffer.clear();
+    lidar_receive_time_buffer.clear();
+  }
+  if (is_first_lidar) {
+    is_first_lidar = false;
+  }
+  last_timestamp_lidar = cur_time;
 
-    if (!time_sync_en && abs(last_timestamp_imu - last_timestamp_lidar) > 10.0 && !imu_buffer.empty() && !lidar_buffer.empty() )
-    {
-        printf("IMU and LiDAR not Synced, IMU time: %lf, lidar header time: %lf \n",last_timestamp_imu, last_timestamp_lidar);
-    }
+  if (!time_sync_en && abs(last_timestamp_imu - last_timestamp_lidar) > 10.0 && !imu_buffer.empty() &&
+      !lidar_buffer.empty()) {
+    printf(
+      "IMU and LiDAR not Synced, IMU time: %lf, lidar header time: %lf \n", last_timestamp_imu, last_timestamp_lidar);
+  }
 
-    if (time_sync_en && !timediff_set_flg && abs(last_timestamp_lidar - last_timestamp_imu) > 1 && !imu_buffer.empty())
-    {
-        timediff_set_flg = true;
-        timediff_lidar_wrt_imu = last_timestamp_lidar + 0.1 - last_timestamp_imu;
-        printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
-    }
+  if (time_sync_en && !timediff_set_flg && abs(last_timestamp_lidar - last_timestamp_imu) > 1 && !imu_buffer.empty()) {
+    timediff_set_flg = true;
+    timediff_lidar_wrt_imu = last_timestamp_lidar + 0.1 - last_timestamp_imu;
+    printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
+  }
 
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
-    lidar_buffer.push_back(ptr);
-    time_buffer.push_back(last_timestamp_lidar);
-    lidar_receive_time_buffer.push_back(receive_time);
+  PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+  p_pre->process(msg, ptr);
+  lidar_buffer.push_back(ptr);
+  time_buffer.push_back(last_timestamp_lidar);
+  lidar_receive_time_buffer.push_back(receive_time);
 
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
-    mtx_buffer.unlock();
-    sig_buffer.notify_all();
+  s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+  mtx_buffer.unlock();
+  sig_buffer.notify_all();
 }
 
 void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stamp)
 {
-    publish_count ++;
-    if (!diag_first_imu_cb_logged) {
-        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                    "[STARTUP][FAST_LIO] first imu cb raw_stamp=%.3f adjusted_stamp=%.3f",
-                    debug_raw_stamp,
-                    get_time_sec(msg->header.stamp));
-        diag_first_imu_cb_logged = true;
-    }
+  publish_count++;
+  if (!diag_first_imu_cb_logged) {
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[STARTUP][FAST_LIO] first imu cb raw_stamp=%.3f adjusted_stamp=%.3f",
+                debug_raw_stamp,
+                get_time_sec(msg->header.stamp));
+    diag_first_imu_cb_logged = true;
+  }
 
-    double timestamp = get_time_sec(msg->header.stamp);
+  double timestamp = get_time_sec(msg->header.stamp);
 
-    mtx_buffer.lock();
+  mtx_buffer.lock();
 
-    if (timestamp < last_timestamp_imu)
-    {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        imu_buffer.clear();
-    }
+  if (timestamp < last_timestamp_imu) {
+    std::cerr << "lidar loop back, clear buffer" << std::endl;
+    imu_buffer.clear();
+  }
 
-    last_timestamp_imu = timestamp;
+  last_timestamp_imu = timestamp;
 
-    imu_buffer.push_back(msg);
-    mtx_buffer.unlock();
-    sig_buffer.notify_all();
+  imu_buffer.push_back(msg);
+  mtx_buffer.unlock();
+  sig_buffer.notify_all();
 }
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
-    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
-    msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
-    if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
-    {
-        msg->header.stamp = rclcpp::Time(timediff_lidar_wrt_imu + get_time_sec(msg_in->header.stamp));
-    }
-    enqueue_imu_msg(msg, get_time_sec(msg_in->header.stamp));
+  sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+  msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
+  if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en) {
+    msg->header.stamp = rclcpp::Time(timediff_lidar_wrt_imu + get_time_sec(msg_in->header.stamp));
+  }
+  enqueue_imu_msg(msg, get_time_sec(msg_in->header.stamp));
 }
 
 void imu_bias_cbk(const fixposition_driver_msgs::msg::FpaImubias::UniquePtr msg_in)
 {
-    std::lock_guard<std::mutex> lock(mtx_fixposition_bias);
-    fixposition_bias_acc = Eigen::Vector3d(msg_in->bias_acc.x, msg_in->bias_acc.y, msg_in->bias_acc.z);
-    fixposition_bias_gyr = Eigen::Vector3d(msg_in->bias_gyr.x, msg_in->bias_gyr.y, msg_in->bias_gyr.z);
-    fixposition_bias_status = msg_in->imu_status;
-    fixposition_has_bias = true;
-    if (!diag_first_fixposition_bias_logged) {
-        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                    "[STARTUP][FAST_LIO] first bias status=%d acc=[%.5f %.5f %.5f] gyr=[%.6f %.6f %.6f]",
-                    fixposition_bias_status,
-                    fixposition_bias_acc.x(),
-                    fixposition_bias_acc.y(),
-                    fixposition_bias_acc.z(),
-                    fixposition_bias_gyr.x(),
-                    fixposition_bias_gyr.y(),
-                    fixposition_bias_gyr.z());
-        diag_first_fixposition_bias_logged = true;
-    }
+  std::lock_guard<std::mutex> lock(mtx_fixposition_bias);
+  fixposition_bias_acc = Eigen::Vector3d(msg_in->bias_acc.x, msg_in->bias_acc.y, msg_in->bias_acc.z);
+  fixposition_bias_gyr = Eigen::Vector3d(msg_in->bias_gyr.x, msg_in->bias_gyr.y, msg_in->bias_gyr.z);
+  fixposition_bias_status = msg_in->imu_status;
+  fixposition_has_bias = true;
+  if (!diag_first_fixposition_bias_logged) {
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[STARTUP][FAST_LIO] first bias status=%d acc=[%.5f %.5f %.5f] gyr=[%.6f %.6f %.6f]",
+                fixposition_bias_status,
+                fixposition_bias_acc.x(),
+                fixposition_bias_acc.y(),
+                fixposition_bias_acc.z(),
+                fixposition_bias_gyr.x(),
+                fixposition_bias_gyr.y(),
+                fixposition_bias_gyr.z());
+    diag_first_fixposition_bias_logged = true;
+  }
 }
 
 void imu_fpa_cbk(const fixposition_driver_msgs::msg::FpaImu::UniquePtr msg_in)
 {
-    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(msg_in->data));
-    msg->header.stamp = get_ros_time(get_time_sec(msg_in->data.header.stamp) + imu_time_offset);
+  sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(msg_in->data));
+  msg->header.stamp = get_ros_time(get_time_sec(msg_in->data.header.stamp) + imu_time_offset);
 
-    bool apply_bias = false;
-    {
-        std::lock_guard<std::mutex> lock(mtx_fixposition_bias);
-        apply_bias = fixposition_has_bias && fixposition_bias_status >= kFixpositionBiasStatusThresh;
-        if (apply_bias) {
-            msg->linear_acceleration.x -= fixposition_bias_acc.x();
-            msg->linear_acceleration.y -= fixposition_bias_acc.y();
-            msg->linear_acceleration.z -= fixposition_bias_acc.z();
-            msg->angular_velocity.x -= fixposition_bias_gyr.x();
-            msg->angular_velocity.y -= fixposition_bias_gyr.y();
-            msg->angular_velocity.z -= fixposition_bias_gyr.z();
-        }
+  bool apply_bias = false;
+  {
+    std::lock_guard<std::mutex> lock(mtx_fixposition_bias);
+    apply_bias = fixposition_has_bias && fixposition_bias_status >= kFixpositionBiasStatusThresh;
+    if (apply_bias) {
+      msg->linear_acceleration.x -= fixposition_bias_acc.x();
+      msg->linear_acceleration.y -= fixposition_bias_acc.y();
+      msg->linear_acceleration.z -= fixposition_bias_acc.z();
+      msg->angular_velocity.x -= fixposition_bias_gyr.x();
+      msg->angular_velocity.y -= fixposition_bias_gyr.y();
+      msg->angular_velocity.z -= fixposition_bias_gyr.z();
     }
-    if (apply_bias && !diag_first_fixposition_bias_applied_logged) {
-        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                    "[STARTUP][FAST_LIO] first bias-corrected FPA imu raw_stamp=%.3f adjusted_stamp=%.3f",
-                    get_time_sec(msg_in->data.header.stamp),
-                    get_time_sec(msg->header.stamp));
-        diag_first_fixposition_bias_applied_logged = true;
-    }
-    enqueue_imu_msg(msg, get_time_sec(msg_in->data.header.stamp));
+  }
+  if (apply_bias && !diag_first_fixposition_bias_applied_logged) {
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[STARTUP][FAST_LIO] first bias-corrected FPA imu raw_stamp=%.3f adjusted_stamp=%.3f",
+                get_time_sec(msg_in->data.header.stamp),
+                get_time_sec(msg->header.stamp));
+    diag_first_fixposition_bias_applied_logged = true;
+  }
+  enqueue_imu_msg(msg, get_time_sec(msg_in->data.header.stamp));
 }
 
 void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
 {
-    Eigen::Vector3d v(msg_in->twist.linear.x, msg_in->twist.linear.y, msg_in->twist.linear.z);
-    std::lock_guard<std::mutex> lk(mtx_twist);
-    twist_buffer.push_back(v);
-    while (twist_buffer.size() > 100) twist_buffer.pop_front();
+  Eigen::Vector3d v(msg_in->twist.linear.x, msg_in->twist.linear.y, msg_in->twist.linear.z);
+  std::lock_guard<std::mutex> lk(mtx_twist);
+  twist_buffer.push_back(v);
+  while (twist_buffer.size() > 100)
+    twist_buffer.pop_front();
 }
 
 double lidar_mean_scantime = 0.0;
-int    scan_num = 0;
-bool sync_packages(MeasureGroup &meas)
+int scan_num = 0;
+bool sync_packages(MeasureGroup & meas)
 {
-    if (lidar_buffer.empty() || imu_buffer.empty()) {
-        return false;
-    }
+  if (lidar_buffer.empty() || imu_buffer.empty()) {
+    return false;
+  }
 
-    /*** push a lidar scan ***/
-    if(!lidar_pushed)
+  /*** push a lidar scan ***/
+  if (!lidar_pushed) {
+    meas.lidar = lidar_buffer.front();
+    if (!diag_first_sync_logged) {
+      RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                  "[STARTUP][FAST_LIO] first sync lidar_beg=%.3f imu_buf=%zu lidar_buf=%zu",
+                  time_buffer.front(),
+                  imu_buffer.size(),
+                  lidar_buffer.size());
+      diag_first_sync_logged = true;
+    }
+    meas.lidar_beg_time = time_buffer.front();
+    if (!lidar_receive_time_buffer.empty()) {
+      current_lidar_receive_time = lidar_receive_time_buffer.front();
+    }
+    if (meas.lidar->points.size() <= 1)  // time too little
     {
-        meas.lidar = lidar_buffer.front();
-        if (!diag_first_sync_logged) {
-            RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                        "[STARTUP][FAST_LIO] first sync lidar_beg=%.3f imu_buf=%zu lidar_buf=%zu",
-                        time_buffer.front(),
-                        imu_buffer.size(),
-                        lidar_buffer.size());
-            diag_first_sync_logged = true;
-        }
-        meas.lidar_beg_time = time_buffer.front();
-        if (!lidar_receive_time_buffer.empty()) {
-            current_lidar_receive_time = lidar_receive_time_buffer.front();
-        }
-        if (meas.lidar->points.size() <= 1) // time too little
-        {
-            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-            std::cerr << "Too few input point cloud!\n";
-        }
-        else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
-        {
-            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-        }
-        else
-        {
-            scan_num ++;
-            lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
-            lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
-        }
-
-        meas.lidar_end_time = lidar_end_time;
-
-        lidar_pushed = true;
+      lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+      std::cerr << "Too few input point cloud!\n";
+    } else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime) {
+      lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+    } else {
+      scan_num++;
+      lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
+      lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
     }
 
-    if (last_timestamp_imu < lidar_end_time)
-    {
-        return false;
-    }
+    meas.lidar_end_time = lidar_end_time;
 
-    /*** push imu data, and pop from imu buffer ***/
-    double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-    meas.imu.clear();
-    while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
-    {
-        imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-        if(imu_time > lidar_end_time) break;
-        meas.imu.push_back(imu_buffer.front());
-        imu_buffer.pop_front();
-    }
+    lidar_pushed = true;
+  }
 
-    lidar_buffer.pop_front();
-    time_buffer.pop_front();
-    if (!lidar_receive_time_buffer.empty()) lidar_receive_time_buffer.pop_front();
-    lidar_pushed = false;
-    return true;
+  if (last_timestamp_imu < lidar_end_time) {
+    return false;
+  }
+
+  /*** push imu data, and pop from imu buffer ***/
+  double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+  meas.imu.clear();
+  while ((!imu_buffer.empty()) && (imu_time < lidar_end_time)) {
+    imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+    if (imu_time > lidar_end_time)
+      break;
+    meas.imu.push_back(imu_buffer.front());
+    imu_buffer.pop_front();
+  }
+
+  lidar_buffer.pop_front();
+  time_buffer.pop_front();
+  if (!lidar_receive_time_buffer.empty())
+    lidar_receive_time_buffer.pop_front();
+  lidar_pushed = false;
+  return true;
 }
 
 int process_increments = 0;
@@ -978,143 +986,142 @@ int process_increments = 0;
 // it never runs concurrently with Nearest_Search. The background rebuild it may trigger
 // runs concurrently exactly as in the synchronous path. Net: the Add cost (~16ms steady,
 // spikes to ~78ms) leaves the per-scan critical path and hides in the inter-scan idle gap.
-bool                    async_map_en = true;   // gated by env FLIO_ASYNC_MAP ("0" disables)
-std::mutex              map_add_mtx;
+bool async_map_en = true;  // gated by env FLIO_ASYNC_MAP ("0" disables)
+std::mutex map_add_mtx;
 std::condition_variable map_add_cv;
-PointVector             map_add_ds_;            // handoff: points to add WITH downsample
-PointVector             map_add_nods_;          // handoff: points to add WITHOUT downsample
-bool                    map_add_ready_   = false;  // a job is queued, not yet taken
-bool                    map_add_running_ = false;  // worker is executing a job
-bool                    map_worker_stop_ = false;
-std::thread             map_worker_thread;
-std::atomic<uint64_t>   g_async_add_us{0};      // last completed worker Add() wall time (us)
-double                  g_map_join_wait_ms = 0; // last joinMapAdd() block time (main-only)
+PointVector map_add_ds_;        // handoff: points to add WITH downsample
+PointVector map_add_nods_;      // handoff: points to add WITHOUT downsample
+bool map_add_ready_ = false;    // a job is queued, not yet taken
+bool map_add_running_ = false;  // worker is executing a job
+bool map_worker_stop_ = false;
+std::thread map_worker_thread;
+std::atomic<uint64_t> g_async_add_us{0};  // last completed worker Add() wall time (us)
+double g_map_join_wait_ms = 0;            // last joinMapAdd() block time (main-only)
 
 void mapWorkerLoop()
 {
-    std::unique_lock<std::mutex> lk(map_add_mtx);
-    while (true)
-    {
-        map_add_cv.wait(lk, [] { return map_add_ready_ || map_worker_stop_; });
-        if (map_worker_stop_ && !map_add_ready_) break;
-        PointVector toAdd, noDS;
-        toAdd.swap(map_add_ds_);
-        noDS.swap(map_add_nods_);
-        map_add_ready_   = false;
-        map_add_running_ = true;
-        lk.unlock();
+  std::unique_lock<std::mutex> lk(map_add_mtx);
+  while (true) {
+    map_add_cv.wait(lk, [] { return map_add_ready_ || map_worker_stop_; });
+    if (map_worker_stop_ && !map_add_ready_)
+      break;
+    PointVector toAdd, noDS;
+    toAdd.swap(map_add_ds_);
+    noDS.swap(map_add_nods_);
+    map_add_ready_ = false;
+    map_add_running_ = true;
+    lk.unlock();
 
-        const double st = omp_get_wtime();
-        ikdtree.Add_Points(toAdd, true);
-        ikdtree.Add_Points(noDS, false);
-        g_async_add_us.store((uint64_t)((omp_get_wtime() - st) * 1e6), std::memory_order_relaxed);
+    const double st = omp_get_wtime();
+    ikdtree.Add_Points(toAdd, true);
+    ikdtree.Add_Points(noDS, false);
+    g_async_add_us.store((uint64_t)((omp_get_wtime() - st) * 1e6), std::memory_order_relaxed);
 
-        lk.lock();
-        map_add_running_ = false;
-        map_add_cv.notify_all();
-    }
+    lk.lock();
+    map_add_running_ = false;
+    map_add_cv.notify_all();
+  }
 }
 
 void startMapWorker()
 {
-    map_worker_stop_ = false;
-    if (!map_worker_thread.joinable())
-        map_worker_thread = std::thread(mapWorkerLoop);
+  map_worker_stop_ = false;
+  if (!map_worker_thread.joinable())
+    map_worker_thread = std::thread(mapWorkerLoop);
 }
 
 void stopMapWorker()  // drain any in-flight Add + join; idempotent
 {
-    {
-        std::lock_guard<std::mutex> lk(map_add_mtx);
-        map_worker_stop_ = true;
-    }
-    map_add_cv.notify_all();
-    if (map_worker_thread.joinable()) map_worker_thread.join();
+  {
+    std::lock_guard<std::mutex> lk(map_add_mtx);
+    map_worker_stop_ = true;
+  }
+  map_add_cv.notify_all();
+  if (map_worker_thread.joinable())
+    map_worker_thread.join();
 }
 
 // Hand the two add-lists to the worker. Precondition: worker idle (caller joined this
 // scan's predecessor). Moves the vectors so the hot path does no point copy.
-void dispatchMapAdd(PointVector &toAdd, PointVector &noDS)
+void dispatchMapAdd(PointVector & toAdd, PointVector & noDS)
 {
-    {
-        std::lock_guard<std::mutex> lk(map_add_mtx);
-        map_add_ds_.swap(toAdd);
-        map_add_nods_.swap(noDS);
-        map_add_ready_ = true;
-    }
-    map_add_cv.notify_one();
+  {
+    std::lock_guard<std::mutex> lk(map_add_mtx);
+    map_add_ds_.swap(toAdd);
+    map_add_nods_.swap(noDS);
+    map_add_ready_ = true;
+  }
+  map_add_cv.notify_one();
 }
 
 // Block until the worker has finished the in-flight Add. Called before the next scan's
 // first tree op (lasermap_fov_segment) to restore the single-operator invariant.
 void joinMapAdd()
 {
-    const double t0 = omp_get_wtime();
-    std::unique_lock<std::mutex> lk(map_add_mtx);
-    map_add_cv.wait(lk, [] { return !map_add_ready_ && !map_add_running_; });
-    g_map_join_wait_ms = (omp_get_wtime() - t0) * 1000.0;
+  const double t0 = omp_get_wtime();
+  std::unique_lock<std::mutex> lk(map_add_mtx);
+  map_add_cv.wait(lk, [] { return !map_add_ready_ && !map_add_running_; });
+  g_map_join_wait_ms = (omp_get_wtime() - t0) * 1000.0;
 }
 
 void map_incremental()
 {
-    PointVector PointToAdd;
-    PointVector PointNoNeedDownsample;
-    PointToAdd.reserve(feats_down_size);
-    PointNoNeedDownsample.reserve(feats_down_size);
-    for (int i = 0; i < feats_down_size; i++)
-    {
-        /* transform to world frame */
-        pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
-        /* decide if need add to map */
-        if (!Nearest_Points[i].empty() && flg_EKF_inited)
-        {
-            const PointVector &points_near = Nearest_Points[i];
-            bool need_add = true;
-            BoxPointType Box_of_Point;
-            PointType downsample_result, mid_point; 
-            mid_point.x = floor(feats_down_world->points[i].x/filter_size_map_min)*filter_size_map_min + 0.5 * filter_size_map_min;
-            mid_point.y = floor(feats_down_world->points[i].y/filter_size_map_min)*filter_size_map_min + 0.5 * filter_size_map_min;
-            mid_point.z = floor(feats_down_world->points[i].z/filter_size_map_min)*filter_size_map_min + 0.5 * filter_size_map_min;
-            float dist  = calc_dist(feats_down_world->points[i],mid_point);
-            if (fabs(points_near[0].x - mid_point.x) > 0.5 * filter_size_map_min && fabs(points_near[0].y - mid_point.y) > 0.5 * filter_size_map_min && fabs(points_near[0].z - mid_point.z) > 0.5 * filter_size_map_min){
-                PointNoNeedDownsample.push_back(feats_down_world->points[i]);
-                continue;
-            }
-            for (int readd_i = 0; readd_i < NUM_MATCH_POINTS; readd_i ++)
-            {
-                if (points_near.size() < NUM_MATCH_POINTS) break;
-                if (calc_dist(points_near[readd_i], mid_point) < dist)
-                {
-                    need_add = false;
-                    break;
-                }
-            }
-            if (need_add) PointToAdd.push_back(feats_down_world->points[i]);
+  PointVector PointToAdd;
+  PointVector PointNoNeedDownsample;
+  PointToAdd.reserve(feats_down_size);
+  PointNoNeedDownsample.reserve(feats_down_size);
+  for (int i = 0; i < feats_down_size; i++) {
+    /* transform to world frame */
+    pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+    /* decide if need add to map */
+    if (!Nearest_Points[i].empty() && flg_EKF_inited) {
+      const PointVector & points_near = Nearest_Points[i];
+      bool need_add = true;
+      BoxPointType Box_of_Point;
+      PointType downsample_result, mid_point;
+      mid_point.x =
+        floor(feats_down_world->points[i].x / filter_size_map_min) * filter_size_map_min + 0.5 * filter_size_map_min;
+      mid_point.y =
+        floor(feats_down_world->points[i].y / filter_size_map_min) * filter_size_map_min + 0.5 * filter_size_map_min;
+      mid_point.z =
+        floor(feats_down_world->points[i].z / filter_size_map_min) * filter_size_map_min + 0.5 * filter_size_map_min;
+      float dist = calc_dist(feats_down_world->points[i], mid_point);
+      if (fabs(points_near[0].x - mid_point.x) > 0.5 * filter_size_map_min &&
+          fabs(points_near[0].y - mid_point.y) > 0.5 * filter_size_map_min &&
+          fabs(points_near[0].z - mid_point.z) > 0.5 * filter_size_map_min) {
+        PointNoNeedDownsample.push_back(feats_down_world->points[i]);
+        continue;
+      }
+      for (int readd_i = 0; readd_i < NUM_MATCH_POINTS; readd_i++) {
+        if (points_near.size() < NUM_MATCH_POINTS)
+          break;
+        if (calc_dist(points_near[readd_i], mid_point) < dist) {
+          need_add = false;
+          break;
         }
-        else
-        {
-            PointToAdd.push_back(feats_down_world->points[i]);
-        }
+      }
+      if (need_add)
+        PointToAdd.push_back(feats_down_world->points[i]);
+    } else {
+      PointToAdd.push_back(feats_down_world->points[i]);
     }
+  }
 
-    if (async_map_en)
-    {
-        // Off-thread: the worker calls Add_Points during the inter-scan gap; joined before
-        // the next scan's first tree op. add_point_size is known here (sizes); the Add wall
-        // time lands in g_async_add_us (see mapWorkerLoop). kdtree_incremental_time is left
-        // untouched in this path — it is a main-thread debug stat and the worker must not
-        // write plain globals the main thread reads.
-        add_point_size = (int)(PointToAdd.size() + PointNoNeedDownsample.size());
-        dispatchMapAdd(PointToAdd, PointNoNeedDownsample);
-    }
-    else
-    {
-        double st_time = omp_get_wtime();
-        add_point_size = ikdtree.Add_Points(PointToAdd, true);
-        ikdtree.Add_Points(PointNoNeedDownsample, false);
-        add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
-        kdtree_incremental_time = omp_get_wtime() - st_time;
-    }
+  if (async_map_en) {
+    // Off-thread: the worker calls Add_Points during the inter-scan gap; joined before
+    // the next scan's first tree op. add_point_size is known here (sizes); the Add wall
+    // time lands in g_async_add_us (see mapWorkerLoop). kdtree_incremental_time is left
+    // untouched in this path — it is a main-thread debug stat and the worker must not
+    // write plain globals the main thread reads.
+    add_point_size = (int)(PointToAdd.size() + PointNoNeedDownsample.size());
+    dispatchMapAdd(PointToAdd, PointNoNeedDownsample);
+  } else {
+    double st_time = omp_get_wtime();
+    add_point_size = ikdtree.Add_Points(PointToAdd, true);
+    ikdtree.Add_Points(PointNoNeedDownsample, false);
+    add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
+    kdtree_incremental_time = omp_get_wtime() - st_time;
+  }
 }
 
 // P2 VoxelMap-lite: fold the converged scan into the per-voxel Welford moments
@@ -1126,41 +1133,45 @@ void map_incremental()
 // updating; delta arithmetic in double, storage in float.
 void vxl_update()
 {
-    if (!vxl_en) return;
-    if (vxl_grid.empty()) vxl_grid.reserve(1 << 20);
-    for (int i = 0; i < feats_down_size; i++)
-    {
-        const PointType &pb = feats_down_body->points[i];
-        if (std::hypot(pb.x, pb.y) > vxl_max_range) continue;
-        PointType pw;
-        pointBodyToWorld(&feats_down_body->points[i], &pw);
-        VxlCell &c = vxl_grid[vxlKey(pw.x, pw.y, pw.z)];
-        if (c.n >= vxl_freeze_pts) continue;
-        if (c.n == 0)
-        {
-            c.mean[0] = pw.x; c.mean[1] = pw.y; c.mean[2] = pw.z;
-            c.zq = pw.z;
-            c.n = 1;
-            continue;
-        }
-        ++c.n;
-        // SGD quantile step toward the 10th percentile: down-moves 9x faster
-        // than up-moves, so zq settles on the cell's lower mode.
-        constexpr float kVxlZqEta = 0.02f;
-        c.zq += kVxlZqEta * (0.1f - (pw.z < c.zq ? 1.0f : 0.0f));
-        const double d0 = pw.x - c.mean[0], d1 = pw.y - c.mean[1], d2 = pw.z - c.mean[2];
-        const double inv_n = 1.0 / static_cast<double>(c.n);
-        c.mean[0] += static_cast<float>(d0 * inv_n);
-        c.mean[1] += static_cast<float>(d1 * inv_n);
-        c.mean[2] += static_cast<float>(d2 * inv_n);
-        const double e0 = pw.x - c.mean[0], e1 = pw.y - c.mean[1], e2 = pw.z - c.mean[2];
-        c.m2[0] += static_cast<float>(d0 * e0);
-        c.m2[1] += static_cast<float>(d0 * e1);
-        c.m2[2] += static_cast<float>(d0 * e2);
-        c.m2[3] += static_cast<float>(d1 * e1);
-        c.m2[4] += static_cast<float>(d1 * e2);
-        c.m2[5] += static_cast<float>(d2 * e2);
+  if (!vxl_en)
+    return;
+  if (vxl_grid.empty())
+    vxl_grid.reserve(1 << 20);
+  for (int i = 0; i < feats_down_size; i++) {
+    const PointType & pb = feats_down_body->points[i];
+    if (std::hypot(pb.x, pb.y) > vxl_max_range)
+      continue;
+    PointType pw;
+    pointBodyToWorld(&feats_down_body->points[i], &pw);
+    VxlCell & c = vxl_grid[vxlKey(pw.x, pw.y, pw.z)];
+    if (c.n >= vxl_freeze_pts)
+      continue;
+    if (c.n == 0) {
+      c.mean[0] = pw.x;
+      c.mean[1] = pw.y;
+      c.mean[2] = pw.z;
+      c.zq = pw.z;
+      c.n = 1;
+      continue;
     }
+    ++c.n;
+    // SGD quantile step toward the 10th percentile: down-moves 9x faster
+    // than up-moves, so zq settles on the cell's lower mode.
+    constexpr float kVxlZqEta = 0.02f;
+    c.zq += kVxlZqEta * (0.1f - (pw.z < c.zq ? 1.0f : 0.0f));
+    const double d0 = pw.x - c.mean[0], d1 = pw.y - c.mean[1], d2 = pw.z - c.mean[2];
+    const double inv_n = 1.0 / static_cast<double>(c.n);
+    c.mean[0] += static_cast<float>(d0 * inv_n);
+    c.mean[1] += static_cast<float>(d1 * inv_n);
+    c.mean[2] += static_cast<float>(d2 * inv_n);
+    const double e0 = pw.x - c.mean[0], e1 = pw.y - c.mean[1], e2 = pw.z - c.mean[2];
+    c.m2[0] += static_cast<float>(d0 * e0);
+    c.m2[1] += static_cast<float>(d0 * e1);
+    c.m2[2] += static_cast<float>(d0 * e2);
+    c.m2[3] += static_cast<float>(d1 * e1);
+    c.m2[4] += static_cast<float>(d1 * e2);
+    c.m2[5] += static_cast<float>(d2 * e2);
+  }
 }
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
@@ -1180,2298 +1191,2408 @@ std::mutex pcd_queue_mtx;
 std::condition_variable pcd_queue_cv;
 std::deque<PointCloudXYZI::Ptr> pcd_queue;
 std::atomic<bool> pcd_writer_running{false};
-std::atomic<uint64_t> pcd_enqueued{0};  // scans handed to the writer
+std::atomic<uint64_t> pcd_enqueued{0};     // scans handed to the writer
 std::atomic<uint64_t> pcd_accumulated{0};  // scans folded into pcl_wait_save
 std::thread pcd_writer_thread;
 
 void pcdWriterLoop()
 {
-    while (true) {
-        PointCloudXYZI::Ptr cloud;
-        {
-            std::unique_lock<std::mutex> lk(pcd_queue_mtx);
-            pcd_queue_cv.wait(lk, [] { return !pcd_queue.empty() || !pcd_writer_running.load(); });
-            if (pcd_queue.empty() && !pcd_writer_running.load()) break;  // drained + asked to stop
-            cloud = pcd_queue.front();
-            pcd_queue.pop_front();
-        }
-        if (!cloud || cloud->empty()) { pcd_accumulated.fetch_add(1); continue; }
-        {
-            std::lock_guard<std::mutex> save_lk(pcl_wait_save_mtx);
-            *pcl_wait_save += *cloud;  // realloc/copy happens HERE, off the processing thread
-            if (pcd_save_interval > 0) {
-                static int scan_wait_num = 0;
-                if (++scan_wait_num >= pcd_save_interval && !pcl_wait_save->empty()) {
-                    pcd_index++;
-                    string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
-                    pcl::PCDWriter pcd_writer;
-                    pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-                    pcl_wait_save->clear();
-                    scan_wait_num = 0;
-                }
-            }
-        }
-        pcd_accumulated.fetch_add(1);  // signal flushPcdQueue() that this scan is folded in
+  while (true) {
+    PointCloudXYZI::Ptr cloud;
+    {
+      std::unique_lock<std::mutex> lk(pcd_queue_mtx);
+      pcd_queue_cv.wait(lk, [] { return !pcd_queue.empty() || !pcd_writer_running.load(); });
+      if (pcd_queue.empty() && !pcd_writer_running.load())
+        break;  // drained + asked to stop
+      cloud = pcd_queue.front();
+      pcd_queue.pop_front();
     }
+    if (!cloud || cloud->empty()) {
+      pcd_accumulated.fetch_add(1);
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> save_lk(pcl_wait_save_mtx);
+      *pcl_wait_save += *cloud;  // realloc/copy happens HERE, off the processing thread
+      if (pcd_save_interval > 0) {
+        static int scan_wait_num = 0;
+        if (++scan_wait_num >= pcd_save_interval && !pcl_wait_save->empty()) {
+          pcd_index++;
+          string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
+          pcl::PCDWriter pcd_writer;
+          pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+          pcl_wait_save->clear();
+          scan_wait_num = 0;
+        }
+      }
+    }
+    pcd_accumulated.fetch_add(1);  // signal flushPcdQueue() that this scan is folded in
+  }
 }
 
 // Block until the writer has folded in every scan enqueued so far. Used by the readers
 // (map_save service / save_to_pcd) so a mid-run save can't miss still-queued scans.
 void flushPcdQueue()
 {
-    const uint64_t target = pcd_enqueued.load();
-    while (pcd_writer_running.load() && pcd_accumulated.load() < target) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
+  const uint64_t target = pcd_enqueued.load();
+  while (pcd_writer_running.load() && pcd_accumulated.load() < target) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
 }
 
 void startPcdWriter()
 {
-    bool expected = false;
-    if (pcd_writer_running.compare_exchange_strong(expected, true)) {
-        pcd_writer_thread = std::thread(pcdWriterLoop);
-    }
+  bool expected = false;
+  if (pcd_writer_running.compare_exchange_strong(expected, true)) {
+    pcd_writer_thread = std::thread(pcdWriterLoop);
+  }
 }
 
 void stopPcdWriter()  // drain queue + join; idempotent, call once at shutdown
 {
-    if (!pcd_writer_running.exchange(false)) return;
-    pcd_queue_cv.notify_all();
-    if (pcd_writer_thread.joinable()) pcd_writer_thread.join();
+  if (!pcd_writer_running.exchange(false))
+    return;
+  pcd_queue_cv.notify_all();
+  if (pcd_writer_thread.joinable())
+    pcd_writer_thread.join();
 }
 void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
 {
-    if(scan_pub_en)
-    {
-        PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
-        int size = laserCloudFullRes->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld( \
-                        new PointCloudXYZI(size, 1));
+  if (scan_pub_en) {
+    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+    int size = laserCloudFullRes->points.size();
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
 
-        for (int i = 0; i < size; i++)
-        {
-            RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
-                                &laserCloudWorld->points[i]);
-        }
-
-        sensor_msgs::msg::PointCloud2 laserCloudmsg;
-        pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
-        // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
-        pubLaserCloudFull->publish(laserCloudmsg);
-        publish_count -= PUBFRAME_PERIOD;
+    for (int i = 0; i < size; i++) {
+      RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
     }
 
-    /**************** save map ****************/
-    // Same pause gate: skip accumulation when mapping is disabled, so the
-    // exported scans.pcd doesn't contain operator-suppressed frames.
-    if (pcd_save_en && mapping_enabled.load(std::memory_order_relaxed))
-    {
-        int size = feats_undistort->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+    laserCloudmsg.header.frame_id = "camera_init";
+    pubLaserCloudFull->publish(laserCloudmsg);
+    publish_count -= PUBFRAME_PERIOD;
+  }
 
-        for (int i = 0; i < size; i++)
-        {
-            RGBpointBodyToWorld(&feats_undistort->points[i],
-                                &laserCloudWorld->points[i]);
-        }
-        // Hand the transformed scan to the writer thread; accumulation + any interval
-        // flush now run there (see pcdWriterLoop), off this LiDAR processing thread.
-        {
-            std::lock_guard<std::mutex> lk(pcd_queue_mtx);
-            pcd_queue.push_back(laserCloudWorld);
-        }
-        pcd_enqueued.fetch_add(1);
-        pcd_queue_cv.notify_one();
+  /**************** save map ****************/
+  // Same pause gate: skip accumulation when mapping is disabled, so the
+  // exported scans.pcd doesn't contain operator-suppressed frames.
+  if (pcd_save_en && mapping_enabled.load(std::memory_order_relaxed)) {
+    int size = feats_undistort->points.size();
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+
+    for (int i = 0; i < size; i++) {
+      RGBpointBodyToWorld(&feats_undistort->points[i], &laserCloudWorld->points[i]);
     }
+    // Hand the transformed scan to the writer thread; accumulation + any interval
+    // flush now run there (see pcdWriterLoop), off this LiDAR processing thread.
+    {
+      std::lock_guard<std::mutex> lk(pcd_queue_mtx);
+      pcd_queue.push_back(laserCloudWorld);
+    }
+    pcd_enqueued.fetch_add(1);
+    pcd_queue_cv.notify_one();
+  }
 }
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
 {
-    int size = feats_undistort->points.size();
-    PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
+  int size = feats_undistort->points.size();
+  PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
 
-    for (int i = 0; i < size; i++)
-    {
-        RGBpointBodyLidarToIMU(&feats_undistort->points[i], \
-                            &laserCloudIMUBody->points[i]);
-    }
+  for (int i = 0; i < size; i++) {
+    RGBpointBodyLidarToIMU(&feats_undistort->points[i], &laserCloudIMUBody->points[i]);
+  }
 
-    sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
-    pubLaserCloudFull_body->publish(laserCloudmsg);
-    publish_count -= PUBFRAME_PERIOD;
+  sensor_msgs::msg::PointCloud2 laserCloudmsg;
+  pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
+  laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+  laserCloudmsg.header.frame_id = "body";
+  pubLaserCloudFull_body->publish(laserCloudmsg);
+  publish_count -= PUBFRAME_PERIOD;
 }
 
 void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
 {
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(effct_feat_num, 1));
-    for (int i = 0; i < effct_feat_num; i++)
-    {
-        RGBpointBodyToWorld(&laserCloudOri->points[i], \
-                            &laserCloudWorld->points[i]);
-    }
-    sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
-    pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
-    laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
-    pubLaserCloudEffect->publish(laserCloudFullRes3);
+  PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(effct_feat_num, 1));
+  for (int i = 0; i < effct_feat_num; i++) {
+    RGBpointBodyToWorld(&laserCloudOri->points[i], &laserCloudWorld->points[i]);
+  }
+  sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
+  pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
+  laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
+  laserCloudFullRes3.header.frame_id = "camera_init";
+  pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
 void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
 {
-    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
-    int size = laserCloudFullRes->points.size();
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(size, 1));
+  PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+  int size = laserCloudFullRes->points.size();
+  PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
 
-    for (int i = 0; i < size; i++)
-    {
-        RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
-                            &laserCloudWorld->points[i]);
+  for (int i = 0; i < size; i++) {
+    RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
+  }
+  *pcl_wait_pub += *laserCloudWorld;
+
+  // Voxel-downsample + hard cap so the accumulated /Laser_map stays bounded and
+  // renderable. publish_map otherwise just appends a scan per tick and grows
+  // without limit. Start at a 0.3 m leaf and coarsen until under ~100k points.
+  {
+    constexpr size_t kMapPubMaxPoints = 100000;
+    float leaf = 0.3f;
+    for (int pass = 0; pass < 8; ++pass) {
+      pcl::VoxelGrid<PointType> vg;
+      vg.setLeafSize(leaf, leaf, leaf);
+      vg.setInputCloud(pcl_wait_pub);
+      PointCloudXYZI::Ptr ds(new PointCloudXYZI());
+      vg.filter(*ds);
+      pcl_wait_pub = ds;
+      if (pcl_wait_pub->size() <= kMapPubMaxPoints)
+        break;
+      leaf *= 1.5f;
     }
-    *pcl_wait_pub += *laserCloudWorld;
+  }
 
-    // Voxel-downsample + hard cap so the accumulated /Laser_map stays bounded and
-    // renderable. publish_map otherwise just appends a scan per tick and grows
-    // without limit. Start at a 0.3 m leaf and coarsen until under ~100k points.
-    {
-        constexpr size_t kMapPubMaxPoints = 100000;
-        float leaf = 0.3f;
-        for (int pass = 0; pass < 8; ++pass)
-        {
-            pcl::VoxelGrid<PointType> vg;
-            vg.setLeafSize(leaf, leaf, leaf);
-            vg.setInputCloud(pcl_wait_pub);
-            PointCloudXYZI::Ptr ds(new PointCloudXYZI());
-            vg.filter(*ds);
-            pcl_wait_pub = ds;
-            if (pcl_wait_pub->size() <= kMapPubMaxPoints) break;
-            leaf *= 1.5f;
-        }
-    }
+  sensor_msgs::msg::PointCloud2 laserCloudmsg;
+  pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
+  // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+  laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+  laserCloudmsg.header.frame_id = "camera_init";
+  pubLaserCloudMap->publish(laserCloudmsg);
 
-    sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
-    pubLaserCloudMap->publish(laserCloudmsg);
-
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
-    // pubLaserCloudMap->publish(laserCloudMap);
+  // sensor_msgs::msg::PointCloud2 laserCloudMap;
+  // pcl::toROSMsg(*featsFromMap, laserCloudMap);
+  // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
+  // laserCloudMap.header.frame_id = "camera_init";
+  // pubLaserCloudMap->publish(laserCloudMap);
 }
 
 void save_to_pcd()
 {
-    pcl::PCDWriter pcd_writer;
-    // pcl_wait_save accumulates full-resolution feats_undistort every scan (when pcd_save_en=true).
-    // pcl_wait_pub only has ~1/10 frames from the 1Hz publish_map timer with downsampled points.
-    // Make sure every enqueued scan is folded in, then lock against the async writer
-    // thread (the other accessor of pcl_wait_save) for the write itself.
-    flushPcdQueue();
-    std::lock_guard<std::mutex> lk(pcl_wait_save_mtx);
-    pcd_writer.writeBinary(map_file_path, *pcl_wait_save);
+  pcl::PCDWriter pcd_writer;
+  // pcl_wait_save accumulates full-resolution feats_undistort every scan (when pcd_save_en=true).
+  // pcl_wait_pub only has ~1/10 frames from the 1Hz publish_map timer with downsampled points.
+  // Make sure every enqueued scan is folded in, then lock against the async writer
+  // thread (the other accessor of pcl_wait_save) for the write itself.
+  flushPcdQueue();
+  std::lock_guard<std::mutex> lk(pcl_wait_save_mtx);
+  pcd_writer.writeBinary(map_file_path, *pcl_wait_save);
 }
 
 template<typename T>
 void set_posestamp(T & out)
 {
-    out.pose.position.x = state_point.pos(0);
-    out.pose.position.y = state_point.pos(1);
-    out.pose.position.z = state_point.pos(2);
-    out.pose.orientation.x = geoQuat.x;
-    out.pose.orientation.y = geoQuat.y;
-    out.pose.orientation.z = geoQuat.z;
-    out.pose.orientation.w = geoQuat.w;
-    
+  out.pose.position.x = state_point.pos(0);
+  out.pose.position.y = state_point.pos(1);
+  out.pose.position.z = state_point.pos(2);
+  out.pose.orientation.x = geoQuat.x;
+  out.pose.orientation.y = geoQuat.y;
+  out.pose.orientation.z = geoQuat.z;
+  out.pose.orientation.w = geoQuat.w;
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped,
+                      std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
-    set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
-    if (!diag_first_odom_pub_logged) {
-        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                    "[STARTUP][FAST_LIO] first /Odometry publish stamp=%.3f pos=[%.3f %.3f %.3f]",
-                    lidar_end_time,
-                    odomAftMapped.pose.pose.position.x,
-                    odomAftMapped.pose.pose.position.y,
-                    odomAftMapped.pose.pose.position.z);
-        diag_first_odom_pub_logged = true;
-    }
+  odomAftMapped.header.frame_id = "camera_init";
+  odomAftMapped.child_frame_id = "body";
+  odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
+  set_posestamp(odomAftMapped.pose);
+  pubOdomAftMapped->publish(odomAftMapped);
+  if (!diag_first_odom_pub_logged) {
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[STARTUP][FAST_LIO] first /Odometry publish stamp=%.3f pos=[%.3f %.3f %.3f]",
+                lidar_end_time,
+                odomAftMapped.pose.pose.position.x,
+                odomAftMapped.pose.pose.position.y,
+                odomAftMapped.pose.pose.position.z);
+    diag_first_odom_pub_logged = true;
+  }
 
-    if (latency_diag_en && current_lidar_receive_time.time_since_epoch().count() != 0) {
-        const auto now = SteadyClock::now();
-        const double latency_ms = std::chrono::duration<double, std::milli>(now - current_lidar_receive_time).count();
-        sensor_to_odom_latency_stats.add(latency_ms);
-        if (last_latency_log_time.time_since_epoch().count() == 0 ||
-            std::chrono::duration<double>(now - last_latency_log_time).count() >= latency_log_period_sec) {
-            RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                        "[LATENCY][FAST_LIO][SENSOR_TO_ODOM] count=%d mean=%.2fms min=%.2fms max=%.2fms",
-                        sensor_to_odom_latency_stats.count,
-                        sensor_to_odom_latency_stats.mean(),
-                        sensor_to_odom_latency_stats.min_ms,
-                        sensor_to_odom_latency_stats.max_ms);
-            last_latency_log_time = now;
-        }
+  if (latency_diag_en && current_lidar_receive_time.time_since_epoch().count() != 0) {
+    const auto now = SteadyClock::now();
+    const double latency_ms = std::chrono::duration<double, std::milli>(now - current_lidar_receive_time).count();
+    sensor_to_odom_latency_stats.add(latency_ms);
+    if (last_latency_log_time.time_since_epoch().count() == 0 ||
+        std::chrono::duration<double>(now - last_latency_log_time).count() >= latency_log_period_sec) {
+      RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                  "[LATENCY][FAST_LIO][SENSOR_TO_ODOM] count=%d mean=%.2fms min=%.2fms max=%.2fms",
+                  sensor_to_odom_latency_stats.count,
+                  sensor_to_odom_latency_stats.mean(),
+                  sensor_to_odom_latency_stats.min_ms,
+                  sensor_to_odom_latency_stats.max_ms);
+      last_latency_log_time = now;
     }
-    auto P = kf.get_P();
-    for (int i = 0; i < 6; i ++)
-    {
-        int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
-    }
+  }
+  auto P = kf.get_P();
+  for (int i = 0; i < 6; i++) {
+    int k = i < 3 ? i + 3 : i - 3;
+    odomAftMapped.pose.covariance[i * 6 + 0] = P(k, 3);
+    odomAftMapped.pose.covariance[i * 6 + 1] = P(k, 4);
+    odomAftMapped.pose.covariance[i * 6 + 2] = P(k, 5);
+    odomAftMapped.pose.covariance[i * 6 + 3] = P(k, 0);
+    odomAftMapped.pose.covariance[i * 6 + 4] = P(k, 1);
+    odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
+  }
 
-    // Divergence guard (P1): while the front end is dead-reckoning (LiDAR
-    // starved), advertise large position variance on the ROS pose covariance
-    // (x,y,z diagonal) so the PGO back-end down-weights these poses instead of
-    // trusting a bounded-but-uncertain dead-reckoned estimate.
-    if (flio_degraded_odom)
-    {
-        constexpr double kDegradedPosVar = 100.0;  // (10 m)^2
-        odomAftMapped.pose.covariance[0]  += kDegradedPosVar;   // x
-        odomAftMapped.pose.covariance[7]  += kDegradedPosVar;   // y
-        odomAftMapped.pose.covariance[14] += kDegradedPosVar;   // z
-    }
+  // Divergence guard (P1): while the front end is dead-reckoning (LiDAR
+  // starved), advertise large position variance on the ROS pose covariance
+  // (x,y,z diagonal) so the PGO back-end down-weights these poses instead of
+  // trusting a bounded-but-uncertain dead-reckoned estimate.
+  if (flio_degraded_odom) {
+    constexpr double kDegradedPosVar = 100.0;              // (10 m)^2
+    odomAftMapped.pose.covariance[0] += kDegradedPosVar;   // x
+    odomAftMapped.pose.covariance[7] += kDegradedPosVar;   // y
+    odomAftMapped.pose.covariance[14] += kDegradedPosVar;  // z
+  }
 
-    geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = "camera_init";
-    trans.child_frame_id = "body";
-    trans.header.stamp = get_ros_time(lidar_end_time);
-    trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-    trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-    trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-    trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
-    trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
-    trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
-    trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
-    tf_br->sendTransform(trans);
+  geometry_msgs::msg::TransformStamped trans;
+  trans.header.frame_id = "camera_init";
+  trans.child_frame_id = "body";
+  trans.header.stamp = get_ros_time(lidar_end_time);
+  trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
+  trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
+  trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
+  trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
+  trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
+  trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
+  trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
+  tf_br->sendTransform(trans);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
-    set_posestamp(msg_body_pose);
-    msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+  set_posestamp(msg_body_pose);
+  msg_body_pose.header.stamp = get_ros_time(lidar_end_time);  // ros::Time().fromSec(lidar_end_time);
+  msg_body_pose.header.frame_id = "camera_init";
 
-    /*** if path is too large, the rvis will crash ***/
-    static int jjj = 0;
-    jjj++;
-    if (jjj % 10 == 0) 
-    {
-        path.poses.push_back(msg_body_pose);
-        pubPath->publish(path);
-    }
+  /*** if path is too large, the rvis will crash ***/
+  static int jjj = 0;
+  jjj++;
+  if (jjj % 10 == 0) {
+    path.poses.push_back(msg_body_pose);
+    pubPath->publish(path);
+  }
 }
 
-void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
+void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_data)
 {
-    double match_start = omp_get_wtime();
-    laserCloudOri->clear(); 
-    corr_normvect->clear(); 
-    total_residual = 0.0; 
+  double match_start = omp_get_wtime();
+  laserCloudOri->clear();
+  corr_normvect->clear();
+  total_residual = 0.0;
 
-    /** closest surface search and residual computation **/
-    #ifdef MP_EN
-        // Respect OMP_NUM_THREADS when set so the runtime CPU budget (cgroup
-        // --cpus) can be honoured; the compile-time MP_PROC_NUM (8 on x86) would
-        // otherwise spawn 8 OMP threads and oversubscribe a 4-CPU container,
-        // starving the PGO node it shares cores with.
-        {
-            static const int omp_threads = []() {
-                const char * e = std::getenv("OMP_NUM_THREADS");
-                return (e && std::atoi(e) > 0) ? std::atoi(e) : MP_PROC_NUM;
-            }();
-            omp_set_num_threads(omp_threads);
-        }
-        #pragma omp parallel for
-    #endif
-    for (int i = 0; i < feats_down_size; i++)
-    {
-        PointType &point_body  = feats_down_body->points[i];
-        PointType &point_world = feats_down_world->points[i];
+/** closest surface search and residual computation **/
+#ifdef MP_EN
+  // Respect OMP_NUM_THREADS when set so the runtime CPU budget (cgroup
+  // --cpus) can be honoured; the compile-time MP_PROC_NUM (8 on x86) would
+  // otherwise spawn 8 OMP threads and oversubscribe a 4-CPU container,
+  // starving the PGO node it shares cores with.
+  {
+    static const int omp_threads = []() {
+      const char * e = std::getenv("OMP_NUM_THREADS");
+      return (e && std::atoi(e) > 0) ? std::atoi(e) : MP_PROC_NUM;
+    }();
+    omp_set_num_threads(omp_threads);
+  }
+#pragma omp parallel for
+#endif
+  for (int i = 0; i < feats_down_size; i++) {
+    PointType & point_body = feats_down_body->points[i];
+    PointType & point_world = feats_down_world->points[i];
 
-        /* transform to world frame */
-        V3D p_body(point_body.x, point_body.y, point_body.z);
-        V3D p_global(s.rot * (s.offset_R_L_I*p_body + s.offset_T_L_I) + s.pos);
-        point_world.x = p_global(0);
-        point_world.y = p_global(1);
-        point_world.z = p_global(2);
-        point_world.intensity = point_body.intensity;
+    /* transform to world frame */
+    V3D p_body(point_body.x, point_body.y, point_body.z);
+    V3D p_global(s.rot * (s.offset_R_L_I * p_body + s.offset_T_L_I) + s.pos);
+    point_world.x = p_global(0);
+    point_world.y = p_global(1);
+    point_world.z = p_global(2);
+    point_world.intensity = point_body.intensity;
 
-        vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
+    vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
 
-        auto &points_near = Nearest_Points[i];
+    auto & points_near = Nearest_Points[i];
 
-        if (ekfom_data.converge)
-        {
-            /** Find the closest surfaces in the map **/
-            ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
-            point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
-        }
-
-        if (!point_selected_surf[i]) continue;
-
-        VF(4) pabcd;
-        point_selected_surf[i] = false;
-        if (esti_plane(pabcd, points_near, 0.1f))
-        {
-            float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
-            float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
-
-            if (s > 0.9)
-            {
-                point_selected_surf[i] = true;
-                normvec->points[i].x = pabcd(0);
-                normvec->points[i].y = pabcd(1);
-                normvec->points[i].z = pabcd(2);
-                normvec->points[i].intensity = pd2;
-                res_last[i] = abs(pd2);
-            }
-        }
-    }
-    
-    // Canopy/clutter TELEMETRY (does not gate any behavior): near-field effective
-    // ground fraction + height p95, both in the LiDAR/cloud BODY frame
-    // (drift-immune). MUST run BEFORE the ground recovery pass below so the
-    // statistic reflects the unmodified selection, not the recovery's own output.
-    // The debounced mode switch in the main loop is telemetry/diagnostics too.
-    // TEM consumes canopy_ground_frac as its anchor-quality signal (egf), so the
-    // statistic is also computed when tem_en.
-    if (canopy_detect_en || tem_en)
-    {
-        static std::vector<float> near_z;   // h_share_model is single-threaded here
-        near_z.clear();
-        int ground_cnt = 0;
-        for (int i = 0; i < feats_down_size; i++)
-        {
-            if (!point_selected_surf[i]) continue;
-            const PointType &pb = feats_down_body->points[i];
-            if (std::hypot(pb.x, pb.y) > canopy_near_range) continue;
-            near_z.push_back(pb.z);
-            if (std::fabs(normvec->points[i].z) >= canopy_normal_z_min &&
-                std::fabs(pb.z - canopy_ground_z) <= canopy_ground_halfband)
-                ++ground_cnt;
-        }
-        canopy_near_count = static_cast<int>(near_z.size());
-        if (canopy_near_count > 0)
-        {
-            canopy_ground_frac = static_cast<double>(ground_cnt) / canopy_near_count;
-            const size_t k = static_cast<size_t>(0.95 * (near_z.size() - 1));
-            std::nth_element(near_z.begin(), near_z.begin() + k, near_z.end());
-            canopy_zp95 = near_z[k];
-        }
+    if (ekfom_data.converge) {
+      /** Find the closest surfaces in the map **/
+      ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+      point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS        ? false
+                               : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false
+                                                                            : true;
     }
 
-    // P2 VoxelMap-lite anisotropic deweight (see the flag's block comment).
-    // Runs on the ACCEPTED rows BEFORE ground recovery, so recovery rows (added
-    // below with fabricated vertical normals — the load-bearing counterweight)
-    // are never rescaled. esti_plane rewrites the organic normals every iEKF
-    // iteration, so the scaling is applied fresh each call — no compounding.
-    // The grid is only written from the main thread between scans; this pass
-    // is read-only and safe under OMP.
-    vxl_tested = vxl_cut = vxl_vert_cnt = vxl_env_cnt = 0;
-    vxl_msum = vxl_sd_sum = vxl_vert_msum = vxl_env_habs = 0.0;
-    if (vxl_en)
-    {
-        // P3 envelope cache, per scan per row (the column's mature-cell set only
-        // moves with map growth, not with iEKF iterations; the residual itself
-        // is recomputed each iteration from the fresh world point).
-        static double env_time = -1.0;
-        static int8_t env_state[100000];  // 0 = not computed, 1 = served, 2 = none
-        static float  env_z[100000], env_sig[100000];
-        if (vxl_env_en && lidar_end_time != env_time)
-        {
-            env_time = lidar_end_time;
-            std::fill_n(env_state, feats_down_size, static_cast<int8_t>(0));
+    if (!point_selected_surf[i])
+      continue;
+
+    VF(4) pabcd;
+    point_selected_surf[i] = false;
+    if (esti_plane(pabcd, points_near, 0.1f)) {
+      float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
+      float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+
+      if (s > 0.9) {
+        point_selected_surf[i] = true;
+        normvec->points[i].x = pabcd(0);
+        normvec->points[i].y = pabcd(1);
+        normvec->points[i].z = pabcd(2);
+        normvec->points[i].intensity = pd2;
+        res_last[i] = abs(pd2);
+      }
+    }
+  }
+
+  // Canopy/clutter TELEMETRY (does not gate any behavior): near-field effective
+  // ground fraction + height p95, both in the LiDAR/cloud BODY frame
+  // (drift-immune). MUST run BEFORE the ground recovery pass below so the
+  // statistic reflects the unmodified selection, not the recovery's own output.
+  // The debounced mode switch in the main loop is telemetry/diagnostics too.
+  // TEM consumes canopy_ground_frac as its anchor-quality signal (egf), so the
+  // statistic is also computed when tem_en.
+  if (canopy_detect_en || tem_en) {
+    static std::vector<float> near_z;  // h_share_model is single-threaded here
+    near_z.clear();
+    int ground_cnt = 0;
+    for (int i = 0; i < feats_down_size; i++) {
+      if (!point_selected_surf[i])
+        continue;
+      const PointType & pb = feats_down_body->points[i];
+      if (std::hypot(pb.x, pb.y) > canopy_near_range)
+        continue;
+      near_z.push_back(pb.z);
+      if (std::fabs(normvec->points[i].z) >= canopy_normal_z_min &&
+          std::fabs(pb.z - canopy_ground_z) <= canopy_ground_halfband)
+        ++ground_cnt;
+    }
+    canopy_near_count = static_cast<int>(near_z.size());
+    if (canopy_near_count > 0) {
+      canopy_ground_frac = static_cast<double>(ground_cnt) / canopy_near_count;
+      const size_t k = static_cast<size_t>(0.95 * (near_z.size() - 1));
+      std::nth_element(near_z.begin(), near_z.begin() + k, near_z.end());
+      canopy_zp95 = near_z[k];
+    }
+  }
+
+  // P2 VoxelMap-lite anisotropic deweight (see the flag's block comment).
+  // Runs on the ACCEPTED rows BEFORE ground recovery, so recovery rows (added
+  // below with fabricated vertical normals — the load-bearing counterweight)
+  // are never rescaled. esti_plane rewrites the organic normals every iEKF
+  // iteration, so the scaling is applied fresh each call — no compounding.
+  // The grid is only written from the main thread between scans; this pass
+  // is read-only and safe under OMP.
+  vxl_tested = vxl_cut = vxl_vert_cnt = vxl_env_cnt = 0;
+  vxl_msum = vxl_sd_sum = vxl_vert_msum = vxl_env_habs = 0.0;
+  if (vxl_en) {
+    // P3 envelope cache, per scan per row (the column's mature-cell set only
+    // moves with map growth, not with iEKF iterations; the residual itself
+    // is recomputed each iteration from the fresh world point).
+    static double env_time = -1.0;
+    static int8_t env_state[100000];  // 0 = not computed, 1 = served, 2 = none
+    static float env_z[100000], env_sig[100000];
+    if (vxl_env_en && lidar_end_time != env_time) {
+      env_time = lidar_end_time;
+      std::fill_n(env_state, feats_down_size, static_cast<int8_t>(0));
+    }
+    int tested = 0, cut = 0, vert_cnt = 0, env_cnt = 0;
+    double msum = 0.0, sdsum = 0.0, vert_msum = 0.0, env_habs = 0.0;
+#ifdef MP_EN
+#pragma omp parallel for reduction(+ : tested, cut, vert_cnt, msum, sdsum, vert_msum, env_cnt, env_habs)
+#endif
+    for (int i = 0; i < feats_down_size; i++) {
+      if (!point_selected_surf[i])
+        continue;
+      const PointType & pb = feats_down_body->points[i];
+      if (std::hypot(pb.x, pb.y) > vxl_max_range)
+        continue;
+      const PointType & pw = feats_down_world->points[i];
+      const double nx = normvec->points[i].x, ny = normvec->points[i].y,
+                   nz = normvec->points[i].z;  // unit normal from esti_plane
+      // P3 residual-reference swap for ground-class rows (see the
+      // vxl_env_en block comment). Evidence is per point: its height
+      // against the column's lower envelope, not the (possibly bent)
+      // fitted normal — but strong lateral carriers are never swapped.
+      if (vxl_env_en && std::fabs(nz) >= vxl_env_nz_min) {
+        if (env_state[i] == 0) {
+          // Lowest mature cell in this column, from one slab above the
+          // point down to 2 m below (kVxlEnvScanDown slabs).
+          constexpr int kVxlEnvScanDown = 8;
+          const int64_t kx = static_cast<int64_t>(std::floor(pw.x / vxl_size_xy));
+          const int64_t ky = static_cast<int64_t>(std::floor(pw.y / vxl_size_xy));
+          const int64_t kz0 = static_cast<int64_t>(std::floor(pw.z / vxl_size_z));
+          env_state[i] = 2;
+          for (int64_t kz = kz0 - kVxlEnvScanDown; kz <= kz0 + 1; kz++) {
+            const auto ite = vxl_grid.find(vxlKeyIdx(kx, ky, kz));
+            if (ite == vxl_grid.end() || ite->second.n < vxl_env_min_pts)
+              continue;
+            env_state[i] = 1;
+            env_z[i] = ite->second.zq;
+            env_sig[i] = std::max(std::sqrt(std::max(ite->second.m2[5] / ite->second.n, 0.0f)), 0.05f);
+            break;  // lowest first: kz ascends from the bottom
+          }
         }
-        int tested = 0, cut = 0, vert_cnt = 0, env_cnt = 0;
-        double msum = 0.0, sdsum = 0.0, vert_msum = 0.0, env_habs = 0.0;
-        #ifdef MP_EN
-            #pragma omp parallel for reduction(+:tested,cut,vert_cnt,msum,sdsum,vert_msum,env_cnt,env_habs)
-        #endif
-        for (int i = 0; i < feats_down_size; i++)
-        {
-            if (!point_selected_surf[i]) continue;
-            const PointType &pb = feats_down_body->points[i];
-            if (std::hypot(pb.x, pb.y) > vxl_max_range) continue;
-            const PointType &pw = feats_down_world->points[i];
-            const double nx = normvec->points[i].x, ny = normvec->points[i].y,
-                         nz = normvec->points[i].z;  // unit normal from esti_plane
-            // P3 residual-reference swap for ground-class rows (see the
-            // vxl_env_en block comment). Evidence is per point: its height
-            // against the column's lower envelope, not the (possibly bent)
-            // fitted normal — but strong lateral carriers are never swapped.
-            if (vxl_env_en && std::fabs(nz) >= vxl_env_nz_min)
-            {
-                if (env_state[i] == 0)
-                {
-                    // Lowest mature cell in this column, from one slab above the
-                    // point down to 2 m below (kVxlEnvScanDown slabs).
-                    constexpr int kVxlEnvScanDown = 8;
-                    const int64_t kx = static_cast<int64_t>(std::floor(pw.x / vxl_size_xy));
-                    const int64_t ky = static_cast<int64_t>(std::floor(pw.y / vxl_size_xy));
-                    const int64_t kz0 = static_cast<int64_t>(std::floor(pw.z / vxl_size_z));
-                    env_state[i] = 2;
-                    for (int64_t kz = kz0 - kVxlEnvScanDown; kz <= kz0 + 1; kz++)
-                    {
-                        const auto ite = vxl_grid.find(vxlKeyIdx(kx, ky, kz));
-                        if (ite == vxl_grid.end() || ite->second.n < vxl_env_min_pts) continue;
-                        env_state[i] = 1;
-                        env_z[i] = ite->second.zq;
-                        env_sig[i] = std::max(
-                            std::sqrt(std::max(ite->second.m2[5] / ite->second.n, 0.0f)), 0.05f);
-                        break;  // lowest first: kz ascends from the bottom
-                    }
-                }
-                if (env_state[i] == 1 &&
-                    std::fabs(pw.z - env_z[i]) <= vxl_env_band)
-                {
-                    // Same row shape as a recovery row: forced vertical normal,
-                    // envelope residual, trust-region clamp (never hard-gated),
-                    // honest weight from the envelope cell's own thickness.
-                    const double sig = env_sig[i];
-                    const double pd2 = std::clamp(static_cast<double>(pw.z - env_z[i]),
-                                                  -3.0 * sig, 3.0 * sig);
-                    const double w = vxl_sigma_r / std::sqrt(vxl_sigma_r * vxl_sigma_r + sig * sig);
-                    normvec->points[i].x = 0.0f;
-                    normvec->points[i].y = 0.0f;
-                    normvec->points[i].z = static_cast<float>(w);
-                    normvec->points[i].intensity = static_cast<float>(w * pd2);
-                    res_last[i] = std::fabs(pd2);
-                    ++env_cnt;
-                    env_habs += std::fabs(pd2);
-                    continue;  // re-referenced: the P2 plane deweight no longer applies
-                }
-            }
-            const auto it = vxl_grid.find(vxlKey(pw.x, pw.y, pw.z));
-            if (it == vxl_grid.end() || it->second.n < vxl_min_pts) continue;
-            const VxlCell &c = it->second;
-            const double inv_n = 1.0 / static_cast<double>(c.n);
-            // sigma_dir^2 = n^T Cov n from the upper-triangle comoment sums
-            const double sd2 = std::max(0.0,
-                (nx * nx * c.m2[0] + ny * ny * c.m2[3] + nz * nz * c.m2[5] +
-                 2.0 * (nx * ny * c.m2[1] + nx * nz * c.m2[2] + ny * nz * c.m2[4])) * inv_n);
-            const double m = std::clamp(
-                vxl_sigma_r / std::sqrt(vxl_sigma_r * vxl_sigma_r + sd2), vxl_min_weight, 1.0);
-            ++tested;
-            msum += m;
-            sdsum += std::sqrt(sd2);
-            if (std::fabs(nz) > 0.8) { ++vert_cnt; vert_msum += m; }
-            if (m < 0.999)
-            {
-                ++cut;
-                normvec->points[i].x *= static_cast<float>(m);
-                normvec->points[i].y *= static_cast<float>(m);
-                normvec->points[i].z *= static_cast<float>(m);
-                normvec->points[i].intensity *= static_cast<float>(m);
-            }
+        if (env_state[i] == 1 && std::fabs(pw.z - env_z[i]) <= vxl_env_band) {
+          // Same row shape as a recovery row: forced vertical normal,
+          // envelope residual, trust-region clamp (never hard-gated),
+          // honest weight from the envelope cell's own thickness.
+          const double sig = env_sig[i];
+          const double pd2 = std::clamp(static_cast<double>(pw.z - env_z[i]), -3.0 * sig, 3.0 * sig);
+          const double w = vxl_sigma_r / std::sqrt(vxl_sigma_r * vxl_sigma_r + sig * sig);
+          normvec->points[i].x = 0.0f;
+          normvec->points[i].y = 0.0f;
+          normvec->points[i].z = static_cast<float>(w);
+          normvec->points[i].intensity = static_cast<float>(w * pd2);
+          res_last[i] = std::fabs(pd2);
+          ++env_cnt;
+          env_habs += std::fabs(pd2);
+          continue;  // re-referenced: the P2 plane deweight no longer applies
         }
-        vxl_tested = tested;
-        vxl_cut = cut;
-        vxl_msum = msum;
-        vxl_sd_sum = sdsum;
-        vxl_vert_cnt = vert_cnt;
-        vxl_vert_msum = vert_msum;
-        vxl_env_cnt = env_cnt;
-        vxl_env_habs = env_habs;
+      }
+      const auto it = vxl_grid.find(vxlKey(pw.x, pw.y, pw.z));
+      if (it == vxl_grid.end() || it->second.n < vxl_min_pts)
+        continue;
+      const VxlCell & c = it->second;
+      const double inv_n = 1.0 / static_cast<double>(c.n);
+      // sigma_dir^2 = n^T Cov n from the upper-triangle comoment sums
+      const double sd2 = std::max(0.0,
+                                  (nx * nx * c.m2[0] + ny * ny * c.m2[3] + nz * nz * c.m2[5] +
+                                   2.0 * (nx * ny * c.m2[1] + nx * nz * c.m2[2] + ny * nz * c.m2[4])) *
+                                    inv_n);
+      const double m = std::clamp(vxl_sigma_r / std::sqrt(vxl_sigma_r * vxl_sigma_r + sd2), vxl_min_weight, 1.0);
+      ++tested;
+      msum += m;
+      sdsum += std::sqrt(sd2);
+      if (std::fabs(nz) > 0.8) {
+        ++vert_cnt;
+        vert_msum += m;
+      }
+      if (m < 0.999) {
+        ++cut;
+        normvec->points[i].x *= static_cast<float>(m);
+        normvec->points[i].y *= static_cast<float>(m);
+        normvec->points[i].z *= static_cast<float>(m);
+        normvec->points[i].intensity *= static_cast<float>(m);
+      }
+    }
+    vxl_tested = tested;
+    vxl_cut = cut;
+    vxl_msum = msum;
+    vxl_sd_sum = sdsum;
+    vxl_vert_cnt = vert_cnt;
+    vxl_vert_msum = vert_msum;
+    vxl_env_cnt = env_cnt;
+    vxl_env_habs = env_habs;
+  }
+
+  /*** Ground recovery (selection-layer repair, 2026-07-06 forensics): ANY
+   *   ground-hugging clutter (grass, crops, debris — content-agnostic) pollutes
+   *   the 5-NN esti_plane + s>0.9 gates: true-ground returns get REJECTED while
+   *   clutter micro-patches get accepted, depleting the vertical-normal share of
+   *   the effective set even though the raw scan-to-scan Z valley stays sharp
+   *   (measured: raw ground 62-70 % → ~10 % effective on the giant 0702 bag).
+   *   Repair at the same layer, SELF-GATED (no scene classifier): (1) fit robust
+   *   ground planes HYBRID global+sector in the body frame (shrinking-band LS —
+   *   anything above the dominant surface is trimmed regardless of what it is).
+   *   The whole-scan GLOBAL fit pools every candidate: maximum support, hardest
+   *   to bias (in deep clutter a per-sector fit can latch onto a locally
+   *   consistent clutter shelf that the pooled fit rejects — measured: sector-
+   *   only was ~2x weaker than whole-scan in the 0702 canopy). Per-SECTOR fits
+   *   refine it for crowned/rutted/partially-occupied terrain, but a sector
+   *   plane is used only where it AGREES with the global plane (normal dot +
+   *   height at the sector centroid); a sector that fails its own gates or
+   *   disagrees falls back to the global plane, and without a valid global fit
+   *   the surviving sector fits stand alone. The height-sanity gate (plane at
+   *   the known sensor mount height) guarantees the dominant surface IS what
+   *   the vehicle stands on, without scene semantics.
+   *   (2) re-admit rejected near-field returns lying on their sector's plane,
+   *   with an imposed vertical world normal and the residual measured against
+   *   the LOWER ENVELOPE of their map neighbors (mean of the two lowest z —
+   *   robust to clutter fuzz in the map). Rows flow into the standard
+   *   point-to-plane H. Only points the normal path rejected are touched.
+   *   NOTE: distinct from the removed A'-3 boost, which amplified already-
+   *   matched rows (NEGATIVE result); this restores SELECTION of discarded
+   *   true ground. ***/
+  canopy_ground_recovered = 0;
+  tem_rows = tem_ext_rows = tem_env_rows = 0;
+  if (ground_recover_en) {
+    // Per-sector ground planes, cached per scan (body cloud is fixed across
+    // iEKF iterations). n·p + d = 0 with unit n, n_z > 0.
+    constexpr int kGndSectors = 8;
+    static double fit_time = -1.0;
+    static bool sec_ok[kGndSectors];
+    static Eigen::Vector3d sec_n[kGndSectors];
+    static double sec_d[kGndSectors];
+    if (lidar_end_time != fit_time) {
+      fit_time = lidar_end_time;
+      static std::vector<Eigen::Vector3d> cand[kGndSectors];
+      for (int s = 0; s < kGndSectors; s++) {
+        cand[s].clear();
+        sec_ok[s] = false;
+      }
+      for (int i = 0; i < feats_down_size; i++) {
+        const PointType & pb = feats_down_body->points[i];
+        if (std::hypot(pb.x, pb.y) > canopy_near_range)
+          continue;
+        if (std::fabs(pb.z - canopy_ground_z) > canopy_ground_halfband)
+          continue;
+        const int s =
+          std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
+        cand[s].emplace_back(pb.x, pb.y, pb.z);
+      }
+      // Shrinking-band iterative LS over one or more candidate sets.
+      // Gates: enough support, near-horizontal (terrain + vehicle tilt stay
+      // within a few degrees), sane height under the sensor. The height gate
+      // is what makes always-on safe: the accepted surface must sit where
+      // the vehicle's own ground sits.
+      auto fit_ground = [](const std::vector<Eigen::Vector3d> * sets,
+                           int nsets,
+                           int min_in,
+                           Eigen::Vector3d & n_out,
+                           double & d_out) -> bool {
+        static std::vector<float> zs;
+        zs.clear();
+        for (int k = 0; k < nsets; k++)
+          for (const auto & p : sets[k])
+            zs.push_back(static_cast<float>(p.z()));
+        if (static_cast<int>(zs.size()) < min_in)
+          return false;
+        // Init: horizontal plane at the pooled median candidate height.
+        std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
+        Eigen::Vector3d n(0, 0, 1);
+        double d = -static_cast<double>(zs[zs.size() / 2]);
+        int n_in = 0;
+        const double bands[3] = {0.4, 0.25, 0.15};
+        for (double band : bands) {
+          Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+          Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+          n_in = 0;
+          for (int k = 0; k < nsets; k++)
+            for (const auto & p : sets[k])
+              if (std::fabs(n.dot(p) + d) <= band) {
+                mean += p;
+                ++n_in;
+              }
+          if (n_in < min_in)
+            break;
+          mean /= n_in;
+          for (int k = 0; k < nsets; k++)
+            for (const auto & p : sets[k])
+              if (std::fabs(n.dot(p) + d) <= band) {
+                const Eigen::Vector3d q = p - mean;
+                cov.noalias() += q * q.transpose();
+              }
+          Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
+          n = es.eigenvectors().col(0);
+          if (n.z() < 0)
+            n = -n;
+          d = -n.dot(mean);
+        }
+        n_out = n;
+        d_out = d;
+        return n_in >= min_in && n.z() >= 0.95 &&
+               std::fabs(-d / std::max(n.z(), 1e-6) - canopy_ground_z) <= canopy_ground_halfband;
+      };
+      // Global whole-scan fit: pooled support is the hardest to bias — the
+      // prior every sector must agree with, and the fallback plane.
+      Eigen::Vector3d gn(0, 0, 1);
+      double gd = 0.0;
+      const bool glob_ok = fit_ground(cand, kGndSectors, ground_recover_min_inliers, gn, gd);
+      for (int s = 0; s < kGndSectors; s++) {
+        Eigen::Vector3d n;
+        double d;
+        bool own_ok = fit_ground(&cand[s], 1, ground_recover_min_inliers, n, d);
+        if (own_ok && glob_ok) {
+          // A sector plane may only REFINE the global one: normals must
+          // agree and the plane heights at the sector centroid must match
+          // within ground_recover_sector_tol; otherwise the sector fit
+          // latched onto something the pooled fit rejected.
+          Eigen::Vector3d c = Eigen::Vector3d::Zero();
+          for (const auto & p : cand[s])
+            c += p;
+          c /= static_cast<double>(cand[s].size());
+          const double z_sec = -(d + n.x() * c.x() + n.y() * c.y()) / std::max(n.z(), 1e-6);
+          const double z_glob = -(gd + gn.x() * c.x() + gn.y() * c.y()) / std::max(gn.z(), 1e-6);
+          constexpr double kSectorNormalDotMin = 0.985;  // ~10 deg relative tilt
+          own_ok = n.dot(gn) >= kSectorNormalDotMin && std::fabs(z_sec - z_glob) <= ground_recover_sector_tol;
+        }
+        if (own_ok) {
+          sec_ok[s] = true;
+          sec_n[s] = n;
+          sec_d[s] = d;
+        } else if (glob_ok) {
+          sec_ok[s] = true;
+          sec_n[s] = gn;
+          sec_d[s] = gd;
+        }
+      }
+      // TEM observation samples: this scan's fit-band inliers (raw geometry
+      // only — recovered rows are downstream of TEM and must never feed it).
+      // Consumed once per scan in the main loop with the CONVERGED pose.
+      if (tem_en) {
+        tem_samples.clear();
+        size_t total = 0;
+        for (int s = 0; s < kGndSectors; s++)
+          if (sec_ok[s])
+            total += cand[s].size();
+        const size_t stride = std::max<size_t>(1, total / 2000);
+        size_t idx = 0;
+        for (int s = 0; s < kGndSectors; s++) {
+          if (!sec_ok[s])
+            continue;
+          for (const auto & p : cand[s]) {
+            if (std::fabs(sec_n[s].dot(p) + sec_d[s]) > ground_recover_scan_band)
+              continue;
+            if (idx++ % stride == 0)
+              tem_samples.push_back(p);
+          }
+        }
+      }
+    }
+    // Clutter deweight pass (see the flag's block comment). Runs on the
+    // ACCEPTED rows before recovery; the expensive k=15 thickness is cached
+    // per scan (band membership is body-frame = iteration-invariant, the
+    // organic normals are rewritten by esti_plane every iteration so the
+    // scaling below is applied fresh each call — no compounding).
+    if (clutter_deweight_en) {
+      // Band lower edge 0.5 m is a HARD boundary: the 0.15-0.5 m grass
+      // layer just above the fitted plane carries Z bias BUT is also the
+      // bulk of the effective Z constraint in deep clutter (half of it is
+      // true ground in mixed grass) — lowering the edge to 0.25 m
+      // re-opened the raw pathology worse than baseline (FE 2D 796 m,
+      // Z -105, /odom breached 8.8 m). Do not lower it again.
+      constexpr double kClutBandLo = 0.5, kClutBandHi = 3.0;  // m above the sector plane
+      constexpr int kClutK = 15;                              // measured: 5 is blind, 15 separates 12x
+      constexpr int kClutMinNeighbors = 12;                   // sparse map neighborhood = no verdict
+      constexpr double kClutNzLo = 0.3, kClutNzHi = 0.8;      // |n_z| taper (lateral carriers spared)
+      static double clut_time = -1.0;
+      static float clut_thick[100000];
+      if (lidar_end_time != clut_time) {
+        clut_time = lidar_end_time;
+        std::fill_n(clut_thick, feats_down_size, -1.0f);
+      }
+      int tested = 0, cut = 0;
+      double msum = 0.0;
+#ifdef MP_EN
+#pragma omp parallel for reduction(+ : tested, cut, msum)
+#endif
+      for (int i = 0; i < feats_down_size; i++) {
+        if (!point_selected_surf[i])
+          continue;
+        const PointType & pb = feats_down_body->points[i];
+        if (std::hypot(pb.x, pb.y) > canopy_near_range)
+          continue;
+        const int s =
+          std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
+        if (!sec_ok[s])
+          continue;
+        const double h = sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s];
+        if (h < kClutBandLo || h > kClutBandHi)
+          continue;
+        ++tested;
+        if (clut_thick[i] < 0.0f) {
+          PointVector nb;
+          std::vector<float> sq;
+          ikdtree.Nearest_Search(feats_down_world->points[i], kClutK, nb, sq);
+          if (static_cast<int>(nb.size()) < kClutMinNeighbors) {
+            clut_thick[i] = 0.0f;  // no verdict — leave the row alone
+          } else {
+            Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+            for (const auto & p : nb)
+              mean += Eigen::Vector3d(p.x, p.y, p.z);
+            mean /= static_cast<double>(nb.size());
+            Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+            for (const auto & p : nb) {
+              const Eigen::Vector3d q = Eigen::Vector3d(p.x, p.y, p.z) - mean;
+              cov.noalias() += q * q.transpose();
+            }
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov / static_cast<double>(nb.size()));
+            clut_thick[i] = static_cast<float>(std::sqrt(std::max(es.eigenvalues()(0), 0.0)));
+          }
+        }
+        // f: planar at map scale -> 1, fuzzy -> 0 (linear ramp).
+        const double f =
+          std::clamp((clutter_th_hi - clut_thick[i]) / std::max(clutter_th_hi - clutter_th_lo, 1e-6), 0.0, 1.0);
+        // g: only vertical-normal rows (Z-bias carriers) take the cut.
+        const double nz = std::fabs(normvec->points[i].z);
+        const double g = std::clamp((nz - kClutNzLo) / (kClutNzHi - kClutNzLo), 0.0, 1.0);
+        const double m = std::max(1.0 - (1.0 - f) * g, clutter_min_weight);
+        msum += m;
+        if (m < 0.999) {
+          ++cut;
+          normvec->points[i].x *= static_cast<float>(m);
+          normvec->points[i].y *= static_cast<float>(m);
+          normvec->points[i].z *= static_cast<float>(m);
+          normvec->points[i].intensity *= static_cast<float>(m);
+        }
+      }
+      clut_tested = tested;
+      clut_cut = cut;
+      clut_msum = msum;
+    }
+    for (int i = 0; i < feats_down_size; i++) {
+      if (point_selected_surf[i])
+        continue;
+      if (canopy_ground_recovered >= ground_recover_max_rows)
+        break;
+      const PointType & pb = feats_down_body->points[i];
+      if (std::hypot(pb.x, pb.y) > canopy_near_range)
+        continue;
+      const int s =
+        std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
+      if (!sec_ok[s])
+        continue;
+      // Scan side: on this sector's ground plane (clutter trimmed by the fit band).
+      if (std::fabs(sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s]) > ground_recover_scan_band)
+        continue;
+      auto & pn = Nearest_Points[i];
+      if (static_cast<int>(pn.size()) < NUM_MATCH_POINTS)
+        continue;
+      const PointType & pw = feats_down_world->points[i];
+      // Map neighborhood must actually be nearby (same criterion class as
+      // the normal path's 5th-neighbor sqdist gate).
+      const double dx0 = pn[0].x - pw.x, dy0 = pn[0].y - pw.y, dz0 = pn[0].z - pw.z;
+      if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 > 5.0)
+        continue;
+      // Residual reference, best available first: TEM terrain memory
+      // (drift-independent — learned while healthy, frozen while not),
+      // weighted down by the interpolated cell std so slopes / disagreeing
+      // observations pull weakly; else the map-neighbor lower envelope
+      // (mean of the two lowest z — robust to clutter fuzz, but it DRIFTS
+      // with the vehicle: ratchet-slowing only).
+      // Reference split by JOB, not by availability. 3/4 of the rows keep
+      // the map lower envelope at weight 1 — local Z observability
+      // restoration, the validated hybrid behavior, untouched. Every 4th
+      // row is the ABSOLUTE channel: residual against the TEM (direct
+      // where served, slope-envelope extrapolation otherwise) with a
+      // trust-region clamp and a sigma-collapsed weight. The absolute
+      // channel is NEVER gated by max_residual — a multi-metre secular
+      // drift is exactly what it exists to fight (measured failure: hard-
+      // gating TEM rows at 1 m gutted the whole recovery channel once the
+      // drift passed 1 m, and the raw pathology returned worse, -64.6 m).
+      constexpr double kTemClampSigma = 3.0;
+      constexpr double kTemStdFloor = 0.1;  // weight floor: never trust a cell below 10 cm
+      // AUTHORITY IS PINNED AT THE SAFE-NEUTRAL LEVEL (~0.07 m/s counter-
+      // drift) — the full dose-response of pushing harder is measured and
+      // closed. (a) A 2.5 m clamp floor + sigma0 0.5 reaches parity with
+      // the worst dive (~0.5 m/s) and does cut the Z ratchet (-55 -> -43),
+      // but the point-plane Jacobian's attitude columns turn the pull into
+      // torque and the error reroutes into XY in attitude-degenerate
+      // clutter (FE 2D 150 -> 327 m, alignment bent 8 deg). (b) Zeroing
+      // the attitude/extrinsic columns (translation-only rows) makes the
+      // filter's measurement model inconsistent and Z diverges
+      // exponentially (measured -12 km; healthy scenes also damaged).
+      // The B3 lesson holds at every level tried: while degraded clutter
+      // still pollutes the constraint set, absolute-Z injection strong
+      // enough to matter always finds another channel to blow. Do NOT
+      // raise the authority again — fix the constraint set instead.
+      double pd2, w_row = 1.0;
+      int ref_kind = 2;  // 0 = TEM direct, 1 = TEM extrapolated, 2 = envelope
+      double z_tem, std_tem;
+      const bool abs_slot = tem_en && (canopy_ground_recovered % 4) == 3;
+      if (abs_slot && temLookup(pw.x, pw.y, z_tem, std_tem)) {
+        const double sig = std::max(std_tem, kTemStdFloor);
+        const double lim = kTemClampSigma * sig;
+        pd2 = std::clamp(pw.z - z_tem, -lim, lim);
+        w_row = tem_sigma0 / (tem_sigma0 + sig);
+        ref_kind = 0;
+      } else if (abs_slot && tem_ext_ok) {
+        const double sig = std::max(tem_ext_sigma, kTemStdFloor);
+        const double lim = kTemClampSigma * sig;
+        pd2 = std::clamp(pw.z - tem_ext_z, -lim, lim);
+        w_row = tem_sigma0 / (tem_sigma0 + sig);
+        ref_kind = 1;
+      } else {
+        float z1 = pn[0].z, z2 = std::numeric_limits<float>::max();
+        for (size_t k = 1; k < pn.size(); k++) {
+          const float z = pn[k].z;
+          if (z < z1) {
+            z2 = z1;
+            z1 = z;
+          } else if (z < z2) {
+            z2 = z;
+          }
+        }
+        const double z_ground_map = 0.5 * (z1 + (z2 == std::numeric_limits<float>::max() ? z1 : z2));
+        pd2 = pw.z - z_ground_map;
+        if (std::fabs(pd2) > ground_recover_max_residual)
+          continue;
+      }
+      point_selected_surf[i] = true;
+      normvec->points[i].x = 0.0f;
+      normvec->points[i].y = 0.0f;
+      // Row weight rides on the normal + residual scaling (information
+      // scales as w_row^2 in the point-to-plane H) — same mechanism as an
+      // ordinary row, no new plumbing.
+      normvec->points[i].z = static_cast<float>(w_row);
+      normvec->points[i].intensity = static_cast<float>(w_row * pd2);
+      res_last[i] = std::fabs(pd2);
+      ++(ref_kind == 0 ? tem_rows : ref_kind == 1 ? tem_ext_rows : tem_env_rows);
+      ++canopy_ground_recovered;
+    }
+  }
+
+  effct_feat_num = 0;
+
+  for (int i = 0; i < feats_down_size; i++) {
+    if (point_selected_surf[i]) {
+      laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
+      corr_normvect->points[effct_feat_num] = normvec->points[i];
+      total_residual += res_last[i];
+      effct_feat_num++;
+    }
+  }
+
+  // Position-observability metric (degeneracy detector): eigenvalues of the
+  // normal information matrix M = sum(n n^T) over effective points. The min
+  // eigenvalue is the weakest-constrained position direction; if its
+  // eigenvector points along Z, the Z update is ill-conditioned.
+  {
+    Eigen::Matrix3d M = Eigen::Matrix3d::Zero();
+    for (int i = 0; i < effct_feat_num; i++) {
+      const PointType & np = corr_normvect->points[i];
+      Eigen::Vector3d n(np.x, np.y, np.z);
+      M.noalias() += n * n.transpose();
+    }
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
+    pos_obs_eig_min = es.eigenvalues()(0);
+    pos_obs_eig_max = es.eigenvalues()(2);
+    pos_obs_z_weak = std::abs(es.eigenvectors()(2, 0));  // |Z| of weakest eigenvector
+  }
+
+  if (effct_feat_num < 1) {
+    ekfom_data.valid = false;
+    std::cerr << "No Effective Points!" << std::endl;
+    return;
+  }
+
+  res_mean_last = total_residual / effct_feat_num;
+  match_time += omp_get_wtime() - match_start;
+  double solve_start_ = omp_get_wtime();
+
+  /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
+  ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12);  // 23
+  ekfom_data.h.resize(effct_feat_num);
+
+  for (int i = 0; i < effct_feat_num; i++) {
+    const PointType & laser_p = laserCloudOri->points[i];
+    V3D point_this_be(laser_p.x, laser_p.y, laser_p.z);
+    M3D point_be_crossmat;
+    point_be_crossmat << SKEW_SYM_MATRX(point_this_be);
+    V3D point_this = s.offset_R_L_I * point_this_be + s.offset_T_L_I;
+    M3D point_crossmat;
+    point_crossmat << SKEW_SYM_MATRX(point_this);
+
+    /*** get the normal vector of closest surface/corner ***/
+    const PointType & norm_p = corr_normvect->points[i];
+    V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
+
+    /*** calculate the Measuremnt Jacobian matrix H ***/
+    V3D C(s.rot.conjugate() * norm_vec);
+    V3D A(point_crossmat * C);
+    if (extrinsic_est_en) {
+      V3D B(point_be_crossmat * s.offset_R_L_I.conjugate() * C);  // s.rot.conjugate()*norm_vec);
+      ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B),
+        VEC_FROM_ARRAY(C);
+    } else {
+      ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0;
     }
 
-    /*** Ground recovery (selection-layer repair, 2026-07-06 forensics): ANY
-     *   ground-hugging clutter (grass, crops, debris — content-agnostic) pollutes
-     *   the 5-NN esti_plane + s>0.9 gates: true-ground returns get REJECTED while
-     *   clutter micro-patches get accepted, depleting the vertical-normal share of
-     *   the effective set even though the raw scan-to-scan Z valley stays sharp
-     *   (measured: raw ground 62-70 % → ~10 % effective on the giant 0702 bag).
-     *   Repair at the same layer, SELF-GATED (no scene classifier): (1) fit robust
-     *   ground planes HYBRID global+sector in the body frame (shrinking-band LS —
-     *   anything above the dominant surface is trimmed regardless of what it is).
-     *   The whole-scan GLOBAL fit pools every candidate: maximum support, hardest
-     *   to bias (in deep clutter a per-sector fit can latch onto a locally
-     *   consistent clutter shelf that the pooled fit rejects — measured: sector-
-     *   only was ~2x weaker than whole-scan in the 0702 canopy). Per-SECTOR fits
-     *   refine it for crowned/rutted/partially-occupied terrain, but a sector
-     *   plane is used only where it AGREES with the global plane (normal dot +
-     *   height at the sector centroid); a sector that fails its own gates or
-     *   disagrees falls back to the global plane, and without a valid global fit
-     *   the surviving sector fits stand alone. The height-sanity gate (plane at
-     *   the known sensor mount height) guarantees the dominant surface IS what
-     *   the vehicle stands on, without scene semantics.
-     *   (2) re-admit rejected near-field returns lying on their sector's plane,
-     *   with an imposed vertical world normal and the residual measured against
-     *   the LOWER ENVELOPE of their map neighbors (mean of the two lowest z —
-     *   robust to clutter fuzz in the map). Rows flow into the standard
-     *   point-to-plane H. Only points the normal path rejected are touched.
-     *   NOTE: distinct from the removed A'-3 boost, which amplified already-
-     *   matched rows (NEGATIVE result); this restores SELECTION of discarded
-     *   true ground. ***/
-    canopy_ground_recovered = 0;
-    tem_rows = tem_ext_rows = tem_env_rows = 0;
-    if (ground_recover_en)
-    {
-        // Per-sector ground planes, cached per scan (body cloud is fixed across
-        // iEKF iterations). n·p + d = 0 with unit n, n_z > 0.
-        constexpr int kGndSectors = 8;
-        static double fit_time = -1.0;
-        static bool   sec_ok[kGndSectors];
-        static Eigen::Vector3d sec_n[kGndSectors];
-        static double sec_d[kGndSectors];
-        if (lidar_end_time != fit_time)
-        {
-            fit_time = lidar_end_time;
-            static std::vector<Eigen::Vector3d> cand[kGndSectors];
-            for (int s = 0; s < kGndSectors; s++) { cand[s].clear(); sec_ok[s] = false; }
-            for (int i = 0; i < feats_down_size; i++)
-            {
-                const PointType &pb = feats_down_body->points[i];
-                if (std::hypot(pb.x, pb.y) > canopy_near_range) continue;
-                if (std::fabs(pb.z - canopy_ground_z) > canopy_ground_halfband) continue;
-                const int s = std::min(kGndSectors - 1,
-                    static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
-                cand[s].emplace_back(pb.x, pb.y, pb.z);
-            }
-            // Shrinking-band iterative LS over one or more candidate sets.
-            // Gates: enough support, near-horizontal (terrain + vehicle tilt stay
-            // within a few degrees), sane height under the sensor. The height gate
-            // is what makes always-on safe: the accepted surface must sit where
-            // the vehicle's own ground sits.
-            auto fit_ground = [](const std::vector<Eigen::Vector3d> *sets, int nsets, int min_in,
-                                 Eigen::Vector3d &n_out, double &d_out) -> bool {
-                static std::vector<float> zs;
-                zs.clear();
-                for (int k = 0; k < nsets; k++)
-                    for (const auto &p : sets[k]) zs.push_back(static_cast<float>(p.z()));
-                if (static_cast<int>(zs.size()) < min_in) return false;
-                // Init: horizontal plane at the pooled median candidate height.
-                std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
-                Eigen::Vector3d n(0, 0, 1);
-                double d = -static_cast<double>(zs[zs.size() / 2]);
-                int n_in = 0;
-                const double bands[3] = {0.4, 0.25, 0.15};
-                for (double band : bands)
-                {
-                    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-                    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-                    n_in = 0;
-                    for (int k = 0; k < nsets; k++)
-                        for (const auto &p : sets[k])
-                            if (std::fabs(n.dot(p) + d) <= band) { mean += p; ++n_in; }
-                    if (n_in < min_in) break;
-                    mean /= n_in;
-                    for (int k = 0; k < nsets; k++)
-                        for (const auto &p : sets[k])
-                            if (std::fabs(n.dot(p) + d) <= band)
-                            {
-                                const Eigen::Vector3d q = p - mean;
-                                cov.noalias() += q * q.transpose();
-                            }
-                    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
-                    n = es.eigenvectors().col(0);
-                    if (n.z() < 0) n = -n;
-                    d = -n.dot(mean);
-                }
-                n_out = n;
-                d_out = d;
-                return n_in >= min_in && n.z() >= 0.95 &&
-                       std::fabs(-d / std::max(n.z(), 1e-6) - canopy_ground_z) <= canopy_ground_halfband;
-            };
-            // Global whole-scan fit: pooled support is the hardest to bias — the
-            // prior every sector must agree with, and the fallback plane.
-            Eigen::Vector3d gn(0, 0, 1);
-            double gd = 0.0;
-            const bool glob_ok = fit_ground(cand, kGndSectors, ground_recover_min_inliers, gn, gd);
-            for (int s = 0; s < kGndSectors; s++)
-            {
-                Eigen::Vector3d n;
-                double d;
-                bool own_ok = fit_ground(&cand[s], 1, ground_recover_min_inliers, n, d);
-                if (own_ok && glob_ok)
-                {
-                    // A sector plane may only REFINE the global one: normals must
-                    // agree and the plane heights at the sector centroid must match
-                    // within ground_recover_sector_tol; otherwise the sector fit
-                    // latched onto something the pooled fit rejected.
-                    Eigen::Vector3d c = Eigen::Vector3d::Zero();
-                    for (const auto &p : cand[s]) c += p;
-                    c /= static_cast<double>(cand[s].size());
-                    const double z_sec = -(d + n.x() * c.x() + n.y() * c.y()) / std::max(n.z(), 1e-6);
-                    const double z_glob = -(gd + gn.x() * c.x() + gn.y() * c.y()) / std::max(gn.z(), 1e-6);
-                    constexpr double kSectorNormalDotMin = 0.985;  // ~10 deg relative tilt
-                    own_ok = n.dot(gn) >= kSectorNormalDotMin &&
-                             std::fabs(z_sec - z_glob) <= ground_recover_sector_tol;
-                }
-                if (own_ok)      { sec_ok[s] = true; sec_n[s] = n;  sec_d[s] = d;  }
-                else if (glob_ok) { sec_ok[s] = true; sec_n[s] = gn; sec_d[s] = gd; }
-            }
-            // TEM observation samples: this scan's fit-band inliers (raw geometry
-            // only — recovered rows are downstream of TEM and must never feed it).
-            // Consumed once per scan in the main loop with the CONVERGED pose.
-            if (tem_en)
-            {
-                tem_samples.clear();
-                size_t total = 0;
-                for (int s = 0; s < kGndSectors; s++)
-                    if (sec_ok[s]) total += cand[s].size();
-                const size_t stride = std::max<size_t>(1, total / 2000);
-                size_t idx = 0;
-                for (int s = 0; s < kGndSectors; s++)
-                {
-                    if (!sec_ok[s]) continue;
-                    for (const auto &p : cand[s])
-                    {
-                        if (std::fabs(sec_n[s].dot(p) + sec_d[s]) > ground_recover_scan_band) continue;
-                        if (idx++ % stride == 0) tem_samples.push_back(p);
-                    }
-                }
-            }
-        }
-        // Clutter deweight pass (see the flag's block comment). Runs on the
-        // ACCEPTED rows before recovery; the expensive k=15 thickness is cached
-        // per scan (band membership is body-frame = iteration-invariant, the
-        // organic normals are rewritten by esti_plane every iteration so the
-        // scaling below is applied fresh each call — no compounding).
-        if (clutter_deweight_en)
-        {
-            // Band lower edge 0.5 m is a HARD boundary: the 0.15-0.5 m grass
-            // layer just above the fitted plane carries Z bias BUT is also the
-            // bulk of the effective Z constraint in deep clutter (half of it is
-            // true ground in mixed grass) — lowering the edge to 0.25 m
-            // re-opened the raw pathology worse than baseline (FE 2D 796 m,
-            // Z -105, /odom breached 8.8 m). Do not lower it again.
-            constexpr double kClutBandLo = 0.5, kClutBandHi = 3.0;  // m above the sector plane
-            constexpr int kClutK = 15;             // measured: 5 is blind, 15 separates 12x
-            constexpr int kClutMinNeighbors = 12;  // sparse map neighborhood = no verdict
-            constexpr double kClutNzLo = 0.3, kClutNzHi = 0.8;  // |n_z| taper (lateral carriers spared)
-            static double clut_time = -1.0;
-            static float clut_thick[100000];
-            if (lidar_end_time != clut_time)
-            {
-                clut_time = lidar_end_time;
-                std::fill_n(clut_thick, feats_down_size, -1.0f);
-            }
-            int tested = 0, cut = 0;
-            double msum = 0.0;
-            #ifdef MP_EN
-                #pragma omp parallel for reduction(+:tested,cut,msum)
-            #endif
-            for (int i = 0; i < feats_down_size; i++)
-            {
-                if (!point_selected_surf[i]) continue;
-                const PointType &pb = feats_down_body->points[i];
-                if (std::hypot(pb.x, pb.y) > canopy_near_range) continue;
-                const int s = std::min(kGndSectors - 1,
-                    static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
-                if (!sec_ok[s]) continue;
-                const double h = sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s];
-                if (h < kClutBandLo || h > kClutBandHi) continue;
-                ++tested;
-                if (clut_thick[i] < 0.0f)
-                {
-                    PointVector nb;
-                    std::vector<float> sq;
-                    ikdtree.Nearest_Search(feats_down_world->points[i], kClutK, nb, sq);
-                    if (static_cast<int>(nb.size()) < kClutMinNeighbors)
-                    {
-                        clut_thick[i] = 0.0f;  // no verdict — leave the row alone
-                    }
-                    else
-                    {
-                        Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-                        for (const auto &p : nb) mean += Eigen::Vector3d(p.x, p.y, p.z);
-                        mean /= static_cast<double>(nb.size());
-                        Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-                        for (const auto &p : nb)
-                        {
-                            const Eigen::Vector3d q = Eigen::Vector3d(p.x, p.y, p.z) - mean;
-                            cov.noalias() += q * q.transpose();
-                        }
-                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov / static_cast<double>(nb.size()));
-                        clut_thick[i] = static_cast<float>(std::sqrt(std::max(es.eigenvalues()(0), 0.0)));
-                    }
-                }
-                // f: planar at map scale -> 1, fuzzy -> 0 (linear ramp).
-                const double f = std::clamp(
-                    (clutter_th_hi - clut_thick[i]) / std::max(clutter_th_hi - clutter_th_lo, 1e-6), 0.0, 1.0);
-                // g: only vertical-normal rows (Z-bias carriers) take the cut.
-                const double nz = std::fabs(normvec->points[i].z);
-                const double g = std::clamp((nz - kClutNzLo) / (kClutNzHi - kClutNzLo), 0.0, 1.0);
-                const double m = std::max(1.0 - (1.0 - f) * g, clutter_min_weight);
-                msum += m;
-                if (m < 0.999)
-                {
-                    ++cut;
-                    normvec->points[i].x *= static_cast<float>(m);
-                    normvec->points[i].y *= static_cast<float>(m);
-                    normvec->points[i].z *= static_cast<float>(m);
-                    normvec->points[i].intensity *= static_cast<float>(m);
-                }
-            }
-            clut_tested = tested;
-            clut_cut = cut;
-            clut_msum = msum;
-        }
-        for (int i = 0; i < feats_down_size; i++)
-        {
-            if (point_selected_surf[i]) continue;
-            if (canopy_ground_recovered >= ground_recover_max_rows) break;
-            const PointType &pb = feats_down_body->points[i];
-            if (std::hypot(pb.x, pb.y) > canopy_near_range) continue;
-            const int s = std::min(kGndSectors - 1,
-                static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
-            if (!sec_ok[s]) continue;
-            // Scan side: on this sector's ground plane (clutter trimmed by the fit band).
-            if (std::fabs(sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s]) >
-                ground_recover_scan_band) continue;
-            auto &pn = Nearest_Points[i];
-            if (static_cast<int>(pn.size()) < NUM_MATCH_POINTS) continue;
-            const PointType &pw = feats_down_world->points[i];
-            // Map neighborhood must actually be nearby (same criterion class as
-            // the normal path's 5th-neighbor sqdist gate).
-            const double dx0 = pn[0].x - pw.x, dy0 = pn[0].y - pw.y, dz0 = pn[0].z - pw.z;
-            if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 > 5.0) continue;
-            // Residual reference, best available first: TEM terrain memory
-            // (drift-independent — learned while healthy, frozen while not),
-            // weighted down by the interpolated cell std so slopes / disagreeing
-            // observations pull weakly; else the map-neighbor lower envelope
-            // (mean of the two lowest z — robust to clutter fuzz, but it DRIFTS
-            // with the vehicle: ratchet-slowing only).
-            // Reference split by JOB, not by availability. 3/4 of the rows keep
-            // the map lower envelope at weight 1 — local Z observability
-            // restoration, the validated hybrid behavior, untouched. Every 4th
-            // row is the ABSOLUTE channel: residual against the TEM (direct
-            // where served, slope-envelope extrapolation otherwise) with a
-            // trust-region clamp and a sigma-collapsed weight. The absolute
-            // channel is NEVER gated by max_residual — a multi-metre secular
-            // drift is exactly what it exists to fight (measured failure: hard-
-            // gating TEM rows at 1 m gutted the whole recovery channel once the
-            // drift passed 1 m, and the raw pathology returned worse, -64.6 m).
-            constexpr double kTemClampSigma = 3.0;
-            constexpr double kTemStdFloor = 0.1;  // weight floor: never trust a cell below 10 cm
-            // AUTHORITY IS PINNED AT THE SAFE-NEUTRAL LEVEL (~0.07 m/s counter-
-            // drift) — the full dose-response of pushing harder is measured and
-            // closed. (a) A 2.5 m clamp floor + sigma0 0.5 reaches parity with
-            // the worst dive (~0.5 m/s) and does cut the Z ratchet (-55 -> -43),
-            // but the point-plane Jacobian's attitude columns turn the pull into
-            // torque and the error reroutes into XY in attitude-degenerate
-            // clutter (FE 2D 150 -> 327 m, alignment bent 8 deg). (b) Zeroing
-            // the attitude/extrinsic columns (translation-only rows) makes the
-            // filter's measurement model inconsistent and Z diverges
-            // exponentially (measured -12 km; healthy scenes also damaged).
-            // The B3 lesson holds at every level tried: while degraded clutter
-            // still pollutes the constraint set, absolute-Z injection strong
-            // enough to matter always finds another channel to blow. Do NOT
-            // raise the authority again — fix the constraint set instead.
-            double pd2, w_row = 1.0;
-            int ref_kind = 2;  // 0 = TEM direct, 1 = TEM extrapolated, 2 = envelope
-            double z_tem, std_tem;
-            const bool abs_slot = tem_en && (canopy_ground_recovered % 4) == 3;
-            if (abs_slot && temLookup(pw.x, pw.y, z_tem, std_tem))
-            {
-                const double sig = std::max(std_tem, kTemStdFloor);
-                const double lim = kTemClampSigma * sig;
-                pd2 = std::clamp(pw.z - z_tem, -lim, lim);
-                w_row = tem_sigma0 / (tem_sigma0 + sig);
-                ref_kind = 0;
-            }
-            else if (abs_slot && tem_ext_ok)
-            {
-                const double sig = std::max(tem_ext_sigma, kTemStdFloor);
-                const double lim = kTemClampSigma * sig;
-                pd2 = std::clamp(pw.z - tem_ext_z, -lim, lim);
-                w_row = tem_sigma0 / (tem_sigma0 + sig);
-                ref_kind = 1;
-            }
-            else
-            {
-                float z1 = pn[0].z, z2 = std::numeric_limits<float>::max();
-                for (size_t k = 1; k < pn.size(); k++)
-                {
-                    const float z = pn[k].z;
-                    if (z < z1) { z2 = z1; z1 = z; }
-                    else if (z < z2) { z2 = z; }
-                }
-                const double z_ground_map = 0.5 * (z1 + (z2 == std::numeric_limits<float>::max() ? z1 : z2));
-                pd2 = pw.z - z_ground_map;
-                if (std::fabs(pd2) > ground_recover_max_residual) continue;
-            }
-            point_selected_surf[i] = true;
-            normvec->points[i].x = 0.0f;
-            normvec->points[i].y = 0.0f;
-            // Row weight rides on the normal + residual scaling (information
-            // scales as w_row^2 in the point-to-plane H) — same mechanism as an
-            // ordinary row, no new plumbing.
-            normvec->points[i].z = static_cast<float>(w_row);
-            normvec->points[i].intensity = static_cast<float>(w_row * pd2);
-            res_last[i] = std::fabs(pd2);
-            ++(ref_kind == 0 ? tem_rows : ref_kind == 1 ? tem_ext_rows : tem_env_rows);
-            ++canopy_ground_recovered;
-        }
-    }
+    /*** Measuremnt: distance to the closest surface/corner ***/
+    ekfom_data.h(i) = -norm_p.intensity;
+  }
 
-    effct_feat_num = 0;
-
-    for (int i = 0; i < feats_down_size; i++)
-    {
-        if (point_selected_surf[i])
-        {
-            laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
-            corr_normvect->points[effct_feat_num] = normvec->points[i];
-            total_residual += res_last[i];
-            effct_feat_num ++;
-        }
-    }
-
-    // Position-observability metric (degeneracy detector): eigenvalues of the
-    // normal information matrix M = sum(n n^T) over effective points. The min
-    // eigenvalue is the weakest-constrained position direction; if its
-    // eigenvector points along Z, the Z update is ill-conditioned.
-    {
-        Eigen::Matrix3d M = Eigen::Matrix3d::Zero();
-        for (int i = 0; i < effct_feat_num; i++)
-        {
-            const PointType &np = corr_normvect->points[i];
-            Eigen::Vector3d n(np.x, np.y, np.z);
-            M.noalias() += n * n.transpose();
-        }
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
-        pos_obs_eig_min = es.eigenvalues()(0);
-        pos_obs_eig_max = es.eigenvalues()(2);
-        pos_obs_z_weak = std::abs(es.eigenvectors()(2, 0));  // |Z| of weakest eigenvector
-    }
-
-    if (effct_feat_num < 1)
-    {
-        ekfom_data.valid = false;
-        std::cerr << "No Effective Points!" << std::endl;
-        return;
-    }
-
-    res_mean_last = total_residual / effct_feat_num;
-    match_time  += omp_get_wtime() - match_start;
-    double solve_start_  = omp_get_wtime();
-    
-    /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
-    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12); //23
-    ekfom_data.h.resize(effct_feat_num);
-
-    for (int i = 0; i < effct_feat_num; i++)
-    {
-        const PointType &laser_p  = laserCloudOri->points[i];
-        V3D point_this_be(laser_p.x, laser_p.y, laser_p.z);
-        M3D point_be_crossmat;
-        point_be_crossmat << SKEW_SYM_MATRX(point_this_be);
-        V3D point_this = s.offset_R_L_I * point_this_be + s.offset_T_L_I;
-        M3D point_crossmat;
-        point_crossmat<<SKEW_SYM_MATRX(point_this);
-
-        /*** get the normal vector of closest surface/corner ***/
-        const PointType &norm_p = corr_normvect->points[i];
-        V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
-
-        /*** calculate the Measuremnt Jacobian matrix H ***/
-        V3D C(s.rot.conjugate() *norm_vec);
-        V3D A(point_crossmat * C);
-        if (extrinsic_est_en)
-        {
-            V3D B(point_be_crossmat * s.offset_R_L_I.conjugate() * C); //s.rot.conjugate()*norm_vec);
-            ekfom_data.h_x.block<1, 12>(i,0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
-        }
-        else
-        {
-            ekfom_data.h_x.block<1, 12>(i,0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
-        }
-
-        /*** Measuremnt: distance to the closest surface/corner ***/
-        ekfom_data.h(i) = -norm_p.intensity;
-
-
-    }
-
-    solve_time += omp_get_wtime() - solve_start_;
+  solve_time += omp_get_wtime() - solve_start_;
 }
 
 class LaserMappingNode : public rclcpp::Node
 {
 public:
-    LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
+  LaserMappingNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
+  {
+    this->declare_parameter<bool>("publish.path_en", true);
+    this->declare_parameter<bool>("publish.effect_map_en", false);
+    this->declare_parameter<bool>("publish.map_en", false);
+    this->declare_parameter<double>("publish.map_period_sec", 5.0);  // /Laser_map publish period (s); 5s = 0.2Hz
+    this->declare_parameter<bool>("publish.scan_publish_en", true);
+    this->declare_parameter<bool>("publish.dense_publish_en", true);
+    this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+    this->declare_parameter<int>("max_iteration", 4);
+    this->declare_parameter<bool>("degeneracy_debug", false);
+    this->declare_parameter<bool>("planar_constraint_en", false);
+    this->declare_parameter<double>("planar_constraint_noise", 0.1);
+    this->declare_parameter<double>("planar_constraint_z_weak_thresh", 0.5);
+    this->declare_parameter<bool>("gravity_align_en", false);
+    this->declare_parameter<double>("gravity_align_noise", 0.05);
+    this->declare_parameter<double>("gravity_align_z_weak_thresh", 0.3);
+    this->declare_parameter<double>("gravity_align_accel_tol", 0.05);
+    this->declare_parameter<double>("gravity_align_gyro_tol", 0.35);
+    this->declare_parameter<bool>("divergence_guard_en", true);
+    this->declare_parameter<int>("divergence_guard_min_eff", 50);
+    this->declare_parameter<int>("divergence_guard_streak", 5);
+    this->declare_parameter<double>("divergence_guard_max_speed", 30.0);
+    this->declare_parameter<bool>("canopy_detect_en", false);
+    this->declare_parameter<bool>("canopy_debug", false);
+    this->declare_parameter<double>("canopy_near_range", 20.0);
+    this->declare_parameter<double>("canopy_ground_z", -0.47);
+    this->declare_parameter<double>("canopy_ground_halfband", 0.8);
+    this->declare_parameter<double>("canopy_normal_z_min", 0.966);
+    this->declare_parameter<double>("canopy_frac_enter", 0.65);
+    this->declare_parameter<double>("canopy_frac_exit", 0.75);
+    this->declare_parameter<double>("canopy_zp95_enter", 1.5);
+    this->declare_parameter<int>("canopy_min_near", 50);
+    this->declare_parameter<int>("canopy_enter_scans", 10);
+    this->declare_parameter<int>("canopy_exit_scans", 30);
+    this->declare_parameter<bool>("ground_recover_en", false);
+    this->declare_parameter<double>("ground_recover_scan_band", 0.15);
+    this->declare_parameter<int>("ground_recover_min_inliers", 100);
+    this->declare_parameter<double>("ground_recover_max_residual", 1.0);
+    this->declare_parameter<double>("ground_recover_sector_tol", 0.25);
+    this->declare_parameter<int>("ground_recover_max_rows", 4000);
+    this->declare_parameter<bool>("tem_en", false);
+    this->declare_parameter<double>("tem_cell", 5.0);
+    this->declare_parameter<double>("tem_tau", 2.0);
+    this->declare_parameter<double>("tem_egf_floor", 0.30);
+    this->declare_parameter<double>("tem_egf_ref", 0.60);
+    this->declare_parameter<double>("tem_sigma0", 0.15);
+    this->declare_parameter<bool>("tem_anchor_en", false);
+    this->declare_parameter<double>("tem_anchor_max_age", 3.0);
+    this->declare_parameter<bool>("clutter_deweight_en", false);
+    this->declare_parameter<double>("clutter_th_lo", 0.05);
+    this->declare_parameter<double>("clutter_th_hi", 0.20);
+    this->declare_parameter<double>("clutter_min_weight", 0.15);
+    this->declare_parameter<bool>("vxl_en", false);
+    this->declare_parameter<double>("vxl_size_xy", 1.0);
+    this->declare_parameter<double>("vxl_size_z", 0.25);
+    this->declare_parameter<double>("vxl_sigma_r", 0.05);
+    this->declare_parameter<double>("vxl_min_weight", 0.10);
+    this->declare_parameter<double>("vxl_max_range", 30.0);
+    this->declare_parameter<int>("vxl_min_pts", 8);
+    this->declare_parameter<int>("vxl_freeze_pts", 300);
+    this->declare_parameter<bool>("vxl_env_en", false);
+    this->declare_parameter<int>("vxl_env_min_pts", 20);
+    this->declare_parameter<double>("vxl_env_band", 0.12);
+    this->declare_parameter<double>("vxl_env_nz_min", 0.5);
+    this->declare_parameter<string>("map_file_path", "");
+    this->declare_parameter<string>("data_dir", "");
+    this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
+    this->declare_parameter<string>("common.imu_topic", "/livox/imu");
+    this->declare_parameter<string>("common.imu_input_type", "sensor_msgs");
+    this->declare_parameter<string>("common.imu_bias_topic", "/fixposition/fpa/imubias");
+    this->declare_parameter<bool>("common.time_sync_en", false);
+    this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
+    this->declare_parameter<double>("common.imu_time_offset", 0.0);
+    this->declare_parameter<double>("filter_size_corner", 0.5);
+    this->declare_parameter<double>("filter_size_surf", 0.5);
+    this->declare_parameter<double>("filter_size_map", 0.5);
+    this->declare_parameter<double>("cube_side_length", 200.);
+    this->declare_parameter<float>("mapping.det_range", 300.);
+    this->declare_parameter<double>("mapping.fov_degree", 180.);
+    this->declare_parameter<double>("mapping.gyr_cov", 0.1);
+    this->declare_parameter<double>("mapping.acc_cov", 0.1);
+    this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
+    this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
+    this->declare_parameter<double>("preprocess.blind", 0.01);
+    this->declare_parameter<int>("preprocess.lidar_type", AVIA);
+    this->declare_parameter<int>("preprocess.scan_line", 16);
+    this->declare_parameter<int>("preprocess.timestamp_unit", US);
+    this->declare_parameter<int>("preprocess.scan_rate", 10);
+    this->declare_parameter<int>("point_filter_num", 2);
+    this->declare_parameter<bool>("feature_extract_enable", false);
+    this->declare_parameter<bool>("runtime_pos_log_enable", false);
+    this->declare_parameter<bool>("diagnostics.latency_enable", true);
+    this->declare_parameter<double>("diagnostics.latency_log_period_sec", 1.0);
+    this->declare_parameter<bool>("diagnostics.kalman_channel_enable", false);
+    this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
+    this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
+    this->declare_parameter<int>("pcd_save.interval", -1);
+    this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
+    this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+    this->declare_parameter<string>("prior_map_pcd", "");
+    this->declare_parameter<vector<double>>("initial_pose", vector<double>());
+    // initial_pose_full_rpy_override:
+    //   false (default) — inject only XYZ + yaw from initial_pose; keep
+    //     roll/pitch from the IMU-derived gravity-aligned current state.
+    //   true            — fully overwrite roll/pitch from initial_pose. The
+    //     caller MUST guarantee these match gravity (accel along -Z),
+    //     otherwise point cloud transforms will be incorrect.
+    this->declare_parameter<bool>("initial_pose_full_rpy_override", false);
+    // Deprecated alias for initial_pose_full_rpy_override. Kept for
+    // backward compatibility; will emit a warning if set to true.
+    this->declare_parameter<bool>("initial_pose_apply_roll_pitch", false);
+    this->declare_parameter<bool>("wheel_odom_en", false);
+    this->declare_parameter<string>("wheel_topic", "/lio/twist");
+    this->declare_parameter<double>("wheel_speed_scale", 1.0);
+    this->declare_parameter<double>("wheel_vel_noise_vx", 0.10);
+    this->declare_parameter<double>("wheel_vel_noise_vy", 0.05);
+    this->declare_parameter<double>("wheel_vel_noise_vz", 0.10);
+    this->declare_parameter<vector<double>>("wheel_extrinsic_R", vector<double>());
+    this->get_parameter_or<bool>("publish.path_en", path_en, true);
+    this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
+    this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
+    this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
+    this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
+    this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+    this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
+    this->get_parameter_or<bool>("degeneracy_debug", degeneracy_debug, false);
+    this->get_parameter_or<bool>("planar_constraint_en", planar_constraint_en, false);
+    this->get_parameter_or<double>("planar_constraint_noise", planar_constraint_noise, 0.1);
+    this->get_parameter_or<double>("planar_constraint_z_weak_thresh", planar_constraint_z_weak_thresh, 0.5);
+    this->get_parameter_or<bool>("gravity_align_en", gravity_align_en, false);
+    this->get_parameter_or<double>("gravity_align_noise", gravity_align_noise, 0.05);
+    this->get_parameter_or<double>("gravity_align_z_weak_thresh", gravity_align_z_weak_thresh, 0.3);
+    this->get_parameter_or<double>("gravity_align_accel_tol", gravity_align_accel_tol, 0.05);
+    this->get_parameter_or<double>("gravity_align_gyro_tol", gravity_align_gyro_tol, 0.35);
+    this->get_parameter_or<bool>("divergence_guard_en", divergence_guard_en, true);
+    this->get_parameter_or<int>("divergence_guard_min_eff", divergence_guard_min_eff, 50);
+    this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
+    this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
+    this->get_parameter_or<bool>("canopy_detect_en", canopy_detect_en, false);
+    this->get_parameter_or<bool>("canopy_debug", canopy_debug, false);
+    this->get_parameter_or<double>("canopy_near_range", canopy_near_range, 20.0);
+    this->get_parameter_or<double>("canopy_ground_z", canopy_ground_z, -0.47);
+    this->get_parameter_or<double>("canopy_ground_halfband", canopy_ground_halfband, 0.8);
+    this->get_parameter_or<double>("canopy_normal_z_min", canopy_normal_z_min, 0.966);
+    this->get_parameter_or<double>("canopy_frac_enter", canopy_frac_enter, 0.65);
+    this->get_parameter_or<double>("canopy_frac_exit", canopy_frac_exit, 0.75);
+    this->get_parameter_or<double>("canopy_zp95_enter", canopy_zp95_enter, 1.5);
+    this->get_parameter_or<int>("canopy_min_near", canopy_min_near, 50);
+    this->get_parameter_or<int>("canopy_enter_scans", canopy_enter_scans, 10);
+    this->get_parameter_or<int>("canopy_exit_scans", canopy_exit_scans, 30);
+    this->get_parameter_or<bool>("ground_recover_en", ground_recover_en, false);
+    this->get_parameter_or<double>("ground_recover_scan_band", ground_recover_scan_band, 0.15);
+    this->get_parameter_or<int>("ground_recover_min_inliers", ground_recover_min_inliers, 100);
+    this->get_parameter_or<double>("ground_recover_max_residual", ground_recover_max_residual, 1.0);
+    this->get_parameter_or<double>("ground_recover_sector_tol", ground_recover_sector_tol, 0.25);
+    this->get_parameter_or<int>("ground_recover_max_rows", ground_recover_max_rows, 4000);
+    this->get_parameter_or<bool>("tem_en", tem_en, false);
+    this->get_parameter_or<double>("tem_cell", tem_cell, 5.0);
+    this->get_parameter_or<double>("tem_tau", tem_tau, 2.0);
+    this->get_parameter_or<double>("tem_egf_floor", tem_egf_floor, 0.30);
+    this->get_parameter_or<double>("tem_egf_ref", tem_egf_ref, 0.60);
+    this->get_parameter_or<double>("tem_sigma0", tem_sigma0, 0.15);
+    this->get_parameter_or<bool>("tem_anchor_en", tem_anchor_en, false);
+    this->get_parameter_or<double>("tem_anchor_max_age", tem_anchor_max_age, 3.0);
+    this->get_parameter_or<bool>("clutter_deweight_en", clutter_deweight_en, false);
+    this->get_parameter_or<double>("clutter_th_lo", clutter_th_lo, 0.05);
+    this->get_parameter_or<double>("clutter_th_hi", clutter_th_hi, 0.20);
+    this->get_parameter_or<double>("clutter_min_weight", clutter_min_weight, 0.15);
+    this->get_parameter_or<bool>("vxl_en", vxl_en, false);
+    this->get_parameter_or<double>("vxl_size_xy", vxl_size_xy, 1.0);
+    this->get_parameter_or<double>("vxl_size_z", vxl_size_z, 0.25);
+    this->get_parameter_or<double>("vxl_sigma_r", vxl_sigma_r, 0.05);
+    this->get_parameter_or<double>("vxl_min_weight", vxl_min_weight, 0.10);
+    this->get_parameter_or<double>("vxl_max_range", vxl_max_range, 30.0);
+    this->get_parameter_or<int>("vxl_min_pts", vxl_min_pts, 8);
+    this->get_parameter_or<int>("vxl_freeze_pts", vxl_freeze_pts, 300);
+    this->get_parameter_or<bool>("vxl_env_en", vxl_env_en, false);
+    this->get_parameter_or<int>("vxl_env_min_pts", vxl_env_min_pts, 20);
+    this->get_parameter_or<double>("vxl_env_band", vxl_env_band, 0.12);
+    this->get_parameter_or<double>("vxl_env_nz_min", vxl_env_nz_min, 0.5);
+    this->get_parameter_or<string>("map_file_path", map_file_path, "");
+    string data_dir_param;
+    this->get_parameter_or<string>("data_dir", data_dir_param, "");
+    if (!data_dir_param.empty()) {
+      root_dir = data_dir_param;
+      if (root_dir.back() != '/')
+        root_dir += '/';
+    }
+    this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
+    this->get_parameter_or<string>("common.imu_topic", imu_topic, "/livox/imu");
+    this->get_parameter_or<string>("common.imu_input_type", imu_input_type, string("sensor_msgs"));
+    this->get_parameter_or<string>("common.imu_bias_topic", imu_bias_topic, string("/fixposition/fpa/imubias"));
+    this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
+    this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
+    this->get_parameter_or<double>("common.imu_time_offset", imu_time_offset, 0.0);
+    this->get_parameter_or<double>("filter_size_corner", filter_size_corner_min, 0.5);
+    this->get_parameter_or<double>("filter_size_surf", filter_size_surf_min, 0.5);
+    this->get_parameter_or<double>("filter_size_map", filter_size_map_min, 0.5);
+    this->get_parameter_or<double>("cube_side_length", cube_len, 200.f);
+    this->get_parameter_or<float>("mapping.det_range", DET_RANGE, 300.f);
+    this->get_parameter_or<double>("mapping.fov_degree", fov_deg, 180.f);
+    this->get_parameter_or<double>("mapping.gyr_cov", gyr_cov, 0.1);
+    this->get_parameter_or<double>("mapping.acc_cov", acc_cov, 0.1);
+    this->get_parameter_or<double>("mapping.b_gyr_cov", b_gyr_cov, 0.0001);
+    this->get_parameter_or<double>("mapping.b_acc_cov", b_acc_cov, 0.0001);
+    this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
+    this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
+    this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
+    this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
+    this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
+    this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
+    this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
+    this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
+    p_imu->runtime_log_en = runtime_pos_log;                // mirror to ImuProcess so Log/imu.txt is written
+    ikd_profile = (getenv("FLIO_IKD_PROFILE") != nullptr);  // [ikd-profile] opt-in via env
     {
-        this->declare_parameter<bool>("publish.path_en", true);
-        this->declare_parameter<bool>("publish.effect_map_en", false);
-        this->declare_parameter<bool>("publish.map_en", false);
-        this->declare_parameter<double>("publish.map_period_sec", 5.0);  // /Laser_map publish period (s); 5s = 0.2Hz
-        this->declare_parameter<bool>("publish.scan_publish_en", true);
-        this->declare_parameter<bool>("publish.dense_publish_en", true);
-        this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
-        this->declare_parameter<int>("max_iteration", 4);
-        this->declare_parameter<bool>("degeneracy_debug", false);
-        this->declare_parameter<bool>("planar_constraint_en", false);
-        this->declare_parameter<double>("planar_constraint_noise", 0.1);
-        this->declare_parameter<double>("planar_constraint_z_weak_thresh", 0.5);
-        this->declare_parameter<bool>("gravity_align_en", false);
-        this->declare_parameter<double>("gravity_align_noise", 0.05);
-        this->declare_parameter<double>("gravity_align_z_weak_thresh", 0.3);
-        this->declare_parameter<double>("gravity_align_accel_tol", 0.05);
-        this->declare_parameter<double>("gravity_align_gyro_tol", 0.35);
-        this->declare_parameter<bool>("divergence_guard_en", true);
-        this->declare_parameter<int>("divergence_guard_min_eff", 50);
-        this->declare_parameter<int>("divergence_guard_streak", 5);
-        this->declare_parameter<double>("divergence_guard_max_speed", 30.0);
-        this->declare_parameter<bool>("canopy_detect_en", false);
-        this->declare_parameter<bool>("canopy_debug", false);
-        this->declare_parameter<double>("canopy_near_range", 20.0);
-        this->declare_parameter<double>("canopy_ground_z", -0.47);
-        this->declare_parameter<double>("canopy_ground_halfband", 0.8);
-        this->declare_parameter<double>("canopy_normal_z_min", 0.966);
-        this->declare_parameter<double>("canopy_frac_enter", 0.65);
-        this->declare_parameter<double>("canopy_frac_exit", 0.75);
-        this->declare_parameter<double>("canopy_zp95_enter", 1.5);
-        this->declare_parameter<int>("canopy_min_near", 50);
-        this->declare_parameter<int>("canopy_enter_scans", 10);
-        this->declare_parameter<int>("canopy_exit_scans", 30);
-        this->declare_parameter<bool>("ground_recover_en", false);
-        this->declare_parameter<double>("ground_recover_scan_band", 0.15);
-        this->declare_parameter<int>("ground_recover_min_inliers", 100);
-        this->declare_parameter<double>("ground_recover_max_residual", 1.0);
-        this->declare_parameter<double>("ground_recover_sector_tol", 0.25);
-        this->declare_parameter<int>("ground_recover_max_rows", 4000);
-        this->declare_parameter<bool>("tem_en", false);
-        this->declare_parameter<double>("tem_cell", 5.0);
-        this->declare_parameter<double>("tem_tau", 2.0);
-        this->declare_parameter<double>("tem_egf_floor", 0.30);
-        this->declare_parameter<double>("tem_egf_ref", 0.60);
-        this->declare_parameter<double>("tem_sigma0", 0.15);
-        this->declare_parameter<bool>("tem_anchor_en", false);
-        this->declare_parameter<double>("tem_anchor_max_age", 3.0);
-        this->declare_parameter<bool>("clutter_deweight_en", false);
-        this->declare_parameter<double>("clutter_th_lo", 0.05);
-        this->declare_parameter<double>("clutter_th_hi", 0.20);
-        this->declare_parameter<double>("clutter_min_weight", 0.15);
-        this->declare_parameter<bool>("vxl_en", false);
-        this->declare_parameter<double>("vxl_size_xy", 1.0);
-        this->declare_parameter<double>("vxl_size_z", 0.25);
-        this->declare_parameter<double>("vxl_sigma_r", 0.05);
-        this->declare_parameter<double>("vxl_min_weight", 0.10);
-        this->declare_parameter<double>("vxl_max_range", 30.0);
-        this->declare_parameter<int>("vxl_min_pts", 8);
-        this->declare_parameter<int>("vxl_freeze_pts", 300);
-        this->declare_parameter<bool>("vxl_env_en", false);
-        this->declare_parameter<int>("vxl_env_min_pts", 20);
-        this->declare_parameter<double>("vxl_env_band", 0.12);
-        this->declare_parameter<double>("vxl_env_nz_min", 0.5);
-        this->declare_parameter<string>("map_file_path", "");
-        this->declare_parameter<string>("data_dir", "");
-        this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
-        this->declare_parameter<string>("common.imu_topic", "/livox/imu");
-        this->declare_parameter<string>("common.imu_input_type", "sensor_msgs");
-        this->declare_parameter<string>("common.imu_bias_topic", "/fixposition/fpa/imubias");
-        this->declare_parameter<bool>("common.time_sync_en", false);
-        this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
-        this->declare_parameter<double>("common.imu_time_offset", 0.0);
-        this->declare_parameter<double>("filter_size_corner", 0.5);
-        this->declare_parameter<double>("filter_size_surf", 0.5);
-        this->declare_parameter<double>("filter_size_map", 0.5);
-        this->declare_parameter<double>("cube_side_length", 200.);
-        this->declare_parameter<float>("mapping.det_range", 300.);
-        this->declare_parameter<double>("mapping.fov_degree", 180.);
-        this->declare_parameter<double>("mapping.gyr_cov", 0.1);
-        this->declare_parameter<double>("mapping.acc_cov", 0.1);
-        this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
-        this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
-        this->declare_parameter<double>("preprocess.blind", 0.01);
-        this->declare_parameter<int>("preprocess.lidar_type", AVIA);
-        this->declare_parameter<int>("preprocess.scan_line", 16);
-        this->declare_parameter<int>("preprocess.timestamp_unit", US);
-        this->declare_parameter<int>("preprocess.scan_rate", 10);
-        this->declare_parameter<int>("point_filter_num", 2);
-        this->declare_parameter<bool>("feature_extract_enable", false);
-        this->declare_parameter<bool>("runtime_pos_log_enable", false);
-        this->declare_parameter<bool>("diagnostics.latency_enable", true);
-        this->declare_parameter<double>("diagnostics.latency_log_period_sec", 1.0);
-        this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
-        this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
-        this->declare_parameter<int>("pcd_save.interval", -1);
-        this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
-        this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
-        this->declare_parameter<string>("prior_map_pcd", "");
-        this->declare_parameter<vector<double>>("initial_pose", vector<double>());
-        // initial_pose_full_rpy_override:
-        //   false (default) — inject only XYZ + yaw from initial_pose; keep
-        //     roll/pitch from the IMU-derived gravity-aligned current state.
-        //   true            — fully overwrite roll/pitch from initial_pose. The
-        //     caller MUST guarantee these match gravity (accel along -Z),
-        //     otherwise point cloud transforms will be incorrect.
-        this->declare_parameter<bool>("initial_pose_full_rpy_override", false);
-        // Deprecated alias for initial_pose_full_rpy_override. Kept for
-        // backward compatibility; will emit a warning if set to true.
-        this->declare_parameter<bool>("initial_pose_apply_roll_pitch", false);
-        this->declare_parameter<bool>("wheel_odom_en", false);
-        this->declare_parameter<string>("wheel_topic", "/lio/twist");
-        this->declare_parameter<double>("wheel_speed_scale", 1.0);
-        this->declare_parameter<double>("wheel_vel_noise_vx", 0.10);
-        this->declare_parameter<double>("wheel_vel_noise_vy", 0.05);
-        this->declare_parameter<double>("wheel_vel_noise_vz", 0.10);
-        this->declare_parameter<vector<double>>("wheel_extrinsic_R", vector<double>());
-        this->get_parameter_or<bool>("publish.path_en", path_en, true);
-        this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
-        this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
-        this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
-        this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
-        this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
-        this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
-        this->get_parameter_or<bool>("degeneracy_debug", degeneracy_debug, false);
-        this->get_parameter_or<bool>("planar_constraint_en", planar_constraint_en, false);
-        this->get_parameter_or<double>("planar_constraint_noise", planar_constraint_noise, 0.1);
-        this->get_parameter_or<double>("planar_constraint_z_weak_thresh", planar_constraint_z_weak_thresh, 0.5);
-        this->get_parameter_or<bool>("gravity_align_en", gravity_align_en, false);
-        this->get_parameter_or<double>("gravity_align_noise", gravity_align_noise, 0.05);
-        this->get_parameter_or<double>("gravity_align_z_weak_thresh", gravity_align_z_weak_thresh, 0.3);
-        this->get_parameter_or<double>("gravity_align_accel_tol", gravity_align_accel_tol, 0.05);
-        this->get_parameter_or<double>("gravity_align_gyro_tol", gravity_align_gyro_tol, 0.35);
-        this->get_parameter_or<bool>("divergence_guard_en", divergence_guard_en, true);
-        this->get_parameter_or<int>("divergence_guard_min_eff", divergence_guard_min_eff, 50);
-        this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
-        this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
-        this->get_parameter_or<bool>("canopy_detect_en", canopy_detect_en, false);
-        this->get_parameter_or<bool>("canopy_debug", canopy_debug, false);
-        this->get_parameter_or<double>("canopy_near_range", canopy_near_range, 20.0);
-        this->get_parameter_or<double>("canopy_ground_z", canopy_ground_z, -0.47);
-        this->get_parameter_or<double>("canopy_ground_halfband", canopy_ground_halfband, 0.8);
-        this->get_parameter_or<double>("canopy_normal_z_min", canopy_normal_z_min, 0.966);
-        this->get_parameter_or<double>("canopy_frac_enter", canopy_frac_enter, 0.65);
-        this->get_parameter_or<double>("canopy_frac_exit", canopy_frac_exit, 0.75);
-        this->get_parameter_or<double>("canopy_zp95_enter", canopy_zp95_enter, 1.5);
-        this->get_parameter_or<int>("canopy_min_near", canopy_min_near, 50);
-        this->get_parameter_or<int>("canopy_enter_scans", canopy_enter_scans, 10);
-        this->get_parameter_or<int>("canopy_exit_scans", canopy_exit_scans, 30);
-        this->get_parameter_or<bool>("ground_recover_en", ground_recover_en, false);
-        this->get_parameter_or<double>("ground_recover_scan_band", ground_recover_scan_band, 0.15);
-        this->get_parameter_or<int>("ground_recover_min_inliers", ground_recover_min_inliers, 100);
-        this->get_parameter_or<double>("ground_recover_max_residual", ground_recover_max_residual, 1.0);
-        this->get_parameter_or<double>("ground_recover_sector_tol", ground_recover_sector_tol, 0.25);
-        this->get_parameter_or<int>("ground_recover_max_rows", ground_recover_max_rows, 4000);
-        this->get_parameter_or<bool>("tem_en", tem_en, false);
-        this->get_parameter_or<double>("tem_cell", tem_cell, 5.0);
-        this->get_parameter_or<double>("tem_tau", tem_tau, 2.0);
-        this->get_parameter_or<double>("tem_egf_floor", tem_egf_floor, 0.30);
-        this->get_parameter_or<double>("tem_egf_ref", tem_egf_ref, 0.60);
-        this->get_parameter_or<double>("tem_sigma0", tem_sigma0, 0.15);
-        this->get_parameter_or<bool>("tem_anchor_en", tem_anchor_en, false);
-        this->get_parameter_or<double>("tem_anchor_max_age", tem_anchor_max_age, 3.0);
-        this->get_parameter_or<bool>("clutter_deweight_en", clutter_deweight_en, false);
-        this->get_parameter_or<double>("clutter_th_lo", clutter_th_lo, 0.05);
-        this->get_parameter_or<double>("clutter_th_hi", clutter_th_hi, 0.20);
-        this->get_parameter_or<double>("clutter_min_weight", clutter_min_weight, 0.15);
-        this->get_parameter_or<bool>("vxl_en", vxl_en, false);
-        this->get_parameter_or<double>("vxl_size_xy", vxl_size_xy, 1.0);
-        this->get_parameter_or<double>("vxl_size_z", vxl_size_z, 0.25);
-        this->get_parameter_or<double>("vxl_sigma_r", vxl_sigma_r, 0.05);
-        this->get_parameter_or<double>("vxl_min_weight", vxl_min_weight, 0.10);
-        this->get_parameter_or<double>("vxl_max_range", vxl_max_range, 30.0);
-        this->get_parameter_or<int>("vxl_min_pts", vxl_min_pts, 8);
-        this->get_parameter_or<int>("vxl_freeze_pts", vxl_freeze_pts, 300);
-        this->get_parameter_or<bool>("vxl_env_en", vxl_env_en, false);
-        this->get_parameter_or<int>("vxl_env_min_pts", vxl_env_min_pts, 20);
-        this->get_parameter_or<double>("vxl_env_band", vxl_env_band, 0.12);
-        this->get_parameter_or<double>("vxl_env_nz_min", vxl_env_nz_min, 0.5);
-        this->get_parameter_or<string>("map_file_path", map_file_path, "");
-        string data_dir_param;
-        this->get_parameter_or<string>("data_dir", data_dir_param, "");
-        if (!data_dir_param.empty()) {
-            root_dir = data_dir_param;
-            if (root_dir.back() != '/') root_dir += '/';
-        }
-        this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
-        this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
-        this->get_parameter_or<string>("common.imu_input_type", imu_input_type, string("sensor_msgs"));
-        this->get_parameter_or<string>("common.imu_bias_topic", imu_bias_topic, string("/fixposition/fpa/imubias"));
-        this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
-        this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
-        this->get_parameter_or<double>("common.imu_time_offset", imu_time_offset, 0.0);
-        this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
-        this->get_parameter_or<double>("filter_size_surf",filter_size_surf_min,0.5);
-        this->get_parameter_or<double>("filter_size_map",filter_size_map_min,0.5);
-        this->get_parameter_or<double>("cube_side_length",cube_len,200.f);
-        this->get_parameter_or<float>("mapping.det_range",DET_RANGE,300.f);
-        this->get_parameter_or<double>("mapping.fov_degree",fov_deg,180.f);
-        this->get_parameter_or<double>("mapping.gyr_cov",gyr_cov,0.1);
-        this->get_parameter_or<double>("mapping.acc_cov",acc_cov,0.1);
-        this->get_parameter_or<double>("mapping.b_gyr_cov",b_gyr_cov,0.0001);
-        this->get_parameter_or<double>("mapping.b_acc_cov",b_acc_cov,0.0001);
-        this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
-        this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
-        this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
-        this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
-        this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
-        this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
-        this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
-        this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
-        p_imu->runtime_log_en = runtime_pos_log;  // mirror to ImuProcess so Log/imu.txt is written
-        ikd_profile = (getenv("FLIO_IKD_PROFILE") != nullptr);  // [ikd-profile] opt-in via env
-        { const char *am = getenv("FLIO_ASYNC_MAP"); if (am && std::string(am) == "0") async_map_en = false; }
+      const char * am = getenv("FLIO_ASYNC_MAP");
+      if (am && std::string(am) == "0")
+        async_map_en = false;
+    }
 #ifdef USE_IVOX
-        {   // option B: iVox map backend. nearby_type MUST be >=18 (Phase-0: NEARBY6 inadequate).
-            // res=0.5 NN voxels give the best probe NN-agreement (99.9%, tightest normals);
-            // a GLOBAL fine-grid dedup (= filter_size_map) keeps the map at ikd-Tree's 542k.
-            const double ivox_res    = this->declare_parameter<double>("ivox_grid_resolution", 0.5);
-            const int    ivox_nearby = this->declare_parameter<int>("ivox_nearby_type", 26);
-            const int    ivox_vcap   = this->declare_parameter<int>("ivox_voxel_capacity", 50);
-            const int    ivox_maxvox = this->declare_parameter<int>("ivox_max_voxels", 5000000);
-            ikdtree.Init(static_cast<float>(ivox_res), ivox_nearby, ivox_vcap,
-                         static_cast<std::size_t>(ivox_maxvox));
-            RCLCPP_INFO(this->get_logger(),
-                "[IVOX] map backend = iVox (res=%.2f nearby=%d voxel_cap=%d max_voxels=%d)",
-                ivox_res, ivox_nearby, ivox_vcap, ivox_maxvox);
-        }
+    {  // option B: iVox map backend. nearby_type MUST be >=18 (Phase-0: NEARBY6 inadequate).
+      // res=0.5 NN voxels give the best probe NN-agreement (99.9%, tightest normals);
+      // a GLOBAL fine-grid dedup (= filter_size_map) keeps the map at ikd-Tree's 542k.
+      const double ivox_res = this->declare_parameter<double>("ivox_grid_resolution", 0.5);
+      const int ivox_nearby = this->declare_parameter<int>("ivox_nearby_type", 26);
+      const int ivox_vcap = this->declare_parameter<int>("ivox_voxel_capacity", 50);
+      const int ivox_maxvox = this->declare_parameter<int>("ivox_max_voxels", 5000000);
+      ikdtree.Init(static_cast<float>(ivox_res), ivox_nearby, ivox_vcap, static_cast<std::size_t>(ivox_maxvox));
+      RCLCPP_INFO(this->get_logger(),
+                  "[IVOX] map backend = iVox (res=%.2f nearby=%d voxel_cap=%d max_voxels=%d)",
+                  ivox_res,
+                  ivox_nearby,
+                  ivox_vcap,
+                  ivox_maxvox);
+    }
 #endif
-        this->get_parameter_or<bool>("diagnostics.latency_enable", latency_diag_en, true);
-        this->get_parameter_or<double>("diagnostics.latency_log_period_sec", latency_log_period_sec, 1.0);
-        this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
-        this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
-        this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
-        this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
-        this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
-        this->get_parameter_or<string>("prior_map_pcd", prior_map_pcd_, string(""));
-        this->get_parameter_or<vector<double>>("initial_pose", initial_pose_vec_, vector<double>());
-        {
-            bool full_rpy_override = false;
-            bool legacy_apply_rp = false;
-            this->get_parameter_or<bool>("initial_pose_full_rpy_override", full_rpy_override, false);
-            this->get_parameter_or<bool>("initial_pose_apply_roll_pitch", legacy_apply_rp, false);
-            if (legacy_apply_rp) {
-                RCLCPP_WARN(this->get_logger(),
+    this->get_parameter_or<bool>("diagnostics.latency_enable", latency_diag_en, true);
+    this->get_parameter_or<double>("diagnostics.latency_log_period_sec", latency_log_period_sec, 1.0);
+    this->get_parameter_or<bool>("diagnostics.kalman_channel_enable", kalman_channel_diag_en, false);
+    this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
+    this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
+    this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
+    this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
+    this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+    this->get_parameter_or<string>("prior_map_pcd", prior_map_pcd_, string(""));
+    this->get_parameter_or<vector<double>>("initial_pose", initial_pose_vec_, vector<double>());
+    {
+      bool full_rpy_override = false;
+      bool legacy_apply_rp = false;
+      this->get_parameter_or<bool>("initial_pose_full_rpy_override", full_rpy_override, false);
+      this->get_parameter_or<bool>("initial_pose_apply_roll_pitch", legacy_apply_rp, false);
+      if (legacy_apply_rp) {
+        RCLCPP_WARN(this->get_logger(),
                     "Parameter 'initial_pose_apply_roll_pitch' is deprecated; "
                     "use 'initial_pose_full_rpy_override' instead.");
-            }
-            initial_pose_full_rpy_override_ = full_rpy_override || legacy_apply_rp;
-            if (initial_pose_full_rpy_override_) {
-                RCLCPP_WARN(this->get_logger(),
+      }
+      initial_pose_full_rpy_override_ = full_rpy_override || legacy_apply_rp;
+      if (initial_pose_full_rpy_override_) {
+        RCLCPP_WARN(this->get_logger(),
                     "initial_pose_full_rpy_override=true: overriding IMU-aligned "
                     "roll/pitch with values from initial_pose. Caller must ensure "
                     "these match gravity (accel along -Z), else point cloud "
                     "transforms will be incorrect.");
-            }
-        }
-        this->get_parameter_or<bool>("wheel_odom_en", wheel_odom_en, false);
-        this->get_parameter_or<string>("wheel_topic", wheel_topic, string("/lio/twist"));
-        this->get_parameter_or<double>("wheel_speed_scale", wheel_speed_scale, 1.0);
-        this->get_parameter_or<double>("wheel_vel_noise_vx", wheel_vel_noise_vx, 0.10);
-        this->get_parameter_or<double>("wheel_vel_noise_vy", wheel_vel_noise_vy, 0.05);
-        this->get_parameter_or<double>("wheel_vel_noise_vz", wheel_vel_noise_vz, 0.10);
-        vector<double> wext;
-        this->get_parameter_or<vector<double>>("wheel_extrinsic_R", wext, vector<double>());
-        if (wext.size() == 9)
-            R_robot_to_imu = Eigen::Map<const Eigen::Matrix<double,3,3,Eigen::RowMajor>>(wext.data());
-        RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+      }
+    }
+    this->get_parameter_or<bool>("wheel_odom_en", wheel_odom_en, false);
+    this->get_parameter_or<string>("wheel_topic", wheel_topic, string("/lio/twist"));
+    this->get_parameter_or<double>("wheel_speed_scale", wheel_speed_scale, 1.0);
+    this->get_parameter_or<double>("wheel_vel_noise_vx", wheel_vel_noise_vx, 0.10);
+    this->get_parameter_or<double>("wheel_vel_noise_vy", wheel_vel_noise_vy, 0.05);
+    this->get_parameter_or<double>("wheel_vel_noise_vz", wheel_vel_noise_vz, 0.10);
+    vector<double> wext;
+    this->get_parameter_or<vector<double>>("wheel_extrinsic_R", wext, vector<double>());
+    if (wext.size() == 9)
+      R_robot_to_imu = Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(wext.data());
+    RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
-        path.header.stamp = this->get_clock()->now();
-        path.header.frame_id ="camera_init";
+    path.header.stamp = this->get_clock()->now();
+    path.header.frame_id = "camera_init";
 
-        // /*** variables definition ***/
-        // int effect_feat_num = 0, frame_num = 0;
-        // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
-        // bool flg_EKF_converged, EKF_stop_flg = 0;
+    // /*** variables definition ***/
+    // int effect_feat_num = 0, frame_num = 0;
+    // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0,
+    // aver_time_solve = 0, aver_time_const_H_time = 0; bool flg_EKF_converged, EKF_stop_flg = 0;
 
-        FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
-        HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
+    FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
+    HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
 
-        _featsArray.reset(new PointCloudXYZI());
+    _featsArray.reset(new PointCloudXYZI());
 
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
-        downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
-        downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
+    memset(point_selected_surf, true, sizeof(point_selected_surf));
+    memset(res_last, -1000.0f, sizeof(res_last));
+    downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
+    downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
+    memset(point_selected_surf, true, sizeof(point_selected_surf));
+    memset(res_last, -1000.0f, sizeof(res_last));
 
-        Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
-        Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
-        p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
-        p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
-        p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
-        p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
-        p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
+    Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
+    p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+    p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
+    p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
+    p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
+    p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
 
-        fill(epsi, epsi+23, 0.001);
-        kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+    fill(epsi, epsi + 23, 0.001);
+    kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
-        /*** debug record ***/
-        // FILE *fp;
-        string pos_log_dir = root_dir + "/Log/pos_log.txt";
-        fp = fopen(pos_log_dir.c_str(),"w");
+    /*** debug record ***/
+    // FILE *fp;
+    string pos_log_dir = root_dir + "/Log/pos_log.txt";
+    fp = fopen(pos_log_dir.c_str(), "w");
 
-        // ofstream fout_pre, fout_out, fout_dbg;
-        fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
-        fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
-        fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
-        fout_jump.open(DEBUG_FILE_DIR("jump_diag.txt"), ios::out);
-        if (fout_pre && fout_out)
-            cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
-        else
-            cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
+    // ofstream fout_pre, fout_out, fout_dbg;
+    fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);
+    fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), ios::out);
+    fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"), ios::out);
+    fout_jump.open(DEBUG_FILE_DIR("jump_diag.txt"), ios::out);
+    if (kalman_channel_diag_en) {
+      fout_kalman.open(DEBUG_FILE_DIR("kalman_channels.csv"), ios::out);
+      fout_kalman << "schema_version,scan_index,time,channel,valid,converged,iterations,measurement_dim,"
+                  << "residual_norm,weighted_residual_squared,effct_feat_num,res_mean,pos_obs_eig_min,"
+                  << "pos_obs_eig_max,pos_obs_z_weak,z0,z1,z2,h0,h1,h2,"
+                  << "dx_pos_x,dx_pos_y,dx_pos_z,dx_rot_x,dx_rot_y,dx_rot_z,"
+                  << "dx_ext_rot_x,dx_ext_rot_y,dx_ext_rot_z,dx_ext_t_x,dx_ext_t_y,dx_ext_t_z,"
+                  << "dx_vel_x,dx_vel_y,dx_vel_z,dx_bg_x,dx_bg_y,dx_bg_z,dx_ba_x,dx_ba_y,dx_ba_z,"
+                  << "dx_grav_t0,dx_grav_t1,dpos_x,dpos_y,dpos_z,dvel_x,dvel_y,dvel_z,"
+                  << "dba_x,dba_y,dba_z,dgrav_x,dgrav_y,dgrav_z,"
+                  << "gain_rot,gain_vel,gain_ba,gain_grav,projection_rot,projection_vel,projection_ba,projection_grav,"
+                  << "p_grav_pos,p_grav_rot,p_grav_vel,p_grav_ba,p_ba_pos,p_ba_rot,p_ba_vel,"
+                  << "p_grav_diag0_before,p_grav_diag1_before,p_grav_diag0_after,p_grav_diag1_after,"
+                  << "p_ba_x_before,p_ba_y_before,p_ba_z_before,p_ba_x_after,p_ba_y_after,p_ba_z_after\n";
+      RCLCPP_INFO(this->get_logger(),
+                  "Kalman channel diagnostics enabled: %s (schema v1)",
+                  DEBUG_FILE_DIR("kalman_channels.csv").c_str());
+    }
+    if (fout_pre && fout_out)
+      cout << "~~~~" << ROOT_DIR << " file opened" << endl;
+    else
+      cout << "~~~~" << ROOT_DIR << " doesn't exist" << endl;
 
-        /*** ROS subscribe initialization ***/
-        if (p_pre->lidar_type == AVIA)
-        {
-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
-        }
-        else if (p_pre->lidar_type == ALLPOINT)
-        {
-            // /pre/all_point is published RELIABLE with fixed 8MB messages; a small
-            // reliable KeepLast queue matches the bag publisher and bounds memory
-            // (a few buffered scans) while avoiding silent drops of whole scans.
-            rclcpp::QoS shm_qos(rclcpp::KeepLast(5));
-            sub_pcl_shm_ = this->create_subscription<shm_msgs::msg::PointCloud8mAndPose>(lid_topic, shm_qos, shm_allpoint_cbk);
-            RCLCPP_INFO(this->get_logger(), "shm allpoint mode: subscribing %s (shm_msgs/PointCloud8mAndPose)", lid_topic.c_str());
-        }
-        else
-        {
-            // Diagnostic knob (env FLIO_LIDAR_QDEPTH): a deep best-effort LiDAR queue so
-            // the single-thread executor's processing spikes buffer scans instead of
-            // dropping them. Eliminating real-time scan drops makes the front-end process
-            // an identical scan sequence every run — required to turn the metastable bag2
-            // raw-Z into a repeatable, measurable metric. Unset → SensorDataQoS (depth 5),
-            // the production default. best_effort stays compatible with the bag publisher.
-            const char* qd = std::getenv("FLIO_LIDAR_QDEPTH");
-            const int qdepth = (qd && std::atoi(qd) > 0) ? std::atoi(qd) : 0;
-            // Default RELIABLE KeepLast(5) to MATCH the lidar_adapter publisher
-            // (it publishes canonical /lio/points reliable so no 8MB scan is silently
-            // dropped). The matched reliable+volatile+keep_last pair is also what lets
-            // the intra-process manager do the zero-copy unique_ptr handoff when this
-            // node is co-composed with the adapter. FLIO_LIDAR_QDEPTH keeps the
-            // best-effort deep-queue diagnostic override.
-            rclcpp::QoS pc_qos = qdepth > 0
-                ? rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(qdepth))).best_effort()
-                : rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, pc_qos, standard_pcl_cbk);
-        }
-        if (imu_input_type == "fixposition_fpa")
-        {
-            auto imu_qos = rclcpp::SensorDataQoS();
-            sub_imu_fpa_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImu>(imu_topic, imu_qos, imu_fpa_cbk);
-            sub_imu_bias_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImubias>(imu_bias_topic, imu_qos, imu_bias_cbk);
-            RCLCPP_INFO(this->get_logger(), "Fixposition IMU direct mode: topic=%s bias_topic=%s imu_time_offset=%.3f", imu_topic.c_str(), imu_bias_topic.c_str(), imu_time_offset);
-        }
-        else
-        {
-            sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
-            RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", imu_topic.c_str());
-        }
-        if (wheel_odom_en)
-        {
-            sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(wheel_topic, 2000, twist_cbk);
-            RCLCPP_INFO(this->get_logger(), "Wheel odom enabled, topic: %s, scale: %.3f", wheel_topic.c_str(), wheel_speed_scale);
-        }
-        pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
-        pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
-        pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
-        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
-        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
-        pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
-        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    /*** ROS subscribe initialization ***/
+    if (p_pre->lidar_type == AVIA) {
+      sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+    } else if (p_pre->lidar_type == ALLPOINT) {
+      // /pre/all_point is published RELIABLE with fixed 8MB messages; a small
+      // reliable KeepLast queue matches the bag publisher and bounds memory
+      // (a few buffered scans) while avoiding silent drops of whole scans.
+      rclcpp::QoS shm_qos(rclcpp::KeepLast(5));
+      sub_pcl_shm_ =
+        this->create_subscription<shm_msgs::msg::PointCloud8mAndPose>(lid_topic, shm_qos, shm_allpoint_cbk);
+      RCLCPP_INFO(
+        this->get_logger(), "shm allpoint mode: subscribing %s (shm_msgs/PointCloud8mAndPose)", lid_topic.c_str());
+    } else {
+      // Diagnostic knob (env FLIO_LIDAR_QDEPTH): a deep best-effort LiDAR queue so
+      // the single-thread executor's processing spikes buffer scans instead of
+      // dropping them. Eliminating real-time scan drops makes the front-end process
+      // an identical scan sequence every run — required to turn the metastable bag2
+      // raw-Z into a repeatable, measurable metric. Unset → SensorDataQoS (depth 5),
+      // the production default. best_effort stays compatible with the bag publisher.
+      const char * qd = std::getenv("FLIO_LIDAR_QDEPTH");
+      const int qdepth = (qd && std::atoi(qd) > 0) ? std::atoi(qd) : 0;
+      // Default RELIABLE KeepLast(5) to MATCH the lidar_adapter publisher
+      // (it publishes canonical /lio/points reliable so no 8MB scan is silently
+      // dropped). The matched reliable+volatile+keep_last pair is also what lets
+      // the intra-process manager do the zero-copy unique_ptr handoff when this
+      // node is co-composed with the adapter. FLIO_LIDAR_QDEPTH keeps the
+      // best-effort deep-queue diagnostic override.
+      rclcpp::QoS pc_qos = qdepth > 0 ? rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(qdepth))).best_effort()
+                                      : rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
+      sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, pc_qos, standard_pcl_cbk);
+    }
+    if (imu_input_type == "fixposition_fpa") {
+      auto imu_qos = rclcpp::SensorDataQoS();
+      sub_imu_fpa_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImu>(imu_topic, imu_qos, imu_fpa_cbk);
+      sub_imu_bias_ =
+        this->create_subscription<fixposition_driver_msgs::msg::FpaImubias>(imu_bias_topic, imu_qos, imu_bias_cbk);
+      RCLCPP_INFO(this->get_logger(),
+                  "Fixposition IMU direct mode: topic=%s bias_topic=%s imu_time_offset=%.3f",
+                  imu_topic.c_str(),
+                  imu_bias_topic.c_str(),
+                  imu_time_offset);
+    } else {
+      sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
+      RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", imu_topic.c_str());
+    }
+    if (wheel_odom_en) {
+      sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(wheel_topic, 2000, twist_cbk);
+      RCLCPP_INFO(
+        this->get_logger(), "Wheel odom enabled, topic: %s, scale: %.3f", wheel_topic.c_str(), wheel_speed_scale);
+    }
+    pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
+    pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
+    pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
+    pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
+    pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+    pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
-        //------------------------------------------------------------------------------------------------------
-        auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
-        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
+    //------------------------------------------------------------------------------------------------------
+    auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
+    timer_ =
+      rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
 
-        // The voxel-capped /Laser_map is a coarse global map, not a live feed, so it
-        // publishes slowly (default 0.2 Hz). Period is configurable via publish.map_period_sec.
-        double map_pub_period_sec = 5.0;
-        this->get_parameter_or<double>("publish.map_period_sec", map_pub_period_sec, 5.0);
-        if (map_pub_period_sec <= 0.0) map_pub_period_sec = 5.0;
-        auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(map_pub_period_sec * 1000.0));
-        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
+    // The voxel-capped /Laser_map is a coarse global map, not a live feed, so it
+    // publishes slowly (default 0.2 Hz). Period is configurable via publish.map_period_sec.
+    double map_pub_period_sec = 5.0;
+    this->get_parameter_or<double>("publish.map_period_sec", map_pub_period_sec, 5.0);
+    if (map_pub_period_sec <= 0.0)
+      map_pub_period_sec = 5.0;
+    auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(map_pub_period_sec * 1000.0));
+    map_pub_timer_ = rclcpp::create_timer(
+      this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
-        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+    map_save_srv_ = this->create_service<std_srvs::srv::Trigger>(
+      "map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
-        // Spin up the async PCD writer so the hot path never blocks on accumulation.
-        if (pcd_save_en) startPcdWriter();
+    // Spin up the async PCD writer so the hot path never blocks on accumulation.
+    if (pcd_save_en)
+      startPcdWriter();
 
-        // Spin up the off-thread ikd-tree map-update worker (option A). Idempotent.
-        if (async_map_en) {
-            startMapWorker();
-            RCLCPP_INFO(this->get_logger(),
-                        "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0).");
-        }
-
-        // Mapping pause/resume: latched (transient_local) subscription so we
-        // pick up the most recent state even if PGO published before we
-        // started.  The PGO node is the sole publisher; we only read.
-        auto mapping_qos = rclcpp::QoS(1).transient_local();
-        // transient_local durability is incompatible with intra-process comms, which
-        // this node enables for the point-cloud zero-copy path. This latched gate is a
-        // tiny, low-rate Bool from the (separate-process) PGO node, so force it onto the
-        // normal inter-process path; node-level intra-process stays on for /lio/points.
-        rclcpp::SubscriptionOptions mapping_sub_opts;
-        mapping_sub_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
-        mapping_enabled_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-            "/lio_slam/mapping_enabled", mapping_qos,
-            [this](std_msgs::msg::Bool::SharedPtr msg) {
-                const bool prev = mapping_enabled.exchange(msg->data, std::memory_order_relaxed);
-                if (prev != msg->data) {
-                    RCLCPP_WARN(this->get_logger(),
-                                "[MAPPING] %s — ikd-tree updates %s.",
-                                msg->data ? "RESUMED" : "PAUSED",
-                                msg->data ? "re-enabled" : "suspended");
-                }
-            },
-            mapping_sub_opts);
-
-        // Graph-side FE Z-drift feedback for the TEM (terrain anchoring). Tiny
-        // low-rate scalar stream from the PGO node; inter-process only.
-        if (tem_en && tem_anchor_en)
-        {
-            rclcpp::SubscriptionOptions drift_opts;
-            drift_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
-            fe_z_drift_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-                "/lio_slam/fe_z_drift", rclcpp::QoS(1).best_effort(),
-                [](nav_msgs::msg::Odometry::SharedPtr msg) {
-                    std::lock_guard<std::mutex> lk(tem_anchor_mtx);
-                    tem_anchor_d = msg->pose.pose.position.z;
-                    tem_anchor_sigma = std::sqrt(std::max(msg->pose.covariance[14], 1e-4));
-                    tem_anchor_stamp = rclcpp::Time(msg->header.stamp).seconds();
-                },
-                drift_opts);
-            RCLCPP_INFO(this->get_logger(),
-                        "[TEM] graph drift anchoring ON (/lio_slam/fe_z_drift, max_age=%.1fs)",
-                        tem_anchor_max_age);
-        }
-
-        RCLCPP_INFO(this->get_logger(), "Node init finished.");
+    // Spin up the off-thread ikd-tree map-update worker (option A). Idempotent.
+    if (async_map_en) {
+      startMapWorker();
+      RCLCPP_INFO(this->get_logger(), "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0).");
     }
 
-    ~LaserMappingNode()
-    {
-        fout_out.close();
-        fout_pre.close();
-        fout_jump.close();
-        fclose(fp);
+    // Mapping pause/resume: latched (transient_local) subscription so we
+    // pick up the most recent state even if PGO published before we
+    // started.  The PGO node is the sole publisher; we only read.
+    auto mapping_qos = rclcpp::QoS(1).transient_local();
+    // transient_local durability is incompatible with intra-process comms, which
+    // this node enables for the point-cloud zero-copy path. This latched gate is a
+    // tiny, low-rate Bool from the (separate-process) PGO node, so force it onto the
+    // normal inter-process path; node-level intra-process stays on for /lio/points.
+    rclcpp::SubscriptionOptions mapping_sub_opts;
+    mapping_sub_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+    mapping_enabled_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+      "/lio_slam/mapping_enabled",
+      mapping_qos,
+      [this](std_msgs::msg::Bool::SharedPtr msg) {
+        const bool prev = mapping_enabled.exchange(msg->data, std::memory_order_relaxed);
+        if (prev != msg->data) {
+          RCLCPP_WARN(this->get_logger(),
+                      "[MAPPING] %s — ikd-tree updates %s.",
+                      msg->data ? "RESUMED" : "PAUSED",
+                      msg->data ? "re-enabled" : "suspended");
+        }
+      },
+      mapping_sub_opts);
+
+    // Graph-side FE Z-drift feedback for the TEM (terrain anchoring). Tiny
+    // low-rate scalar stream from the PGO node; inter-process only.
+    if (tem_en && tem_anchor_en) {
+      rclcpp::SubscriptionOptions drift_opts;
+      drift_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+      fe_z_drift_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        "/lio_slam/fe_z_drift",
+        rclcpp::QoS(1).best_effort(),
+        [](nav_msgs::msg::Odometry::SharedPtr msg) {
+          std::lock_guard<std::mutex> lk(tem_anchor_mtx);
+          tem_anchor_d = msg->pose.pose.position.z;
+          tem_anchor_sigma = std::sqrt(std::max(msg->pose.covariance[14], 1e-4));
+          tem_anchor_stamp = rclcpp::Time(msg->header.stamp).seconds();
+        },
+        drift_opts);
+      RCLCPP_INFO(
+        this->get_logger(), "[TEM] graph drift anchoring ON (/lio_slam/fe_z_drift, max_age=%.1fs)", tem_anchor_max_age);
     }
+
+    RCLCPP_INFO(this->get_logger(), "Node init finished.");
+  }
+
+  ~LaserMappingNode()
+  {
+    fout_out.close();
+    fout_pre.close();
+    fout_jump.close();
+    fout_kalman.close();
+    fclose(fp);
+  }
 
 private:
-    void timer_callback()
-    {
-        if(sync_packages(Measures))
-        {
-            if (flg_first_scan)
-            {
-                first_lidar_time = Measures.lidar_beg_time;
-                p_imu->first_lidar_time = first_lidar_time;
-                flg_first_scan = false;
-                return;
-            }
+  using EkfUpdateDiagnostics = esekfom::esekf<state_ikfom, 12, input_ikfom>::UpdateDiagnostics;
 
-            double t0,t1,t2,t3,t4,t5,match_start, solve_start, svd_time;
+  static double
+  covarianceBlockNorm(const Eigen::Matrix<double, 23, 23> & covariance, int row, int rows, int col, int cols)
+  {
+    return covariance.block(row, col, rows, cols).norm();
+  }
 
-            match_time = 0;
-            kdtree_search_time = 0.0;
-            solve_time = 0;
-            solve_const_H_time = 0;
-            svd_time   = 0;
-            t0 = omp_get_wtime();
+  static double vectorBlockNorm(const Eigen::Matrix<double, 23, 1> & values, int row, int rows)
+  {
+    return values.segment(row, rows).norm();
+  }
 
-            p_imu->Process(Measures, kf, feats_undistort);
-            state_point = kf.get_x();
-            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+  void writeKalmanChannel(const char * channel,
+                          const state_ikfom & before,
+                          const state_ikfom & after,
+                          const Eigen::Matrix<double, 23, 23> & covarianceBefore,
+                          const EkfUpdateDiagnostics & diagnostics,
+                          const V3D & measurement,
+                          const V3D & prediction)
+  {
+    if (!kalman_channel_diag_en || !fout_kalman.is_open())
+      return;
 
-            if (feats_undistort->empty() || (feats_undistort == NULL))
-            {
-                if (!diag_first_no_point_logged) {
-                    RCLCPP_WARN(this->get_logger(),
-                                "[STARTUP][FAST_LIO] first no-point scan lidar_beg=%.3f",
-                                Measures.lidar_beg_time);
-                    diag_first_no_point_logged = true;
-                }
-                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
-                return;
-            }
+    const V3D dpos = after.pos - before.pos;
+    const V3D dvel = after.vel - before.vel;
+    const V3D dba = after.ba - before.ba;
+    const V3D dgrav(after.grav[0] - before.grav[0], after.grav[1] - before.grav[1], after.grav[2] - before.grav[2]);
+    const auto & dx = diagnostics.last_dx;
+    const auto & gain = diagnostics.gain_row_norm;
+    const auto & projection = diagnostics.correction_projection_row_norm;
+    const auto & pBefore = diagnostics.covariance_diag_before;
+    const auto & pAfter = diagnostics.covariance_diag_after;
 
-            if (!diag_first_valid_scan_logged) {
-                RCLCPP_INFO(this->get_logger(),
-                            "[STARTUP][FAST_LIO] first valid scan lidar_beg=%.3f points=%zu",
-                            Measures.lidar_beg_time,
-                            feats_undistort->size());
-                diag_first_valid_scan_logged = true;
-            }
+    fout_kalman << std::setprecision(17) << 1 << ',' << time_log_counter << ','
+                << Measures.lidar_beg_time - first_lidar_time << ',' << channel << ',' << diagnostics.valid << ','
+                << diagnostics.converged << ',' << diagnostics.iterations << ',' << diagnostics.measurement_dim << ','
+                << diagnostics.residual_norm << ',' << diagnostics.weighted_residual_squared << ',' << effct_feat_num
+                << ',' << res_mean_last << ',' << pos_obs_eig_min << ',' << pos_obs_eig_max << ',' << pos_obs_z_weak
+                << ',' << measurement.x() << ',' << measurement.y() << ',' << measurement.z() << ',' << prediction.x()
+                << ',' << prediction.y() << ',' << prediction.z();
+    for (int i = 0; i < 23; ++i)
+      fout_kalman << ',' << dx(i);
+    fout_kalman << ',' << dpos.x() << ',' << dpos.y() << ',' << dpos.z() << ',' << dvel.x() << ',' << dvel.y() << ','
+                << dvel.z() << ',' << dba.x() << ',' << dba.y() << ',' << dba.z() << ',' << dgrav.x() << ','
+                << dgrav.y() << ',' << dgrav.z() << ',' << vectorBlockNorm(gain, 3, 3) << ','
+                << vectorBlockNorm(gain, 12, 3) << ',' << vectorBlockNorm(gain, 18, 3) << ','
+                << vectorBlockNorm(gain, 21, 2) << ',' << vectorBlockNorm(projection, 3, 3) << ','
+                << vectorBlockNorm(projection, 12, 3) << ',' << vectorBlockNorm(projection, 18, 3) << ','
+                << vectorBlockNorm(projection, 21, 2) << ',' << covarianceBlockNorm(covarianceBefore, 21, 2, 0, 3)
+                << ',' << covarianceBlockNorm(covarianceBefore, 21, 2, 3, 3) << ','
+                << covarianceBlockNorm(covarianceBefore, 21, 2, 12, 3) << ','
+                << covarianceBlockNorm(covarianceBefore, 21, 2, 18, 3) << ','
+                << covarianceBlockNorm(covarianceBefore, 18, 3, 0, 3) << ','
+                << covarianceBlockNorm(covarianceBefore, 18, 3, 3, 3) << ','
+                << covarianceBlockNorm(covarianceBefore, 18, 3, 12, 3) << ',' << pBefore(21) << ',' << pBefore(22)
+                << ',' << pAfter(21) << ',' << pAfter(22) << ',' << pBefore(18) << ',' << pBefore(19) << ','
+                << pBefore(20) << ',' << pAfter(18) << ',' << pAfter(19) << ',' << pAfter(20) << '\n';
+    fout_kalman.flush();
+  }
 
-            flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
-                            false : true;
-            /*** Restore the ikd-tree single-operator invariant: wait for the previous
-             *   scan's off-thread map Add to finish before this scan touches the tree. ***/
-            if (async_map_en) joinMapAdd();
+  void timer_callback()
+  {
+    if (sync_packages(Measures)) {
+      if (flg_first_scan) {
+        first_lidar_time = Measures.lidar_beg_time;
+        p_imu->first_lidar_time = first_lidar_time;
+        flg_first_scan = false;
+        return;
+      }
 
-            /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
+      double t0, t1, t2, t3, t4, t5, match_start, solve_start, svd_time;
 
-            /*** downsample the feature points in a scan ***/
-            downSizeFilterSurf.setInputCloud(feats_undistort);
-            downSizeFilterSurf.filter(*feats_down_body);
-            t1 = omp_get_wtime();
-            feats_down_size = feats_down_body->points.size();
-            /*** initialize the map kdtree ***/
+      match_time = 0;
+      kdtree_search_time = 0.0;
+      solve_time = 0;
+      solve_const_H_time = 0;
+      svd_time = 0;
+      t0 = omp_get_wtime();
+
+      p_imu->Process(Measures, kf, feats_undistort);
+      state_point = kf.get_x();
+      pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+
+      if (feats_undistort->empty() || (feats_undistort == NULL)) {
+        if (!diag_first_no_point_logged) {
+          RCLCPP_WARN(
+            this->get_logger(), "[STARTUP][FAST_LIO] first no-point scan lidar_beg=%.3f", Measures.lidar_beg_time);
+          diag_first_no_point_logged = true;
+        }
+        RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+        return;
+      }
+
+      if (!diag_first_valid_scan_logged) {
+        RCLCPP_INFO(this->get_logger(),
+                    "[STARTUP][FAST_LIO] first valid scan lidar_beg=%.3f points=%zu",
+                    Measures.lidar_beg_time,
+                    feats_undistort->size());
+        diag_first_valid_scan_logged = true;
+      }
+
+      flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? false : true;
+      /*** Restore the ikd-tree single-operator invariant: wait for the previous
+       *   scan's off-thread map Add to finish before this scan touches the tree. ***/
+      if (async_map_en)
+        joinMapAdd();
+
+      /*** Segment the map in lidar FOV ***/
+      lasermap_fov_segment();
+
+      /*** downsample the feature points in a scan ***/
+      downSizeFilterSurf.setInputCloud(feats_undistort);
+      downSizeFilterSurf.filter(*feats_down_body);
+      t1 = omp_get_wtime();
+      feats_down_size = feats_down_body->points.size();
+      /*** initialize the map kdtree ***/
 #ifdef USE_IVOX
-            if(ikdtree.empty())
+      if (ikdtree.empty())
 #else
-            if(ikdtree.Root_Node == nullptr)
+      if (ikdtree.Root_Node == nullptr)
 #endif
-            {
-                RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
-                if(feats_down_size > 5)
-                {
-                    // --- Prior map preload (Scheme 1) ---
-                    if (!prior_map_pcd_.empty())
-                    {
-                        // 1. Inject initial pose into EKF if provided
-                        if (initial_pose_vec_.size() >= 6)
-                        {
-                            state_ikfom new_state = kf.get_x();
-                            new_state.pos = Eigen::Vector3d(initial_pose_vec_[0],
-                                                        initial_pose_vec_[1],
-                                                        initial_pose_vec_[2]);
-                            double roll_rad  = initial_pose_vec_[3] * M_PI / 180.0;
-                            double pitch_rad = initial_pose_vec_[4] * M_PI / 180.0;
-                            double yaw_rad   = initial_pose_vec_[5] * M_PI / 180.0;
-                            Eigen::Quaterniond q_current(new_state.rot.matrix());
-                            Eigen::Vector3d current_rpy = q_current.toRotationMatrix().eulerAngles(0, 1, 2);
-                            double applied_roll = initial_pose_full_rpy_override_ ? roll_rad : current_rpy.x();
-                            double applied_pitch = initial_pose_full_rpy_override_ ? pitch_rad : current_rpy.y();
-                            Eigen::AngleAxisd rollAngle(applied_roll, Eigen::Vector3d::UnitX());
-                            Eigen::AngleAxisd pitchAngle(applied_pitch, Eigen::Vector3d::UnitY());
-                            Eigen::AngleAxisd yawAngle(yaw_rad, Eigen::Vector3d::UnitZ());
-                            Eigen::Quaterniond q_init = yawAngle * pitchAngle * rollAngle;
-                            new_state.rot = SO3(q_init);
-                            kf.change_x(new_state);
-                            state_point = kf.get_x();
-                            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-                            RCLCPP_INFO(this->get_logger(),
-                                "Injected initial pose: [%.3f, %.3f, %.3f] yaw_deg=%.1f full_rpy_override=%s",
-                                initial_pose_vec_[0], initial_pose_vec_[1], initial_pose_vec_[2],
-                                initial_pose_vec_[5], initial_pose_full_rpy_override_ ? "true" : "false");
-                        }
+      {
+        RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
+        if (feats_down_size > 5) {
+          // --- Prior map preload (Scheme 1) ---
+          if (!prior_map_pcd_.empty()) {
+            // 1. Inject initial pose into EKF if provided
+            if (initial_pose_vec_.size() >= 6) {
+              state_ikfom new_state = kf.get_x();
+              new_state.pos = Eigen::Vector3d(initial_pose_vec_[0], initial_pose_vec_[1], initial_pose_vec_[2]);
+              double roll_rad = initial_pose_vec_[3] * M_PI / 180.0;
+              double pitch_rad = initial_pose_vec_[4] * M_PI / 180.0;
+              double yaw_rad = initial_pose_vec_[5] * M_PI / 180.0;
+              Eigen::Quaterniond q_current(new_state.rot.matrix());
+              Eigen::Vector3d current_rpy = q_current.toRotationMatrix().eulerAngles(0, 1, 2);
+              double applied_roll = initial_pose_full_rpy_override_ ? roll_rad : current_rpy.x();
+              double applied_pitch = initial_pose_full_rpy_override_ ? pitch_rad : current_rpy.y();
+              Eigen::AngleAxisd rollAngle(applied_roll, Eigen::Vector3d::UnitX());
+              Eigen::AngleAxisd pitchAngle(applied_pitch, Eigen::Vector3d::UnitY());
+              Eigen::AngleAxisd yawAngle(yaw_rad, Eigen::Vector3d::UnitZ());
+              Eigen::Quaterniond q_init = yawAngle * pitchAngle * rollAngle;
+              new_state.rot = SO3(q_init);
+              kf.change_x(new_state);
+              state_point = kf.get_x();
+              pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+              RCLCPP_INFO(this->get_logger(),
+                          "Injected initial pose: [%.3f, %.3f, %.3f] yaw_deg=%.1f full_rpy_override=%s",
+                          initial_pose_vec_[0],
+                          initial_pose_vec_[1],
+                          initial_pose_vec_[2],
+                          initial_pose_vec_[5],
+                          initial_pose_full_rpy_override_ ? "true" : "false");
+            }
 
-                        // 2. Load prior PCD
-                        PointCloudXYZI::Ptr prior_cloud(new PointCloudXYZI());
-                        if (pcl::io::loadPCDFile(prior_map_pcd_, *prior_cloud) == 0)
-                        {
-                            RCLCPP_INFO(this->get_logger(),
-                                "Loaded prior map: %s (%zu points)",
-                                prior_map_pcd_.c_str(), prior_cloud->size());
+            // 2. Load prior PCD
+            PointCloudXYZI::Ptr prior_cloud(new PointCloudXYZI());
+            if (pcl::io::loadPCDFile(prior_map_pcd_, *prior_cloud) == 0) {
+              RCLCPP_INFO(
+                this->get_logger(), "Loaded prior map: %s (%zu points)", prior_map_pcd_.c_str(), prior_cloud->size());
 
-                            // AABB self-check: helps diagnose wrong-frame PCDs
-                            // (e.g. a UTM map loaded where ENU was expected).
-                            // center→origin > ~10 km strongly suggests a global frame.
-                            if (!prior_cloud->empty()) {
-                                float xmin = std::numeric_limits<float>::max();
-                                float ymin = xmin;
-                                float zmin = xmin;
-                                float xmax = -xmin;
-                                float ymax = -xmin;
-                                float zmax = -xmin;
-                                for (const auto & pt : prior_cloud->points) {
-                                    xmin = std::min(xmin, pt.x);
-                                    ymin = std::min(ymin, pt.y);
-                                    zmin = std::min(zmin, pt.z);
-                                    xmax = std::max(xmax, pt.x);
-                                    ymax = std::max(ymax, pt.y);
-                                    zmax = std::max(zmax, pt.z);
-                                }
-                                const double cx = 0.5 * (xmin + xmax);
-                                const double cy = 0.5 * (ymin + ymax);
-                                const double cz = 0.5 * (zmin + zmax);
-                                const double dist_to_origin =
-                                    std::sqrt(cx * cx + cy * cy + cz * cz);
-                                RCLCPP_INFO(this->get_logger(),
-                                    "Prior map bbox: x=[%.2f..%.2f] y=[%.2f..%.2f] "
-                                    "z=[%.2f..%.2f] center→origin=%.1f m%s",
-                                    xmin, xmax, ymin, ymax, zmin, zmax, dist_to_origin,
-                                    dist_to_origin > 10000.0
-                                      ? "  (large offset — likely UTM/global frame, "
-                                        "check coordinate system!)"
-                                      : "");
-                            }
-
-                            // 3. Downsample prior map
-                            pcl::VoxelGrid<PointType> voxel;
-                            voxel.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
-                            voxel.setInputCloud(prior_cloud);
-                            PointCloudXYZI::Ptr prior_ds(new PointCloudXYZI());
-                            voxel.filter(*prior_ds);
-                            RCLCPP_INFO(this->get_logger(),
-                                "Prior map downsampled: %zu → %zu points",
-                                prior_cloud->size(), prior_ds->size());
-
-                            // 4. Transform current scan to world frame
-                            ikdtree.set_downsample_param(filter_size_map_min);
-                            feats_down_world->resize(feats_down_size);
-                            for(int i = 0; i < feats_down_size; i++)
-                            {
-                                pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
-                            }
-
-                            // 5. Merge prior + current scan → build tree
-                            PointCloudXYZI::Ptr combined(new PointCloudXYZI());
-                            *combined = *prior_ds;
-                            *combined += *feats_down_world;
-                            ikdtree.Build(combined->points);
-                            Localmap_Initialized = false;
-
-                            RCLCPP_INFO(this->get_logger(),
-                                "ikd-tree built from prior map + current scan (%zu + %d = %zu points)",
-                                prior_ds->size(), feats_down_size, combined->size());
-                        }
-                        else
-                        {
-                            RCLCPP_ERROR(this->get_logger(),
-                                "Failed to load prior map PCD: %s, falling back to normal init",
-                                prior_map_pcd_.c_str());
-                            // Fall back: build from current scan only
-                            ikdtree.set_downsample_param(filter_size_map_min);
-                            feats_down_world->resize(feats_down_size);
-                            for(int i = 0; i < feats_down_size; i++)
-                            {
-                                pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
-                            }
-                            ikdtree.Build(feats_down_world->points);
-                        }
-                        prior_map_pcd_.clear();  // Prevent re-execution
-                    }
-                    else
-                    {
-                        // Normal init: build from current scan only
-                        ikdtree.set_downsample_param(filter_size_map_min);
-                        feats_down_world->resize(feats_down_size);
-                        for(int i = 0; i < feats_down_size; i++)
-                        {
-                            pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
-                        }
-                        ikdtree.Build(feats_down_world->points);
-                    }
+              // AABB self-check: helps diagnose wrong-frame PCDs
+              // (e.g. a UTM map loaded where ENU was expected).
+              // center→origin > ~10 km strongly suggests a global frame.
+              if (!prior_cloud->empty()) {
+                float xmin = std::numeric_limits<float>::max();
+                float ymin = xmin;
+                float zmin = xmin;
+                float xmax = -xmin;
+                float ymax = -xmin;
+                float zmax = -xmin;
+                for (const auto & pt : prior_cloud->points) {
+                  xmin = std::min(xmin, pt.x);
+                  ymin = std::min(ymin, pt.y);
+                  zmin = std::min(zmin, pt.z);
+                  xmax = std::max(xmax, pt.x);
+                  ymax = std::max(ymax, pt.y);
+                  zmax = std::max(zmax, pt.z);
                 }
-                return;
-            }
-            int featsFromMapNum = ikdtree.validnum();
-            kdtree_size_st = ikdtree.size();
-            
-            // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
+                const double cx = 0.5 * (xmin + xmax);
+                const double cy = 0.5 * (ymin + ymax);
+                const double cz = 0.5 * (zmin + zmax);
+                const double dist_to_origin = std::sqrt(cx * cx + cy * cy + cz * cz);
+                RCLCPP_INFO(this->get_logger(),
+                            "Prior map bbox: x=[%.2f..%.2f] y=[%.2f..%.2f] "
+                            "z=[%.2f..%.2f] center→origin=%.1f m%s",
+                            xmin,
+                            xmax,
+                            ymin,
+                            ymax,
+                            zmin,
+                            zmax,
+                            dist_to_origin,
+                            dist_to_origin > 10000.0 ? "  (large offset — likely UTM/global frame, "
+                                                       "check coordinate system!)"
+                                                     : "");
+              }
 
-            /*** ICP and iterated Kalman filter update ***/
-            if (feats_down_size < 5)
-            {
-                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
-                return;
+              // 3. Downsample prior map
+              pcl::VoxelGrid<PointType> voxel;
+              voxel.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
+              voxel.setInputCloud(prior_cloud);
+              PointCloudXYZI::Ptr prior_ds(new PointCloudXYZI());
+              voxel.filter(*prior_ds);
+              RCLCPP_INFO(
+                this->get_logger(), "Prior map downsampled: %zu → %zu points", prior_cloud->size(), prior_ds->size());
+
+              // 4. Transform current scan to world frame
+              ikdtree.set_downsample_param(filter_size_map_min);
+              feats_down_world->resize(feats_down_size);
+              for (int i = 0; i < feats_down_size; i++) {
+                pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+              }
+
+              // 5. Merge prior + current scan → build tree
+              PointCloudXYZI::Ptr combined(new PointCloudXYZI());
+              *combined = *prior_ds;
+              *combined += *feats_down_world;
+              ikdtree.Build(combined->points);
+              Localmap_Initialized = false;
+
+              RCLCPP_INFO(this->get_logger(),
+                          "ikd-tree built from prior map + current scan (%zu + %d = %zu points)",
+                          prior_ds->size(),
+                          feats_down_size,
+                          combined->size());
+            } else {
+              RCLCPP_ERROR(this->get_logger(),
+                           "Failed to load prior map PCD: %s, falling back to normal init",
+                           prior_map_pcd_.c_str());
+              // Fall back: build from current scan only
+              ikdtree.set_downsample_param(filter_size_map_min);
+              feats_down_world->resize(feats_down_size);
+              for (int i = 0; i < feats_down_size; i++) {
+                pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+              }
+              ikdtree.Build(feats_down_world->points);
             }
-            
-            normvec->resize(feats_down_size);
+            prior_map_pcd_.clear();  // Prevent re-execution
+          } else {
+            // Normal init: build from current scan only
+            ikdtree.set_downsample_param(filter_size_map_min);
             feats_down_world->resize(feats_down_size);
-
-            V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
-            if (runtime_pos_log) {
-                fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
-                <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< "\n";
+            for (int i = 0; i < feats_down_size; i++) {
+              pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
             }
+            ikdtree.Build(feats_down_world->points);
+          }
+        }
+        return;
+      }
+      int featsFromMapNum = ikdtree.validnum();
+      kdtree_size_st = ikdtree.size();
+
+      // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num:
+      // "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
+
+      /*** ICP and iterated Kalman filter update ***/
+      if (feats_down_size < 5) {
+        RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+        return;
+      }
+
+      normvec->resize(feats_down_size);
+      feats_down_world->resize(feats_down_size);
+
+      V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
+      if (runtime_pos_log) {
+        fout_pre << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " "
+                 << state_point.pos.transpose() << " " << ext_euler.transpose() << " "
+                 << state_point.offset_T_L_I.transpose() << " " << state_point.vel.transpose() << " "
+                 << state_point.bg.transpose() << " " << state_point.ba.transpose() << " " << state_point.grav << "\n";
+      }
 
 #ifndef USE_IVOX
-            if(0) // If you need to see map point, change to "if(1)"
-            {
-                PointVector ().swap(ikdtree.PCL_Storage);
-                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
-                featsFromMap->clear();
-                featsFromMap->points = ikdtree.PCL_Storage;
-            }
+      if (0)  // If you need to see map point, change to "if(1)"
+      {
+        PointVector().swap(ikdtree.PCL_Storage);
+        ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+        featsFromMap->clear();
+        featsFromMap->points = ikdtree.PCL_Storage;
+      }
 #endif
 
-            pointSearchInd_surf.resize(feats_down_size);
-            Nearest_Points.resize(feats_down_size);
-            int  rematch_num = 0;
-            bool nearest_search_en = true; //
+      pointSearchInd_surf.resize(feats_down_size);
+      Nearest_Points.resize(feats_down_size);
+      int rematch_num = 0;
+      bool nearest_search_en = true;  //
 
-            double t_pre_icp = omp_get_wtime();
+      double t_pre_icp = omp_get_wtime();
 
-            /*** iterated state estimation ***/
-            const auto state_before_update = state_point;
-            const V3D euler_before_update = SO3ToEuler(state_before_update.rot);
-            const V3D pos_before_update = state_before_update.pos;
-            double t_update_start = omp_get_wtime();
-            // [ikd-profile] snapshot background/inline rebuild work spanning iEKF + map_incre
-            const uint64_t prof_rb_us0  = g_ikd_rebuild_us.load(std::memory_order_relaxed);
-            const uint64_t prof_rb_cnt0 = g_ikd_rebuild_count.load(std::memory_order_relaxed);
-            const uint64_t prof_inl_us0 = g_ikd_inline_rebuild_us.load(std::memory_order_relaxed);
-            double solve_H_time = 0;
-            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+      /*** iterated state estimation ***/
+      const auto state_before_update = state_point;
+      const V3D euler_before_update = SO3ToEuler(state_before_update.rot);
+      const V3D pos_before_update = state_before_update.pos;
+      double t_update_start = omp_get_wtime();
+      // [ikd-profile] snapshot background/inline rebuild work spanning iEKF + map_incre
+      const uint64_t prof_rb_us0 = g_ikd_rebuild_us.load(std::memory_order_relaxed);
+      const uint64_t prof_rb_cnt0 = g_ikd_rebuild_count.load(std::memory_order_relaxed);
+      const uint64_t prof_inl_us0 = g_ikd_inline_rebuild_us.load(std::memory_order_relaxed);
+      double solve_H_time = 0;
+      EkfUpdateDiagnostics lidarDiagnostics;
+      Eigen::Matrix<double, 23, 23> lidarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
+      if (kalman_channel_diag_en)
+        lidarCovarianceBefore = kf.get_P();
+      kf.update_iterated_dyn_share_modified(
+        LASER_POINT_COV, solve_H_time, kalman_channel_diag_en ? &lidarDiagnostics : nullptr);
 
-            state_point = kf.get_x();
+      state_point = kf.get_x();
+      if (kalman_channel_diag_en) {
+        writeKalmanChannel(
+          "lidar", state_before_update, state_point, lidarCovarianceBefore, lidarDiagnostics, Zero3d, Zero3d);
+      }
 
-            /*** Divergence guard (P1) — two independent divergence signals:
-             *   (1) effective-correspondence collapse streak: effct_feat_num (the
-             *       matched-plane count from the final iEKF iteration) staying low
-             *       for several scans means the scan no longer overlaps the map
-             *       (starvation / featureless) — the slow-drift onset.
-             *   (2) velocity runaway: a ground vehicle cannot physically exceed a
-             *       few m/s, so a body speed above divergence_guard_max_speed is
-             *       unambiguous IMU-dead-reckoning blow-up — catches the fast mode
-             *       (big IMU-integration jumps after dropped scans) that signal (1)
-             *       can miss because the post-gap scan may still match.
-             *   Either signal arms the degraded response below (force planar-Z,
-             *   clamp the speed, freeze the map). Both are inert in healthy
-             *   operation, so the guard is accuracy-neutral when undisturbed. ***/
-            flio_map_frozen = false;
-            flio_degraded_odom = false;
-            bool flio_vel_runaway = false;
-            if (divergence_guard_en)
-            {
-                if (effct_feat_num < divergence_guard_min_eff) ++consec_low_eff;
-                else                                           consec_low_eff = 0;
-                flio_vel_runaway = (state_point.vel.norm() > divergence_guard_max_speed);
-            }
-            const bool flio_in_degraded =
-                divergence_guard_en &&
-                (consec_low_eff >= divergence_guard_streak || flio_vel_runaway);
-
-            /*** Canopy mode debounce (once per scan, on the h_share_model raw
-             *   stats). Enter needs BOTH signals (ground fraction collapsed AND
-             *   near-field points tall) for canopy_enter_scans consecutive scans;
-             *   exit needs the ground fraction healthy for canopy_exit_scans.
-             *   Scans with too few near-field points are neutral: hold state,
-             *   reset both streaks (no drift toward either decision). ***/
-            if (canopy_detect_en)
-            {
-                const bool measurable = canopy_near_count >= canopy_min_near;
-                const bool vote_enter = measurable &&
-                    canopy_ground_frac < canopy_frac_enter && canopy_zp95 > canopy_zp95_enter;
-                const bool vote_exit = measurable && canopy_ground_frac > canopy_frac_exit;
-                if (!canopy_mode)
-                {
-                    canopy_enter_streak = vote_enter ? canopy_enter_streak + 1 : 0;
-                    if (canopy_enter_streak >= canopy_enter_scans)
-                    {
-                        canopy_mode = true;
-                        canopy_enter_streak = 0;
-                        RCLCPP_WARN(this->get_logger(),
-                            "[CANOPY] ENTER ground_frac=%.2f zp95=%.2f near=%d posZ=%.2f",
-                            canopy_ground_frac, canopy_zp95, canopy_near_count, state_point.pos[2]);
-                    }
-                }
-                else
-                {
-                    canopy_exit_streak = vote_exit ? canopy_exit_streak + 1 : 0;
-                    if (canopy_exit_streak >= canopy_exit_scans)
-                    {
-                        canopy_mode = false;
-                        canopy_exit_streak = 0;
-                        RCLCPP_WARN(this->get_logger(),
-                            "[CANOPY] EXIT ground_frac=%.2f zp95=%.2f near=%d posZ=%.2f",
-                            canopy_ground_frac, canopy_zp95, canopy_near_count, state_point.pos[2]);
-                    }
-                }
-                if (canopy_debug)
-                    std::cerr << "[CANOPY] t=" << std::fixed << std::setprecision(3) << lidar_end_time
-                              << " frac=" << canopy_ground_frac << " zp95=" << canopy_zp95
-                              << " near=" << canopy_near_count << " mode=" << canopy_mode
-                              << " rec=" << canopy_ground_recovered << " posZ=" << state_point.pos[2]
-                              << std::endl;
-            }
-
-            /*** TEM update (once per scan, CONVERGED pose — h_share iterations
-             *   only read the grid). Learning rate = alpha0(tem_tau) x q where
-             *   q is the dead-banded, squared ramp of the smoothed egf: fully
-             *   frozen at/below tem_egf_floor (any nonzero rate would hand the
-             *   memory to the drift over a ~700 s canopy dwell), full rate
-             *   at/above tem_egf_ref. Samples are the scan's fit-band inliers —
-             *   never recovered rows, so TEM cannot vouch for itself. ***/
-            if (tem_en)
-            {
-                static double tem_last_t = -1.0;
-                const double dt = (tem_last_t > 0.0 && lidar_end_time > tem_last_t)
-                                      ? std::min(lidar_end_time - tem_last_t, 0.5) : 0.1;
-                tem_last_t = lidar_end_time;
-                // Smoothed egf (~1 s at 10 Hz); unmeasurable scans hold the estimate.
-                if (canopy_near_count >= canopy_min_near)
-                    tem_egf_ema += 0.1 * (canopy_ground_frac - tem_egf_ema);
-                double q = (tem_egf_ema - tem_egf_floor) / std::max(tem_egf_ref - tem_egf_floor, 1e-6);
-                q = std::clamp(q, 0.0, 1.0);
-                q *= q;
-                // Graph-side drift note: while FRESH, samples are drift-corrected
-                // (z + d) and learning runs at a high fixed rate regardless of
-                // egf — the poisoning egf guarded against is measured and removed
-                // upstream. Stale note = plain egf-gated self-learning.
-                double d_use = 0.0, d_sig2 = 0.0;
-                bool anchored = false;
-                if (tem_anchor_en)
-                {
-                    std::lock_guard<std::mutex> lk(tem_anchor_mtx);
-                    if (tem_anchor_stamp > 0.0 &&
-                        std::fabs(lidar_end_time - tem_anchor_stamp) < tem_anchor_max_age)
-                    {
-                        d_use = tem_anchor_d;
-                        d_sig2 = tem_anchor_sigma * tem_anchor_sigma;
-                        anchored = true;
-                    }
-                }
-                constexpr double kTemAnchorQ = 0.8;
-                const double q_eff = anchored ? std::max(q, kTemAnchorQ) : q;
-                if (q_eff > 0.0 && !tem_samples.empty())
-                {
-                    struct TemAcc { double n = 0.0, sz = 0.0, szz = 0.0; };
-                    static std::unordered_map<int64_t, TemAcc> acc;
-                    acc.clear();
-                    for (const auto &pb : tem_samples)
-                    {
-                        const V3D pw = state_point.rot *
-                                           (state_point.offset_R_L_I * pb + state_point.offset_T_L_I) +
-                                       state_point.pos;
-                        const double zc = pw.z() + d_use;  // drift-corrected (epoch-frame) height
-                        TemAcc &a = acc[temKey(pw.x(), pw.y())];
-                        a.n += 1.0;
-                        a.sz += zc;
-                        a.szz += zc * zc;
-                    }
-                    const double alpha0 = 1.0 - std::exp(-dt / std::max(tem_tau, 1e-3));
-                    constexpr double kTemMinCellSamples = 5.0;  // one-point cells carry no spread info
-                    constexpr double kTemWMax = 30.0;           // confidence cap (~30 healthy scans)
-                    constexpr double kTemVarPrior = 0.01;       // (0.1 m)^2 until frames disagree
-                    for (const auto &kv : acc)
-                    {
-                        const TemAcc &a = kv.second;
-                        if (a.n < kTemMinCellSamples) continue;
-                        const double mean_s = a.sz / a.n;
-                        const double var_s = std::max(a.szz / a.n - mean_s * mean_s, 0.0) + d_sig2;
-                        auto it = tem_grid.find(kv.first);
-                        if (it == tem_grid.end())
-                        {
-                            tem_grid.emplace(kv.first, TemCell{mean_s, var_s + kTemVarPrior, q_eff});
-                            continue;
-                        }
-                        TemCell &c = it->second;
-                        const double alpha = alpha0 * q_eff;
-                        const double dz = mean_s - c.z;
-                        c.z += alpha * dz;
-                        // Variance sees intra-cell spread AND frame-to-frame
-                        // disagreement: slopes and residual drift inflate it, and
-                        // the recovery row weight collapses with it.
-                        c.var += alpha * (dz * dz + var_s - c.var);
-                        c.w = std::min(c.w + q_eff, kTemWMax);
-                        // Online slope statistic from served-neighbor gradients:
-                        // the extrapolation envelope's only terrain prior, learned
-                        // on site. HIGH-QUALITY updates only — at low q a cell
-                        // freshly touched by a drifting estimate sits metres from
-                        // its pre-drift neighbor and the gradient samples poison
-                        // the statistic (measured: 0.014 → 0.05-0.11 through the
-                        // 0702 canopy edge, blowing sigma_ext to 20-35 m).
-                        if (q_eff < 0.5) continue;
-                        constexpr double kTemMinServeW = 2.0;
-                        int64_t ckx, cky;
-                        temKeyToIdx(kv.first, ckx, cky);
-                        const int64_t nkeys[4] = {temKeyIdx(ckx - 1, cky), temKeyIdx(ckx + 1, cky),
-                                                  temKeyIdx(ckx, cky - 1), temKeyIdx(ckx, cky + 1)};
-                        for (const int64_t nk : nkeys)
-                        {
-                            const auto nit = tem_grid.find(nk);
-                            if (nit == tem_grid.end() || nit->second.w < kTemMinServeW) continue;
-                            const double slope = std::fabs(c.z - nit->second.z) / tem_cell;
-                            const double ds = slope - tem_slope_mean;
-                            tem_slope_mean += 0.02 * ds;
-                            tem_slope_var += 0.02 * (ds * ds - tem_slope_var);
-                        }
-                    }
-                }
-                // Per-scan extrapolation anchor: nearest served cells to the
-                // vehicle (expanding ring search). Runs precisely when q == 0 too
-                // — first-visit degraded terrain is where it is needed.
-                tem_ext_ok = false;
-                if (!tem_grid.empty())
-                {
-                    constexpr double kTemMinServeW = 2.0;
-                    constexpr int kTemExtMaxRing = 60;  // x tem_cell = 300 m reach
-                    const int64_t vx = static_cast<int64_t>(std::floor(state_point.pos(0) / tem_cell));
-                    const int64_t vy = static_cast<int64_t>(std::floor(state_point.pos(1) / tem_cell));
-                    for (int r = 0; r <= kTemExtMaxRing && !tem_ext_ok; r++)
-                    {
-                        double zsum = 0.0, vsum = 0.0, n = 0.0;
-                        for (int dx = -r; dx <= r; dx++)
-                            for (int dy = -r; dy <= r; dy++)
-                            {
-                                if (std::max(std::abs(dx), std::abs(dy)) != r) continue;  // ring only
-                                const auto it = tem_grid.find(temKeyIdx(vx + dx, vy + dy));
-                                if (it == tem_grid.end() || it->second.w < kTemMinServeW) continue;
-                                zsum += it->second.z;
-                                vsum += it->second.var;
-                                n += 1.0;
-                            }
-                        if (n < 1.0) continue;
-                        const double slope_hi =
-                            std::max(tem_slope_mean + 2.0 * std::sqrt(std::max(tem_slope_var, 0.0)), 0.003);
-                        const double dist = (r + 4.0) * tem_cell;  // +4 cells: row spread allowance (~20 m)
-                        tem_ext_z = zsum / n;
-                        tem_ext_sigma = std::sqrt(std::max(vsum / n, 0.0)) + slope_hi * dist;
-                        tem_ext_ok = true;
-                    }
-                }
-                if (canopy_debug)
-                    std::cerr << "[TEM] t=" << std::fixed << std::setprecision(3) << lidar_end_time
-                              << " egf=" << tem_egf_ema << " q=" << q_eff << " cells=" << tem_grid.size()
-                              << " rows=" << tem_rows << "/" << tem_ext_rows << "/" << tem_env_rows
-                              << " ext=" << (tem_ext_ok ? tem_ext_sigma : -1.0)
-                              << " slope=" << tem_slope_mean
-                              << " d=" << (anchored ? d_use : std::nan("")) << std::endl;
-            }
-
-            if (clutter_deweight_en && canopy_debug)
-                std::cerr << "[CLUT] t=" << std::fixed << std::setprecision(3) << lidar_end_time
-                          << " tested=" << clut_tested << " cut=" << clut_cut
-                          << " m_avg=" << (clut_tested > 0 ? clut_msum / clut_tested : 1.0)
-                          << " eigmin=" << pos_obs_eig_min << " zweak=" << pos_obs_z_weak << std::endl;
-
-            if (vxl_en && canopy_debug)
-                std::cerr << "[VXL] t=" << std::fixed << std::setprecision(3) << lidar_end_time
-                          << " cells=" << vxl_grid.size()
-                          << " tested=" << vxl_tested << " cut=" << vxl_cut
-                          << " m_avg=" << (vxl_tested > 0 ? vxl_msum / vxl_tested : 1.0)
-                          << " mv_avg=" << (vxl_vert_cnt > 0 ? vxl_vert_msum / vxl_vert_cnt : 1.0)
-                          << " sd_avg=" << (vxl_tested > 0 ? vxl_sd_sum / vxl_tested : 0.0)
-                          << " env=" << vxl_env_cnt
-                          << " h_avg=" << (vxl_env_cnt > 0 ? vxl_env_habs / vxl_env_cnt : 0.0)
-                          << " eigmin=" << pos_obs_eig_min << " zweak=" << pos_obs_z_weak << std::endl;
-
-            /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
-             *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll
-             *   reference the body-vz planar constraint below structurally lacks.
-             *   When LiDAR Z is degenerate, and only when the IMU is in low-linear-
-             *   acceleration motion (|‖a‖−g| small, so specific force ≈ gravity) and
-             *   not turning hard (lever-arm safety), the bias-free accelerometer
-             *   direction equals world-up expressed in the body frame. Pull the
-             *   grav-state up-axis onto it with a soft pseudo-measurement. Constrains
-             *   roll/pitch ONLY: yaw lies in the measurement null space (skew(g_body)
-             *   sends a yaw-axis δθ to 0), so the LiDAR-excellent heading is untouched.
-             *   h(x)=Rᵀ·u_world, right-perturbation R=R̂·Exp(δθ) ⇒ ∂h/∂δθ=skew(g_body),
-             *   the same form as the planar/wheel updates. ***/
-            if (gravity_align_en && !Measures.imu.empty() &&
-                (pos_obs_z_weak > gravity_align_z_weak_thresh || flio_in_degraded))
-            {
-                const auto &imu_last = Measures.imu.back();
-                V3D a_raw(imu_last->linear_acceleration.x,
-                          imu_last->linear_acceleration.y,
-                          imu_last->linear_acceleration.z);
-                V3D w_raw(imu_last->angular_velocity.x,
-                          imu_last->angular_velocity.y,
-                          imu_last->angular_velocity.z);
-                const double g_raw  = p_imu->gravity_norm();   // gravity magnitude, raw units
-                state_ikfom st = kf.get_x();
-                M3D Rw = st.rot.toRotationMatrix();
-                // Kinematic-acceleration compensation. The measured specific force is
-                // f = a_kinematic − g. On the open-area row-end turns that coincide with
-                // weak-Z, a_kinematic is dominated by centripetal ω×v_body, which tilts
-                // the raw accelerometer (mostly in ROLL) and, left uncorrected, drove a
-                // ~5 m upward Z drift. Subtract it (transport theorem; tangential dv/dt
-                // neglected, caught by the magnitude gate below) to recover clean gravity
-                // even mid-turn. Scaled into the IMU's accel units so it is g-unit safe.
-                V3D omega  = w_raw - V3D(st.bg[0], st.bg[1], st.bg[2]);  // true body rate
-                V3D v_body = Rw.transpose() * st.vel;                    // velocity in IMU frame
-                V3D a_kin  = omega.cross(v_body) * (g_raw / G_m_s2);     // centripetal, IMU units
-                V3D a_grav = a_raw - a_kin;                             // specific force − motion
-                const double a_norm = a_grav.norm();
-                // Validity gate: compensated magnitude ≈ gravity (rejects residual
-                // tangential accel) AND not spinning absurdly fast (ω×v single-sample
-                // approximation breaks down; magnitude gate is the primary guard).
-                if (g_raw > 1e-3 && a_norm > 1e-6 &&
-                    std::abs(a_norm - g_raw) <= gravity_align_accel_tol * g_raw &&
-                    w_raw.norm() <= gravity_align_gyro_tol)
-                {
-                    V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
-                    V3D u_world  = -grav_w.normalized();             // world up (unit)
-                    V3D g_body   = Rw.transpose() * u_world;         // predicted up in body (unit)
-                    V3D m_body   = a_grav / a_norm;                  // measured up in body (unit)
-                    V3D residual = m_body - g_body;                  // z − h(x)
-                    Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
-                    H.block<3,3>(0, 3) = skew_sym_mat(g_body);       // ∂h/∂(rot); yaw in null space
-                    const double n2 = gravity_align_noise * gravity_align_noise;
-                    Eigen::Vector3d R_diag(n2, n2, n2);
-                    if (degeneracy_debug)
-                    {
-                        // Leveling error the prior sees, BEFORE applying it: signed
-                        // tilt of measured-up vs predicted-up, decomposed so we can see
-                        // which way (and how hard) it will rotate pitch/roll.
-                        V3D tilt = g_body.cross(m_body);   // axis*sin(angle), body frame
-                        const double ang_deg = std::asin(std::min(1.0, tilt.norm())) * 57.2958;
-                        V3D eul_before = SO3ToEuler(st.rot);
-                        kf.update_simple(H, residual, R_diag);
-                        state_point = kf.get_x();
-                        V3D eul_after = SO3ToEuler(state_point.rot);
-                        V3D deul = eul_after - eul_before;
-                        std::cerr << "[GALIGN] z_weak=" << pos_obs_z_weak
-                                  << " degr=" << flio_in_degraded
-                                  << " tilt_deg=" << ang_deg
-                                  << " tiltAxisB=[" << tilt.x() << "," << tilt.y() << "," << tilt.z() << "]"
-                                  << " dRPY_deg=[" << deul.x()*57.2958 << "," << deul.y()*57.2958 << "," << deul.z()*57.2958 << "]"
-                                  << " posZ=" << state_point.pos[2] << "m" << std::endl;
-                    }
-                    else
-                    {
-                        kf.update_simple(H, residual, R_diag);
-                        state_point = kf.get_x();
-                    }
-                }
-            }
-
-            /*** A'-2 planar-motion soft constraint: pseudo-measurement that the
-             *   BODY-frame vertical velocity is ~0 (a ground-robot non-holonomic
-             *   prior, same mechanism as the wheel-odom update below). Applied only
-             *   when LiDAR Z is degenerate (pos_obs_z_weak high), so it is inert
-             *   during normal operation. Body-frame → it does NOT fight slope
-             *   motion: world-frame vertical velocity on a ramp is produced by the
-             *   robot's pitch (rotation state), not by body-frame vz. This supplies
-             *   the missing vertical information that the degenerate iEKF otherwise
-             *   dumps into the accel bias, flying the state off (bag2 km-runaway). ***/
-            if (planar_constraint_en &&
-                (pos_obs_z_weak > planar_constraint_z_weak_thresh || flio_in_degraded))
-            {
-                state_ikfom st = kf.get_x();
-                M3D Rw = st.rot.toRotationMatrix();
-                V3D v_body = Rw.transpose() * st.vel;   // velocity in IMU/body frame
-                // Measurement: body velocity = 0, but only the vertical (z) row is
-                // enforced — x/y get huge noise so forward/lateral motion is untouched.
-                V3D residual = -v_body;
-                Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
-                H.block<3,3>(0, 3)  = skew_sym_mat(v_body);   // dh/d(rot)
-                H.block<3,3>(0, 12) = Rw.transpose();          // dh/d(vel)
-                Eigen::Vector3d R_diag(1e6, 1e6, planar_constraint_noise * planar_constraint_noise);
-                kf.update_simple(H, residual, R_diag);
-                state_point = kf.get_x();
-            }
-
-            /*** Divergence guard (P1) — bound the runaway while degraded. A ground
-             *   vehicle cannot exceed a few m/s; a larger body speed here is
-             *   IMU-dead-reckoning blow-up, so clamp it (direction preserved) to keep
-             *   position growth linear and recoverable instead of exponential. Freeze
-             *   the map so dead-reckoned scans do not corrupt it, and flag the
-             *   odometry degraded so downstream (PGO) down-weights these poses. ***/
-            if (flio_in_degraded)
-            {
-                state_ikfom st = kf.get_x();
-                const double spd = st.vel.norm();
-                if (spd > divergence_guard_max_speed)
-                {
-                    st.vel *= divergence_guard_max_speed / spd;
-                    kf.change_x(st);
-                    state_point = kf.get_x();
-                }
-                flio_map_frozen = true;
-                flio_degraded_odom = true;
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                    "[DIVERGENCE-GUARD] LiDAR starved %d scans (effct=%d): planar-Z pinned, "
-                    "speed clamped, map frozen; posZ=%.1fm spd=%.2fm/s",
-                    consec_low_eff, effct_feat_num, state_point.pos[2], state_point.vel.norm());
-            }
-
-            /*** Optional degeneracy diagnostics ***/
-            if (degeneracy_debug)
-            {
-                const double lidar_correction = (state_point.pos - pos_before_update).norm();
-                const double body_speed = state_point.vel.norm();
-                const double dvel = (state_point.vel - state_before_update.vel).norm();
-                const double dba  = (state_point.ba  - state_before_update.ba ).norm();
-                const double dbg  = (state_point.bg  - state_before_update.bg ).norm();
-                if (lidar_correction > 0.2 || body_speed > 1.5 || dvel > 0.3 ||
-                    dba > 0.05 || dbg > 0.01 || effct_feat_num < 200 || pos_obs_z_weak > 0.7)
-                {
-                    std::cerr << "[DEGEN] effct=" << effct_feat_num
-                              << " corr=" << lidar_correction << "m speed=" << body_speed
-                              << " dvel=" << dvel << " dba=" << dba << " dbg=" << dbg
-                              << " z_weak=" << pos_obs_z_weak << " posZ=" << state_point.pos[2] << "m"
-                              << " rec=" << canopy_ground_recovered << std::endl;
-                }
-            }
-
-            /*** Wheel velocity update (after ICP, constrains along-track drift) ***/
-            if (wheel_odom_en)
-            {
-                Eigen::Vector3d twist_v;
-                bool have_twist = false;
-                {
-                    std::lock_guard<std::mutex> lk(mtx_twist);
-                    if (!twist_buffer.empty()) {
-                        twist_v = twist_buffer.back();
-                        twist_buffer.clear();
-                        have_twist = true;
-                    }
-                }
-                if (have_twist)
-                {
-                    state_ikfom st = kf.get_x();
-                    M3D Rw = st.rot.toRotationMatrix();    // R_{world←IMU}
-                    M3D Re_T = R_robot_to_imu.transpose();  // R_{robot←IMU}
-                    V3D v_imu = Rw.transpose() * st.vel;    // vel in IMU frame
-
-                    // Predicted: h(x) = R_ext^T * R_w^T * vel (robot frame)
-                    V3D h_pred = Re_T * v_imu;
-                    // Measured: z = [vx*scale, 0, 0] (non-holonomic: vy=vz=0)
-                    V3D z_meas(twist_v(0) * wheel_speed_scale, 0.0, 0.0);
-                    V3D residual = z_meas - h_pred;
-
-                    // Jacobian H (3×23): non-zero at rot(3-5) and vel(12-14)
-                    Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
-                    H.block<3,3>(0, 3)  = Re_T * skew_sym_mat(v_imu);  // dh/d(rot)
-                    H.block<3,3>(0, 12) = Re_T * Rw.transpose();        // dh/d(vel)
-
-                    // Diagonal noise variances
-                    Eigen::Vector3d R_diag(
-                        wheel_vel_noise_vx * wheel_vel_noise_vx,
-                        wheel_vel_noise_vy * wheel_vel_noise_vy,
-                        wheel_vel_noise_vz * wheel_vel_noise_vz);
-
-                    kf.update_simple(H, residual, R_diag);
-                    state_point = kf.get_x();  // re-read corrected state
-                }
-            }
-
-            euler_cur = SO3ToEuler(state_point.rot);
-            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            geoQuat.x = state_point.rot.coeffs()[0];
-            geoQuat.y = state_point.rot.coeffs()[1];
-            geoQuat.z = state_point.rot.coeffs()[2];
-            geoQuat.w = state_point.rot.coeffs()[3];
-
-            double t_update_end = omp_get_wtime();
-
-            /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
-
-            /*** add the feature points to map kdtree ***/
-            t3 = omp_get_wtime();
-            // Mapping pause gate: when operator has disabled mapping (via
-            // /lio_slam/set_mapping_enabled in the PGO node), skip ikd-tree
-            // growth so the prior map isn't polluted by stationary frames or
-            // teleport segments (elevator).  EKF and odometry publishing
-            // above continue normally.
-            if (mapping_enabled.load(std::memory_order_relaxed) && !flio_map_frozen) {
-                map_incremental();
-                // Same gate as map growth: a frozen/paused map means "don't
-                // learn from this state" — that applies to the voxel surface
-                // statistics as much as to the ikd-tree.
-                vxl_update();
-            }
-            t5 = omp_get_wtime();
-
-            // [ikd-profile] per-scan split: iEKF (search-bound) vs map_incre Add vs transform
-            // loop, correlated with concurrent background-rebuild work + inline rebuild.
-            if (ikd_profile) {
-                const double iekf_ms = (t_update_end - t_update_start) * 1000.0;
-                // Under async, the Add runs off-thread: report its last completed wall time
-                // (g_async_add_us, == previous scan's Add) and the join-wait this scan paid
-                // (the residual Add cost the inter-scan gap could NOT hide). loop_ms is then
-                // just the on-thread decision loop + dispatch.
-                const double add_ms  = async_map_en ? (g_async_add_us.load(std::memory_order_relaxed) / 1000.0)
-                                                    : (kdtree_incremental_time * 1000.0);
-                const double join_ms = async_map_en ? g_map_join_wait_ms : 0.0;
-                const double loop_ms = async_map_en ? ((t5 - t3) * 1000.0)
-                                                    : ((t5 - t3) * 1000.0 - add_ms);
-                const uint64_t d_rb_us  = g_ikd_rebuild_us.load(std::memory_order_relaxed)        - prof_rb_us0;
-                const uint64_t d_rb_cnt = g_ikd_rebuild_count.load(std::memory_order_relaxed)     - prof_rb_cnt0;
-                const uint64_t d_inl_us = g_ikd_inline_rebuild_us.load(std::memory_order_relaxed) - prof_inl_us0;
-                // tree= uses kdtree_size_st (captured at scan start, worker idle) — calling
-                // ikdtree.size() here would race the worker's in-flight Add under async.
-                printf("[IKDPROF] tree=%d feats=%d iekf_ms=%.1f add_ms=%.1f join_ms=%.1f loop_ms=%.1f | "
-                       "rb_dcnt=%llu rb_dus_ms=%.1f inl_dus_ms=%.1f rb_active=%d "
-                       "rb_maxus_ms=%.1f rb_maxsz=%llu rootreb=%llu\n",
-                       kdtree_size_st, feats_down_size, iekf_ms, add_ms, join_ms, loop_ms,
-                       (unsigned long long)d_rb_cnt, d_rb_us / 1000.0, d_inl_us / 1000.0,
-                       (int)g_ikd_rebuild_active.load(std::memory_order_relaxed),
-                       g_ikd_rebuild_max_us.load(std::memory_order_relaxed) / 1000.0,
-                       (unsigned long long)g_ikd_rebuild_max_size.load(std::memory_order_relaxed),
-                       (unsigned long long)g_ikd_root_rebuild_count.load(std::memory_order_relaxed));
-            }
-
-            /******* Publish points *******/
-            if (path_en)                         publish_path(pubPath_);
-            if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
-            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
-            if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
-            // if (map_pub_en) publish_map(pubLaserCloudMap_);
-
-            /*** Debug variables ***/
-            if (runtime_pos_log)
-            {
-                frame_num ++;
-                // Under async the worker may be mid-Add; reading ikdtree.size() here would
-                // race it. Estimate from the scan-start size + this scan's add count.
-                kdtree_size_end = async_map_en ? (kdtree_size_st + add_point_size) : ikdtree.size();
-                aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t5 - t0) / frame_num;
-                aver_time_icp = aver_time_icp * (frame_num - 1)/frame_num + (t_update_end - t_update_start) / frame_num;
-                aver_time_match = aver_time_match * (frame_num - 1)/frame_num + (match_time)/frame_num;
-                aver_time_incre = aver_time_incre * (frame_num - 1)/frame_num + (kdtree_incremental_time)/frame_num;
-                aver_time_solve = aver_time_solve * (frame_num - 1)/frame_num + (solve_time + solve_H_time)/frame_num;
-                aver_time_const_H_time = aver_time_const_H_time * (frame_num - 1)/frame_num + solve_time / frame_num;
-                T1[time_log_counter] = Measures.lidar_beg_time;
-                s_plot[time_log_counter] = t5 - t0;
-                s_plot2[time_log_counter] = feats_undistort->points.size();
-                s_plot3[time_log_counter] = kdtree_incremental_time;
-                s_plot4[time_log_counter] = kdtree_search_time;
-                s_plot5[time_log_counter] = kdtree_delete_counter;
-                s_plot6[time_log_counter] = kdtree_delete_time;
-                s_plot7[time_log_counter] = kdtree_size_st;
-                s_plot8[time_log_counter] = kdtree_size_end;
-                s_plot9[time_log_counter] = aver_time_consu;
-                s_plot10[time_log_counter] = add_point_size;
-                time_log_counter ++;
-                printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
-                if ((t3 - t1) > 0.05) {
-                    printf("[ SPIKE ]: t1_to_pre_icp: %0.3f  icp: %0.3f  publish: %0.3f  total(t3-t1): %0.3f  feats: %d  tree: %d\n",
-                           (t_pre_icp-t1)*1000, (t_update_end-t_update_start)*1000, (t3-t_update_end)*1000, (t3-t1)*1000, feats_down_size, kdtree_size_st);
-                }
-                ext_euler = SO3ToEuler(state_point.offset_R_L_I);
-                if (time_log_counter % 500 == 0 || time_log_counter == 1) {
-                    printf("[ extrinsic ]: T_L_I = [%0.5f, %0.5f, %0.5f]  R_euler = [%0.3f, %0.3f, %0.3f] deg  bg = [%0.6f, %0.6f, %0.6f]  ba = [%0.6f, %0.6f, %0.6f]  grav = [%0.5f, %0.5f, %0.5f]\n",
-                        state_point.offset_T_L_I(0), state_point.offset_T_L_I(1), state_point.offset_T_L_I(2),
-                        ext_euler(0), ext_euler(1), ext_euler(2),
-                        state_point.bg(0), state_point.bg(1), state_point.bg(2),
-                        state_point.ba(0), state_point.ba(1), state_point.ba(2),
-                        state_point.grav[0], state_point.grav[1], state_point.grav[2]);
-                }
-                fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
-                <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<"\n";
-                fout_jump << setw(20) << Measures.lidar_beg_time - first_lidar_time
-                          << " yaw_before_deg " << euler_before_update(2)
-                          << " yaw_after_deg " << euler_cur(2)
-                          << " yaw_step_deg " << (euler_cur(2) - euler_before_update(2))
-                          << " pos_step_xy " << (state_point.pos.head<2>() - pos_before_update.head<2>()).norm()
-                          << " feats_down " << feats_down_size
-                          << " effct_feat_num " << effct_feat_num
-                          << " res_mean_last " << res_mean_last
-                          << " solve_H_ms " << solve_H_time * 1000.0
-                          << " icp_ms " << (t_update_end - t_update_start) * 1000.0
-                          << "\n";
-                fout_jump.flush();
-                dump_lio_state_to_log(fp);
-            }
-        }
-    }
-
-    void map_publish_callback()
-    {
-        // publish_map() flattens the ikd-tree (a tree read). This 1 Hz timer shares the
-        // single executor thread with timer_callback, so it can fire BETWEEN scans while
-        // the off-thread Add is in flight — join first to keep the single-operator invariant.
-        if (map_pub_en) {
-            if (async_map_en) joinMapAdd();
-            publish_map(pubLaserCloudMap_);
-        }
-    }
-
-    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
-    {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
-        if (pcd_save_en)
-        {
-            save_to_pcd();
-            res->success = true;
-            res->message = "Map saved.";
-        }
+      /*** Divergence guard (P1) — two independent divergence signals:
+       *   (1) effective-correspondence collapse streak: effct_feat_num (the
+       *       matched-plane count from the final iEKF iteration) staying low
+       *       for several scans means the scan no longer overlaps the map
+       *       (starvation / featureless) — the slow-drift onset.
+       *   (2) velocity runaway: a ground vehicle cannot physically exceed a
+       *       few m/s, so a body speed above divergence_guard_max_speed is
+       *       unambiguous IMU-dead-reckoning blow-up — catches the fast mode
+       *       (big IMU-integration jumps after dropped scans) that signal (1)
+       *       can miss because the post-gap scan may still match.
+       *   Either signal arms the degraded response below (force planar-Z,
+       *   clamp the speed, freeze the map). Both are inert in healthy
+       *   operation, so the guard is accuracy-neutral when undisturbed. ***/
+      flio_map_frozen = false;
+      flio_degraded_odom = false;
+      bool flio_vel_runaway = false;
+      if (divergence_guard_en) {
+        if (effct_feat_num < divergence_guard_min_eff)
+          ++consec_low_eff;
         else
-        {
-            res->success = false;
-            res->message = "Map save disabled.";
+          consec_low_eff = 0;
+        flio_vel_runaway = (state_point.vel.norm() > divergence_guard_max_speed);
+      }
+      const bool flio_in_degraded =
+        divergence_guard_en && (consec_low_eff >= divergence_guard_streak || flio_vel_runaway);
+
+      /*** Canopy mode debounce (once per scan, on the h_share_model raw
+       *   stats). Enter needs BOTH signals (ground fraction collapsed AND
+       *   near-field points tall) for canopy_enter_scans consecutive scans;
+       *   exit needs the ground fraction healthy for canopy_exit_scans.
+       *   Scans with too few near-field points are neutral: hold state,
+       *   reset both streaks (no drift toward either decision). ***/
+      if (canopy_detect_en) {
+        const bool measurable = canopy_near_count >= canopy_min_near;
+        const bool vote_enter = measurable && canopy_ground_frac < canopy_frac_enter && canopy_zp95 > canopy_zp95_enter;
+        const bool vote_exit = measurable && canopy_ground_frac > canopy_frac_exit;
+        if (!canopy_mode) {
+          canopy_enter_streak = vote_enter ? canopy_enter_streak + 1 : 0;
+          if (canopy_enter_streak >= canopy_enter_scans) {
+            canopy_mode = true;
+            canopy_enter_streak = 0;
+            RCLCPP_WARN(this->get_logger(),
+                        "[CANOPY] ENTER ground_frac=%.2f zp95=%.2f near=%d posZ=%.2f",
+                        canopy_ground_frac,
+                        canopy_zp95,
+                        canopy_near_count,
+                        state_point.pos[2]);
+          }
+        } else {
+          canopy_exit_streak = vote_exit ? canopy_exit_streak + 1 : 0;
+          if (canopy_exit_streak >= canopy_exit_scans) {
+            canopy_mode = false;
+            canopy_exit_streak = 0;
+            RCLCPP_WARN(this->get_logger(),
+                        "[CANOPY] EXIT ground_frac=%.2f zp95=%.2f near=%d posZ=%.2f",
+                        canopy_ground_frac,
+                        canopy_zp95,
+                        canopy_near_count,
+                        state_point.pos[2]);
+          }
         }
+        if (canopy_debug)
+          std::cerr << "[CANOPY] t=" << std::fixed << std::setprecision(3) << lidar_end_time
+                    << " frac=" << canopy_ground_frac << " zp95=" << canopy_zp95 << " near=" << canopy_near_count
+                    << " mode=" << canopy_mode << " rec=" << canopy_ground_recovered << " posZ=" << state_point.pos[2]
+                    << std::endl;
+      }
+
+      /*** TEM update (once per scan, CONVERGED pose — h_share iterations
+       *   only read the grid). Learning rate = alpha0(tem_tau) x q where
+       *   q is the dead-banded, squared ramp of the smoothed egf: fully
+       *   frozen at/below tem_egf_floor (any nonzero rate would hand the
+       *   memory to the drift over a ~700 s canopy dwell), full rate
+       *   at/above tem_egf_ref. Samples are the scan's fit-band inliers —
+       *   never recovered rows, so TEM cannot vouch for itself. ***/
+      if (tem_en) {
+        static double tem_last_t = -1.0;
+        const double dt =
+          (tem_last_t > 0.0 && lidar_end_time > tem_last_t) ? std::min(lidar_end_time - tem_last_t, 0.5) : 0.1;
+        tem_last_t = lidar_end_time;
+        // Smoothed egf (~1 s at 10 Hz); unmeasurable scans hold the estimate.
+        if (canopy_near_count >= canopy_min_near)
+          tem_egf_ema += 0.1 * (canopy_ground_frac - tem_egf_ema);
+        double q = (tem_egf_ema - tem_egf_floor) / std::max(tem_egf_ref - tem_egf_floor, 1e-6);
+        q = std::clamp(q, 0.0, 1.0);
+        q *= q;
+        // Graph-side drift note: while FRESH, samples are drift-corrected
+        // (z + d) and learning runs at a high fixed rate regardless of
+        // egf — the poisoning egf guarded against is measured and removed
+        // upstream. Stale note = plain egf-gated self-learning.
+        double d_use = 0.0, d_sig2 = 0.0;
+        bool anchored = false;
+        if (tem_anchor_en) {
+          std::lock_guard<std::mutex> lk(tem_anchor_mtx);
+          if (tem_anchor_stamp > 0.0 && std::fabs(lidar_end_time - tem_anchor_stamp) < tem_anchor_max_age) {
+            d_use = tem_anchor_d;
+            d_sig2 = tem_anchor_sigma * tem_anchor_sigma;
+            anchored = true;
+          }
+        }
+        constexpr double kTemAnchorQ = 0.8;
+        const double q_eff = anchored ? std::max(q, kTemAnchorQ) : q;
+        if (q_eff > 0.0 && !tem_samples.empty()) {
+          struct TemAcc
+          {
+            double n = 0.0, sz = 0.0, szz = 0.0;
+          };
+          static std::unordered_map<int64_t, TemAcc> acc;
+          acc.clear();
+          for (const auto & pb : tem_samples) {
+            const V3D pw =
+              state_point.rot * (state_point.offset_R_L_I * pb + state_point.offset_T_L_I) + state_point.pos;
+            const double zc = pw.z() + d_use;  // drift-corrected (epoch-frame) height
+            TemAcc & a = acc[temKey(pw.x(), pw.y())];
+            a.n += 1.0;
+            a.sz += zc;
+            a.szz += zc * zc;
+          }
+          const double alpha0 = 1.0 - std::exp(-dt / std::max(tem_tau, 1e-3));
+          constexpr double kTemMinCellSamples = 5.0;  // one-point cells carry no spread info
+          constexpr double kTemWMax = 30.0;           // confidence cap (~30 healthy scans)
+          constexpr double kTemVarPrior = 0.01;       // (0.1 m)^2 until frames disagree
+          for (const auto & kv : acc) {
+            const TemAcc & a = kv.second;
+            if (a.n < kTemMinCellSamples)
+              continue;
+            const double mean_s = a.sz / a.n;
+            const double var_s = std::max(a.szz / a.n - mean_s * mean_s, 0.0) + d_sig2;
+            auto it = tem_grid.find(kv.first);
+            if (it == tem_grid.end()) {
+              tem_grid.emplace(kv.first, TemCell{mean_s, var_s + kTemVarPrior, q_eff});
+              continue;
+            }
+            TemCell & c = it->second;
+            const double alpha = alpha0 * q_eff;
+            const double dz = mean_s - c.z;
+            c.z += alpha * dz;
+            // Variance sees intra-cell spread AND frame-to-frame
+            // disagreement: slopes and residual drift inflate it, and
+            // the recovery row weight collapses with it.
+            c.var += alpha * (dz * dz + var_s - c.var);
+            c.w = std::min(c.w + q_eff, kTemWMax);
+            // Online slope statistic from served-neighbor gradients:
+            // the extrapolation envelope's only terrain prior, learned
+            // on site. HIGH-QUALITY updates only — at low q a cell
+            // freshly touched by a drifting estimate sits metres from
+            // its pre-drift neighbor and the gradient samples poison
+            // the statistic (measured: 0.014 → 0.05-0.11 through the
+            // 0702 canopy edge, blowing sigma_ext to 20-35 m).
+            if (q_eff < 0.5)
+              continue;
+            constexpr double kTemMinServeW = 2.0;
+            int64_t ckx, cky;
+            temKeyToIdx(kv.first, ckx, cky);
+            const int64_t nkeys[4] = {
+              temKeyIdx(ckx - 1, cky), temKeyIdx(ckx + 1, cky), temKeyIdx(ckx, cky - 1), temKeyIdx(ckx, cky + 1)};
+            for (const int64_t nk : nkeys) {
+              const auto nit = tem_grid.find(nk);
+              if (nit == tem_grid.end() || nit->second.w < kTemMinServeW)
+                continue;
+              const double slope = std::fabs(c.z - nit->second.z) / tem_cell;
+              const double ds = slope - tem_slope_mean;
+              tem_slope_mean += 0.02 * ds;
+              tem_slope_var += 0.02 * (ds * ds - tem_slope_var);
+            }
+          }
+        }
+        // Per-scan extrapolation anchor: nearest served cells to the
+        // vehicle (expanding ring search). Runs precisely when q == 0 too
+        // — first-visit degraded terrain is where it is needed.
+        tem_ext_ok = false;
+        if (!tem_grid.empty()) {
+          constexpr double kTemMinServeW = 2.0;
+          constexpr int kTemExtMaxRing = 60;  // x tem_cell = 300 m reach
+          const int64_t vx = static_cast<int64_t>(std::floor(state_point.pos(0) / tem_cell));
+          const int64_t vy = static_cast<int64_t>(std::floor(state_point.pos(1) / tem_cell));
+          for (int r = 0; r <= kTemExtMaxRing && !tem_ext_ok; r++) {
+            double zsum = 0.0, vsum = 0.0, n = 0.0;
+            for (int dx = -r; dx <= r; dx++)
+              for (int dy = -r; dy <= r; dy++) {
+                if (std::max(std::abs(dx), std::abs(dy)) != r)
+                  continue;  // ring only
+                const auto it = tem_grid.find(temKeyIdx(vx + dx, vy + dy));
+                if (it == tem_grid.end() || it->second.w < kTemMinServeW)
+                  continue;
+                zsum += it->second.z;
+                vsum += it->second.var;
+                n += 1.0;
+              }
+            if (n < 1.0)
+              continue;
+            const double slope_hi = std::max(tem_slope_mean + 2.0 * std::sqrt(std::max(tem_slope_var, 0.0)), 0.003);
+            const double dist = (r + 4.0) * tem_cell;  // +4 cells: row spread allowance (~20 m)
+            tem_ext_z = zsum / n;
+            tem_ext_sigma = std::sqrt(std::max(vsum / n, 0.0)) + slope_hi * dist;
+            tem_ext_ok = true;
+          }
+        }
+        if (canopy_debug)
+          std::cerr << "[TEM] t=" << std::fixed << std::setprecision(3) << lidar_end_time << " egf=" << tem_egf_ema
+                    << " q=" << q_eff << " cells=" << tem_grid.size() << " rows=" << tem_rows << "/" << tem_ext_rows
+                    << "/" << tem_env_rows << " ext=" << (tem_ext_ok ? tem_ext_sigma : -1.0)
+                    << " slope=" << tem_slope_mean << " d=" << (anchored ? d_use : std::nan("")) << std::endl;
+      }
+
+      if (clutter_deweight_en && canopy_debug)
+        std::cerr << "[CLUT] t=" << std::fixed << std::setprecision(3) << lidar_end_time << " tested=" << clut_tested
+                  << " cut=" << clut_cut << " m_avg=" << (clut_tested > 0 ? clut_msum / clut_tested : 1.0)
+                  << " eigmin=" << pos_obs_eig_min << " zweak=" << pos_obs_z_weak << std::endl;
+
+      if (vxl_en && canopy_debug)
+        std::cerr << "[VXL] t=" << std::fixed << std::setprecision(3) << lidar_end_time << " cells=" << vxl_grid.size()
+                  << " tested=" << vxl_tested << " cut=" << vxl_cut
+                  << " m_avg=" << (vxl_tested > 0 ? vxl_msum / vxl_tested : 1.0)
+                  << " mv_avg=" << (vxl_vert_cnt > 0 ? vxl_vert_msum / vxl_vert_cnt : 1.0)
+                  << " sd_avg=" << (vxl_tested > 0 ? vxl_sd_sum / vxl_tested : 0.0) << " env=" << vxl_env_cnt
+                  << " h_avg=" << (vxl_env_cnt > 0 ? vxl_env_habs / vxl_env_cnt : 0.0) << " eigmin=" << pos_obs_eig_min
+                  << " zweak=" << pos_obs_z_weak << std::endl;
+
+      /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
+       *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll
+       *   reference the body-vz planar constraint below structurally lacks.
+       *   When LiDAR Z is degenerate, and only when the IMU is in low-linear-
+       *   acceleration motion (|‖a‖−g| small, so specific force ≈ gravity) and
+       *   not turning hard (lever-arm safety), the bias-free accelerometer
+       *   direction equals world-up expressed in the body frame. Pull the
+       *   grav-state up-axis onto it with a soft pseudo-measurement. Constrains
+       *   roll/pitch ONLY: yaw lies in the measurement null space (skew(g_body)
+       *   sends a yaw-axis δθ to 0), so the LiDAR-excellent heading is untouched.
+       *   h(x)=Rᵀ·u_world, right-perturbation R=R̂·Exp(δθ) ⇒ ∂h/∂δθ=skew(g_body),
+       *   the same form as the planar/wheel updates. ***/
+      if (gravity_align_en && !Measures.imu.empty() &&
+          (pos_obs_z_weak > gravity_align_z_weak_thresh || flio_in_degraded)) {
+        const auto & imu_last = Measures.imu.back();
+        V3D a_raw(imu_last->linear_acceleration.x, imu_last->linear_acceleration.y, imu_last->linear_acceleration.z);
+        V3D w_raw(imu_last->angular_velocity.x, imu_last->angular_velocity.y, imu_last->angular_velocity.z);
+        const double g_raw = p_imu->gravity_norm();  // gravity magnitude, raw units
+        state_ikfom st = kf.get_x();
+        M3D Rw = st.rot.toRotationMatrix();
+        // Kinematic-acceleration compensation. The measured specific force is
+        // f = a_kinematic − g. On the open-area row-end turns that coincide with
+        // weak-Z, a_kinematic is dominated by centripetal ω×v_body, which tilts
+        // the raw accelerometer (mostly in ROLL) and, left uncorrected, drove a
+        // ~5 m upward Z drift. Subtract it (transport theorem; tangential dv/dt
+        // neglected, caught by the magnitude gate below) to recover clean gravity
+        // even mid-turn. Scaled into the IMU's accel units so it is g-unit safe.
+        V3D omega = w_raw - V3D(st.bg[0], st.bg[1], st.bg[2]);  // true body rate
+        V3D v_body = Rw.transpose() * st.vel;                   // velocity in IMU frame
+        V3D a_kin = omega.cross(v_body) * (g_raw / G_m_s2);     // centripetal, IMU units
+        V3D a_grav = a_raw - a_kin;                             // specific force − motion
+        const double a_norm = a_grav.norm();
+        // Validity gate: compensated magnitude ≈ gravity (rejects residual
+        // tangential accel) AND not spinning absurdly fast (ω×v single-sample
+        // approximation breaks down; magnitude gate is the primary guard).
+        if (g_raw > 1e-3 && a_norm > 1e-6 && std::abs(a_norm - g_raw) <= gravity_align_accel_tol * g_raw &&
+            w_raw.norm() <= gravity_align_gyro_tol) {
+          V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
+          V3D u_world = -grav_w.normalized();              // world up (unit)
+          V3D g_body = Rw.transpose() * u_world;           // predicted up in body (unit)
+          V3D m_body = a_grav / a_norm;                    // measured up in body (unit)
+          V3D residual = m_body - g_body;                  // z − h(x)
+          Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
+          H.block<3, 3>(0, 3) = skew_sym_mat(g_body);  // ∂h/∂(rot); yaw in null space
+          const double n2 = gravity_align_noise * gravity_align_noise;
+          Eigen::Vector3d R_diag(n2, n2, n2);
+          if (degeneracy_debug) {
+            // Leveling error the prior sees, BEFORE applying it: signed
+            // tilt of measured-up vs predicted-up, decomposed so we can see
+            // which way (and how hard) it will rotate pitch/roll.
+            V3D tilt = g_body.cross(m_body);  // axis*sin(angle), body frame
+            const double ang_deg = std::asin(std::min(1.0, tilt.norm())) * 57.2958;
+            V3D eul_before = SO3ToEuler(st.rot);
+            kf.update_simple(H, residual, R_diag);
+            state_point = kf.get_x();
+            V3D eul_after = SO3ToEuler(state_point.rot);
+            V3D deul = eul_after - eul_before;
+            std::cerr << "[GALIGN] z_weak=" << pos_obs_z_weak << " degr=" << flio_in_degraded << " tilt_deg=" << ang_deg
+                      << " tiltAxisB=[" << tilt.x() << "," << tilt.y() << "," << tilt.z() << "]"
+                      << " dRPY_deg=[" << deul.x() * 57.2958 << "," << deul.y() * 57.2958 << "," << deul.z() * 57.2958
+                      << "]"
+                      << " posZ=" << state_point.pos[2] << "m" << std::endl;
+          } else {
+            kf.update_simple(H, residual, R_diag);
+            state_point = kf.get_x();
+          }
+        }
+      }
+
+      /*** A'-2 planar-motion soft constraint: pseudo-measurement that the
+       *   BODY-frame vertical velocity is ~0 (a ground-robot non-holonomic
+       *   prior, same mechanism as the wheel-odom update below). Applied only
+       *   when LiDAR Z is degenerate (pos_obs_z_weak high), so it is inert
+       *   during normal operation. Body-frame → it does NOT fight slope
+       *   motion: world-frame vertical velocity on a ramp is produced by the
+       *   robot's pitch (rotation state), not by body-frame vz. This supplies
+       *   the missing vertical information that the degenerate iEKF otherwise
+       *   dumps into the accel bias, flying the state off (bag2 km-runaway). ***/
+      if (planar_constraint_en && (pos_obs_z_weak > planar_constraint_z_weak_thresh || flio_in_degraded)) {
+        state_ikfom st = kf.get_x();
+        M3D Rw = st.rot.toRotationMatrix();
+        V3D v_body = Rw.transpose() * st.vel;  // velocity in IMU/body frame
+        // Measurement: body velocity = 0, but only the vertical (z) row is
+        // enforced — x/y get huge noise so forward/lateral motion is untouched.
+        V3D residual = -v_body;
+        Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
+        H.block<3, 3>(0, 3) = skew_sym_mat(v_body);  // dh/d(rot)
+        H.block<3, 3>(0, 12) = Rw.transpose();       // dh/d(vel)
+        Eigen::Vector3d R_diag(1e6, 1e6, planar_constraint_noise * planar_constraint_noise);
+        kf.update_simple(H, residual, R_diag);
+        state_point = kf.get_x();
+      }
+
+      /*** Divergence guard (P1) — bound the runaway while degraded. A ground
+       *   vehicle cannot exceed a few m/s; a larger body speed here is
+       *   IMU-dead-reckoning blow-up, so clamp it (direction preserved) to keep
+       *   position growth linear and recoverable instead of exponential. Freeze
+       *   the map so dead-reckoned scans do not corrupt it, and flag the
+       *   odometry degraded so downstream (PGO) down-weights these poses. ***/
+      if (flio_in_degraded) {
+        state_ikfom st = kf.get_x();
+        const double spd = st.vel.norm();
+        if (spd > divergence_guard_max_speed) {
+          st.vel *= divergence_guard_max_speed / spd;
+          kf.change_x(st);
+          state_point = kf.get_x();
+        }
+        flio_map_frozen = true;
+        flio_degraded_odom = true;
+        RCLCPP_WARN_THROTTLE(this->get_logger(),
+                             *this->get_clock(),
+                             2000,
+                             "[DIVERGENCE-GUARD] LiDAR starved %d scans (effct=%d): planar-Z pinned, "
+                             "speed clamped, map frozen; posZ=%.1fm spd=%.2fm/s",
+                             consec_low_eff,
+                             effct_feat_num,
+                             state_point.pos[2],
+                             state_point.vel.norm());
+      }
+
+      /*** Optional degeneracy diagnostics ***/
+      if (degeneracy_debug) {
+        const double lidar_correction = (state_point.pos - pos_before_update).norm();
+        const double body_speed = state_point.vel.norm();
+        const double dvel = (state_point.vel - state_before_update.vel).norm();
+        const double dba = (state_point.ba - state_before_update.ba).norm();
+        const double dbg = (state_point.bg - state_before_update.bg).norm();
+        if (lidar_correction > 0.2 || body_speed > 1.5 || dvel > 0.3 || dba > 0.05 || dbg > 0.01 ||
+            effct_feat_num < 200 || pos_obs_z_weak > 0.7) {
+          std::cerr << "[DEGEN] effct=" << effct_feat_num << " corr=" << lidar_correction << "m speed=" << body_speed
+                    << " dvel=" << dvel << " dba=" << dba << " dbg=" << dbg << " z_weak=" << pos_obs_z_weak
+                    << " posZ=" << state_point.pos[2] << "m"
+                    << " rec=" << canopy_ground_recovered << std::endl;
+        }
+      }
+
+      /*** Wheel velocity update (after ICP, constrains along-track drift) ***/
+      if (wheel_odom_en) {
+        Eigen::Vector3d twist_v;
+        bool have_twist = false;
+        {
+          std::lock_guard<std::mutex> lk(mtx_twist);
+          if (!twist_buffer.empty()) {
+            twist_v = twist_buffer.back();
+            twist_buffer.clear();
+            have_twist = true;
+          }
+        }
+        if (have_twist) {
+          state_ikfom st = kf.get_x();
+          M3D Rw = st.rot.toRotationMatrix();     // R_{world←IMU}
+          M3D Re_T = R_robot_to_imu.transpose();  // R_{robot←IMU}
+          V3D v_imu = Rw.transpose() * st.vel;    // vel in IMU frame
+
+          // Predicted: h(x) = R_ext^T * R_w^T * vel (robot frame)
+          V3D h_pred = Re_T * v_imu;
+          // Measured: z = [vx*scale, 0, 0] (non-holonomic: vy=vz=0)
+          V3D z_meas(twist_v(0) * wheel_speed_scale, 0.0, 0.0);
+          V3D residual = z_meas - h_pred;
+
+          // Jacobian H (3×23): non-zero at rot(3-5) and vel(12-14)
+          Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
+          H.block<3, 3>(0, 3) = Re_T * skew_sym_mat(v_imu);  // dh/d(rot)
+          H.block<3, 3>(0, 12) = Re_T * Rw.transpose();      // dh/d(vel)
+
+          // Diagonal noise variances
+          Eigen::Vector3d R_diag(wheel_vel_noise_vx * wheel_vel_noise_vx,
+                                 wheel_vel_noise_vy * wheel_vel_noise_vy,
+                                 wheel_vel_noise_vz * wheel_vel_noise_vz);
+
+          EkfUpdateDiagnostics wheelDiagnostics;
+          Eigen::Matrix<double, 23, 23> wheelCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
+          if (kalman_channel_diag_en)
+            wheelCovarianceBefore = kf.get_P();
+          kf.update_simple(H, residual, R_diag, kalman_channel_diag_en ? &wheelDiagnostics : nullptr);
+          state_point = kf.get_x();  // re-read corrected state
+          if (kalman_channel_diag_en) {
+            writeKalmanChannel("wheel", st, state_point, wheelCovarianceBefore, wheelDiagnostics, z_meas, h_pred);
+          }
+        }
+      }
+
+      euler_cur = SO3ToEuler(state_point.rot);
+      pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+      geoQuat.x = state_point.rot.coeffs()[0];
+      geoQuat.y = state_point.rot.coeffs()[1];
+      geoQuat.z = state_point.rot.coeffs()[2];
+      geoQuat.w = state_point.rot.coeffs()[3];
+
+      double t_update_end = omp_get_wtime();
+
+      /******* Publish odometry *******/
+      publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+
+      /*** add the feature points to map kdtree ***/
+      t3 = omp_get_wtime();
+      // Mapping pause gate: when operator has disabled mapping (via
+      // /lio_slam/set_mapping_enabled in the PGO node), skip ikd-tree
+      // growth so the prior map isn't polluted by stationary frames or
+      // teleport segments (elevator).  EKF and odometry publishing
+      // above continue normally.
+      if (mapping_enabled.load(std::memory_order_relaxed) && !flio_map_frozen) {
+        map_incremental();
+        // Same gate as map growth: a frozen/paused map means "don't
+        // learn from this state" — that applies to the voxel surface
+        // statistics as much as to the ikd-tree.
+        vxl_update();
+      }
+      t5 = omp_get_wtime();
+
+      // [ikd-profile] per-scan split: iEKF (search-bound) vs map_incre Add vs transform
+      // loop, correlated with concurrent background-rebuild work + inline rebuild.
+      if (ikd_profile) {
+        const double iekf_ms = (t_update_end - t_update_start) * 1000.0;
+        // Under async, the Add runs off-thread: report its last completed wall time
+        // (g_async_add_us, == previous scan's Add) and the join-wait this scan paid
+        // (the residual Add cost the inter-scan gap could NOT hide). loop_ms is then
+        // just the on-thread decision loop + dispatch.
+        const double add_ms =
+          async_map_en ? (g_async_add_us.load(std::memory_order_relaxed) / 1000.0) : (kdtree_incremental_time * 1000.0);
+        const double join_ms = async_map_en ? g_map_join_wait_ms : 0.0;
+        const double loop_ms = async_map_en ? ((t5 - t3) * 1000.0) : ((t5 - t3) * 1000.0 - add_ms);
+        const uint64_t d_rb_us = g_ikd_rebuild_us.load(std::memory_order_relaxed) - prof_rb_us0;
+        const uint64_t d_rb_cnt = g_ikd_rebuild_count.load(std::memory_order_relaxed) - prof_rb_cnt0;
+        const uint64_t d_inl_us = g_ikd_inline_rebuild_us.load(std::memory_order_relaxed) - prof_inl_us0;
+        // tree= uses kdtree_size_st (captured at scan start, worker idle) — calling
+        // ikdtree.size() here would race the worker's in-flight Add under async.
+        printf(
+          "[IKDPROF] tree=%d feats=%d iekf_ms=%.1f add_ms=%.1f join_ms=%.1f loop_ms=%.1f | "
+          "rb_dcnt=%llu rb_dus_ms=%.1f inl_dus_ms=%.1f rb_active=%d "
+          "rb_maxus_ms=%.1f rb_maxsz=%llu rootreb=%llu\n",
+          kdtree_size_st,
+          feats_down_size,
+          iekf_ms,
+          add_ms,
+          join_ms,
+          loop_ms,
+          (unsigned long long)d_rb_cnt,
+          d_rb_us / 1000.0,
+          d_inl_us / 1000.0,
+          (int)g_ikd_rebuild_active.load(std::memory_order_relaxed),
+          g_ikd_rebuild_max_us.load(std::memory_order_relaxed) / 1000.0,
+          (unsigned long long)g_ikd_rebuild_max_size.load(std::memory_order_relaxed),
+          (unsigned long long)g_ikd_root_rebuild_count.load(std::memory_order_relaxed));
+      }
+
+      /******* Publish points *******/
+      if (path_en)
+        publish_path(pubPath_);
+      if (scan_pub_en)
+        publish_frame_world(pubLaserCloudFull_);
+      if (scan_pub_en && scan_body_pub_en)
+        publish_frame_body(pubLaserCloudFull_body_);
+      if (effect_pub_en)
+        publish_effect_world(pubLaserCloudEffect_);
+      // if (map_pub_en) publish_map(pubLaserCloudMap_);
+
+      /*** Debug variables ***/
+      if (runtime_pos_log) {
+        frame_num++;
+        // Under async the worker may be mid-Add; reading ikdtree.size() here would
+        // race it. Estimate from the scan-start size + this scan's add count.
+        kdtree_size_end = async_map_en ? (kdtree_size_st + add_point_size) : ikdtree.size();
+        aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t5 - t0) / frame_num;
+        aver_time_icp = aver_time_icp * (frame_num - 1) / frame_num + (t_update_end - t_update_start) / frame_num;
+        aver_time_match = aver_time_match * (frame_num - 1) / frame_num + (match_time) / frame_num;
+        aver_time_incre = aver_time_incre * (frame_num - 1) / frame_num + (kdtree_incremental_time) / frame_num;
+        aver_time_solve = aver_time_solve * (frame_num - 1) / frame_num + (solve_time + solve_H_time) / frame_num;
+        aver_time_const_H_time = aver_time_const_H_time * (frame_num - 1) / frame_num + solve_time / frame_num;
+        T1[time_log_counter] = Measures.lidar_beg_time;
+        s_plot[time_log_counter] = t5 - t0;
+        s_plot2[time_log_counter] = feats_undistort->points.size();
+        s_plot3[time_log_counter] = kdtree_incremental_time;
+        s_plot4[time_log_counter] = kdtree_search_time;
+        s_plot5[time_log_counter] = kdtree_delete_counter;
+        s_plot6[time_log_counter] = kdtree_delete_time;
+        s_plot7[time_log_counter] = kdtree_size_st;
+        s_plot8[time_log_counter] = kdtree_size_end;
+        s_plot9[time_log_counter] = aver_time_consu;
+        s_plot10[time_log_counter] = add_point_size;
+        time_log_counter++;
+        printf(
+          "[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  "
+          "map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",
+          t1 - t0,
+          aver_time_match,
+          aver_time_solve,
+          t3 - t1,
+          t5 - t3,
+          aver_time_consu,
+          aver_time_icp,
+          aver_time_const_H_time);
+        if ((t3 - t1) > 0.05) {
+          printf(
+            "[ SPIKE ]: t1_to_pre_icp: %0.3f  icp: %0.3f  publish: %0.3f  total(t3-t1): %0.3f  feats: %d  tree: %d\n",
+            (t_pre_icp - t1) * 1000,
+            (t_update_end - t_update_start) * 1000,
+            (t3 - t_update_end) * 1000,
+            (t3 - t1) * 1000,
+            feats_down_size,
+            kdtree_size_st);
+        }
+        ext_euler = SO3ToEuler(state_point.offset_R_L_I);
+        if (time_log_counter % 500 == 0 || time_log_counter == 1) {
+          printf(
+            "[ extrinsic ]: T_L_I = [%0.5f, %0.5f, %0.5f]  R_euler = [%0.3f, %0.3f, %0.3f] deg  bg = [%0.6f, %0.6f, "
+            "%0.6f]  ba = [%0.6f, %0.6f, %0.6f]  grav = [%0.5f, %0.5f, %0.5f]\n",
+            state_point.offset_T_L_I(0),
+            state_point.offset_T_L_I(1),
+            state_point.offset_T_L_I(2),
+            ext_euler(0),
+            ext_euler(1),
+            ext_euler(2),
+            state_point.bg(0),
+            state_point.bg(1),
+            state_point.bg(2),
+            state_point.ba(0),
+            state_point.ba(1),
+            state_point.ba(2),
+            state_point.grav[0],
+            state_point.grav[1],
+            state_point.grav[2]);
+        }
+        fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " "
+                 << state_point.pos.transpose() << " " << ext_euler.transpose() << " "
+                 << state_point.offset_T_L_I.transpose() << " " << state_point.vel.transpose() << " "
+                 << state_point.bg.transpose() << " " << state_point.ba.transpose() << " " << state_point.grav << " "
+                 << feats_undistort->points.size() << "\n";
+        fout_jump << setw(20) << Measures.lidar_beg_time - first_lidar_time << " yaw_before_deg "
+                  << euler_before_update(2) << " yaw_after_deg " << euler_cur(2) << " yaw_step_deg "
+                  << (euler_cur(2) - euler_before_update(2)) << " pos_step_xy "
+                  << (state_point.pos.head<2>() - pos_before_update.head<2>()).norm() << " feats_down "
+                  << feats_down_size << " effct_feat_num " << effct_feat_num << " res_mean_last " << res_mean_last
+                  << " solve_H_ms " << solve_H_time * 1000.0 << " icp_ms " << (t_update_end - t_update_start) * 1000.0
+                  << "\n";
+        fout_jump.flush();
+        dump_lio_state_to_log(fp);
+      }
     }
+  }
+
+  void map_publish_callback()
+  {
+    // publish_map() flattens the ikd-tree (a tree read). This 1 Hz timer shares the
+    // single executor thread with timer_callback, so it can fire BETWEEN scans while
+    // the off-thread Add is in flight — join first to keep the single-operator invariant.
+    if (map_pub_en) {
+      if (async_map_en)
+        joinMapAdd();
+      publish_map(pubLaserCloudMap_);
+    }
+  }
+
+  void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req,
+                         std_srvs::srv::Trigger::Response::SharedPtr res)
+  {
+    RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
+    if (pcd_save_en) {
+      save_to_pcd();
+      res->success = true;
+      res->message = "Map saved.";
+    } else {
+      res->success = false;
+      res->message = "Map save disabled.";
+    }
+  }
 
 private:
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
-    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
-    rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImu>::SharedPtr sub_imu_fpa_;
-    rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImubias>::SharedPtr sub_imu_bias_;
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
-    rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
-    rclcpp::Subscription<shm_msgs::msg::PointCloud8mAndPose>::SharedPtr sub_pcl_shm_;
-    rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr sub_twist_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+  rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImu>::SharedPtr sub_imu_fpa_;
+  rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImubias>::SharedPtr sub_imu_bias_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
+  rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+  rclcpp::Subscription<shm_msgs::msg::PointCloud8mAndPose>::SharedPtr sub_pcl_shm_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr sub_twist_;
 
-    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
-    rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::TimerBase::SharedPtr map_pub_timer_;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr fe_z_drift_sub_;
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mapping_enabled_sub_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr map_pub_timer_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr fe_z_drift_sub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mapping_enabled_sub_;
 
-    bool effect_pub_en = false, map_pub_en = false;
-    int effect_feat_num = 0, frame_num = 0;
-    double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
-    bool flg_EKF_converged, EKF_stop_flg = 0;
-    double epsi[23] = {0.001};
+  bool effect_pub_en = false, map_pub_en = false;
+  int effect_feat_num = 0, frame_num = 0;
+  double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0,
+                         aver_time_solve = 0, aver_time_const_H_time = 0;
+  bool flg_EKF_converged, EKF_stop_flg = 0;
+  double epsi[23] = {0.001};
 
-    FILE *fp;
-    ofstream fout_pre, fout_out, fout_dbg, fout_jump;
+  FILE * fp;
+  ofstream fout_pre, fout_out, fout_dbg, fout_jump, fout_kalman;
 
-    std::string prior_map_pcd_;
-    std::vector<double> initial_pose_vec_;
-    bool initial_pose_full_rpy_override_ = false;
+  std::string prior_map_pcd_;
+  std::vector<double> initial_pose_vec_;
+  bool initial_pose_full_rpy_override_ = false;
 };
 
 #ifndef FASTLIO_AS_COMPONENT
-int main(int argc, char** argv)
+int main(int argc, char ** argv)
 {
-    rclcpp::init(argc, argv);
+  rclcpp::init(argc, argv);
 
-    signal(SIGINT, SigHandle);
-    signal(SIGTERM, SigHandle);
+  signal(SIGINT, SigHandle);
+  signal(SIGTERM, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+  rclcpp::spin(std::make_shared<LaserMappingNode>());
 
-    if (rclcpp::ok())
-        rclcpp::shutdown();
-    // Drain any in-flight off-thread ikd-tree Add and join the worker before the final
-    // map read/save, so the tree is quiescent and the worker thread exits cleanly.
-    stopMapWorker();
-    /**************** save map ****************/
-    /* 1. make sure you have enough memories
-    /* 2. pcd save will largely influence the real-time performences **/
-    // Drain the async writer queue and join before reading pcl_wait_save, so the final
-    // map contains every enqueued scan and there is no race with the writer thread.
-    stopPcdWriter();
-    if (pcl_wait_save->size() > 0 && pcd_save_en)
-    {
-        string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
-        pcl::PCDWriter pcd_writer;
-        cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+  if (rclcpp::ok())
+    rclcpp::shutdown();
+  // Drain any in-flight off-thread ikd-tree Add and join the worker before the final
+  // map read/save, so the tree is quiescent and the worker thread exits cleanly.
+  stopMapWorker();
+  /**************** save map ****************/
+  /* 1. make sure you have enough memories
+  /* 2. pcd save will largely influence the real-time performences **/
+  // Drain the async writer queue and join before reading pcl_wait_save, so the final
+  // map contains every enqueued scan and there is no race with the writer thread.
+  stopPcdWriter();
+  if (pcl_wait_save->size() > 0 && pcd_save_en) {
+    string file_name = string("scans.pcd");
+    string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
+    pcl::PCDWriter pcd_writer;
+    cout << "current scan saved to /PCD/" << file_name << endl;
+    pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+  }
+
+  if (runtime_pos_log) {
+    vector<double> t, s_vec, s_vec2, s_vec3, s_vec4, s_vec5, s_vec6, s_vec7;
+    FILE * fp2;
+    string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
+    fp2 = fopen(log_dir.c_str(), "w");
+    fprintf(fp2,
+            "time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree "
+            "size st, tree size end, add point size, preprocess time\n");
+    for (int i = 0; i < time_log_counter; i++) {
+      fprintf(fp2,
+              "%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",
+              T1[i],
+              s_plot[i],
+              int(s_plot2[i]),
+              s_plot3[i],
+              s_plot4[i],
+              int(s_plot5[i]),
+              s_plot6[i],
+              int(s_plot7[i]),
+              int(s_plot8[i]),
+              int(s_plot10[i]),
+              s_plot11[i]);
+      t.push_back(T1[i]);
+      s_vec.push_back(s_plot9[i]);
+      s_vec2.push_back(s_plot3[i] + s_plot6[i]);
+      s_vec3.push_back(s_plot4[i]);
+      s_vec5.push_back(s_plot[i]);
     }
+    fclose(fp2);
+  }
 
-    if (runtime_pos_log)
-    {
-        vector<double> t, s_vec, s_vec2, s_vec3, s_vec4, s_vec5, s_vec6, s_vec7;    
-        FILE *fp2;
-        string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
-        fp2 = fopen(log_dir.c_str(),"w");
-        fprintf(fp2,"time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree size st, tree size end, add point size, preprocess time\n");
-        for (int i = 0;i<time_log_counter; i++){
-            fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot8[i]), int(s_plot10[i]), s_plot11[i]);
-            t.push_back(T1[i]);
-            s_vec.push_back(s_plot9[i]);
-            s_vec2.push_back(s_plot3[i] + s_plot6[i]);
-            s_vec3.push_back(s_plot4[i]);
-            s_vec5.push_back(s_plot[i]);
-        }
-        fclose(fp2);
-    }
-
-    return 0;
+  return 0;
 }
 #endif  // FASTLIO_AS_COMPONENT
 

@@ -51,6 +51,9 @@ find_package(PythonLibs QUIET)
 
 # ROS dependencies
 find_package(ament_cmake REQUIRED)
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+endif()
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -163,6 +166,12 @@ if(cpp_typesupport_target)  # set by rosidl_get_typesupport_target above (non-EO
 endif()
 ament_target_dependencies(fastlio_mapping_component ${dependencies})
 rclcpp_components_register_nodes(fastlio_mapping_component "LaserMappingNode")
+
+if(BUILD_TESTING)
+  ament_add_pytest_test(test_analyze_kalman_channels
+    test/test_analyze_kalman_channels.py
+  )
+endif()
 
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping

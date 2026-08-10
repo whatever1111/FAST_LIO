@@ -12,7 +12,7 @@ set(CMAKE_CXX_FLAGS "-std=c++14 -O3")
 add_definitions(-DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions")
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions")
@@ -163,6 +163,12 @@ if(USE_IVOX)
 endif()
 if(cpp_typesupport_target)  # set by rosidl_get_typesupport_target above (non-EOL distros)
   target_link_libraries(fastlio_mapping_component ${cpp_typesupport_target})
+else()
+  # EOL distros (foxy/galactic): same own-msgs wiring as the executable —
+  # rosidl_target_interfaces also carries the generated-header include dirs,
+  # without which common_lib.h can't find fast_lio/msg/pose6_d.hpp.
+  rosidl_target_interfaces(fastlio_mapping_component
+    ${PROJECT_NAME} "rosidl_typesupport_cpp")
 endif()
 ament_target_dependencies(fastlio_mapping_component ${dependencies})
 rclcpp_components_register_nodes(fastlio_mapping_component "LaserMappingNode")

@@ -49,6 +49,11 @@
 
 #include <Eigen/Core>
 #include <pcl/filters/voxel_grid.h>
+// PCL < 1.11 (focal/Foxy ships 1.10) does not precompile
+// VoxelGrid<PointXYZINormal>; pull the impl in so this TU instantiates it.
+#if PCL_VERSION_COMPARE(<, 1, 11, 0)
+#include <pcl/filters/impl/voxel_grid.hpp>
+#endif
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -3481,7 +3486,7 @@ private:
     }
   }
 
-  void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req,
+  void map_save_callback(std_srvs::srv::Trigger::Request::SharedPtr req,
                          std_srvs::srv::Trigger::Response::SharedPtr res)
   {
     RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());

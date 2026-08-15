@@ -4,6 +4,29 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include <shm_msgs/msg/point_cloud8m_and_pose.hpp>
+#include <cstdlib>
+
+// Runtime OMP thread budget for the preprocess loops. The compile-time
+// MP_PROC_NUM is derived from the BUILD host's core count (8 on a 16-core dev
+// box, 4 on the CI runner), so `num_threads(MP_PROC_NUM)` made the binary's
+// behaviour depend on where it was compiled: an in-image 8-thread build
+// measured +0.1 m 2D mean on giant 0509 (0.62-0.65 vs 0.49-0.53 for the CI
+// build and for the same source built with MP_PROC_NUM=4) — oversubscription
+// against the eval's OMP_NUM_THREADS=4 budget. Honour OMP_NUM_THREADS when set,
+// exactly like the laserMapping match loop does; fall back to MP_PROC_NUM.
+inline int fastlio_preprocess_omp_threads()
+{
+  static const int n = []() {
+    const char * e = std::getenv("OMP_NUM_THREADS");
+    const int v = (e != nullptr) ? std::atoi(e) : 0;
+#ifdef MP_PROC_NUM
+    return v > 0 ? v : static_cast<int>(MP_PROC_NUM);
+#else
+    return v > 0 ? v : 1;
+#endif
+  }();
+  return n;
+}
 
 using namespace std;
 

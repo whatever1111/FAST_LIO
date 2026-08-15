@@ -172,7 +172,7 @@ void Preprocess::allpoint_handler(const shm_msgs::msg::PointCloud8mAndPose::Uniq
   constexpr float kDropMarker = std::numeric_limits<float>::quiet_NaN();
 
 #ifdef MP_EN
-  #pragma omp parallel for num_threads(MP_PROC_NUM) schedule(static)
+  #pragma omp parallel for num_threads(fastlio_preprocess_omp_threads()) schedule(static)
 #endif
   for (int j = 0; j < n_candidates; ++j) {
     const int i = j * stride;
@@ -730,7 +730,7 @@ void Preprocess::hesai_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &m
   constexpr float kDropMarker = std::numeric_limits<float>::quiet_NaN();
 
 #ifdef MP_EN
-  #pragma omp parallel for num_threads(MP_PROC_NUM) schedule(static)
+  #pragma omp parallel for num_threads(fastlio_preprocess_omp_threads()) schedule(static)
 #endif
   for (int j = 0; j < n_candidates; ++j) {
     const int i = j * stride;

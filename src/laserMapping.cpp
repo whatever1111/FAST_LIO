@@ -187,6 +187,38 @@ bool divergence_guard_en = true;
 int divergence_guard_min_eff = 50;         // effct_feat_num below this = degenerate scan
 int divergence_guard_streak = 5;           // consecutive degenerate scans → enter degraded
 double divergence_guard_max_speed = 30.0;  // m/s; body-speed clamp while degraded (headroom over any platform speed)
+// Engulfment leading indicator (2026-08-14, m20_0814_degrade forensics): when a
+// low-mounted lidar wades into knee-high vegetation the FAR field vanishes from
+// the raw scan (healthy: ~50% of returns beyond guard_engulf_far_range; engulfed:
+// ~5%) BEFORE effct collapses. The last few "valid" updates on sub-metre grass
+// inject velocity/tilt (measured 2.14 m/s vs 0.5 m/s ground truth, 6° tilt)
+// and, worse, insert drifting garbage into the map for divergence_guard_streak
+// scans before the lagging effct-streak criterion freezes it — after which
+// re-lock is impossible (map poisoned) and survival is a scheduling coin-flip
+// (identical runs: clean vs km-runaway). Freezing the map on the SCAN-level
+// signal makes the guard leading instead of lagging. Computed on the raw
+// downsampled scan (a scene property, independent of matching outcome).
+bool guard_engulf_en = true;               // arm the far-field-collapse trigger
+double guard_engulf_far_range = 2.0;       // m; horizontal radius separating near/far
+double guard_engulf_far_frac_min = 0.15;   // enter when far-field fraction < this
+int guard_engulf_streak = 2;               // consecutive engulfed scans → degraded
+// Release hysteresis + velocity reset (m20_0814_degrade far_frac time series):
+// the brush is FOUR separate plunges (t≈146,165,175,191) with far_frac
+// hovering 0.04–0.39 on every shoulder. Instant release on one scan ≥ min
+// flaps on those shoulders and unfreezes the map for half-grass scans; and
+// whatever velocity the iEKF holds at release is unobserved IMU integration
+// (gravity-align saw 6–7° tilt), which then contaminates the inter-plunge
+// map before the next plunge — that is the run-to-run coin flip. So: release
+// only after guard_engulf_release_scans consecutive scans with far_frac ≥
+// guard_engulf_far_frac_release, and ZERO velocity at release so the next
+// good scans re-estimate it from correspondences instead of trusting the
+// blind stretch. Position/attitude/biases are kept.
+double guard_engulf_far_frac_release = 0.35;  // release needs far field this healthy
+int guard_engulf_release_scans = 5;           // ...for this many consecutive scans
+int consec_engulf_clear = 0;                  // running healthy-scan streak while latched
+bool engulf_latched = false;                  // sticky engulfed state (entered, not yet released)
+double scan_far_frac = 1.0;                // per-scan telemetry: fraction of raw points beyond far_range
+int consec_engulf = 0;                     // running engulfed-scan streak
 int consec_low_eff = 0;                    // running degenerate-scan streak counter
 bool flio_map_frozen = false;              // degraded: skip map_incremental (no garbage)
 bool flio_degraded_odom = false;           // degraded: inflate published pose covariance
@@ -2136,6 +2168,12 @@ public:
     this->declare_parameter<double>("gravity_align_gyro_tol", 0.35);
     this->declare_parameter<bool>("divergence_guard_en", true);
     this->declare_parameter<int>("divergence_guard_min_eff", 50);
+    this->declare_parameter<bool>("guard_engulf_en", true);
+    this->declare_parameter<double>("guard_engulf_far_range", 2.0);
+    this->declare_parameter<double>("guard_engulf_far_frac_min", 0.15);
+    this->declare_parameter<int>("guard_engulf_streak", 2);
+    this->declare_parameter<double>("guard_engulf_far_frac_release", 0.35);
+    this->declare_parameter<int>("guard_engulf_release_scans", 5);
     this->declare_parameter<int>("divergence_guard_streak", 5);
     this->declare_parameter<double>("divergence_guard_max_speed", 30.0);
     this->declare_parameter<bool>("canopy_detect_en", false);
@@ -2252,6 +2290,12 @@ public:
     this->get_parameter_or<double>("gravity_align_gyro_tol", gravity_align_gyro_tol, 0.35);
     this->get_parameter_or<bool>("divergence_guard_en", divergence_guard_en, true);
     this->get_parameter_or<int>("divergence_guard_min_eff", divergence_guard_min_eff, 50);
+    this->get_parameter_or<bool>("guard_engulf_en", guard_engulf_en, true);
+    this->get_parameter_or<double>("guard_engulf_far_range", guard_engulf_far_range, 2.0);
+    this->get_parameter_or<double>("guard_engulf_far_frac_min", guard_engulf_far_frac_min, 0.15);
+    this->get_parameter_or<int>("guard_engulf_streak", guard_engulf_streak, 2);
+    this->get_parameter_or<double>("guard_engulf_far_frac_release", guard_engulf_far_frac_release, 0.35);
+    this->get_parameter_or<int>("guard_engulf_release_scans", guard_engulf_release_scans, 5);
     this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
     this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
     this->get_parameter_or<bool>("canopy_detect_en", canopy_detect_en, false);
@@ -2716,6 +2760,17 @@ private:
       downSizeFilterSurf.filter(*feats_down_body);
       t1 = omp_get_wtime();
       feats_down_size = feats_down_body->points.size();
+      /*** Engulfment telemetry: far-field fraction of the raw downsampled scan ***/
+      if (feats_down_size > 0) {
+        int far_cnt = 0;
+        const double far_r2 = guard_engulf_far_range * guard_engulf_far_range;
+        for (int i = 0; i < feats_down_size; i++) {
+          const PointType & pb = feats_down_body->points[i];
+          if (pb.x * pb.x + pb.y * pb.y > far_r2)
+            ++far_cnt;
+        }
+        scan_far_frac = static_cast<double>(far_cnt) / feats_down_size;
+      }
       /*** initialize the map kdtree ***/
 #ifdef USE_IVOX
       if (ikdtree.empty())
@@ -2930,15 +2985,50 @@ private:
       flio_map_frozen = false;
       flio_degraded_odom = false;
       bool flio_vel_runaway = false;
+      bool flio_engulfed = false;
       if (divergence_guard_en) {
         if (effct_feat_num < divergence_guard_min_eff)
           ++consec_low_eff;
         else
           consec_low_eff = 0;
         flio_vel_runaway = (state_point.vel.norm() > divergence_guard_max_speed);
+        // (3) engulfment: far field collapsed in the raw scan — leading indicator
+        //     (fires before effct starves; see guard_engulf_en block comment).
+        if (guard_engulf_en) {
+          if (scan_far_frac < guard_engulf_far_frac_min)
+            ++consec_engulf;
+          else
+            consec_engulf = 0;
+          if (!engulf_latched) {
+            if (consec_engulf >= guard_engulf_streak) {
+              engulf_latched = true;
+              consec_engulf_clear = 0;
+            }
+          } else {
+            // Latched: release only on a SUSTAINED healthy far field (hysteresis).
+            if (scan_far_frac >= guard_engulf_far_frac_release)
+              ++consec_engulf_clear;
+            else
+              consec_engulf_clear = 0;
+            if (consec_engulf_clear >= guard_engulf_release_scans) {
+              engulf_latched = false;
+              consec_engulf = 0;
+              // Discard the blind stretch's velocity (see block comment).
+              state_ikfom st = kf.get_x();
+              st.vel.setZero();
+              kf.change_x(st);
+              state_point = kf.get_x();
+              RCLCPP_WARN(this->get_logger(),
+                          "[DIVERGENCE-GUARD] engulfment released (far_frac=%.2f for %d scans): "
+                          "map unfrozen, velocity reset",
+                          scan_far_frac, guard_engulf_release_scans);
+            }
+          }
+          flio_engulfed = engulf_latched;
+        }
       }
       const bool flio_in_degraded =
-        divergence_guard_en && (consec_low_eff >= divergence_guard_streak || flio_vel_runaway);
+        divergence_guard_en && (consec_low_eff >= divergence_guard_streak || flio_vel_runaway || flio_engulfed);
 
       /*** Canopy mode debounce (once per scan, on the h_share_model raw
        *   stats). Enter needs BOTH signals (ground fraction collapsed AND
@@ -3236,19 +3326,39 @@ private:
         state_ikfom st = kf.get_x();
         const double spd = st.vel.norm();
         if (spd > divergence_guard_max_speed) {
-          st.vel *= divergence_guard_max_speed / spd;
+          // A body speed above the platform's physical maximum is a
+          // GUARANTEED-WRONG state, not a bound to enforce. Clamping it to
+          // max_speed (the old behaviour) turned the clamp into an
+          // equilibrium: IMU propagation re-inflated |vel| every scan and the
+          // callback re-clamped it — measured on m20_0814_degrade as spd=3.00
+          // on every scan for 60 s, dragging the state ~3 m/s out of the
+          // frozen map until no re-lock was geometrically possible. The
+          // decisive response is the same one engulfment release uses: ZERO
+          // the velocity so the next correspondences re-estimate it. Costs at
+          // most one scan of re-convergence on a healthy scene; the clamp
+          // guaranteed max_speed of position error per second.
+          st.vel.setZero();
           kf.change_x(st);
           state_point = kf.get_x();
         }
         flio_map_frozen = true;
         flio_degraded_odom = true;
+        // Report only the defenses that are actually engaged: the planar-Z and
+        // gravity-align priors are config-gated (both default OFF), and a log
+        // line that claimed "planar-Z pinned" unconditionally hid a disabled
+        // defense through the m20 vegetation-engulfment km-runaway (2026-08-14).
         RCLCPP_WARN_THROTTLE(this->get_logger(),
                              *this->get_clock(),
                              2000,
-                             "[DIVERGENCE-GUARD] LiDAR starved %d scans (effct=%d): planar-Z pinned, "
-                             "speed clamped, map frozen; posZ=%.1fm spd=%.2fm/s",
+                             "[DIVERGENCE-GUARD] starved %d scans (effct=%d) engulfed %d scans (far_frac=%.2f): "
+                             "vel reset if >%.1fm/s, map frozen, planar-Z %s, gravity-align %s; posZ=%.1fm spd=%.2fm/s",
                              consec_low_eff,
                              effct_feat_num,
+                             consec_engulf,
+                             scan_far_frac,
+                             divergence_guard_max_speed,
+                             planar_constraint_en ? "pinned" : "OFF",
+                             gravity_align_en ? "on" : "OFF",
                              state_point.pos[2],
                              state_point.vel.norm());
       }

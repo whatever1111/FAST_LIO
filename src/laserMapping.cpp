@@ -217,6 +217,21 @@ double guard_engulf_far_frac_release = 0.35;  // release needs far field this he
 int guard_engulf_release_scans = 5;           // ...for this many consecutive scans
 int consec_engulf_clear = 0;                  // running healthy-scan streak while latched
 bool engulf_latched = false;                  // sticky engulfed state (entered, not yet released)
+// Scan-hole guard: when the gap between consecutive processed scans exceeds
+// guard_hole_min_sec, the IMU-only propagation across the hole is replaced by
+// a bounded constant-velocity hold from the pre-hole state before the lidar
+// update runs. Measured on m20_0814_degrade with injected holes over open
+// ground: <=2 s holes recover cleanly, but a 5 s hole let the IMU-only
+// velocity reach 4.1 m/s (walking 1.8) and the position drift metres off the
+// map (effct 3400 -> 400) before the runaway reset — quadratic IMU divergence
+// that ground-only geometry cannot re-observe. Default OFF.
+bool guard_hole_en = false;
+double guard_hole_min_sec = 0.3;    // s; scan gap that counts as a hole (nominal 0.1)
+double guard_hole_max_accel = 1.0;  // m/s^2; |vel - vel_pre_hole| is capped at this * gap
+bool guard_hole_reanchor_pos = true;  // also reset pos to pos_pre + vel_pre * gap
+double hole_last_scan_end = -1.0;
+V3D hole_vel_pre = V3D::Zero();
+V3D hole_pos_pre = V3D::Zero();
 double scan_far_frac = 1.0;                // per-scan telemetry: fraction of raw points beyond far_range
 int consec_engulf = 0;                     // running engulfed-scan streak
 int consec_low_eff = 0;                    // running degenerate-scan streak counter
@@ -2182,6 +2197,10 @@ public:
     this->declare_parameter<int>("guard_engulf_streak", 2);
     this->declare_parameter<double>("guard_engulf_far_frac_release", 0.35);
     this->declare_parameter<int>("guard_engulf_release_scans", 5);
+    this->declare_parameter<bool>("guard_hole_en", false);
+    this->declare_parameter<double>("guard_hole_min_sec", 0.3);
+    this->declare_parameter<double>("guard_hole_max_accel", 1.0);
+    this->declare_parameter<bool>("guard_hole_reanchor_pos", true);
     this->declare_parameter<int>("divergence_guard_streak", 5);
     this->declare_parameter<double>("divergence_guard_max_speed", 30.0);
     this->declare_parameter<bool>("canopy_detect_en", false);
@@ -2304,6 +2323,10 @@ public:
     this->get_parameter_or<int>("guard_engulf_streak", guard_engulf_streak, 2);
     this->get_parameter_or<double>("guard_engulf_far_frac_release", guard_engulf_far_frac_release, 0.35);
     this->get_parameter_or<int>("guard_engulf_release_scans", guard_engulf_release_scans, 5);
+    this->get_parameter_or<bool>("guard_hole_en", guard_hole_en, false);
+    this->get_parameter_or<double>("guard_hole_min_sec", guard_hole_min_sec, 0.3);
+    this->get_parameter_or<double>("guard_hole_max_accel", guard_hole_max_accel, 1.0);
+    this->get_parameter_or<bool>("guard_hole_reanchor_pos", guard_hole_reanchor_pos, true);
     this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
     this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
     this->get_parameter_or<bool>("canopy_detect_en", canopy_detect_en, false);
@@ -2734,6 +2757,34 @@ private:
 
       p_imu->Process(Measures, kf, feats_undistort);
       state_point = kf.get_x();
+
+      /*** Scan-hole guard: bound the IMU-only excursion across a gap ***/
+      if (guard_hole_en && flg_EKF_inited && hole_last_scan_end > 0.0) {
+        const double gap = Measures.lidar_beg_time - hole_last_scan_end;
+        if (gap > guard_hole_min_sec) {
+          state_ikfom st = kf.get_x();
+          const double spd_imu = st.vel.norm();
+          const V3D dv = st.vel - hole_vel_pre;
+          const double dv_max = guard_hole_max_accel * gap;
+          const double dv_n = dv.norm();
+          if (dv_n > dv_max) {
+            st.vel = hole_vel_pre + dv * (dv_max / dv_n);
+          }
+          const V3D pos_imu = st.pos;
+          if (guard_hole_reanchor_pos) {
+            st.pos = hole_pos_pre + hole_vel_pre * gap;
+          }
+          kf.change_x(st);
+          state_point = kf.get_x();
+          RCLCPP_WARN(this->get_logger(),
+                      "[DIVERGENCE-GUARD] scan hole %.2fs: imu-only vel %.2f m/s (pre-hole %.2f) -> held %.2f; pos re-anchored by %.2fm",
+                      gap,
+                      spd_imu,
+                      hole_vel_pre.norm(),
+                      state_point.vel.norm(),
+                      guard_hole_reanchor_pos ? (pos_imu - state_point.pos).norm() : 0.0);
+        }
+      }
       pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
       if (feats_undistort->empty() || (feats_undistort == NULL)) {
@@ -3457,6 +3508,11 @@ private:
       geoQuat.w = state_point.rot.coeffs()[3];
 
       double t_update_end = omp_get_wtime();
+
+      /*** Scan-hole guard bookkeeping: this scan's posterior is the next hole's anchor ***/
+      hole_last_scan_end = lidar_end_time;
+      hole_vel_pre = state_point.vel;
+      hole_pos_pre = state_point.pos;
 
       /******* Publish odometry *******/
       publish_odometry(pubOdomAftMapped_, tf_broadcaster_);

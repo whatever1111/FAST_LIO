@@ -743,6 +743,14 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
   scan_count++;
   double cur_time = get_time_sec(msg->header.stamp);
   double preprocess_start_time = omp_get_wtime();
+  if (degeneracy_debug) {
+    // Input-side telemetry for scan-stream holes: callback count + stamp step.
+    static double last_cb_stamp = 0.0;
+    const double step = last_cb_stamp > 0.0 ? cur_time - last_cb_stamp : 0.0;
+    last_cb_stamp = cur_time;
+    std::cerr << std::fixed << std::setprecision(3) << "[LIDARCB] n=" << scan_count << " t=" << cur_time
+              << " step=" << step << " buf=" << lidar_buffer.size() << std::endl;
+  }
   if (!is_first_lidar && cur_time < last_timestamp_lidar) {
     std::cerr << "lidar loop back, clear buffer" << std::endl;
     lidar_buffer.clear();
@@ -3370,6 +3378,22 @@ private:
         const double dvel = (state_point.vel - state_before_update.vel).norm();
         const double dba = (state_point.ba - state_before_update.ba).norm();
         const double dbg = (state_point.bg - state_before_update.bg).norm();
+        // Per-scan trace (every scan): lidar end time, IMU samples covering the
+        // scan and their max stamp gap, correspondence count, far-field
+        // fraction, and the update's state deltas — for correlating FE
+        // instabilities against the input stream offline.
+        {
+          double imu_gap_max = 0.0;
+          for (size_t k = 1; k < Measures.imu.size(); ++k) {
+            const double dt = get_time_sec(Measures.imu[k]->header.stamp) - get_time_sec(Measures.imu[k - 1]->header.stamp);
+            if (dt > imu_gap_max) imu_gap_max = dt;
+          }
+          std::cerr << std::fixed << std::setprecision(3) << "[SCAN] t=" << lidar_end_time << " imu_n=" << Measures.imu.size()
+                    << " imu_gap=" << imu_gap_max << " pts=" << feats_down_size << " effct=" << effct_feat_num
+                    << " far=" << scan_far_frac << " speed=" << body_speed << " dvel=" << dvel
+                    << " corr=" << lidar_correction << " posZ=" << state_point.pos[2]
+                    << " deg=" << (flio_in_degraded ? 1 : 0) << std::endl;
+        }
         if (lidar_correction > 0.2 || body_speed > 1.5 || dvel > 0.3 || dba > 0.05 || dbg > 0.01 ||
             effct_feat_num < 200 || pos_obs_z_weak > 0.7) {
           std::cerr << "[DEGEN] effct=" << effct_feat_num << " corr=" << lidar_correction << "m speed=" << body_speed

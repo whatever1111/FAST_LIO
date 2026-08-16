@@ -141,6 +141,7 @@ int iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidN
 // least-constrained direction (degenerate Z), the root trigger of the bag2
 // divergence (see memory bag2-divergence-is-flio2-frontend).
 double pos_obs_eig_min = 0.0, pos_obs_eig_max = 0.0, pos_obs_z_weak = 0.0;
+Eigen::Matrix3d pos_obs_M = Eigen::Matrix3d::Zero();  // Σ n nᵀ of the last update (world frame), for the [SCAN] trace
 bool degeneracy_debug = false;  // verbose per-frame [DEGEN] diagnostics
 
 // Planar-motion (zero body-vertical-velocity) soft constraint — the A'-2 fix.
@@ -2116,6 +2117,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
       M.noalias() += n * n.transpose();
     }
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
+    pos_obs_M = M;
     pos_obs_eig_min = es.eigenvalues()(0);
     pos_obs_eig_max = es.eigenvalues()(2);
     pos_obs_z_weak = std::abs(es.eigenvectors()(2, 0));  // |Z| of weakest eigenvector
@@ -3439,11 +3441,30 @@ private:
             const double dt = get_time_sec(Measures.imu[k]->header.stamp) - get_time_sec(Measures.imu[k - 1]->header.stamp);
             if (dt > imu_gap_max) imu_gap_max = dt;
           }
+          // Translation observability along the travel direction: mean cos² between the
+          // effective plane normals and the world-frame velocity direction (1 = every
+          // plane faces the motion, 0 = all planes parallel to it → along-track unobservable);
+          // plus normalized min/max eigenvalues of M and the weakest horizontal direction.
+          double obs_along = -1.0, obs_emin = 0.0, obs_emax = 0.0, obs_hmin = 0.0;
+          if (effct_feat_num > 0) {
+            const double n = static_cast<double>(effct_feat_num);
+            const Eigen::Vector3d vw(state_point.vel[0], state_point.vel[1], state_point.vel[2]);
+            if (vw.norm() > 0.2) {
+              const Eigen::Vector3d d = vw.normalized();
+              obs_along = d.dot(pos_obs_M * d) / n;
+            }
+            obs_emin = pos_obs_eig_min / n;
+            obs_emax = pos_obs_eig_max / n;
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es2(pos_obs_M.topLeftCorner<2, 2>());
+            obs_hmin = es2.eigenvalues()(0) / n;
+          }
           std::cerr << std::fixed << std::setprecision(3) << "[SCAN] t=" << lidar_end_time << " imu_n=" << Measures.imu.size()
                     << " imu_gap=" << imu_gap_max << " pts=" << feats_down_size << " effct=" << effct_feat_num
                     << " far=" << scan_far_frac << " speed=" << body_speed << " dvel=" << dvel
                     << " corr=" << lidar_correction << " posZ=" << state_point.pos[2]
-                    << " deg=" << (flio_in_degraded ? 1 : 0) << std::endl;
+                    << " deg=" << (flio_in_degraded ? 1 : 0)
+                    << " along=" << obs_along << " emin=" << obs_emin << " emax=" << obs_emax << " hmin=" << obs_hmin
+                    << std::endl;
         }
         if (lidar_correction > 0.2 || body_speed > 1.5 || dvel > 0.3 || dba > 0.05 || dbg > 0.01 ||
             effct_feat_num < 200 || pos_obs_z_weak > 0.7) {

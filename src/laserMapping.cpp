@@ -2777,7 +2777,7 @@ private:
           kf.change_x(st);
           state_point = kf.get_x();
           RCLCPP_WARN(this->get_logger(),
-                      "[DIVERGENCE-GUARD] scan hole %.2fs: imu-only vel %.2f m/s (pre-hole %.2f) -> held %.2f; pos re-anchored by %.2fm",
+                      "[HOLE-GUARD] scan hole %.2fs: imu-only vel %.2f m/s (pre-hole %.2f) -> held %.2f; pos re-anchored by %.2fm",
                       gap,
                       spd_imu,
                       hole_vel_pre.norm(),

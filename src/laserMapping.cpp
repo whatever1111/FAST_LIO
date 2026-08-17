@@ -2772,6 +2772,10 @@ public:
 
   ~LaserMappingNode()
   {
+    // The off-thread map worker is a global std::thread; when the node is used as a
+    // component (offline replay, composed pipelines) nobody else joins it before the
+    // library unloads → std::terminate. Idempotent with the standalone main's call.
+    stopMapWorker();
     fout_out.close();
     fout_pre.close();
     fout_jump.close();
@@ -3534,6 +3538,11 @@ private:
         const double dvel = (state_point.vel - state_before_update.vel).norm();
         const double dba = (state_point.ba - state_before_update.ba).norm();
         const double dbg = (state_point.bg - state_before_update.bg).norm();
+        // Rotation applied by the lidar update (world frame): total angle and its yaw part.
+        const Eigen::AngleAxisd upd_rot(state_point.rot.toRotationMatrix() *
+                                        state_before_update.rot.toRotationMatrix().transpose());
+        const double drot_deg = upd_rot.angle() * 180.0 / M_PI;
+        const double dyaw_deg = upd_rot.angle() * upd_rot.axis()(2) * 180.0 / M_PI;
         // Per-scan trace (every scan): lidar end time, IMU samples covering the
         // scan and their max stamp gap, correspondence count, far-field
         // fraction, and the update's state deltas — for correlating FE
@@ -3567,6 +3576,7 @@ private:
                     << " corr=" << lidar_correction << " posZ=" << state_point.pos[2]
                     << " deg=" << (flio_in_degraded ? 1 : 0)
                     << " along=" << obs_along << " emin=" << obs_emin << " emax=" << obs_emax << " hmin=" << obs_hmin
+                    << " drot=" << drot_deg << " dyaw=" << dyaw_deg << " bgz=" << state_point.bg[2]
                     << std::endl;
         }
         if (lidar_correction > 0.2 || body_speed > 1.5 || dvel > 0.3 || dba > 0.05 || dbg > 0.01 ||

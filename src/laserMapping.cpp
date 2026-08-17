@@ -1096,6 +1096,16 @@ int process_increments = 0;
 // runs concurrently exactly as in the synchronous path. Net: the Add cost (~16ms steady,
 // spikes to ~78ms) leaves the per-scan critical path and hides in the inter-scan idle gap.
 bool async_map_en = true;  // gated by env FLIO_ASYNC_MAP ("0" disables)
+// Deterministic map-insertion lag (mapping.map_insert_delay_scans, default 0):
+// scan k's points enter the map only after scan k+delay has been matched. With
+// the async worker the lag exists implicitly (scan k is still being inserted
+// while k+1 matches) and helps in the near field — a scan matched against a
+// map that already contains its immediate predecessor locks onto it (indoor
+// m20: FE-only re-fix along-track −1.0…−1.4 m sync vs +0.5…+1.5 async) — but
+// its length depends on scheduling (non-reproducible). This makes the lag
+// explicit: same benefit, bit-reproducible.
+int map_insert_delay_scans = 0;
+std::deque<std::pair<PointVector, PointVector>> map_insert_pending;
 std::mutex map_add_mtx;
 std::condition_variable map_add_cv;
 PointVector map_add_ds_;        // handoff: points to add WITH downsample
@@ -1214,6 +1224,21 @@ void map_incremental()
     } else {
       PointToAdd.push_back(feats_down_world->points[i]);
     }
+  }
+
+  if (map_insert_delay_scans > 0) {
+    // Hold this scan's (world-frame) points; insert the scan that is now
+    // `delay` scans old. The add/no-add decisions above were made against the
+    // map as it was when the scan was matched — good enough for a lag of a few
+    // scans, and identical every run.
+    map_insert_pending.emplace_back(std::move(PointToAdd), std::move(PointNoNeedDownsample));
+    if (map_insert_pending.size() <= static_cast<size_t>(map_insert_delay_scans)) {
+      add_point_size = 0;
+      return;
+    }
+    PointToAdd = std::move(map_insert_pending.front().first);
+    PointNoNeedDownsample = std::move(map_insert_pending.front().second);
+    map_insert_pending.pop_front();
   }
 
   if (async_map_en) {
@@ -2326,6 +2351,7 @@ public:
     this->declare_parameter<double>("diagnostics.latency_log_period_sec", 1.0);
     this->declare_parameter<bool>("diagnostics.kalman_channel_enable", false);
     this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
+    this->declare_parameter<int>("mapping.map_insert_delay_scans", 0);
     this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
     this->declare_parameter<int>("pcd_save.interval", -1);
     this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
@@ -2482,6 +2508,10 @@ public:
     this->get_parameter_or<double>("diagnostics.latency_log_period_sec", latency_log_period_sec, 1.0);
     this->get_parameter_or<bool>("diagnostics.kalman_channel_enable", kalman_channel_diag_en, false);
     this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
+    this->get_parameter_or<int>("mapping.map_insert_delay_scans", map_insert_delay_scans, 0);
+    if (map_insert_delay_scans > 0) {
+      RCLCPP_WARN(this->get_logger(), "[MAP] deterministic insertion lag: %d scan(s)", map_insert_delay_scans);
+    }
     this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
     this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
     this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());

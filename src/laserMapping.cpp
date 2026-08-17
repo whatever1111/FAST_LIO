@@ -40,6 +40,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -129,6 +130,7 @@ string map_file_path, lid_topic, imu_topic, imu_input_type = "sensor_msgs", imu_
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
+constexpr double kLidarLoopBackSec = 1.0;  // stamp jump back beyond this = real loop back (bag restart), else a stray sample
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
@@ -768,9 +770,19 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
               << " step=" << step << " buf=" << lidar_buffer.size() << std::endl;
   }
   if (!is_first_lidar && cur_time < last_timestamp_lidar) {
-    std::cerr << "lidar loop back, clear buffer" << std::endl;
-    lidar_buffer.clear();
-    lidar_receive_time_buffer.clear();
+    // A stray out-of-order scan (7 per m20 bag) must not clear the queue —
+    // that throws away the scan waiting for its IMU coverage (a self-inflicted
+    // scan hole). Drop the stray one; only a real jump back clears.
+    if (last_timestamp_lidar - cur_time > kLidarLoopBackSec) {
+      std::cerr << "lidar loop back (" << (last_timestamp_lidar - cur_time) << "s), clear buffer" << std::endl;
+      lidar_buffer.clear();
+      lidar_receive_time_buffer.clear();
+    } else {
+      std::cerr << "lidar scan out of order by " << (last_timestamp_lidar - cur_time) * 1e3 << " ms, dropped"
+                << std::endl;
+      mtx_buffer.unlock();
+      return;
+    }
   }
   if (is_first_lidar) {
     is_first_lidar = false;
@@ -804,9 +816,19 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
   double cur_time = get_time_sec(msg->header.stamp);
   double preprocess_start_time = omp_get_wtime();
   if (!is_first_lidar && cur_time < last_timestamp_lidar) {
-    std::cerr << "lidar loop back, clear buffer" << std::endl;
-    lidar_buffer.clear();
-    lidar_receive_time_buffer.clear();
+    // A stray out-of-order scan (7 per m20 bag) must not clear the queue —
+    // that throws away the scan waiting for its IMU coverage (a self-inflicted
+    // scan hole). Drop the stray one; only a real jump back clears.
+    if (last_timestamp_lidar - cur_time > kLidarLoopBackSec) {
+      std::cerr << "lidar loop back (" << (last_timestamp_lidar - cur_time) << "s), clear buffer" << std::endl;
+      lidar_buffer.clear();
+      lidar_receive_time_buffer.clear();
+    } else {
+      std::cerr << "lidar scan out of order by " << (last_timestamp_lidar - cur_time) * 1e3 << " ms, dropped"
+                << std::endl;
+      mtx_buffer.unlock();
+      return;
+    }
   }
   if (is_first_lidar) {
     is_first_lidar = false;
@@ -839,9 +861,19 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
   double preprocess_start_time = omp_get_wtime();
   scan_count++;
   if (!is_first_lidar && cur_time < last_timestamp_lidar) {
-    std::cerr << "lidar loop back, clear buffer" << std::endl;
-    lidar_buffer.clear();
-    lidar_receive_time_buffer.clear();
+    // A stray out-of-order scan (7 per m20 bag) must not clear the queue —
+    // that throws away the scan waiting for its IMU coverage (a self-inflicted
+    // scan hole). Drop the stray one; only a real jump back clears.
+    if (last_timestamp_lidar - cur_time > kLidarLoopBackSec) {
+      std::cerr << "lidar loop back (" << (last_timestamp_lidar - cur_time) << "s), clear buffer" << std::endl;
+      lidar_buffer.clear();
+      lidar_receive_time_buffer.clear();
+    } else {
+      std::cerr << "lidar scan out of order by " << (last_timestamp_lidar - cur_time) * 1e3 << " ms, dropped"
+                << std::endl;
+      mtx_buffer.unlock();
+      return;
+    }
   }
   if (is_first_lidar) {
     is_first_lidar = false;
@@ -887,8 +919,24 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
   mtx_buffer.lock();
 
   if (timestamp < last_timestamp_imu) {
-    std::cerr << "lidar loop back, clear buffer" << std::endl;
-    imu_buffer.clear();
+    // A single out-of-order IMU sample (DDS reordering, driver hiccup; 7 per
+    // m20 bag) must not wipe the buffer — that removes the coverage of the scan
+    // waiting in lidar_buffer and the next propagation runs over a hole
+    // (measured 0.9 m jump). Drop the stray sample; only a real jump backwards
+    // (bag restart / clock reset, > kImuLoopBackSec) clears the buffer.
+    constexpr double kImuLoopBackSec = 1.0;
+    if (last_timestamp_imu - timestamp > kImuLoopBackSec) {
+      std::cerr << "imu loop back (" << (last_timestamp_imu - timestamp) << "s), clear buffer" << std::endl;
+      imu_buffer.clear();
+    } else {
+      static int stray_count = 0;
+      if (++stray_count <= 20) {
+        std::cerr << "imu sample out of order by " << (last_timestamp_imu - timestamp) * 1e3 << " ms, dropped"
+                  << std::endl;
+      }
+      mtx_buffer.unlock();
+      return;
+    }
   }
 
   last_timestamp_imu = timestamp;
@@ -2595,8 +2643,33 @@ public:
 
     //------------------------------------------------------------------------------------------------------
     auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
-    timer_ =
-      rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
+    // Offline deterministic replay (env FLIO_OFFLINE_STEP=1, see LIO-SLAM
+    // tools/offline_replay): no free-running timer — the replay driver delivers a
+    // scan and its IMU, drains the executor, then publishes one step message; each
+    // step processes every scan queued at that moment (bounded, so a scan whose IMU
+    // coverage is still missing simply waits for the next step). Nothing else in
+    // the node consults wall time for the estimate, so the sequence is reproducible.
+    {
+      const char * os = getenv("FLIO_OFFLINE_STEP");
+      offline_step_en_ = (os != nullptr && std::string(os) != "0");
+    }
+    if (offline_step_en_) {
+      subOfflineStep_ = this->create_subscription<std_msgs::msg::Empty>(
+        "/lio/offline_step", 100, [this](std_msgs::msg::Empty::UniquePtr) {
+          size_t queued = 0;
+          {
+            std::lock_guard<std::mutex> lk(mtx_buffer);
+            queued = lidar_buffer.size();
+          }
+          for (size_t i = 0; i < queued; ++i) {
+            timer_callback();
+          }
+        });
+      RCLCPP_WARN(this->get_logger(), "[OFFLINE_STEP] processing driven by /lio/offline_step (FLIO_OFFLINE_STEP set)");
+    } else {
+      timer_ =
+        rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
+    }
 
     // The voxel-capped /Laser_map is a coarse global map, not a live feed, so it
     // publishes slowly (default 0.2 Hz). Period is configurable via publish.map_period_sec.
@@ -3728,6 +3801,8 @@ private:
 
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   rclcpp::TimerBase::SharedPtr timer_;
+  bool offline_step_en_ = false;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr subOfflineStep_;
   rclcpp::TimerBase::SharedPtr map_pub_timer_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr fe_z_drift_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;

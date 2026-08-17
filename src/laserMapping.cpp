@@ -3543,6 +3543,8 @@ private:
                                         state_before_update.rot.toRotationMatrix().transpose());
         const double drot_deg = upd_rot.angle() * 180.0 / M_PI;
         const double dyaw_deg = upd_rot.angle() * upd_rot.axis()(2) * 180.0 / M_PI;
+        // Online lidar→IMU extrinsic estimate (deg) — to see whether it converges and where.
+        const V3D ex_eul = SO3ToEuler(state_point.offset_R_L_I);
         // Per-scan trace (every scan): lidar end time, IMU samples covering the
         // scan and their max stamp gap, correspondence count, far-field
         // fraction, and the update's state deltas — for correlating FE
@@ -3577,6 +3579,8 @@ private:
                     << " deg=" << (flio_in_degraded ? 1 : 0)
                     << " along=" << obs_along << " emin=" << obs_emin << " emax=" << obs_emax << " hmin=" << obs_hmin
                     << " drot=" << drot_deg << " dyaw=" << dyaw_deg << " bgz=" << state_point.bg[2]
+                    << " exT=" << state_point.offset_T_L_I[0] << "," << state_point.offset_T_L_I[1] << ","
+                    << state_point.offset_T_L_I[2] << " exR=" << ex_eul[0] << "," << ex_eul[1] << "," << ex_eul[2]
                     << std::endl;
         }
         if (lidar_correction > 0.2 || body_speed > 1.5 || dvel > 0.3 || dba > 0.05 || dbg > 0.01 ||

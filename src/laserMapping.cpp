@@ -146,6 +146,19 @@ double pos_obs_eig_min = 0.0, pos_obs_eig_max = 0.0, pos_obs_z_weak = 0.0;
 Eigen::Matrix3d pos_obs_M = Eigen::Matrix3d::Zero();  // Σ n nᵀ of the last update (world frame), for the [SCAN] trace
 bool degeneracy_debug = false;  // verbose per-frame [DEGEN] diagnostics
 
+// Front-end health side-channel (Plan C): per-scan along-motion observability and
+// quality metrics published on /Odometry twist.covariance for the PGO
+// between-factor gate. Layout contract: LIO-SLAM core pgo_factor_kernels.hpp
+// (kFeHealth*Cell). obs_along = d·(pos_obs_M·d)/effct_feat_num with d = the
+// world-frame velocity direction: mean cos² between the effective plane normals
+// and the travel direction (1 = every plane faces the motion, 0 = all planes
+// parallel to it → along-track unobservable). -1 below the speed gate (direction
+// undefined), 0 when a moving scan has no effective points (worst case).
+bool health_pub_en = true;
+constexpr double kHealthSpeedGate = 0.2;  // m/s, same gate as the [SCAN] trace obs_along
+double scan_obs_along = -1.0;
+double scan_body_speed = 0.0;
+
 // Planar-motion (zero body-vertical-velocity) soft constraint — the A'-2 fix.
 //   When LiDAR loses Z observability (pos_obs_z_weak high), the iEKF dumps the
 //   unexplained residual into the accel bias and the state flies off. This adds a
@@ -1536,6 +1549,19 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   odomAftMapped.child_frame_id = "body";
   odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
   set_posestamp(odomAftMapped.pose);
+  // Front-end health side-channel (Plan C) — written BEFORE the publish so it is
+  // same-scan (unlike pose.covariance below, which fills the persistent global
+  // message after publishing and therefore rides out one scan late). The twist
+  // covariance was always zero here and has no other consumer. Layout contract:
+  // LIO-SLAM core pgo_factor_kernels.hpp kFeHealth*Cell.
+  if (health_pub_en) {
+    odomAftMapped.twist.covariance[0] = 1.0;  // sentinel/version
+    odomAftMapped.twist.covariance[7] = scan_obs_along;
+    odomAftMapped.twist.covariance[14] = static_cast<double>(effct_feat_num);
+    odomAftMapped.twist.covariance[21] = scan_far_frac;
+    odomAftMapped.twist.covariance[28] = res_mean_last;
+    odomAftMapped.twist.covariance[35] = scan_body_speed;
+  }
   pubOdomAftMapped->publish(odomAftMapped);
   if (!diag_first_odom_pub_logged) {
     RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
@@ -2256,6 +2282,7 @@ public:
     this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
     this->declare_parameter<int>("max_iteration", 4);
     this->declare_parameter<bool>("degeneracy_debug", false);
+    this->declare_parameter<bool>("health_pub_en", true);
     this->declare_parameter<bool>("planar_constraint_en", false);
     this->declare_parameter<double>("planar_constraint_noise", 0.1);
     this->declare_parameter<double>("planar_constraint_z_weak_thresh", 0.5);
@@ -2383,6 +2410,7 @@ public:
     this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
     this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
     this->get_parameter_or<bool>("degeneracy_debug", degeneracy_debug, false);
+    this->get_parameter_or<bool>("health_pub_en", health_pub_en, true);
     this->get_parameter_or<bool>("planar_constraint_en", planar_constraint_en, false);
     this->get_parameter_or<double>("planar_constraint_noise", planar_constraint_noise, 0.1);
     this->get_parameter_or<double>("planar_constraint_z_weak_thresh", planar_constraint_z_weak_thresh, 0.5);
@@ -3651,6 +3679,22 @@ private:
       hole_last_scan_end = lidar_end_time;
       hole_vel_pre = state_point.vel;
       hole_pos_pre = state_point.pos;
+
+      /*** Front-end health for the PGO between-factor gate (Plan C): along-motion
+           observability of this scan's final (post-update) state ***/
+      {
+        const Eigen::Vector3d vw(state_point.vel[0], state_point.vel[1], state_point.vel[2]);
+        scan_body_speed = vw.norm();
+        scan_obs_along = -1.0;
+        if (scan_body_speed > kHealthSpeedGate) {
+          if (effct_feat_num > 0) {
+            const Eigen::Vector3d d = vw / scan_body_speed;
+            scan_obs_along = d.dot(pos_obs_M * d) / effct_feat_num;
+          } else {
+            scan_obs_along = 0.0;  // moving with no effective points: worst case
+          }
+        }
+      }
 
       /******* Publish odometry *******/
       publish_odometry(pubOdomAftMapped_, tf_broadcaster_);

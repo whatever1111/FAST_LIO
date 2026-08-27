@@ -249,6 +249,13 @@ double hole_last_scan_end = -1.0;
 V3D hole_vel_pre = V3D::Zero();
 V3D hole_pos_pre = V3D::Zero();
 double scan_far_frac = 1.0;                // per-scan telemetry: fraction of raw points beyond far_range
+// [RES] telemetry: converged point-to-plane residual by body range bin (0-2,2-5,5-10,10-20,20-40,40+ m):
+// count and sum of squares from the last h_share_model call of the scan (degeneracy_debug only).
+constexpr int kResBins = 6;
+constexpr double kResBinEdges[kResBins] = {2.0, 5.0, 10.0, 20.0, 40.0, 1e9};
+int res_bin_n[kResBins] = {0};
+double res_bin_ss[kResBins] = {0.0};
+
 int consec_engulf = 0;                     // running engulfed-scan streak
 int consec_low_eff = 0;                    // running degenerate-scan streak counter
 bool flio_map_frozen = false;              // degraded: skip map_incremental (no garbage)
@@ -2194,12 +2201,24 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   }
 
   effct_feat_num = 0;
+  if (degeneracy_debug) {
+    std::fill(std::begin(res_bin_n), std::end(res_bin_n), 0);
+    std::fill(std::begin(res_bin_ss), std::end(res_bin_ss), 0.0);
+  }
 
   for (int i = 0; i < feats_down_size; i++) {
     if (point_selected_surf[i]) {
       laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
       corr_normvect->points[effct_feat_num] = normvec->points[i];
       total_residual += res_last[i];
+      if (degeneracy_debug) {
+        const PointType & pb = feats_down_body->points[i];
+        const double rng = std::sqrt(double(pb.x) * pb.x + double(pb.y) * pb.y + double(pb.z) * pb.z);
+        int b = 0;
+        while (b < kResBins - 1 && rng >= kResBinEdges[b]) ++b;
+        ++res_bin_n[b];
+        res_bin_ss[b] += double(res_last[i]) * res_last[i];
+      }
       effct_feat_num++;
     }
   }
@@ -3609,7 +3628,11 @@ private:
                     << " drot=" << drot_deg << " dyaw=" << dyaw_deg << " bgz=" << state_point.bg[2]
                     << " exT=" << state_point.offset_T_L_I[0] << "," << state_point.offset_T_L_I[1] << ","
                     << state_point.offset_T_L_I[2] << " exR=" << ex_eul[0] << "," << ex_eul[1] << "," << ex_eul[2]
-                    << std::endl;
+                    << " res=";
+          for (int b = 0; b < kResBins; ++b)
+            std::cerr << (b ? "," : "") << res_bin_n[b] << ":"
+                      << (res_bin_n[b] ? std::sqrt(res_bin_ss[b] / res_bin_n[b]) * 1000.0 : 0.0);
+          std::cerr << std::endl;
         }
         if (lidar_correction > 0.2 || body_speed > 1.5 || dvel > 0.3 || dba > 0.05 || dbg > 0.01 ||
             effct_feat_num < 200 || pos_obs_z_weak > 0.7) {

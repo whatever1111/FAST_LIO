@@ -55,6 +55,15 @@ class ImuProcess
   // so the raw IMU stream is available for offline drift/gravity analysis. Set by
   // laserMapping from the runtime_pos_log_enable param before the first Process().
   bool runtime_log_en = false;
+  // Quasi-static init gate (2026-08-31, m20_0831): initializing gravity from a
+  // WALKING accel mean tilted the world frame 6.5-7 deg for the entire run —
+  // every later observation is frame-relative, nothing can re-level the map
+  // post hoc (measured: plane-fit tilt 6.5 deg, residual Z RMS 4 cm). When
+  // enabled, the init accumulator restarts until the accel-norm scatter says
+  // the platform is still; after init_still_timeout_s it proceeds with a WARN.
+  bool   init_require_still = false;
+  double init_still_tol = 0.03;        // sqrt(tr(cov_acc))/|mean_acc| threshold
+  double init_still_timeout_s = 20.0;  // fall back to legacy init after this
   V3D cov_acc;
   V3D cov_gyr;
   V3D cov_acc_scale;
@@ -418,6 +427,21 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
     state_ikfom imu_state = kf_state.get_x();
     if (init_iter_num > MAX_INI_COUNT)
     {
+      const double still_ratio = mean_acc.norm() > 1e-6 ? std::sqrt(cov_acc.sum()) / mean_acc.norm() : 1e9;
+      const bool timed_out = (meas.lidar_beg_time - first_lidar_time) > init_still_timeout_s;
+      if (init_require_still && still_ratio > init_still_tol && !timed_out)
+      {
+        // platform is moving: restart the accumulation window and keep waiting
+        std::cerr << "[IMU-INIT] motion detected during init (scatter " << still_ratio
+                  << " > " << init_still_tol << ") — restarting init window" << std::endl;
+        b_first_frame_ = true;   // next IMU_init call re-seeds mean/cov from fresh samples
+        init_iter_num = 1;
+        return;
+      }
+      if (init_require_still && timed_out && still_ratio > init_still_tol)
+        std::cerr << "[IMU-INIT] WARN still-gate timeout after " << init_still_timeout_s
+                  << " s — initializing from a MOVING mean (gravity may be tilted; scatter "
+                  << still_ratio << ")" << std::endl;
       cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init_ = false;
 

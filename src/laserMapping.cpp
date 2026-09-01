@@ -187,6 +187,28 @@ double gravity_align_noise = 0.05;         // unit-vector (≈rad) std of the le
 double gravity_align_z_weak_thresh = 0.3;  // engage only when pos_obs_z_weak exceeds this
 double gravity_align_accel_tol = 0.05;     // |‖a‖−g|/g must be below this (low-linear-accel gate)
 double gravity_align_gyro_tol = 0.35;      // rad/s; skip during fast turns (lever-arm safety)
+// 2026-08-31 additions (m20_0831 doorway pitch anatomy) — all default-off:
+double gravity_align_window_s = 0.0;       // [L2] >0: measurement = window-mean specific force
+bool gravity_align_continuous = false;     // [L2] engage every scan (gates still apply)
+double gravity_align_hold_s = 0.0;         // [L1] hold the degraded-strength prior after a trigger
+double gravity_align_noise_degraded = 0.0; // [L1] tighter sigma while triggered/held (0 = use base)
+double attitude_cov_floor_deg = 0.0;       // [L3] roll/pitch error-state std floor while triggered
+double gravity_align_mag_ref = 0.0;        // magnitude-gate anchor; 0 = IMU-init g (biased if init in motion)
+double gravity_align_grav_leak = 1.0;      // [v4] per-engaged-scan multiplicative variance leak on the S2
+                                           // gravity block (fading memory); 1.0 = off
+double gravity_align_grav_cap_deg = 3.0;   // [v4] leak cap: grav tangent std ceiling (deg) — bounds how far
+                                           // the gravity state may be steered per run
+bool imu_init_require_still_ = false;      // quasi-static IMU-init gate (see IMU_Processing.hpp)
+double imu_init_still_tol_ = 0.03;
+double imu_init_still_timeout_s_ = 20.0;
+struct GravWinAgg {
+  double t;
+  Eigen::Vector3d sum;
+  int n;
+  double max_w;
+};
+std::deque<GravWinAgg> grav_win;           // scan-thread only
+double gravity_align_last_trig = -1e18;
 
 // Divergence guard (P1): when LiDAR correspondences collapse (scan starvation
 // under CPU/IO load, or feature-poor geometry), the iEKF runs on IMU
@@ -2310,6 +2332,17 @@ public:
     this->declare_parameter<double>("gravity_align_z_weak_thresh", 0.3);
     this->declare_parameter<double>("gravity_align_accel_tol", 0.05);
     this->declare_parameter<double>("gravity_align_gyro_tol", 0.35);
+    this->declare_parameter<double>("gravity_align_window_s", 0.0);
+    this->declare_parameter<bool>("gravity_align_continuous", false);
+    this->declare_parameter<double>("gravity_align_hold_s", 0.0);
+    this->declare_parameter<double>("gravity_align_noise_degraded", 0.0);
+    this->declare_parameter<double>("attitude_cov_floor_deg", 0.0);
+    this->declare_parameter<double>("gravity_align_mag_ref", 0.0);
+    this->declare_parameter<double>("gravity_align_grav_leak", 1.0);
+    this->declare_parameter<double>("gravity_align_grav_cap_deg", 3.0);
+    this->declare_parameter<bool>("imu_init_require_still", false);
+    this->declare_parameter<double>("imu_init_still_tol", 0.03);
+    this->declare_parameter<double>("imu_init_still_timeout_s", 20.0);
     this->declare_parameter<bool>("divergence_guard_en", true);
     this->declare_parameter<int>("divergence_guard_min_eff", 50);
     this->declare_parameter<bool>("guard_engulf_en", true);
@@ -2438,6 +2471,17 @@ public:
     this->get_parameter_or<double>("gravity_align_z_weak_thresh", gravity_align_z_weak_thresh, 0.3);
     this->get_parameter_or<double>("gravity_align_accel_tol", gravity_align_accel_tol, 0.05);
     this->get_parameter_or<double>("gravity_align_gyro_tol", gravity_align_gyro_tol, 0.35);
+    this->get_parameter_or<double>("gravity_align_window_s", gravity_align_window_s, 0.0);
+    this->get_parameter_or<bool>("gravity_align_continuous", gravity_align_continuous, false);
+    this->get_parameter_or<double>("gravity_align_hold_s", gravity_align_hold_s, 0.0);
+    this->get_parameter_or<double>("gravity_align_noise_degraded", gravity_align_noise_degraded, 0.0);
+    this->get_parameter_or<double>("attitude_cov_floor_deg", attitude_cov_floor_deg, 0.0);
+    this->get_parameter_or<double>("gravity_align_mag_ref", gravity_align_mag_ref, 0.0);
+    this->get_parameter_or<double>("gravity_align_grav_leak", gravity_align_grav_leak, 1.0);
+    this->get_parameter_or<double>("gravity_align_grav_cap_deg", gravity_align_grav_cap_deg, 3.0);
+    this->get_parameter_or<bool>("imu_init_require_still", imu_init_require_still_, false);
+    this->get_parameter_or<double>("imu_init_still_tol", imu_init_still_tol_, 0.03);
+    this->get_parameter_or<double>("imu_init_still_timeout_s", imu_init_still_timeout_s_, 20.0);
     this->get_parameter_or<bool>("divergence_guard_en", divergence_guard_en, true);
     this->get_parameter_or<int>("divergence_guard_min_eff", divergence_guard_min_eff, 50);
     this->get_parameter_or<bool>("guard_engulf_en", guard_engulf_en, true);
@@ -2618,6 +2662,9 @@ public:
 
     Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
     Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
+    p_imu->init_require_still = imu_init_require_still_;
+    p_imu->init_still_tol = imu_init_still_tol_;
+    p_imu->init_still_timeout_s = imu_init_still_timeout_s_;
     p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
     p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
     p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
@@ -3441,68 +3488,187 @@ private:
       /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
        *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll
        *   reference the body-vz planar constraint below structurally lacks.
-       *   When LiDAR Z is degenerate, and only when the IMU is in low-linear-
-       *   acceleration motion (|‖a‖−g| small, so specific force ≈ gravity) and
-       *   not turning hard (lever-arm safety), the bias-free accelerometer
-       *   direction equals world-up expressed in the body frame. Pull the
-       *   grav-state up-axis onto it with a soft pseudo-measurement. Constrains
-       *   roll/pitch ONLY: yaw lies in the measurement null space (skew(g_body)
-       *   sends a yaw-axis δθ to 0), so the LiDAR-excellent heading is untouched.
-       *   h(x)=Rᵀ·u_world, right-perturbation R=R̂·Exp(δθ) ⇒ ∂h/∂δθ=skew(g_body),
-       *   the same form as the planar/wheel updates. ***/
-      if (gravity_align_en && !Measures.imu.empty() &&
-          (pos_obs_z_weak > gravity_align_z_weak_thresh || flio_in_degraded)) {
-        const auto & imu_last = Measures.imu.back();
-        V3D a_raw(imu_last->linear_acceleration.x, imu_last->linear_acceleration.y, imu_last->linear_acceleration.z);
-        V3D w_raw(imu_last->angular_velocity.x, imu_last->angular_velocity.y, imu_last->angular_velocity.z);
+       *   2026-08-31 upgrade (m20_0831 doorway pitch anatomy: dZ_rate =
+       *   −v·sin(pitch_err), r=0.94; the per-sample standstill gate engaged
+       *   7/2569 scans, all inside guard windows — the phase where no error
+       *   integrates). Three additions, parameter-gated, defaults = legacy:
+       *   [L2] gravity_align_window_s > 0: the measurement becomes the
+       *        WINDOW-MEAN compensated specific force — gait linear
+       *        acceleration is near zero-mean over a stride, so the mean is a
+       *        clean gravity direction even while walking (measured on
+       *        m20_0831 /IMU: 0.13-0.56° median at 1.2 m/s vs 1.2-2.5°
+       *        per-sample). gravity_align_continuous engages every scan.
+       *   [L1] gravity_align_hold_s: a z_weak/degraded trigger keeps the
+       *        stronger gravity_align_noise_degraded sigma for this long
+       *        after clearing — the doorway pitch twist integrates into Z on
+       *        the walk AFTER the guard window, not inside it.
+       *   [L3] attitude_cov_floor_deg: while triggered, floor the roll/pitch
+       *        error-state variance BEFORE this update. A confidently-wrong
+       *        iEKF (measured 0.09-0.67°/scan authority against a 6-7° error)
+       *        beats any honestly-weighted witness; softening P is what lets
+       *        the measurement act (Schmidt/consider-state practice).
+       *   Constrains roll/pitch ONLY: yaw lies in the measurement null space
+       *   (skew(g_body) sends a yaw-axis δθ to 0), so the LiDAR-excellent
+       *   heading is untouched. h(x)=Rᵀ·u_world, right-perturbation
+       *   R=R̂·Exp(δθ) ⇒ ∂h/∂δθ=skew(g_body), same form as planar/wheel. ***/
+      if (gravity_align_en && !Measures.imu.empty()) {
         const double g_raw = p_imu->gravity_norm();  // gravity magnitude, raw units
         state_ikfom st = kf.get_x();
         M3D Rw = st.rot.toRotationMatrix();
-        // Kinematic-acceleration compensation. The measured specific force is
-        // f = a_kinematic − g. On the open-area row-end turns that coincide with
-        // weak-Z, a_kinematic is dominated by centripetal ω×v_body, which tilts
-        // the raw accelerometer (mostly in ROLL) and, left uncorrected, drove a
-        // ~5 m upward Z drift. Subtract it (transport theorem; tangential dv/dt
-        // neglected, caught by the magnitude gate below) to recover clean gravity
-        // even mid-turn. Scaled into the IMU's accel units so it is g-unit safe.
-        V3D omega = w_raw - V3D(st.bg[0], st.bg[1], st.bg[2]);  // true body rate
-        V3D v_body = Rw.transpose() * st.vel;                   // velocity in IMU frame
-        V3D a_kin = omega.cross(v_body) * (g_raw / G_m_s2);     // centripetal, IMU units
-        V3D a_grav = a_raw - a_kin;                             // specific force − motion
-        const double a_norm = a_grav.norm();
-        // Validity gate: compensated magnitude ≈ gravity (rejects residual
-        // tangential accel) AND not spinning absurdly fast (ω×v single-sample
-        // approximation breaks down; magnitude gate is the primary guard).
-        if (g_raw > 1e-3 && a_norm > 1e-6 && std::abs(a_norm - g_raw) <= gravity_align_accel_tol * g_raw &&
-            w_raw.norm() <= gravity_align_gyro_tol) {
-          V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
-          V3D u_world = -grav_w.normalized();              // world up (unit)
-          V3D g_body = Rw.transpose() * u_world;           // predicted up in body (unit)
-          V3D m_body = a_grav / a_norm;                    // measured up in body (unit)
-          V3D residual = m_body - g_body;                  // z − h(x)
-          Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
-          H.block<3, 3>(0, 3) = skew_sym_mat(g_body);  // ∂h/∂(rot); yaw in null space
-          const double n2 = gravity_align_noise * gravity_align_noise;
-          Eigen::Vector3d R_diag(n2, n2, n2);
-          if (degeneracy_debug) {
-            // Leveling error the prior sees, BEFORE applying it: signed
-            // tilt of measured-up vs predicted-up, decomposed so we can see
-            // which way (and how hard) it will rotate pitch/roll.
-            V3D tilt = g_body.cross(m_body);  // axis*sin(angle), body frame
-            const double ang_deg = std::asin(std::min(1.0, tilt.norm())) * 57.2958;
-            V3D eul_before = SO3ToEuler(st.rot);
-            kf.update_simple(H, residual, R_diag);
-            state_point = kf.get_x();
-            V3D eul_after = SO3ToEuler(state_point.rot);
-            V3D deul = eul_after - eul_before;
-            std::cerr << "[GALIGN] z_weak=" << pos_obs_z_weak << " degr=" << flio_in_degraded << " tilt_deg=" << ang_deg
-                      << " tiltAxisB=[" << tilt.x() << "," << tilt.y() << "," << tilt.z() << "]"
-                      << " dRPY_deg=[" << deul.x() * 57.2958 << "," << deul.y() * 57.2958 << "," << deul.z() * 57.2958
-                      << "]"
-                      << " posZ=" << state_point.pos[2] << "m" << std::endl;
+        const V3D bg_now(st.bg[0], st.bg[1], st.bg[2]);
+        const V3D v_body_now = Rw.transpose() * st.vel;  // velocity in IMU frame
+        // [L2] per-scan aggregate of kinematically-compensated specific force
+        // (centripetal ω×v_body subtracted per sample — transport theorem; the
+        // scan-end velocity serves every sample, walking-speed error << gates).
+        if (gravity_align_window_s > 0.0) {
+          GravWinAgg agg{lidar_end_time, Eigen::Vector3d::Zero(), 0, 0.0};
+          for (const auto & imu : Measures.imu) {
+            V3D a_i(imu->linear_acceleration.x, imu->linear_acceleration.y, imu->linear_acceleration.z);
+            V3D w_i(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z);
+            // per-SAMPLE gyro filter: one spike must not disqualify the scan
+            // (measured: scan-level max|ω| gating killed 18-23 % of scans).
+            if (w_i.norm() > gravity_align_gyro_tol) { continue; }
+            agg.sum += a_i - (w_i - bg_now).cross(v_body_now) * (g_raw / G_m_s2);
+            agg.n++;
+          }
+          grav_win.push_back(agg);
+          while (!grav_win.empty() &&
+                 (grav_win.front().t < lidar_end_time - gravity_align_window_s || grav_win.size() > 100)) {
+            grav_win.pop_front();
+          }
+        }
+        // Engagement: legacy trigger, [L1] hold hysteresis, [L2] continuous.
+        const bool ga_trig = pos_obs_z_weak > gravity_align_z_weak_thresh || flio_in_degraded;
+        if (ga_trig) { gravity_align_last_trig = lidar_end_time; }
+        const bool ga_held = gravity_align_hold_s > 0.0 && !ga_trig &&
+                             lidar_end_time - gravity_align_last_trig <= gravity_align_hold_s;
+        // [L3] roll/pitch covariance floor while the lidar may be twisting attitude.
+        if (ga_trig && attitude_cov_floor_deg > 0.0) {
+          // Multiplicative inflation (congruence P' = D·P·D with diagonal D):
+          // raises the roll/pitch variance to the floor while scaling the
+          // cross-covariances consistently — correlations and PSD preserved.
+          // A naive diagonal bump leaves stale attitude-vel/pos cross terms
+          // against an inflated variance and the next update drags the whole
+          // state through them (measured 2026-08-31: 100°+ Euler jumps, 8 m
+          // runaways on m20_0814). This is why the literature uses consider/
+          // Schmidt treatments instead of covariance surgery.
+          const double floor2 = std::pow(attitude_cov_floor_deg * M_PI / 180.0, 2);
+          auto P = kf.get_P();
+          bool bumped = false;
+          for (int i = 3; i <= 4; i++) {  // error-state δθ x,y = roll/pitch; 5 = yaw, untouched
+            if (P(i, i) > 1e-12 && P(i, i) < floor2) {
+              const double lam = std::sqrt(floor2 / P(i, i));
+              P.row(i) *= lam;
+              P.col(i) *= lam;
+              bumped = true;
+            }
+          }
+          if (bumped) { kf.change_P(P); }
+        }
+        if (ga_trig || ga_held || gravity_align_continuous) {
+          // Measurement vector: window mean ([L2]) or legacy last-sample.
+          V3D f_meas = V3D::Zero();
+          double win_span = 0.0;
+          int win_n = 0;
+          if (gravity_align_window_s > 0.0) {
+            double t_old = lidar_end_time;
+            for (const auto & a : grav_win) {
+              if (a.n == 0) { continue; }  // scan fully rejected by the per-sample gyro filter
+              f_meas += a.sum;
+              win_n += a.n;
+              t_old = std::min(t_old, a.t);
+            }
+            if (win_n > 0) { f_meas /= double(win_n); }
+            win_span = lidar_end_time - t_old + 0.1;
           } else {
-            kf.update_simple(H, residual, R_diag);
-            state_point = kf.get_x();
+            const auto & imu_last = Measures.imu.back();
+            V3D a_raw(imu_last->linear_acceleration.x, imu_last->linear_acceleration.y,
+                      imu_last->linear_acceleration.z);
+            V3D w_raw(imu_last->angular_velocity.x, imu_last->angular_velocity.y, imu_last->angular_velocity.z);
+            if (w_raw.norm() <= gravity_align_gyro_tol) {
+              f_meas = a_raw - (w_raw - bg_now).cross(v_body_now) * (g_raw / G_m_s2);
+              win_n = 1;
+              win_span = 1.0;
+            }
+          }
+          const double a_norm = f_meas.norm();
+          // Validity gates: enough window coverage (windowed mode), compensated
+          // magnitude ≈ gravity (rejects residual tangential accel). The anchor
+          // is gravity_align_mag_ref when set: the IMU-init g estimate is biased
+          // when the bag/robot starts IN MOTION (m20_0831: init while walking →
+          // the 5 % gate rejected nearly every honest window, 9/2569 engaged).
+          const double g_ref = gravity_align_mag_ref > 1e-3 ? gravity_align_mag_ref : g_raw;
+          const bool span_ok = gravity_align_window_s <= 0.0 ||
+                               (win_span >= 0.7 * gravity_align_window_s && win_n >= 20);
+          if (g_ref > 1e-3 && win_n > 0 && a_norm > 1e-6 && span_ok &&
+              std::abs(a_norm - g_ref) <= gravity_align_accel_tol * g_ref) {
+            V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
+            V3D u_world = -grav_w.normalized();              // world up (unit)
+            V3D g_body = Rw.transpose() * u_world;           // predicted up in body (unit)
+            V3D m_body = f_meas / a_norm;                    // measured up in body (unit)
+            V3D residual = m_body - g_body;                  // z − h(x)
+            if (residual.norm() <= 0.5) {  // ~30° outlier gate (never inject a wild window)
+            Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
+            H.block<3, 3>(0, 3) = skew_sym_mat(g_body);  // ∂h/∂(rot); yaw in null space
+            // [v4] gravity-state observability: h = Rᵀ·(−g/‖g‖) also depends on the
+            // S2 gravity state — without these two columns a motion-biased gravity
+            // INIT is permanently unobservable (m20_0831: the bag starts walking →
+            // the world frame is tilted 6.7° for the entire run and the rot-only
+            // update just pulls attitude onto the tilted gravity — measured as the
+            // 3-5° tug-of-war [GALIGN] tilt that never converges). With the columns
+            // in, the Kalman gain splits the residual by covariance: rot follows
+            // the (tight) lidar, grav follows the absolute accel reference.
+            // ∂h/∂δg = −(1/‖g‖)·Rᵀ·M(g), M = S2_Mx (same helper df_dx uses).
+            {
+              Eigen::Matrix<state_ikfom::scalar, 2, 1> dz0 = Eigen::Matrix<state_ikfom::scalar, 2, 1>::Zero();
+              Eigen::Matrix<state_ikfom::scalar, 3, 2> Mg;
+              st.S2_Mx(Mg, dz0, 21);
+              const double gnorm = grav_w.norm();
+              if (gnorm > 1e-6) { H.block<3, 2>(0, 21) = -(1.0 / gnorm) * Rw.transpose() * Mg; }
+            }
+            // [v4] fading memory on the gravity block: with no process noise the
+            // grav variance collapses and even a correct H routes nothing into it.
+            // Gentle multiplicative leak (congruence row/col scaling — correlations
+            // and PSD preserved, no covariance shock) capped at (3°)².
+            if (gravity_align_grav_leak > 1.0) {
+              const double kGravVarCap = std::pow(gravity_align_grav_cap_deg * M_PI / 180.0, 2);
+              auto Pg = kf.get_P();
+              const double lam = std::sqrt(gravity_align_grav_leak);
+              bool leaked = false;
+              for (int i = 21; i <= 22; i++) {
+                if (Pg(i, i) < kGravVarCap) {
+                  Pg.row(i) *= lam;
+                  Pg.col(i) *= lam;
+                  leaked = true;
+                }
+              }
+              if (leaked) { kf.change_P(Pg); }
+            }
+            const double sigma = (ga_trig || ga_held) && gravity_align_noise_degraded > 0.0
+                                     ? gravity_align_noise_degraded
+                                     : gravity_align_noise;
+            const double n2 = sigma * sigma;
+            Eigen::Vector3d R_diag(n2, n2, n2);
+            if (degeneracy_debug) {
+              V3D tilt = g_body.cross(m_body);  // axis*sin(angle), body frame
+              const double ang_deg = std::asin(std::min(1.0, tilt.norm())) * 57.2958;
+              V3D eul_before = SO3ToEuler(st.rot);
+              kf.update_simple(H, residual, R_diag);
+              state_point = kf.get_x();
+              V3D eul_after = SO3ToEuler(state_point.rot);
+              V3D deul = eul_after - eul_before;
+              std::cerr << "[GALIGN] z_weak=" << pos_obs_z_weak << " degr=" << flio_in_degraded
+                        << " trig=" << ga_trig << " held=" << ga_held << " win_n=" << win_n
+                        << " span=" << win_span << " sigma=" << sigma << " gvar=" << kf.get_P()(21, 21)
+                        << " tilt_deg=" << ang_deg
+                        << " dRPY_deg=[" << deul.x() * 57.2958 << "," << deul.y() * 57.2958 << ","
+                        << deul.z() * 57.2958 << "]"
+                        << " posZ=" << state_point.pos[2] << "m" << std::endl;
+            } else {
+              kf.update_simple(H, residual, R_diag);
+              state_point = kf.get_x();
+            }
+            }  // outlier gate
           }
         }
       }

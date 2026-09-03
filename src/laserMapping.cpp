@@ -589,6 +589,16 @@ deque<PointCloudXYZI::Ptr> lidar_buffer;
 deque<SteadyTimePoint> lidar_receive_time_buffer;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 
+// The scan queue is the front end's only backpressure valve. Unbounded, any
+// sustained shortfall — a starved core, an IMU stream stamped seconds behind
+// the LiDAR — queues every scan the estimator cannot reach, and the process
+// grows until the OOM killer takes it (m20 dog 2, 2026-09-03: 12.9 GB in 20
+// min). Past the cap the oldest waiting scans are dropped instead, so the
+// estimate stays near real time at a lower effective scan rate (the hole guard
+// covers the gap) rather than going stale and then dying. 0 = unbounded.
+int max_buffered_scans = 100;
+size_t dropped_scan_total = 0;
+
 bool latency_diag_en = true;
 double latency_log_period_sec = 1.0;
 bool kalman_channel_diag_en = false;
@@ -790,6 +800,36 @@ void lasermap_fov_segment()
   kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
+// Enforce max_buffered_scans. Called from the LiDAR callbacks with mtx_buffer
+// held; every callback of this node shares one mutually-exclusive callback
+// group, so sync_packages is never mid-flight here. The one exception is the
+// scan it has already taken (lidar_pushed) and not yet popped — that one stays.
+static void trim_lidar_buffer()
+{
+  if (max_buffered_scans <= 0) return;
+  const size_t cap = static_cast<size_t>(max_buffered_scans);
+  const size_t keep_front = lidar_pushed ? 1u : 0u;
+  size_t dropped = 0;
+  while (lidar_buffer.size() > cap && lidar_buffer.size() > keep_front) {
+    lidar_buffer.erase(lidar_buffer.begin() + keep_front);
+    time_buffer.erase(time_buffer.begin() + keep_front);
+    if (lidar_receive_time_buffer.size() > keep_front)
+      lidar_receive_time_buffer.erase(lidar_receive_time_buffer.begin() + keep_front);
+    ++dropped;
+  }
+  if (dropped == 0) return;
+  dropped_scan_total += dropped;
+  static double last_warn_time = 0.0;
+  const double now = omp_get_wtime();
+  if (now - last_warn_time > 5.0) {
+    last_warn_time = now;
+    RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                "[BACKPRESSURE] scan queue at cap %d: dropped %zu scan(s) (%zu total) — the estimator is not "
+                "keeping up with the LiDAR",
+                max_buffered_scans, dropped, dropped_scan_total);
+  }
+}
+
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
   const auto receive_time = SteadyClock::now();
@@ -835,6 +875,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
   lidar_buffer.push_back(ptr);
   time_buffer.push_back(cur_time);
   lidar_receive_time_buffer.push_back(receive_time);
+  trim_lidar_buffer();
   last_timestamp_lidar = cur_time;
   s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
   mtx_buffer.unlock();
@@ -881,6 +922,7 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
   lidar_buffer.push_back(ptr);
   time_buffer.push_back(cur_time);
   lidar_receive_time_buffer.push_back(receive_time);
+  trim_lidar_buffer();
   last_timestamp_lidar = cur_time;
   s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
   mtx_buffer.unlock();
@@ -939,6 +981,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
   lidar_buffer.push_back(ptr);
   time_buffer.push_back(last_timestamp_lidar);
   lidar_receive_time_buffer.push_back(receive_time);
+  trim_lidar_buffer();
 
   s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
   mtx_buffer.unlock();
@@ -2322,6 +2365,7 @@ public:
     this->declare_parameter<bool>("publish.dense_publish_en", true);
     this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
     this->declare_parameter<int>("max_iteration", 4);
+    this->declare_parameter<int>("max_buffered_scans", 100);
     this->declare_parameter<bool>("degeneracy_debug", false);
     this->declare_parameter<bool>("health_pub_en", true);
     this->declare_parameter<bool>("planar_constraint_en", false);
@@ -2461,6 +2505,7 @@ public:
     this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
     this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
     this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
+    this->get_parameter_or<int>("max_buffered_scans", max_buffered_scans, 100);
     this->get_parameter_or<bool>("degeneracy_debug", degeneracy_debug, false);
     this->get_parameter_or<bool>("health_pub_en", health_pub_en, true);
     this->get_parameter_or<bool>("planar_constraint_en", planar_constraint_en, false);

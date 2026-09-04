@@ -617,6 +617,17 @@ vector<PointVector> Nearest_Points;
 // body-range scale in the residual gate are invariant in between and are kept per point.
 vector<VF(4), Eigen::aligned_allocator<VF(4)>> plane_cache;
 vector<char> plane_cache_ok;
+// Neighbour refresh: the filter searches again once it declares itself converged, but if the
+// state barely moved since the last search the neighbour sets cannot have changed, and that
+// second 5-NN pass over the scan is the single most expensive item in the front end.
+bool nn_refresh_gate_en = false;
+double nn_refresh_min_shift = 0.0;
+double nn_refresh_ref_range = 20.0;
+V3D nn_last_search_pos = V3D::Zero();
+M3D nn_last_search_rot = M3D::Identity();
+bool nn_have_last_search = false;
+double nn_max_shift = 0.0;  // per-scan telemetry: largest would-be refresh shift (m)
+int nn_skips = 0;
 vector<float> body_range_sqrt;
 vector<double> extrinT(3, 0.0);
 vector<double> extrinR(9, 0.0);
@@ -1850,7 +1861,25 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_data)
 {
   double match_start = omp_get_wtime();
-  const bool searching = ekfom_data.converge;
+  bool searching = ekfom_data.converge;
+  if (searching && nn_have_last_search) {
+    // A point at range r moves by at most |dt| + r*|dtheta| between two states, so that
+    // bound against the map resolution decides whether a refresh can change anything.
+    const V3D dt = s.pos - nn_last_search_pos;
+    const M3D dR = nn_last_search_rot.transpose() * s.rot.toRotationMatrix();
+    const V3D dr = Log(dR);
+    const double shift = dt.norm() + nn_refresh_ref_range * dr.norm();
+    nn_max_shift = std::max(nn_max_shift, shift);
+    if (nn_refresh_gate_en && shift < nn_refresh_min_shift) {
+      searching = false;
+      ++nn_skips;
+    }
+  }
+  if (searching) {
+    nn_last_search_pos = s.pos;
+    nn_last_search_rot = s.rot.toRotationMatrix();
+    nn_have_last_search = true;
+  }
   ++ekf_iters;
   ekf_search_iters += searching ? 1 : 0;
   laserCloudOri->clear();
@@ -1894,7 +1923,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
 
     auto & points_near = Nearest_Points[i];
 
-    if (ekfom_data.converge) {
+    if (searching) {
       /** Find the closest surfaces in the map **/
       ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
       point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS        ? false
@@ -2644,6 +2673,9 @@ public:
     this->declare_parameter<int>("preprocess.timestamp_unit", US);
     this->declare_parameter<int>("preprocess.scan_rate", 10);
     this->declare_parameter<int>("point_filter_num", 2);
+    this->declare_parameter<bool>("nn_refresh_gate_en", false);
+    this->declare_parameter<double>("nn_refresh_min_shift", 0.0);
+    this->declare_parameter<double>("nn_refresh_ref_range", 20.0);
     this->declare_parameter<bool>("feature_extract_enable", false);
     this->declare_parameter<bool>("runtime_pos_log_enable", false);
     this->declare_parameter<bool>("diagnostics.latency_enable", true);
@@ -2819,6 +2851,9 @@ public:
     this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
     this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
     this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
+    this->get_parameter_or<bool>("nn_refresh_gate_en", nn_refresh_gate_en, false);
+    this->get_parameter_or<double>("nn_refresh_min_shift", nn_refresh_min_shift, 0.0);
+    this->get_parameter_or<double>("nn_refresh_ref_range", nn_refresh_ref_range, 20.0);
     this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
     this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
     p_imu->runtime_log_en = runtime_pos_log;                // mirror to ImuProcess so Log/imu.txt is written
@@ -3213,6 +3248,9 @@ private:
       match_nosearch_time = 0;
       ekf_iters = 0;
       ekf_search_iters = 0;
+      nn_have_last_search = false;
+      nn_max_shift = 0.0;
+      nn_skips = 0;
       kdtree_search_time = 0.0;
       solve_time = 0;
       solve_const_H_time = 0;
@@ -4353,6 +4391,7 @@ private:
         printf(
           "[IKDPROF] tree=%d feats=%d undist_ms=%.1f fov_ms=%.1f ds_ms=%.1f "
           "iekf_ms=%.1f its=%d/%d effct=%d msrch_ms=%.1f mfit_ms=%.1f solve_ms=%.1f "
+          "nnshift_mm=%.1f nnskip=%d "
           "add_ms=%.1f join_ms=%.1f loop_ms=%.1f | "
           "rb_dcnt=%llu rb_dus_ms=%.1f inl_dus_ms=%.1f rb_active=%d "
           "rb_maxus_ms=%.1f rb_maxsz=%llu rootreb=%llu\n",
@@ -4368,6 +4407,8 @@ private:
           match_search_time * 1000.0,
           match_nosearch_time * 1000.0,
           (solve_time + solve_H_time) * 1000.0,
+          nn_max_shift * 1000.0,
+          nn_skips,
           add_ms,
           join_ms,
           loop_ms,

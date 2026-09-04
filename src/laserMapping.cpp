@@ -613,6 +613,11 @@ bool diag_first_odom_pub_logged = false;
 vector<vector<int>> pointSearchInd_surf;
 vector<BoxPointType> cub_needrm;
 vector<PointVector> Nearest_Points;
+// The neighbour set only moves on the iterations that search, so the 5x3 plane fit and the
+// body-range scale in the residual gate are invariant in between and are kept per point.
+vector<VF(4), Eigen::aligned_allocator<VF(4)>> plane_cache;
+vector<char> plane_cache_ok;
+vector<float> body_range_sqrt;
 vector<double> extrinT(3, 0.0);
 vector<double> extrinR(9, 0.0);
 using SteadyClock = std::chrono::steady_clock;
@@ -1853,6 +1858,12 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   total_residual = 0.0;
 
 /** closest surface search and residual computation **/
+  if (static_cast<int>(plane_cache.size()) < feats_down_size) {
+    plane_cache.resize(feats_down_size);
+    plane_cache_ok.resize(feats_down_size);
+    body_range_sqrt.resize(feats_down_size);
+  }
+
 #ifdef MP_EN
   // Respect OMP_NUM_THREADS when set so the runtime CPU budget (cgroup
   // --cpus) can be honoured; the compile-time MP_PROC_NUM (8 on x86) would
@@ -1889,16 +1900,20 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
       point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS        ? false
                                : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false
                                                                             : true;
+      if (point_selected_surf[i]) {
+        plane_cache_ok[i] = esti_plane(plane_cache[i], points_near, 0.1f) ? 1 : 0;
+        body_range_sqrt[i] = sqrt(p_body.norm());
+      }
     }
 
     if (!point_selected_surf[i])
       continue;
 
-    VF(4) pabcd;
+    const VF(4) & pabcd = plane_cache[i];
     point_selected_surf[i] = false;
-    if (esti_plane(pabcd, points_near, 0.1f)) {
+    if (plane_cache_ok[i]) {
       float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
-      float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+      float s = 1 - 0.9 * fabs(pd2) / body_range_sqrt[i];
 
       if (s > 0.9) {
         point_selected_surf[i] = true;

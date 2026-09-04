@@ -204,6 +204,11 @@ if(BUILD_TESTING)
   if(TARGET test_voxel_downsample)
     target_include_directories(test_voxel_downsample PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
+
+  ament_add_gtest(test_parked_hold test/test_parked_hold.cpp)
+  if(TARGET test_parked_hold)
+    target_include_directories(test_parked_hold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
 endif()
 
 # ---------------- Install --------------- #

@@ -86,12 +86,13 @@
 #include <unordered_map>
 
 #include "IMU_Processing.hpp"
-#include "reanchor_gate.hpp"
 #include "adaptive_downsample.hpp"
+#include "parked_hold.hpp"
+#include "preprocess.h"
+#include "reanchor_gate.hpp"
 #include "voxel_downsample.hpp"
 #include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
-#include "preprocess.h"
 
 #define INIT_TIME (0.1)
 #define LASER_POINT_COV (0.001)
@@ -299,6 +300,10 @@ SO3 zupt_anchor_rot;
 bool zupt_anchor_valid = false;
 bool zupt_active = false;
 int zupt_hold_scans = 0;
+// Parked hold (parked_hold.hpp): the same evidence, applied while the scan is
+// HEALTHY.
+fast_lio::ParkedHoldParams parked_hold_params;
+fast_lio::ParkedHoldState parked_hold_state;
 double last_twist_stamp = -1.0;  // newest wheel-speed sample time (s); -1 = none yet
 double last_twist_speed = 0.0;   // |v| of the newest wheel sample (m/s)
 // Re-anchor gate: the guard used to unfreeze the map the moment the scene
@@ -1759,7 +1764,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     unsigned health_flags = 0u;
     if (flio_degraded_odom)
       health_flags |= 1u << 0;  // kFeHealthFlagDegraded
-    if (zupt_active)
+    if (zupt_active || parked_hold_state.active)
       health_flags |= 1u << 1;  // kFeHealthFlagStaticHold
     if (reanchor_gate.state == fast_lio::ReanchorState::kLost)
       health_flags |= 1u << 2;  // kFeHealthFlagLost
@@ -2566,6 +2571,12 @@ public:
     this->declare_parameter<double>("zupt_wheel_speed_thresh", 0.05);
     this->declare_parameter<double>("zupt_wheel_max_age", 0.5);
     this->declare_parameter<bool>("zupt_require_wheel", false);
+    this->declare_parameter<bool>("zupt_parked_hold_en", false);
+    this->declare_parameter<int>("zupt_parked_hold_scans", 3);
+    this->declare_parameter<double>("zupt_hold_pos_noise", 0.05);
+    this->declare_parameter<double>("zupt_hold_rot_noise", 0.02);
+    this->declare_parameter<double>("zupt_hold_vel_noise", 0.05);
+    this->declare_parameter<double>("zupt_hold_deadband_sigma", 3.0);
     this->declare_parameter<bool>("reanchor_en", true);
     this->declare_parameter<int>("reanchor_min_eff", 200);
     this->declare_parameter<double>("reanchor_max_res", 0.10);
@@ -2730,6 +2741,12 @@ public:
     this->get_parameter_or<double>("zupt_wheel_speed_thresh", zupt_wheel_speed_thresh, 0.05);
     this->get_parameter_or<double>("zupt_wheel_max_age", zupt_wheel_max_age, 0.5);
     this->get_parameter_or<bool>("zupt_require_wheel", zupt_require_wheel, false);
+    this->get_parameter_or<bool>("zupt_parked_hold_en", parked_hold_params.enabled, false);
+    this->get_parameter_or<int>("zupt_parked_hold_scans", parked_hold_params.engage_scans, 3);
+    this->get_parameter_or<double>("zupt_hold_pos_noise", parked_hold_params.pos_noise, 0.05);
+    this->get_parameter_or<double>("zupt_hold_rot_noise", parked_hold_params.rot_noise, 0.02);
+    this->get_parameter_or<double>("zupt_hold_vel_noise", parked_hold_params.vel_noise, 0.05);
+    this->get_parameter_or<double>("zupt_hold_deadband_sigma", parked_hold_params.deadband_sigma, 3.0);
     this->get_parameter_or<bool>("reanchor_en", reanchor_params.enabled, true);
     this->get_parameter_or<int>("reanchor_min_eff", reanchor_params.min_eff, 200);
     this->get_parameter_or<double>("reanchor_max_res", reanchor_params.max_res, 0.10);
@@ -3002,14 +3019,15 @@ public:
       sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
       RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", imu_topic.c_str());
     }
-    if (wheel_odom_en || zupt_en) {
+    if (wheel_odom_en || zupt_en || parked_hold_params.enabled) {
       sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(wheel_topic, 2000, twist_cbk);
       RCLCPP_INFO(this->get_logger(),
-                  "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s)",
+                  "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s, parked hold %s)",
                   wheel_topic.c_str(),
                   wheel_speed_scale,
                   wheel_odom_en ? "on" : "off",
-                  zupt_en ? "on" : "off");
+                  zupt_en ? "on" : "off",
+                  parked_hold_params.enabled ? "on" : "off");
     }
     pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
     pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
@@ -4022,6 +4040,17 @@ private:
           rebuild_local_map("REANCHOR");
         }
       }
+      // One verdict per scan. The degraded hold, the parked hold and the runaway
+      // watchdog all key off the same evidence, and scanning the IMU window is
+      // not free.
+      const bool body_static = body_is_static(Measures, lidar_end_time);
+      // Without an anchor there is nothing to hold to, so it is not a hold —
+      // feeding that into the state machine keeps the health flag honest.
+      const auto parked =
+        fast_lio::updateParkedHold(&parked_hold_state, body_static && zupt_anchor_valid, parked_hold_params);
+      if (parked.just_released) {
+        RCLCPP_WARN(this->get_logger(), "[ZUPT] parked hold released: the platform is moving again");
+      }
       if (reanchor.degraded) {
         state_ikfom st = kf.get_x();
         const double spd = st.vel.norm();
@@ -4030,7 +4059,7 @@ private:
         // integrate, and zeroing only the velocity still leaves the position and
         // attitude wherever propagation put them (dog 2, 2026-09-04: −3.9 m of Z
         // in 9 s, unrecoverable once the map unfroze around the wrong pose).
-        const bool static_hold = zupt_en && zupt_anchor_valid && body_is_static(Measures, lidar_end_time);
+        const bool static_hold = zupt_en && zupt_anchor_valid && body_static;
         if (static_hold) {
           st.pos = zupt_anchor_pos;
           st.rot = zupt_anchor_rot;
@@ -4091,10 +4120,18 @@ private:
                              state_point.vel.norm());
       } else {
         // Healthy scan: the map just confirmed this pose, so it becomes the
-        // anchor the next blind stretch holds on to.
-        zupt_anchor_pos = state_point.pos;
-        zupt_anchor_rot = state_point.rot;
-        zupt_anchor_valid = true;
+        // anchor the next blind stretch holds on to — unless independent
+        // evidence says the platform is parked, in which case a pose that
+        // moved was not moved by the robot and must not be adopted. Refreshing
+        // unconditionally is how the anchor followed a pedestrian who dragged
+        // the registration 5.4 m in 6 s (dog 2, 2026-09-04) instead of pinning
+        // against them. The first anchor still has to come from somewhere, so
+        // a platform that boots parked seeds it once.
+        if (!body_static || !zupt_anchor_valid) {
+          zupt_anchor_pos = state_point.pos;
+          zupt_anchor_rot = state_point.rot;
+          zupt_anchor_valid = true;
+        }
         if (zupt_active) {
           RCLCPP_WARN(this->get_logger(),
                       "[ZUPT] static hold released after %d scans (effct=%d far_frac=%.2f)",
@@ -4103,6 +4140,43 @@ private:
                       scan_far_frac);
           zupt_active = false;
           zupt_hold_scans = 0;
+        }
+
+        /*** Parked hold (A'-3): a healthy scan that keeps moving the estimate
+         *   while the IMU and the wheels both say parked is being moved by
+         *   something that is not the robot. The blind-stretch hold above
+         *   cannot answer it — the scan is not degraded — and no residual or
+         *   correspondence-count test can see it either, because the map and
+         *   the mover agree with each other (effct=1308, res=0.047 m during
+         *   the 2026-09-04 drag).
+         *
+         *   Answered as a MEASUREMENT, not an override: pose pulled toward the
+         *   anchor, velocity toward zero, with a covariance that says how much
+         *   the prior is worth. A hard pin here would be wrong — the scan is
+         *   healthy, so the lidar still deserves a vote, and a robot that is
+         *   pushed or slides has to be able to out-vote the prior. That is
+         *   also why the hold is slow to engage and instant to release. ***/
+        if (parked.engaged) {
+          const state_ikfom stp = kf.get_x();
+          const M3D est_rot = stp.rot.toRotationMatrix();
+          const M3D anchor_rot = zupt_anchor_rot.toRotationMatrix();
+          if (fast_lio::parkedHoldShouldApply(zupt_anchor_pos, anchor_rot, stp.pos, est_rot, parked_hold_params)) {
+            const auto hold = fast_lio::parkedHoldMeasurement(
+              zupt_anchor_pos, anchor_rot, stp.pos, est_rot, stp.vel, parked_hold_params);
+            kf.update_simple(hold.H, hold.residual, hold.R_diag);
+            state_point = kf.get_x();
+            RCLCPP_WARN_THROTTLE(this->get_logger(),
+                                 *this->get_clock(),
+                                 5000,
+                                 "[ZUPT] parked hold applied on a healthy scan (effct=%d res=%.3fm): pulling %.2fm "
+                                 "back to the anchor [%.2f %.2f %.2f]",
+                                 effct_feat_num,
+                                 res_mean_last,
+                                 (zupt_anchor_pos - stp.pos).norm(),
+                                 zupt_anchor_pos[0],
+                                 zupt_anchor_pos[1],
+                                 zupt_anchor_pos[2]);
+          }
         }
       }
 
@@ -4120,13 +4194,8 @@ private:
           wheel_speed = last_twist_speed;
         }
         const double wheel_age = wheel_stamp > 0.0 ? std::fabs(lidar_end_time - wheel_stamp) : -1.0;
-        const auto runaway = fast_lio::updateRunawayWatchdog(&runaway_state,
-                                                             lidar_end_time,
-                                                             state_point.vel.norm(),
-                                                             body_is_static(Measures, lidar_end_time),
-                                                             wheel_age,
-                                                             wheel_speed,
-                                                             runaway_params);
+        const auto runaway = fast_lio::updateRunawayWatchdog(
+          &runaway_state, lidar_end_time, state_point.vel.norm(), body_static, wheel_age, wheel_speed, runaway_params);
         if (runaway.tripped) {
           RCLCPP_ERROR(this->get_logger(),
                        "[RUNAWAY] estimate contradicted for %.1fs (%s): speed=%.2fm/s wheel=%.2fm/s effct=%d "

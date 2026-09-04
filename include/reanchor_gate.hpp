@@ -142,6 +142,20 @@ inline ReanchorDecision updateReanchorGate(ReanchorGate * gate,
   return decision;
 }
 
+/// Declare the front end lost from outside the gate — the runaway watchdog sees
+/// drift the scan itself never reveals, and its verdict has the same
+/// consequences: freeze the map and stop claiming the pose is usable.
+inline void tripReanchorLost(ReanchorGate * gate)
+{
+  if (gate == nullptr || gate->state == ReanchorState::kLost) {
+    return;
+  }
+  gate->state = ReanchorState::kLost;
+  gate->ok_streak = 0;
+  gate->verify_start = -1.0;
+  ++gate->losses;
+}
+
 /// Declare the map trustworthy again — after a caller-side map rebuild or an
 /// external relocalisation.
 inline void resetReanchorGate(ReanchorGate * gate)

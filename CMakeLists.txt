@@ -190,6 +190,11 @@ if(BUILD_TESTING)
   if(TARGET test_reanchor_gate)
     target_include_directories(test_reanchor_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
+  # Pure header, no ROS: the only check that sees drift the scan keeps hiding.
+  ament_add_gtest(test_runaway_watchdog test/test_runaway_watchdog.cpp)
+  if(TARGET test_runaway_watchdog)
+    target_include_directories(test_runaway_watchdog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
 endif()
 
 # ---------------- Install --------------- #

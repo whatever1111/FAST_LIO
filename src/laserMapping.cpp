@@ -87,6 +87,7 @@
 
 #include "IMU_Processing.hpp"
 #include "reanchor_gate.hpp"
+#include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
 #include "preprocess.h"
 
@@ -305,6 +306,17 @@ fast_lio::ReanchorGate reanchor_gate;
 // "reset_map" rebuilds the local map at the current pose — the robot keeps
 // working, having traded absolute anchoring for a live estimate.
 std::string reanchor_on_fail = "hold";
+// Runaway watchdog: the guard and the re-anchor gate both key off the scan, and
+// the worst drift keeps the scan looking healthy — the map is rebuilt around
+// the wrong pose every frame, so correspondences and residuals stay good while
+// the estimate walks away (dog 2: effct 2000-3500, res 0.026 m, 45 min at
+// 0.5 m/s, parked). Only evidence from outside the estimator can see that.
+fast_lio::RunawayParams runaway_params;
+fast_lio::RunawayState runaway_state;
+// hold = flag it lost (map freezes, downstream stops consuming the pose),
+// reset_map = rebuild the local map here, fault_exit = die and let the
+// supervisor restart the pipeline.
+std::string runaway_on_trip = "hold";
 double scan_far_frac = 1.0;                // per-scan telemetry: fraction of raw points beyond far_range
 // [RES] telemetry: converged point-to-plane residual by body range bin (0-2,2-5,5-10,10-20,20-40,40+ m):
 // count and sum of squares from the last h_share_model call of the scan (degeneracy_debug only).
@@ -2502,6 +2514,11 @@ public:
     this->declare_parameter<int>("reanchor_confirm_scans", 3);
     this->declare_parameter<double>("reanchor_timeout_sec", 5.0);
     this->declare_parameter<std::string>("reanchor_on_fail", "hold");
+    this->declare_parameter<bool>("runaway_watchdog_en", true);
+    this->declare_parameter<double>("runaway_parked_speed_thresh", 0.3);
+    this->declare_parameter<double>("runaway_wheel_speed_margin", 1.0);
+    this->declare_parameter<double>("runaway_hold_sec", 3.0);
+    this->declare_parameter<std::string>("runaway_on_trip", "hold");
     this->declare_parameter<bool>("canopy_detect_en", false);
     this->declare_parameter<bool>("canopy_debug", false);
     this->declare_parameter<double>("canopy_near_range", 20.0);
@@ -2653,6 +2670,12 @@ public:
     this->get_parameter_or<int>("reanchor_confirm_scans", reanchor_params.confirm_scans, 3);
     this->get_parameter_or<double>("reanchor_timeout_sec", reanchor_params.timeout_sec, 5.0);
     this->get_parameter_or<std::string>("reanchor_on_fail", reanchor_on_fail, std::string("hold"));
+    this->get_parameter_or<bool>("runaway_watchdog_en", runaway_params.enabled, true);
+    this->get_parameter_or<double>("runaway_parked_speed_thresh", runaway_params.parked_speed_thresh, 0.3);
+    this->get_parameter_or<double>("runaway_wheel_speed_margin", runaway_params.wheel_speed_margin, 1.0);
+    this->get_parameter_or<double>("runaway_hold_sec", runaway_params.hold_sec, 3.0);
+    this->get_parameter_or<std::string>("runaway_on_trip", runaway_on_trip, std::string("hold"));
+    runaway_params.wheel_max_age = zupt_wheel_max_age;
     this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
     this->get_parameter_or<bool>("canopy_detect_en", canopy_detect_en, false);
     this->get_parameter_or<bool>("canopy_debug", canopy_debug, false);
@@ -3873,6 +3896,29 @@ private:
        *   the pose error survived the release and the map was rebuilt around
        *   it. A verification that never converges is a lost front end, which
        *   downstream has to hear rather than consume. ***/
+      // Trade absolute anchoring for a working estimate: rebuild the local map
+      // from this scan at the current pose. The jump is real, is logged, and
+      // reaches consumers through the health flags.
+      auto rebuild_local_map = [&](const char * tag) {
+        if (async_map_en)
+          joinMapAdd();
+        feats_down_world->resize(feats_down_size);
+        for (int i = 0; i < feats_down_size; i++) {
+          pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+        }
+        ikdtree.Build(feats_down_world->points);
+        Localmap_Initialized = false;
+        fast_lio::resetReanchorGate(&reanchor_gate);
+        RCLCPP_ERROR(this->get_logger(),
+                     "[%s] map rebuilt from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: the estimate is live "
+                     "again but unanchored",
+                     tag,
+                     feats_down_size,
+                     state_point.pos[0],
+                     state_point.pos[1],
+                     state_point.pos[2]);
+      };
+
       const auto reanchor = fast_lio::updateReanchorGate(
         &reanchor_gate, flio_in_degraded, effct_feat_num, res_mean_last, lidar_end_time, reanchor_params);
       if (reanchor.just_reanchored) {
@@ -3892,25 +3938,7 @@ private:
                      res_mean_last,
                      reanchor_on_fail.c_str());
         if (reanchor_on_fail == "reset_map") {
-          // Trade absolute anchoring for a working estimate: rebuild the local
-          // map from this scan at the current pose. The jump is real and is
-          // reported; the graph/GPS/relocalisation has to re-anchor it.
-          if (async_map_en)
-            joinMapAdd();
-          feats_down_world->resize(feats_down_size);
-          for (int i = 0; i < feats_down_size; i++) {
-            pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
-          }
-          ikdtree.Build(feats_down_world->points);
-          Localmap_Initialized = false;
-          fast_lio::resetReanchorGate(&reanchor_gate);
-          RCLCPP_ERROR(this->get_logger(),
-                       "[REANCHOR] map rebuilt from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: the estimate is "
-                       "live again but unanchored",
-                       feats_down_size,
-                       state_point.pos[0],
-                       state_point.pos[1],
-                       state_point.pos[2]);
+          rebuild_local_map("REANCHOR");
         }
       }
       if (reanchor.degraded) {
@@ -3994,6 +4022,53 @@ private:
                       scan_far_frac);
           zupt_active = false;
           zupt_hold_scans = 0;
+        }
+      }
+
+      /*** Runaway watchdog (runaway_watchdog.hpp): the guard above keys off the
+       *   scan, and the drift that matters most keeps the scan looking healthy.
+       *   Compare the estimate against the only sources outside it — the wheels
+       *   and the IMU's static verdict — and act when they contradict it for
+       *   long enough that noise cannot explain it. ***/
+      if (runaway_params.enabled) {
+        double wheel_stamp = -1.0;
+        double wheel_speed = 0.0;
+        {
+          std::lock_guard<std::mutex> lk(mtx_twist);
+          wheel_stamp = last_twist_stamp;
+          wheel_speed = last_twist_speed;
+        }
+        const double wheel_age = wheel_stamp > 0.0 ? std::fabs(lidar_end_time - wheel_stamp) : -1.0;
+        const auto runaway = fast_lio::updateRunawayWatchdog(&runaway_state,
+                                                             lidar_end_time,
+                                                             state_point.vel.norm(),
+                                                             body_is_static(Measures, lidar_end_time),
+                                                             wheel_age,
+                                                             wheel_speed,
+                                                             runaway_params);
+        if (runaway.tripped) {
+          RCLCPP_ERROR(this->get_logger(),
+                       "[RUNAWAY] estimate contradicted for %.1fs (%s): speed=%.2fm/s wheel=%.2fm/s effct=%d "
+                       "res=%.3fm — trip #%u, policy=%s",
+                       runaway.bad_for,
+                       fast_lio::runawayReasonName(runaway.reason),
+                       state_point.vel.norm(),
+                       wheel_age >= 0.0 ? wheel_speed : -1.0,
+                       effct_feat_num,
+                       res_mean_last,
+                       runaway_state.trips,
+                       runaway_on_trip.c_str());
+          if (runaway_on_trip == "reset_map") {
+            rebuild_local_map("RUNAWAY");
+          } else if (runaway_on_trip == "fault_exit") {
+            RCLCPP_FATAL(this->get_logger(),
+                         "[RUNAWAY] exiting so the supervisor can restart the pipeline (runaway_on_trip=fault_exit)");
+            rclcpp::shutdown();
+          } else {
+            // hold: freeze the map and let the health flags stop downstream from
+            // consuming a pose we no longer believe.
+            fast_lio::tripReanchorLost(&reanchor_gate);
+          }
         }
       }
 

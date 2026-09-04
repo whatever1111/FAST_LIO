@@ -87,14 +87,15 @@
 
 #include "IMU_Processing.hpp"
 #include "prior_map_load.hpp"
-#include "reanchor_gate.hpp"
 #include "adaptive_downsample.hpp"
+#include "parked_hold.hpp"
+#include "preprocess.h"
+#include "reanchor_gate.hpp"
 #include "voxel_downsample.hpp"
 #include "degeneracy_policy.hpp"
 #include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
 #include "zupt_policy.hpp"
-#include "preprocess.h"
 
 #define INIT_TIME (0.1)
 #define LASER_POINT_COV (0.001)
@@ -322,6 +323,10 @@ SO3 zupt_anchor_rot;
 bool zupt_anchor_valid = false;
 bool zupt_active = false;
 int zupt_hold_scans = 0;
+// Parked hold (parked_hold.hpp): the same evidence, applied while the scan is
+// HEALTHY.
+fast_lio::ParkedHoldParams parked_hold_params;
+fast_lio::ParkedHoldState parked_hold_state;
 double last_twist_stamp = -1.0;  // newest wheel-speed sample time (s); -1 = none yet
 double last_twist_speed = 0.0;   // |v| of the newest wheel sample (m/s)
 // Re-anchor gate: the guard used to unfreeze the map the moment the scene
@@ -1511,7 +1516,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     unsigned health_flags = 0u;
     if (flio_degraded_odom)
       health_flags |= 1u << 0;  // kFeHealthFlagDegraded
-    if (zupt_active)
+    if (zupt_active || parked_hold_state.active)
       health_flags |= 1u << 1;  // kFeHealthFlagStaticHold
     if (reanchor_gate.state == fast_lio::ReanchorState::kLost)
       health_flags |= 1u << 2;  // kFeHealthFlagLost
@@ -2118,6 +2123,12 @@ public:
     this->declare_parameter<double>("zupt_wheel_speed_thresh", 0.05);
     this->declare_parameter<double>("zupt_wheel_max_age", 0.5);
     this->declare_parameter<bool>("zupt_require_wheel", false);
+    this->declare_parameter<bool>("zupt_parked_hold_en", false);
+    this->declare_parameter<int>("zupt_parked_hold_scans", 3);
+    this->declare_parameter<double>("zupt_hold_pos_noise", 0.05);
+    this->declare_parameter<double>("zupt_hold_rot_noise", 0.02);
+    this->declare_parameter<double>("zupt_hold_vel_noise", 0.05);
+    this->declare_parameter<double>("zupt_hold_deadband_sigma", 3.0);
     this->declare_parameter<bool>("reanchor_en", true);
     this->declare_parameter<int>("reanchor_min_eff", 200);
     this->declare_parameter<double>("reanchor_max_res", 0.10);
@@ -2274,6 +2285,12 @@ public:
     this->get_parameter_or<double>("zupt_wheel_speed_thresh", zupt_wheel_speed_thresh, 0.05);
     this->get_parameter_or<double>("zupt_wheel_max_age", zupt_wheel_max_age, 0.5);
     this->get_parameter_or<bool>("zupt_require_wheel", zupt_require_wheel, false);
+    this->get_parameter_or<bool>("zupt_parked_hold_en", parked_hold_params.enabled, false);
+    this->get_parameter_or<int>("zupt_parked_hold_scans", parked_hold_params.engage_scans, 3);
+    this->get_parameter_or<double>("zupt_hold_pos_noise", parked_hold_params.pos_noise, 0.05);
+    this->get_parameter_or<double>("zupt_hold_rot_noise", parked_hold_params.rot_noise, 0.02);
+    this->get_parameter_or<double>("zupt_hold_vel_noise", parked_hold_params.vel_noise, 0.05);
+    this->get_parameter_or<double>("zupt_hold_deadband_sigma", parked_hold_params.deadband_sigma, 3.0);
     this->get_parameter_or<bool>("reanchor_en", reanchor_params.enabled, true);
     this->get_parameter_or<int>("reanchor_min_eff", reanchor_params.min_eff, 200);
     this->get_parameter_or<double>("reanchor_max_res", reanchor_params.max_res, 0.10);
@@ -2517,14 +2534,15 @@ public:
       sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
       RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", imu_topic.c_str());
     }
-    if (wheel_odom_en || zupt_en) {
+    if (wheel_odom_en || zupt_en || parked_hold_params.enabled) {
       sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(wheel_topic, 2000, twist_cbk);
       RCLCPP_INFO(this->get_logger(),
-                  "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s)",
+                  "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s, parked hold %s)",
                   wheel_topic.c_str(),
                   wheel_speed_scale,
                   wheel_odom_en ? "on" : "off",
-                  zupt_en ? "on" : "off");
+                  zupt_en ? "on" : "off",
+                  parked_hold_params.enabled ? "on" : "off");
     }
     if (degeneracy_params.enable) {
       RCLCPP_INFO(this->get_logger(),
@@ -3462,6 +3480,14 @@ private:
       zupt_in.speed = kf.get_x().vel.norm();
       zupt_in.max_speed = divergence_guard_max_speed;
       const fast_lio::ZuptDecision zupt_verdict = fast_lio::decideZupt(zupt_in);
+      // The parked hold runs off the same verdict. Without an anchor there is
+      // nothing to hold to, so folding that into the input keeps the health flag
+      // honest rather than reporting a hold that has no reference.
+      const auto parked = fast_lio::updateParkedHold(
+        &parked_hold_state, body_static && zupt_anchor_valid, parked_hold_params);
+      if (parked.just_released) {
+        RCLCPP_WARN(this->get_logger(), "[ZUPT] parked hold released: the platform is moving again");
+      }
       if (reanchor.degraded) {
         state_ikfom st = kf.get_x();
         // Static hold takes precedence over the speed reset: with independent
@@ -3534,10 +3560,17 @@ private:
                              state_point.vel.norm());
       } else {
         // Healthy scan: the map just confirmed this pose, so it becomes the
-        // anchor the next blind stretch holds on to.
-        zupt_anchor_pos = state_point.pos;
-        zupt_anchor_rot = state_point.rot;
-        zupt_anchor_valid = true;
+        // anchor the next blind stretch holds on to — unless independent evidence
+        // says the platform is parked, in which case a pose that moved was not moved
+        // by the robot and must not be adopted. Refreshing unconditionally is how the
+        // anchor followed a pedestrian who dragged the registration 5.4 m in 6 s
+        // (dog 2, 2026-09-04) instead of pinning against them. A platform that boots
+        // parked still seeds it once.
+        if (!body_static || !zupt_anchor_valid) {
+          zupt_anchor_pos = state_point.pos;
+          zupt_anchor_rot = state_point.rot;
+          zupt_anchor_valid = true;
+        }
         release_static_hold("scan healthy");
         // A parked platform has zero velocity, and a healthy-looking scan does not
         // enforce that: with far_frac 0.84 the correspondences pin rotation and
@@ -3562,6 +3595,43 @@ private:
                                  zupt_in.speed,
                                  effct_feat_num,
                                  scan_far_frac);
+          }
+        }
+
+        /*** Parked hold (A'-3): a healthy scan that keeps moving the estimate
+         *   while the IMU and the wheels both say parked is being moved by
+         *   something that is not the robot. The blind-stretch hold above
+         *   cannot answer it — the scan is not degraded — and no residual or
+         *   correspondence-count test can see it either, because the map and
+         *   the mover agree with each other (effct=1308, res=0.047 m during
+         *   the 2026-09-04 drag).
+         *
+         *   Answered as a MEASUREMENT, not an override: pose pulled toward the
+         *   anchor, velocity toward zero, with a covariance that says how much
+         *   the prior is worth. A hard pin here would be wrong — the scan is
+         *   healthy, so the lidar still deserves a vote, and a robot that is
+         *   pushed or slides has to be able to out-vote the prior. That is
+         *   also why the hold is slow to engage and instant to release. ***/
+        if (parked.engaged) {
+          const state_ikfom stp = kf.get_x();
+          const M3D est_rot = stp.rot.toRotationMatrix();
+          const M3D anchor_rot = zupt_anchor_rot.toRotationMatrix();
+          if (fast_lio::parkedHoldShouldApply(zupt_anchor_pos, anchor_rot, stp.pos, est_rot, parked_hold_params)) {
+            const auto hold = fast_lio::parkedHoldMeasurement(
+              zupt_anchor_pos, anchor_rot, stp.pos, est_rot, stp.vel, parked_hold_params);
+            kf.update_simple(hold.H, hold.residual, hold.R_diag);
+            state_point = kf.get_x();
+            RCLCPP_WARN_THROTTLE(this->get_logger(),
+                                 *this->get_clock(),
+                                 5000,
+                                 "[ZUPT] parked hold applied on a healthy scan (effct=%d res=%.3fm): pulling %.2fm "
+                                 "back to the anchor [%.2f %.2f %.2f]",
+                                 effct_feat_num,
+                                 res_mean_last,
+                                 (zupt_anchor_pos - stp.pos).norm(),
+                                 zupt_anchor_pos[0],
+                                 zupt_anchor_pos[1],
+                                 zupt_anchor_pos[2]);
           }
         }
       }

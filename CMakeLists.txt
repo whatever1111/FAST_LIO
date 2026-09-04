@@ -195,6 +195,10 @@ if(BUILD_TESTING)
   if(TARGET test_runaway_watchdog)
     target_include_directories(test_runaway_watchdog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
+  ament_add_gtest(test_adaptive_downsample test/test_adaptive_downsample.cpp)
+  if(TARGET test_adaptive_downsample)
+    target_include_directories(test_adaptive_downsample PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
 endif()
 
 # ---------------- Install --------------- #

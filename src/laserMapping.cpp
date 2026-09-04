@@ -87,6 +87,7 @@
 
 #include "IMU_Processing.hpp"
 #include "reanchor_gate.hpp"
+#include "adaptive_downsample.hpp"
 #include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
 #include "preprocess.h"
@@ -652,6 +653,10 @@ int max_buffered_scans = 100;
 // age keeps the estimator on the newest scan — the cost of falling behind becomes a
 // lower effective scan rate instead of an ever-growing lag.
 double max_scan_backlog_sec = 0.5;
+// 自适应降采样:单帧计算越过预算就把扫描体素调粗,让精度降级而不是延迟降级。
+// Adaptive downsampling: quality degrades instead of latency when a scan costs too much.
+fast_lio::AdaptiveDownsampleParams adaptive_ds_params;
+fast_lio::AdaptiveDownsampleState adaptive_ds_state;
 size_t dropped_scan_total = 0;
 
 bool latency_diag_en = true;
@@ -2487,6 +2492,13 @@ public:
     this->declare_parameter<int>("max_iteration", 4);
     this->declare_parameter<int>("max_buffered_scans", 100);
     this->declare_parameter<double>("max_scan_backlog_sec", 0.5);
+    this->declare_parameter<bool>("adaptive_downsample_en", false);
+    this->declare_parameter<double>("adaptive_downsample_budget_sec", 0.06);
+    this->declare_parameter<double>("adaptive_downsample_release_sec", 0.035);
+    this->declare_parameter<double>("adaptive_downsample_step", 0.05);
+    this->declare_parameter<double>("adaptive_downsample_max_voxel", 0.5);
+    this->declare_parameter<int>("adaptive_downsample_raise_after", 5);
+    this->declare_parameter<int>("adaptive_downsample_lower_after", 100);
     this->declare_parameter<bool>("degeneracy_debug", false);
     this->declare_parameter<bool>("health_pub_en", true);
     this->declare_parameter<bool>("planar_constraint_en", false);
@@ -2645,6 +2657,13 @@ public:
     this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
     this->get_parameter_or<int>("max_buffered_scans", max_buffered_scans, 100);
     this->get_parameter_or<double>("max_scan_backlog_sec", max_scan_backlog_sec, 0.5);
+    this->get_parameter_or<bool>("adaptive_downsample_en", adaptive_ds_params.enabled, false);
+    this->get_parameter_or<double>("adaptive_downsample_budget_sec", adaptive_ds_params.budget_sec, 0.06);
+    this->get_parameter_or<double>("adaptive_downsample_release_sec", adaptive_ds_params.release_sec, 0.035);
+    this->get_parameter_or<double>("adaptive_downsample_step", adaptive_ds_params.step, 0.05);
+    this->get_parameter_or<double>("adaptive_downsample_max_voxel", adaptive_ds_params.max_voxel, 0.5);
+    this->get_parameter_or<int>("adaptive_downsample_raise_after", adaptive_ds_params.raise_after, 5);
+    this->get_parameter_or<int>("adaptive_downsample_lower_after", adaptive_ds_params.lower_after, 100);
     this->get_parameter_or<bool>("degeneracy_debug", degeneracy_debug, false);
     this->get_parameter_or<bool>("health_pub_en", health_pub_en, true);
     this->get_parameter_or<bool>("planar_constraint_en", planar_constraint_en, false);
@@ -4255,6 +4274,26 @@ private:
         vxl_update();
       }
       t5 = omp_get_wtime();
+
+      // 自适应降采样:t5-t0 是这一帧的计算耗时(不含排队 —— 排队归 max_scan_backlog_sec 管)。
+      // 超预算就把扫描体素调粗:点少了、精度略降,但成本回到扫描周期以内。
+      // Per-scan compute (queue wait excluded) drives the voxel: over budget costs points,
+      // not latency.
+      if (adaptive_ds_params.enabled) {
+        const double scan_cost = t5 - t0;
+        if (fast_lio::updateAdaptiveDownsample(
+              &adaptive_ds_state, scan_cost, filter_size_surf_min, adaptive_ds_params)) {
+          const float leaf = static_cast<float>(adaptive_ds_state.voxel);
+          downSizeFilterSurf.setLeafSize(leaf, leaf, leaf);
+          RCLCPP_WARN(this->get_logger(),
+                      "[ADAPTIVE-DS] scan voxel %.2f m (cost %.0f ms vs budget %.0f ms; %u up / %u down)",
+                      adaptive_ds_state.voxel,
+                      scan_cost * 1e3,
+                      adaptive_ds_params.budget_sec * 1e3,
+                      adaptive_ds_state.raises,
+                      adaptive_ds_state.lowers);
+        }
+      }
 
       // [ikd-profile] per-scan split: iEKF (search-bound) vs map_incre Add vs transform
       // loop, correlated with concurrent background-rebuild work + inline rebuild.

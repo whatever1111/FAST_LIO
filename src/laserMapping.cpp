@@ -103,6 +103,11 @@ double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_ti
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN],
   s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
+// [ikd-profile] iEKF ledger: a correspondence search only runs on the iterations the
+// filter declares converged, so the two kinds of iteration are timed apart — that split
+// is what says whether the cost is the search or the residual/plane work around it.
+double match_search_time = 0, match_nosearch_time = 0;
+int ekf_iters = 0, ekf_search_iters = 0;
 int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
 bool ikd_profile = false;  // [ikd-profile] per-scan rebuild-split line, gated by env FLIO_IKD_PROFILE
@@ -1840,6 +1845,9 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_data)
 {
   double match_start = omp_get_wtime();
+  const bool searching = ekfom_data.converge;
+  ++ekf_iters;
+  ekf_search_iters += searching ? 1 : 0;
   laserCloudOri->clear();
   corr_normvect->clear();
   total_residual = 0.0;
@@ -2439,7 +2447,9 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   }
 
   res_mean_last = total_residual / effct_feat_num;
-  match_time += omp_get_wtime() - match_start;
+  const double match_dt = omp_get_wtime() - match_start;
+  match_time += match_dt;
+  (searching ? match_search_time : match_nosearch_time) += match_dt;
   double solve_start_ = omp_get_wtime();
 
   /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
@@ -3184,6 +3194,10 @@ private:
       double t_undist = 0.0, t_join = 0.0, t_fov = 0.0;
 
       match_time = 0;
+      match_search_time = 0;
+      match_nosearch_time = 0;
+      ekf_iters = 0;
+      ekf_search_iters = 0;
       kdtree_search_time = 0.0;
       solve_time = 0;
       solve_const_H_time = 0;
@@ -4323,7 +4337,8 @@ private:
         // ikdtree.size() here would race the worker's in-flight Add under async.
         printf(
           "[IKDPROF] tree=%d feats=%d undist_ms=%.1f fov_ms=%.1f ds_ms=%.1f "
-          "iekf_ms=%.1f add_ms=%.1f join_ms=%.1f loop_ms=%.1f | "
+          "iekf_ms=%.1f its=%d/%d effct=%d msrch_ms=%.1f mfit_ms=%.1f solve_ms=%.1f "
+          "add_ms=%.1f join_ms=%.1f loop_ms=%.1f | "
           "rb_dcnt=%llu rb_dus_ms=%.1f inl_dus_ms=%.1f rb_active=%d "
           "rb_maxus_ms=%.1f rb_maxsz=%llu rootreb=%llu\n",
           kdtree_size_st,
@@ -4332,6 +4347,12 @@ private:
           (t_fov - t_join) * 1000.0,
           (t1 - t_fov) * 1000.0,
           iekf_ms,
+          ekf_search_iters,
+          ekf_iters,
+          effct_feat_num,
+          match_search_time * 1000.0,
+          match_nosearch_time * 1000.0,
+          (solve_time + solve_H_time) * 1000.0,
           add_ms,
           join_ms,
           loop_ms,

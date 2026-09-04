@@ -184,6 +184,12 @@ if(BUILD_TESTING)
   if(TARGET test_static_evidence)
     target_include_directories(test_static_evidence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
+  # Pure header, no ROS: the gate that decides when the frozen map may be
+  # trusted (and grown) again after a blind stretch.
+  ament_add_gtest(test_reanchor_gate test/test_reanchor_gate.cpp)
+  if(TARGET test_reanchor_gate)
+    target_include_directories(test_reanchor_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
 endif()
 
 # ---------------- Install --------------- #

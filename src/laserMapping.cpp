@@ -86,6 +86,7 @@
 #include <unordered_map>
 
 #include "IMU_Processing.hpp"
+#include "reanchor_gate.hpp"
 #include "static_evidence.hpp"
 #include "preprocess.h"
 
@@ -292,6 +293,18 @@ bool zupt_active = false;
 int zupt_hold_scans = 0;
 double last_twist_stamp = -1.0;  // newest wheel-speed sample time (s); -1 = none yet
 double last_twist_speed = 0.0;   // |v| of the newest wheel sample (m/s)
+// Re-anchor gate: the guard used to unfreeze the map the moment the scene
+// looked healthy again, which is where a recoverable blind stretch became a
+// permanent runaway — the pose error survived the release, the map was rebuilt
+// around it, and residuals stayed small while the map walked off with the
+// estimate. Verify against the still-frozen map first (reanchor_gate.hpp).
+fast_lio::ReanchorParams reanchor_params;
+fast_lio::ReanchorGate reanchor_gate;
+// What to do when verification never converges: "hold" keeps the map frozen and
+// the odometry flagged (an external relocalisation has to solve it), while
+// "reset_map" rebuilds the local map at the current pose — the robot keeps
+// working, having traded absolute anchoring for a live estimate.
+std::string reanchor_on_fail = "hold";
 double scan_far_frac = 1.0;                // per-scan telemetry: fraction of raw points beyond far_range
 // [RES] telemetry: converged point-to-plane residual by body range bin (0-2,2-5,5-10,10-20,20-40,40+ m):
 // count and sum of squares from the last h_share_model call of the scan (degeneracy_debug only).
@@ -1693,6 +1706,17 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   // LIO-SLAM core pgo_factor_kernels.hpp kFeHealth*Cell.
   if (health_pub_en) {
     odomAftMapped.twist.covariance[0] = 1.0;  // sentinel/version
+    // Flags say what the front end did about this scan, which is what a
+    // consumer must act on: a degraded pose is fresh and self-consistent, so
+    // staleness gates downstream pass it through unchanged (dog 2, 2026-09-04).
+    unsigned health_flags = 0u;
+    if (flio_degraded_odom)
+      health_flags |= 1u << 0;  // kFeHealthFlagDegraded
+    if (zupt_active)
+      health_flags |= 1u << 1;  // kFeHealthFlagStaticHold
+    if (reanchor_gate.state == fast_lio::ReanchorState::kLost)
+      health_flags |= 1u << 2;  // kFeHealthFlagLost
+    odomAftMapped.twist.covariance[1] = static_cast<double>(health_flags);
     odomAftMapped.twist.covariance[7] = scan_obs_along;
     odomAftMapped.twist.covariance[14] = static_cast<double>(effct_feat_num);
     odomAftMapped.twist.covariance[21] = scan_far_frac;
@@ -2472,6 +2496,12 @@ public:
     this->declare_parameter<double>("zupt_wheel_speed_thresh", 0.05);
     this->declare_parameter<double>("zupt_wheel_max_age", 0.5);
     this->declare_parameter<bool>("zupt_require_wheel", false);
+    this->declare_parameter<bool>("reanchor_en", true);
+    this->declare_parameter<int>("reanchor_min_eff", 200);
+    this->declare_parameter<double>("reanchor_max_res", 0.10);
+    this->declare_parameter<int>("reanchor_confirm_scans", 3);
+    this->declare_parameter<double>("reanchor_timeout_sec", 5.0);
+    this->declare_parameter<std::string>("reanchor_on_fail", "hold");
     this->declare_parameter<bool>("canopy_detect_en", false);
     this->declare_parameter<bool>("canopy_debug", false);
     this->declare_parameter<double>("canopy_near_range", 20.0);
@@ -2617,6 +2647,12 @@ public:
     this->get_parameter_or<double>("zupt_wheel_speed_thresh", zupt_wheel_speed_thresh, 0.05);
     this->get_parameter_or<double>("zupt_wheel_max_age", zupt_wheel_max_age, 0.5);
     this->get_parameter_or<bool>("zupt_require_wheel", zupt_require_wheel, false);
+    this->get_parameter_or<bool>("reanchor_en", reanchor_params.enabled, true);
+    this->get_parameter_or<int>("reanchor_min_eff", reanchor_params.min_eff, 200);
+    this->get_parameter_or<double>("reanchor_max_res", reanchor_params.max_res, 0.10);
+    this->get_parameter_or<int>("reanchor_confirm_scans", reanchor_params.confirm_scans, 3);
+    this->get_parameter_or<double>("reanchor_timeout_sec", reanchor_params.timeout_sec, 5.0);
+    this->get_parameter_or<std::string>("reanchor_on_fail", reanchor_on_fail, std::string("hold"));
     this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
     this->get_parameter_or<bool>("canopy_detect_en", canopy_detect_en, false);
     this->get_parameter_or<bool>("canopy_debug", canopy_debug, false);
@@ -3829,7 +3865,55 @@ private:
        *   position growth linear and recoverable instead of exponential. Freeze
        *   the map so dead-reckoned scans do not corrupt it, and flag the
        *   odometry degraded so downstream (PGO) down-weights these poses. ***/
-      if (flio_in_degraded) {
+      /*** Re-anchor gate (reanchor_gate.hpp): the guard's verdict is not the
+       *   release criterion. Once the scene recovers, the pre-blind map stays
+       *   frozen until THIS scan registers against it — enough correspondences
+       *   with a small residual, several scans running. Releasing on the scene
+       *   alone is what turned dog 2's 9 s blind stretch into 45 min of drift:
+       *   the pose error survived the release and the map was rebuilt around
+       *   it. A verification that never converges is a lost front end, which
+       *   downstream has to hear rather than consume. ***/
+      const auto reanchor = fast_lio::updateReanchorGate(
+        &reanchor_gate, flio_in_degraded, effct_feat_num, res_mean_last, lidar_end_time, reanchor_params);
+      if (reanchor.just_reanchored) {
+        RCLCPP_WARN(this->get_logger(),
+                    "[REANCHOR] re-registered against the frozen map (effct=%d res=%.3fm) after %u blind stretch(es): "
+                    "map unfrozen",
+                    effct_feat_num,
+                    res_mean_last,
+                    reanchor_gate.reanchors);
+      }
+      if (reanchor.just_lost) {
+        RCLCPP_ERROR(this->get_logger(),
+                     "[REANCHOR] LOST: no re-registration within %.1fs (effct=%d res=%.3fm) — the pose no longer fits "
+                     "the map; policy=%s",
+                     reanchor_params.timeout_sec,
+                     effct_feat_num,
+                     res_mean_last,
+                     reanchor_on_fail.c_str());
+        if (reanchor_on_fail == "reset_map") {
+          // Trade absolute anchoring for a working estimate: rebuild the local
+          // map from this scan at the current pose. The jump is real and is
+          // reported; the graph/GPS/relocalisation has to re-anchor it.
+          if (async_map_en)
+            joinMapAdd();
+          feats_down_world->resize(feats_down_size);
+          for (int i = 0; i < feats_down_size; i++) {
+            pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+          }
+          ikdtree.Build(feats_down_world->points);
+          Localmap_Initialized = false;
+          fast_lio::resetReanchorGate(&reanchor_gate);
+          RCLCPP_ERROR(this->get_logger(),
+                       "[REANCHOR] map rebuilt from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: the estimate is "
+                       "live again but unanchored",
+                       feats_down_size,
+                       state_point.pos[0],
+                       state_point.pos[1],
+                       state_point.pos[2]);
+        }
+      }
+      if (reanchor.degraded) {
         state_ikfom st = kf.get_x();
         const double spd = st.vel.norm();
         // Static hold takes precedence over the speed reset: with independent
@@ -3880,12 +3964,17 @@ private:
         RCLCPP_WARN_THROTTLE(this->get_logger(),
                              *this->get_clock(),
                              2000,
-                             "[DIVERGENCE-GUARD] starved %d scans (effct=%d) engulfed %d scans (far_frac=%.2f): "
-                             "vel reset if >%.1fm/s, map frozen, planar-Z %s, gravity-align %s; posZ=%.1fm spd=%.2fm/s",
+                             "[DIVERGENCE-GUARD] starved %d scans (effct=%d) engulfed %d scans (far_frac=%.2f) "
+                             "reanchor=%s: vel reset if >%.1fm/s, map frozen, planar-Z %s, gravity-align %s; "
+                             "posZ=%.1fm spd=%.2fm/s",
                              consec_low_eff,
                              effct_feat_num,
                              consec_engulf,
                              scan_far_frac,
+                             reanchor_gate.state == fast_lio::ReanchorState::kVerifying   ? "verifying"
+                               : reanchor_gate.state == fast_lio::ReanchorState::kLost    ? "LOST"
+                               : reanchor_gate.state == fast_lio::ReanchorState::kBlind   ? "blind"
+                                                                                          : "ok",
                              divergence_guard_max_speed,
                              planar_constraint_en ? "pinned" : "OFF",
                              gravity_align_en ? "on" : "OFF",

@@ -88,6 +88,7 @@
 #include "IMU_Processing.hpp"
 #include "reanchor_gate.hpp"
 #include "adaptive_downsample.hpp"
+#include "voxel_downsample.hpp"
 #include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
 #include "preprocess.h"
@@ -685,7 +686,7 @@ PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr _featsArray;
 
-pcl::VoxelGrid<PointType> downSizeFilterSurf;
+fast_lio::VoxelGridHash downSizeFilterSurf;  // scan downsample: one pass, real points
 pcl::VoxelGrid<PointType> downSizeFilterMap;
 
 // Map backend: ikd-Tree by default; iVox (option B) when built with -DUSE_IVOX=ON. iVox is a
@@ -2879,7 +2880,7 @@ public:
 
     memset(point_selected_surf, true, sizeof(point_selected_surf));
     memset(res_last, -1000.0f, sizeof(res_last));
-    downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
+    downSizeFilterSurf.setLeaf(filter_size_surf_min);
     downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
     memset(point_selected_surf, true, sizeof(point_selected_surf));
     memset(res_last, -1000.0f, sizeof(res_last));
@@ -3252,8 +3253,10 @@ private:
       t_fov = omp_get_wtime();
 
       /*** downsample the feature points in a scan ***/
-      downSizeFilterSurf.setInputCloud(feats_undistort);
-      downSizeFilterSurf.filter(*feats_down_body);
+      downSizeFilterSurf.filter(feats_undistort->points, feats_down_body->points);
+      feats_down_body->width = static_cast<uint32_t>(feats_down_body->points.size());
+      feats_down_body->height = 1;
+      feats_down_body->is_dense = true;
       t1 = omp_get_wtime();
       feats_down_size = feats_down_body->points.size();
       /*** Engulfment telemetry: far-field fraction of the raw downsampled scan ***/
@@ -4290,7 +4293,7 @@ private:
         if (fast_lio::updateAdaptiveDownsample(
               &adaptive_ds_state, scan_cost, filter_size_surf_min, adaptive_ds_params)) {
           const float leaf = static_cast<float>(adaptive_ds_state.voxel);
-          downSizeFilterSurf.setLeafSize(leaf, leaf, leaf);
+          downSizeFilterSurf.setLeaf(leaf);
           RCLCPP_WARN(this->get_logger(),
                       "[ADAPTIVE-DS] scan voxel %.2f m (cost %.0f ms vs budget %.0f ms; %u up / %u down)",
                       adaptive_ds_state.voxel,

@@ -81,6 +81,21 @@ TEST(RunawayWatchdog, EstimateOutrunningTheWheelsTripsWhileDriving)
   EXPECT_EQ(s2.reason, RunawayReason::kWheel);
 }
 
+TEST(RunawayWatchdog, ASpeedSourcePinnedAtZeroCannotAccuseAHealthyWalk)
+{
+  // Dog 2, 2026-09-04: the front end's "wheel" topic was a GNSS velocity proxy,
+  // which reads exactly 0.00 for the whole GNSS-denied stretch. A real 1.9 m/s
+  // walk then looked like it outran the wheels and rebuilt the map every 3 s.
+  RunawayState s;
+  RunawayParams p;
+  EXPECT_EQ(runScans(s, p, 300, 1.9, false, 0.0, 0.05, 0.0), 0);
+  EXPECT_EQ(s.trips, 0u);
+  // Wheels that do report motion still object when the estimate outruns them.
+  RunawayState s2;
+  EXPECT_EQ(runScans(s2, p, 35, 3.0, false, 0.0, 0.05, 0.4), 1);
+  EXPECT_EQ(s2.reason, RunawayReason::kWheel);
+}
+
 TEST(RunawayWatchdog, WithoutEvidenceNothingIsContradicted)
 {
   RunawayState s;

@@ -644,6 +644,14 @@ deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 // estimate stays near real time at a lower effective scan rate (the hole guard
 // covers the gap) rather than going stale and then dying. 0 = unbounded.
 int max_buffered_scans = 100;
+// 条数上限只挡内存(100 帧 = 10 s 积压);真正要挡的是时延 —— 排队 6 s 时队列还没
+// 满,BACKPRESSURE 一次没响,下游却已经在吃 6 s 前的位姿(狗 2 2026-09-04)。按最旧
+// 帧的年龄丢,估计器永远处理最新的一帧:算力不够表现为有效帧率下降,而不是延迟无限
+// 堆高。0 = 关闭。
+// The count cap only bounds memory; latency is what has to be bounded. Dropping by
+// age keeps the estimator on the newest scan — the cost of falling behind becomes a
+// lower effective scan rate instead of an ever-growing lag.
+double max_scan_backlog_sec = 0.5;
 size_t dropped_scan_total = 0;
 
 bool latency_diag_en = true;
@@ -847,17 +855,28 @@ void lasermap_fov_segment()
   kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-// Enforce max_buffered_scans. Called from the LiDAR callbacks with mtx_buffer
+// Enforce max_buffered_scans and max_scan_backlog_sec. Called from the LiDAR callbacks with mtx_buffer
 // held; every callback of this node shares one mutually-exclusive callback
 // group, so sync_packages is never mid-flight here. The one exception is the
 // scan it has already taken (lidar_pushed) and not yet popped — that one stays.
 static void trim_lidar_buffer()
 {
-  if (max_buffered_scans <= 0) return;
-  const size_t cap = static_cast<size_t>(max_buffered_scans);
+  const bool count_bounded = max_buffered_scans > 0;
+  const bool age_bounded = max_scan_backlog_sec > 0.0;
+  if (!count_bounded && !age_bounded) return;
+  const size_t cap = count_bounded ? static_cast<size_t>(max_buffered_scans) : 0u;
   const size_t keep_front = lidar_pushed ? 1u : 0u;
   size_t dropped = 0;
-  while (lidar_buffer.size() > cap && lidar_buffer.size() > keep_front) {
+  auto over_cap = [&]() {
+    if (lidar_buffer.size() <= keep_front) return false;
+    if (count_bounded && lidar_buffer.size() > cap) return true;
+    // 队首(除去已被取走那一帧)比队尾旧过预算 → 它已经没有价值了。
+    if (age_bounded && time_buffer.size() > keep_front &&
+        time_buffer.back() - time_buffer[keep_front] > max_scan_backlog_sec)
+      return true;
+    return false;
+  };
+  while (over_cap()) {
     lidar_buffer.erase(lidar_buffer.begin() + keep_front);
     time_buffer.erase(time_buffer.begin() + keep_front);
     if (lidar_receive_time_buffer.size() > keep_front)
@@ -871,9 +890,9 @@ static void trim_lidar_buffer()
   if (now - last_warn_time > 5.0) {
     last_warn_time = now;
     RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
-                "[BACKPRESSURE] scan queue at cap %d: dropped %zu scan(s) (%zu total) — the estimator is not "
-                "keeping up with the LiDAR",
-                max_buffered_scans, dropped, dropped_scan_total);
+                "[BACKPRESSURE] scan queue over budget (%d scans / %.2fs): dropped %zu scan(s) (%zu total) — "
+                "the estimator is not keeping up with the LiDAR",
+                max_buffered_scans, max_scan_backlog_sec, dropped, dropped_scan_total);
   }
 }
 
@@ -2467,6 +2486,7 @@ public:
     this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
     this->declare_parameter<int>("max_iteration", 4);
     this->declare_parameter<int>("max_buffered_scans", 100);
+    this->declare_parameter<double>("max_scan_backlog_sec", 0.5);
     this->declare_parameter<bool>("degeneracy_debug", false);
     this->declare_parameter<bool>("health_pub_en", true);
     this->declare_parameter<bool>("planar_constraint_en", false);
@@ -2624,6 +2644,7 @@ public:
     this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
     this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
     this->get_parameter_or<int>("max_buffered_scans", max_buffered_scans, 100);
+    this->get_parameter_or<double>("max_scan_backlog_sec", max_scan_backlog_sec, 0.5);
     this->get_parameter_or<bool>("degeneracy_debug", degeneracy_debug, false);
     this->get_parameter_or<bool>("health_pub_en", health_pub_en, true);
     this->get_parameter_or<bool>("planar_constraint_en", planar_constraint_en, false);
@@ -2676,6 +2697,9 @@ public:
     this->get_parameter_or<double>("runaway_hold_sec", runaway_params.hold_sec, 3.0);
     this->get_parameter_or<std::string>("runaway_on_trip", runaway_on_trip, std::string("hold"));
     runaway_params.wheel_max_age = zupt_wheel_max_age;
+    // 轮速要先自己报出运动,才有资格指认跑飞:恒 0 的速度源(m20 的 /lio/twist 是 GNSS
+    // 代理,拒止段整段读 0)否则会把正常行走判成跑飞。
+    runaway_params.wheel_moving_thresh = zupt_wheel_speed_thresh;
     this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
     this->get_parameter_or<bool>("canopy_detect_en", canopy_detect_en, false);
     this->get_parameter_or<bool>("canopy_debug", canopy_debug, false);

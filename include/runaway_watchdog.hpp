@@ -29,6 +29,7 @@ struct RunawayParams
   double wheel_speed_margin = 1.0;   ///< m/s the estimate may exceed the wheels by
   double hold_sec = 3.0;             ///< the contradiction must persist this long
   double wheel_max_age = 0.5;        ///< s; older wheel samples cannot contradict anything
+  double wheel_moving_thresh = 0.05; ///< m/s the wheels must report before they may contradict
 };
 
 enum class RunawayReason : std::uint8_t
@@ -72,9 +73,15 @@ inline RunawayVerdict updateRunawayWatchdog(RunawayState * state,
   RunawayReason reason = RunawayReason::kNone;
   if (evidence_parked && state_speed > params.parked_speed_thresh) {
     reason = RunawayReason::kParked;
-  } else if (wheel_fresh && state_speed > wheel_speed + params.wheel_speed_margin) {
+  } else if (wheel_fresh && wheel_speed > params.wheel_moving_thresh &&
+             state_speed > wheel_speed + params.wheel_speed_margin) {
     // Covers the moving case, where "parked" says nothing: a front end sliding
     // along its own map outruns the wheels even while the robot really drives.
+    // The wheels must report motion of their own to contradict anything — a
+    // source stuck at zero (m20 feeds a GNSS velocity proxy here, which reads
+    // 0.00 for the whole GNSS-denied stretch) would otherwise accuse a healthy
+    // walk of running away. A speed of zero is the parked branch's business,
+    // and that one needs the IMU to agree.
     reason = RunawayReason::kWheel;
   }
 

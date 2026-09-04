@@ -3178,6 +3178,9 @@ private:
       }
 
       double t0, t1, t2, t3, t4, t5, match_start, solve_start, svd_time;
+      // Pre-iEKF split: [IKDPROF] covers only the iEKF and the map-update loop, so the
+      // undistort / FOV-segment / downsample costs were invisible in the per-frame budget.
+      double t_undist = 0.0, t_join = 0.0, t_fov = 0.0;
 
       match_time = 0;
       kdtree_search_time = 0.0;
@@ -3187,6 +3190,7 @@ private:
       t0 = omp_get_wtime();
 
       p_imu->Process(Measures, kf, feats_undistort);
+      t_undist = omp_get_wtime();
       state_point = kf.get_x();
 
       /*** Scan-hole guard: bound the IMU-only excursion across a gap ***/
@@ -3241,9 +3245,11 @@ private:
        *   scan's off-thread map Add to finish before this scan touches the tree. ***/
       if (async_map_en)
         joinMapAdd();
+      t_join = omp_get_wtime();
 
       /*** Segment the map in lidar FOV ***/
       lasermap_fov_segment();
+      t_fov = omp_get_wtime();
 
       /*** downsample the feature points in a scan ***/
       downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -4313,11 +4319,15 @@ private:
         // tree= uses kdtree_size_st (captured at scan start, worker idle) — calling
         // ikdtree.size() here would race the worker's in-flight Add under async.
         printf(
-          "[IKDPROF] tree=%d feats=%d iekf_ms=%.1f add_ms=%.1f join_ms=%.1f loop_ms=%.1f | "
+          "[IKDPROF] tree=%d feats=%d undist_ms=%.1f fov_ms=%.1f ds_ms=%.1f "
+          "iekf_ms=%.1f add_ms=%.1f join_ms=%.1f loop_ms=%.1f | "
           "rb_dcnt=%llu rb_dus_ms=%.1f inl_dus_ms=%.1f rb_active=%d "
           "rb_maxus_ms=%.1f rb_maxsz=%llu rootreb=%llu\n",
           kdtree_size_st,
           feats_down_size,
+          (t_undist - t0) * 1000.0,
+          (t_fov - t_join) * 1000.0,
+          (t1 - t_fov) * 1000.0,
           iekf_ms,
           add_ms,
           join_ms,

@@ -86,6 +86,7 @@
 #include <unordered_map>
 
 #include "IMU_Processing.hpp"
+#include "static_evidence.hpp"
 #include "preprocess.h"
 
 #define INIT_TIME (0.1)
@@ -270,6 +271,27 @@ bool guard_hole_reanchor_pos = true;  // also reset pos to pos_pre + vel_pre * g
 double hole_last_scan_end = -1.0;
 V3D hole_vel_pre = V3D::Zero();
 V3D hole_pos_pre = V3D::Zero();
+// Static hold (ZUPT): while degraded there are no correspondences to bound the
+// iEKF, so it runs on IMU propagation alone. Measured on dog 2 (2026-09-04):
+// 9 s of effct=0 cost 3.9 m of Z and 1.4 m/s of phantom velocity, and the front
+// end never came back — the map is unfrozen at release and then follows the
+// wrong pose. When the IMU and the wheel speed both say the platform is parked
+// there is nothing to dead-reckon: hold the last map-confirmed pose until
+// correspondences return. Evidence is deliberately independent of the pose
+// estimate, which is the thing under suspicion.
+bool zupt_en = true;
+double zupt_gyro_thresh = 0.05;         // rad/s; max |omega| over the scan's IMU window
+double zupt_acc_span_ratio = 0.02;      // (max-min)|a| / mean|a| — free of the IMU's unit scale
+double zupt_wheel_speed_thresh = 0.05;  // m/s; wheel speed below this reads as parked
+double zupt_wheel_max_age = 0.5;        // s; older wheel samples are not evidence
+bool zupt_require_wheel = false;        // true = hold only when a fresh wheel sample agrees
+V3D zupt_anchor_pos = V3D::Zero();      // last pose a healthy scan confirmed
+SO3 zupt_anchor_rot;
+bool zupt_anchor_valid = false;
+bool zupt_active = false;
+int zupt_hold_scans = 0;
+double last_twist_stamp = -1.0;  // newest wheel-speed sample time (s); -1 = none yet
+double last_twist_speed = 0.0;   // |v| of the newest wheel sample (m/s)
 double scan_far_frac = 1.0;                // per-scan telemetry: fraction of raw points beyond far_range
 // [RES] telemetry: converged point-to-plane residual by body range bin (0-2,2-5,5-10,10-20,20-40,40+ m):
 // count and sum of squares from the last h_share_model call of the scan (degeneracy_debug only).
@@ -1097,6 +1119,49 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
   twist_buffer.push_back(v);
   while (twist_buffer.size() > 100)
     twist_buffer.pop_front();
+  // Stamped newest sample for the static hold: the wheel-odom fusion below
+  // consumes the buffer, but the hold needs to know how OLD the evidence is.
+  last_twist_stamp = get_time_sec(msg_in->header.stamp);
+  last_twist_speed = v.norm();
+}
+
+// Independent, front-end-agnostic evidence that the platform is parked. The
+// verdict itself lives in static_evidence.hpp (pure, unit-tested); this only
+// summarises the scan's IMU window and reads the newest wheel sample.
+bool body_is_static(const MeasureGroup & meas, double now)
+{
+  fast_lio::ImuWindowStats imu;
+  imu.acc_min = std::numeric_limits<double>::max();
+  double acc_sum = 0.0;
+  for (const auto & m : meas.imu) {
+    const auto & w = m->angular_velocity;
+    const auto & a = m->linear_acceleration;
+    imu.gyr_max = std::max(imu.gyr_max, V3D(w.x, w.y, w.z).norm());
+    const double acc_norm = V3D(a.x, a.y, a.z).norm();
+    imu.acc_min = std::min(imu.acc_min, acc_norm);
+    imu.acc_max = std::max(imu.acc_max, acc_norm);
+    acc_sum += acc_norm;
+    ++imu.samples;
+  }
+  if (imu.samples > 0)
+    imu.acc_mean = acc_sum / static_cast<double>(imu.samples);
+
+  double wheel_stamp = -1.0;
+  double wheel_speed = 0.0;
+  {
+    std::lock_guard<std::mutex> lk(mtx_twist);
+    wheel_stamp = last_twist_stamp;
+    wheel_speed = last_twist_speed;
+  }
+  const double wheel_age = wheel_stamp > 0.0 ? std::fabs(now - wheel_stamp) : -1.0;
+
+  fast_lio::StaticEvidenceParams params;
+  params.gyro_thresh = zupt_gyro_thresh;
+  params.acc_span_ratio = zupt_acc_span_ratio;
+  params.wheel_speed_thresh = zupt_wheel_speed_thresh;
+  params.wheel_max_age = zupt_wheel_max_age;
+  params.require_wheel = zupt_require_wheel;
+  return fast_lio::bodyIsStatic(imu, wheel_age, wheel_speed, params);
 }
 
 double lidar_mean_scantime = 0.0;
@@ -2401,6 +2466,12 @@ public:
     this->declare_parameter<bool>("guard_hole_reanchor_pos", true);
     this->declare_parameter<int>("divergence_guard_streak", 5);
     this->declare_parameter<double>("divergence_guard_max_speed", 30.0);
+    this->declare_parameter<bool>("zupt_en", true);
+    this->declare_parameter<double>("zupt_gyro_thresh", 0.05);
+    this->declare_parameter<double>("zupt_acc_span_ratio", 0.02);
+    this->declare_parameter<double>("zupt_wheel_speed_thresh", 0.05);
+    this->declare_parameter<double>("zupt_wheel_max_age", 0.5);
+    this->declare_parameter<bool>("zupt_require_wheel", false);
     this->declare_parameter<bool>("canopy_detect_en", false);
     this->declare_parameter<bool>("canopy_debug", false);
     this->declare_parameter<double>("canopy_near_range", 20.0);
@@ -2540,6 +2611,12 @@ public:
     this->get_parameter_or<double>("guard_hole_max_accel", guard_hole_max_accel, 1.0);
     this->get_parameter_or<bool>("guard_hole_reanchor_pos", guard_hole_reanchor_pos, true);
     this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
+    this->get_parameter_or<bool>("zupt_en", zupt_en, true);
+    this->get_parameter_or<double>("zupt_gyro_thresh", zupt_gyro_thresh, 0.05);
+    this->get_parameter_or<double>("zupt_acc_span_ratio", zupt_acc_span_ratio, 0.02);
+    this->get_parameter_or<double>("zupt_wheel_speed_thresh", zupt_wheel_speed_thresh, 0.05);
+    this->get_parameter_or<double>("zupt_wheel_max_age", zupt_wheel_max_age, 0.5);
+    this->get_parameter_or<bool>("zupt_require_wheel", zupt_require_wheel, false);
     this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
     this->get_parameter_or<bool>("canopy_detect_en", canopy_detect_en, false);
     this->get_parameter_or<bool>("canopy_debug", canopy_debug, false);
@@ -2797,10 +2874,14 @@ public:
       sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
       RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", imu_topic.c_str());
     }
-    if (wheel_odom_en) {
+    if (wheel_odom_en || zupt_en) {
       sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(wheel_topic, 2000, twist_cbk);
-      RCLCPP_INFO(
-        this->get_logger(), "Wheel odom enabled, topic: %s, scale: %.3f", wheel_topic.c_str(), wheel_speed_scale);
+      RCLCPP_INFO(this->get_logger(),
+                  "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s)",
+                  wheel_topic.c_str(),
+                  wheel_speed_scale,
+                  wheel_odom_en ? "on" : "off",
+                  zupt_en ? "on" : "off");
     }
     pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
     pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
@@ -3751,7 +3832,30 @@ private:
       if (flio_in_degraded) {
         state_ikfom st = kf.get_x();
         const double spd = st.vel.norm();
-        if (spd > divergence_guard_max_speed) {
+        // Static hold takes precedence over the speed reset: with independent
+        // proof that the platform is parked, the blind stretch has nothing to
+        // integrate, and zeroing only the velocity still leaves the position and
+        // attitude wherever propagation put them (dog 2, 2026-09-04: −3.9 m of Z
+        // in 9 s, unrecoverable once the map unfroze around the wrong pose).
+        const bool static_hold = zupt_en && zupt_anchor_valid && body_is_static(Measures, lidar_end_time);
+        if (static_hold) {
+          st.pos = zupt_anchor_pos;
+          st.rot = zupt_anchor_rot;
+          st.vel.setZero();
+          kf.change_x(st);
+          state_point = kf.get_x();
+          ++zupt_hold_scans;
+          if (!zupt_active) {
+            zupt_active = true;
+            RCLCPP_WARN(this->get_logger(),
+                        "[ZUPT] static hold engaged (effct=%d far_frac=%.2f): pose pinned at [%.2f %.2f %.2f]",
+                        effct_feat_num,
+                        scan_far_frac,
+                        zupt_anchor_pos[0],
+                        zupt_anchor_pos[1],
+                        zupt_anchor_pos[2]);
+          }
+        } else if (spd > divergence_guard_max_speed) {
           // A body speed above the platform's physical maximum is a
           // GUARANTEED-WRONG state, not a bound to enforce. Clamping it to
           // max_speed (the old behaviour) turned the clamp into an
@@ -3787,6 +3891,21 @@ private:
                              gravity_align_en ? "on" : "OFF",
                              state_point.pos[2],
                              state_point.vel.norm());
+      } else {
+        // Healthy scan: the map just confirmed this pose, so it becomes the
+        // anchor the next blind stretch holds on to.
+        zupt_anchor_pos = state_point.pos;
+        zupt_anchor_rot = state_point.rot;
+        zupt_anchor_valid = true;
+        if (zupt_active) {
+          RCLCPP_WARN(this->get_logger(),
+                      "[ZUPT] static hold released after %d scans (effct=%d far_frac=%.2f)",
+                      zupt_hold_scans,
+                      effct_feat_num,
+                      scan_far_frac);
+          zupt_active = false;
+          zupt_hold_scans = 0;
+        }
       }
 
       /*** Optional degeneracy diagnostics ***/

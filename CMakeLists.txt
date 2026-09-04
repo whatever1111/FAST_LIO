@@ -53,6 +53,7 @@ find_package(PythonLibs QUIET)
 find_package(ament_cmake REQUIRED)
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)
 endif()
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
@@ -177,6 +178,12 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_analyze_kalman_channels
     test/test_analyze_kalman_channels.py
   )
+  # Pure header, no ROS: the static-hold verdict that decides whether the iEKF
+  # may be pinned during a blind stretch.
+  ament_add_gtest(test_static_evidence test/test_static_evidence.cpp)
+  if(TARGET test_static_evidence)
+    target_include_directories(test_static_evidence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
 endif()
 
 # ---------------- Install --------------- #

@@ -366,6 +366,43 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   // "No Effective Points" collapses and a 607 m FE dive on the 0702 canopy
   // bag). The two-pointer backward sweep below performs the SAME comparisons
   // in the SAME order as the serial walk, for any head sequence.
+  // Per-segment affine folding. The compensation below is affine in the point and every
+  // factor except the intra-segment rotation is constant over a scan, and Rodrigues on a
+  // fixed axis is exact as R(dt) = R0 + sin(w dt) R1 + (1-cos(w dt)) R2. Precomputing the
+  // three matrices per segment turns the per-point work from an Exp() plus four rotations
+  // into three mat-vecs, which is what the scan-rate budget is actually spent on.
+  const M3D R_li = imu_state.offset_R_L_I.toRotationMatrix();
+  const V3D t_li = imu_state.offset_T_L_I;
+  const M3D M_fold = R_li.transpose() * imu_state.rot.conjugate().toRotationMatrix();
+  const V3D c_li = R_li.transpose() * t_li;
+  std::vector<M3D, Eigen::aligned_allocator<M3D>> segA0(n_seg), segA1(n_seg), segA2(n_seg);
+  std::vector<V3D, Eigen::aligned_allocator<V3D>> segd0(n_seg), segd1(n_seg), segd2(n_seg),
+    segU(n_seg), segV(n_seg), segAcc(n_seg);
+  std::vector<double> seg_w(n_seg);
+  for (int j = 0; j < n_seg; j++)
+  {
+    const double w = seg_gyr[j].norm();
+    seg_w[j] = w;
+    M3D K = M3D::Zero();
+    if (w > 1e-7)
+    {
+      const V3D axis = seg_gyr[j] / w;
+      K << SKEW_SYM_MATRX(axis);
+    }
+    const M3D MR0 = M_fold * seg_R[j];
+    const M3D MR1 = MR0 * K;
+    const M3D MR2 = MR1 * K;
+    segA0[j] = MR0 * R_li;
+    segA1[j] = MR1 * R_li;
+    segA2[j] = MR2 * R_li;
+    segd0[j] = MR0 * t_li - c_li;
+    segd1[j] = MR1 * t_li;
+    segd2[j] = MR2 * t_li;
+    segU[j] = M_fold * (seg_pos[j] - imu_state.pos);
+    segV[j] = M_fold * seg_vel[j];
+    segAcc[j] = 0.5 * (M_fold * seg_acc[j]);
+  }
+
   std::vector<int> seg_of(n_pts);
   {
     int p = n_pts - 1;
@@ -391,15 +428,29 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     const double t = pt.curvature / double(1000);
     const double dt_i = t - seg_head_t[s];
 
-    /* Transform to the 'end' frame, using only the rotation
-     * Note: Compensation direction is INVERSE of Frame's moving direction
-     * So if we want to compensate a point at timestamp-i to the frame-e
-     * P_compensate = R_imu_e ^ T * (R_i * P_i + T_ei) where T_ei is represented in global frame */
-    M3D R_i(seg_R[s] * Exp(seg_gyr[s], dt_i));
+    /* Compensate to the 'end' frame (direction is INVERSE of the frame's motion), as the
+     * per-segment affine folded above: P' = (A0 + sin*A1 + vers*A2) P + d0 + sin*d1 + vers*d2
+     * + U + V dt + Acc dt^2. Intra-segment angles are milliradians, where the series is exact
+     * to double precision and far cheaper than sin/cos; the branch keeps a pathological
+     * gyro/dt honest. */
+    const double th = seg_w[s] * dt_i;
+    double sn, vers;
+    if (std::fabs(th) < 0.1)
+    {
+      const double th2 = th * th;
+      sn = th * (1.0 - th2 * (1.0 / 6.0 - th2 * (1.0 / 120.0)));
+      vers = th2 * (0.5 - th2 * (1.0 / 24.0 - th2 * (1.0 / 720.0)));
+    }
+    else
+    {
+      sn = std::sin(th);
+      vers = 1.0 - std::cos(th);
+    }
 
-    V3D P_i(pt.x, pt.y, pt.z);
-    V3D T_ei(seg_pos[s] + seg_vel[s] * dt_i + 0.5 * seg_acc[s] * dt_i * dt_i - imu_state.pos);
-    V3D P_compensate = imu_state.offset_R_L_I.conjugate() * (imu_state.rot.conjugate() * (R_i * (imu_state.offset_R_L_I * P_i + imu_state.offset_T_L_I) + T_ei) - imu_state.offset_T_L_I);// not accurate!
+    const V3D P_i(pt.x, pt.y, pt.z);
+    const V3D P_compensate = segA0[s] * P_i + sn * (segA1[s] * P_i) + vers * (segA2[s] * P_i)
+                           + segd0[s] + sn * segd1[s] + vers * segd2[s]
+                           + segU[s] + dt_i * segV[s] + (dt_i * dt_i) * segAcc[s];
 
     pt.x = P_compensate(0);
     pt.y = P_compensate(1);

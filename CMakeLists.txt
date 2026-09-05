@@ -210,6 +210,14 @@ if(BUILD_TESTING)
   if(TARGET test_voxel_downsample)
     target_include_directories(test_voxel_downsample PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
+  # The map backend's prior-map tier: what the live run may take away from it (nothing) and
+  # what the guard's recovery drops (only what this run learned).
+  ament_add_gtest(test_ivox_layering test/test_ivox_layering.cpp)
+  if(TARGET test_ivox_layering)
+    target_include_directories(test_ivox_layering PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${PCL_INCLUDE_DIRS}
+                                                          ${EIGEN3_INCLUDE_DIR})
+    target_link_libraries(test_ivox_layering ${PCL_LIBRARIES})
+  endif()
   # Pure header, Eigen only: what a prior map and its initial pose have to prove before
   # either of them reaches the map backend.
   ament_add_gtest(test_prior_map_load test/test_prior_map_load.cpp)

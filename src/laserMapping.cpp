@@ -2773,6 +2773,19 @@ public:
     this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
     this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
     this->declare_parameter<string>("prior_map_pcd", "");
+    // Pin the prior map into its own map-backend tier: it is not something this run learned,
+    // so nothing this run does — LRU eviction as the map fills, or the guard dropping a local
+    // map it can no longer register against — may take it away. Inert without prior_map_pcd,
+    // and bit-identical to the unpinned path until one of those two events happens.
+    //
+    // Off by default, and opt in per scene. On the 0831 lobby bag, forcing the guard to lose
+    // its re-registration ends the run 11.1 m from truth unpinned (the map goes 70023 -> 532
+    // points, so there is nothing left to re-register against) versus 1.5 m pinned, but the
+    // pinned run's worst mid-run excursion is larger (16.5 m vs 11.1 m): keeping a map to
+    // re-register against is not the same as knowing where in it you are, which is what
+    // relocalization decides. The pinned tier also cannot heal — the delivered map owns its
+    // cells for the whole run. iVox backend only (the ikd-Tree build has no tier to pin into).
+    this->declare_parameter<bool>("prior_map_pinned", false);
     this->declare_parameter<vector<double>>("initial_pose", vector<double>());
     // initial_pose_full_rpy_override:
     //   false (default) — inject only XYZ + yaw from initial_pose; keep
@@ -2988,6 +3001,7 @@ public:
     this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
     this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
     this->get_parameter_or<string>("prior_map_pcd", prior_map_pcd_, string(""));
+    this->get_parameter_or<bool>("prior_map_pinned", prior_map_pinned_, false);
     this->get_parameter_or<vector<double>>("initial_pose", initial_pose_vec_, vector<double>());
     {
       bool full_rpy_override = false;
@@ -3552,18 +3566,35 @@ private:
                 pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
               }
 
-              // 5. Merge prior + current scan → build tree
-              PointCloudXYZI::Ptr combined(new PointCloudXYZI());
-              *combined = *prior_ds;
-              *combined += *feats_down_world;
-              ikdtree.Build(combined->points);
+              // 5. Prior map + current scan → map backend. Pinned, the prior map goes into a
+              //    tier of its own; unpinned, it is merged in and lives or dies with the rest.
+              size_t map_points = 0;
+#ifdef USE_IVOX
+              if (prior_map_pinned_) {
+                ikdtree.AddPinnedPoints(prior_ds->points);
+                ikdtree.Add_Points(feats_down_world->points, true);
+                map_points = static_cast<size_t>(ikdtree.size());
+                RCLCPP_INFO(this->get_logger(),
+                            "map built from prior map (PINNED, %zu voxels) + current scan (%zu + %d = %zu points)",
+                            ikdtree.pinnedVoxels(),
+                            prior_ds->size(),
+                            feats_down_size,
+                            map_points);
+              } else
+#endif
+              {
+                PointCloudXYZI::Ptr combined(new PointCloudXYZI());
+                *combined = *prior_ds;
+                *combined += *feats_down_world;
+                ikdtree.Build(combined->points);
+                map_points = combined->size();
+                RCLCPP_INFO(this->get_logger(),
+                            "ikd-tree built from prior map + current scan (%zu + %d = %zu points)",
+                            prior_ds->size(),
+                            feats_down_size,
+                            map_points);
+              }
               Localmap_Initialized = false;
-
-              RCLCPP_INFO(this->get_logger(),
-                          "ikd-tree built from prior map + current scan (%zu + %d = %zu points)",
-                          prior_ds->size(),
-                          feats_down_size,
-                          combined->size());
 #ifdef USE_IVOX
               // The prior map has to survive the load intact. iVox bounds itself by evicting
               // the least-recently-WRITTEN voxel, so a map larger than the capacity is
@@ -4199,17 +4230,47 @@ private:
         for (int i = 0; i < feats_down_size; i++) {
           pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
         }
-        ikdtree.Build(feats_down_world->points);
+        bool kept_prior = false;
+        const int map_before = ikdtree.size();
+#ifdef USE_IVOX
+        if (ikdtree.pinnedVoxels() > 0) {
+          // A pinned prior map is the one thing here that is still trustworthy: the local map
+          // stopped fitting, the delivered map did not. Recovery drops what this run learned
+          // and re-registers against what it was given.
+          ikdtree.clearLive();
+          ikdtree.Add_Points(feats_down_world->points, true);
+          kept_prior = true;
+        } else
+#endif
+        {
+          ikdtree.Build(feats_down_world->points);
+        }
         Localmap_Initialized = false;
         fast_lio::resetReanchorGate(&reanchor_gate);
-        RCLCPP_ERROR(this->get_logger(),
-                     "[%s] map rebuilt from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: the estimate is live "
-                     "again but unanchored",
-                     tag,
-                     feats_down_size,
-                     state_point.pos[0],
-                     state_point.pos[1],
-                     state_point.pos[2]);
+        if (kept_prior) {
+          RCLCPP_ERROR(this->get_logger(),
+                       "[%s] live map dropped and re-seeded from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: "
+                       "map %d -> %d pts, the prior map (%zu voxels) is still there to re-register against",
+                       tag,
+                       feats_down_size,
+                       state_point.pos[0],
+                       state_point.pos[1],
+                       state_point.pos[2],
+                       map_before,
+                       ikdtree.size(),
+                       ikdtree.pinnedVoxels());
+        } else {
+          RCLCPP_ERROR(this->get_logger(),
+                       "[%s] map rebuilt from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: map %d -> %d pts, the "
+                       "estimate is live again but unanchored",
+                       tag,
+                       feats_down_size,
+                       state_point.pos[0],
+                       state_point.pos[1],
+                       state_point.pos[2],
+                       map_before,
+                       ikdtree.size());
+        }
       };
 
       const auto reanchor = fast_lio::updateReanchorGate(
@@ -4768,6 +4829,7 @@ private:
 
   std::string prior_map_pcd_;
   std::size_t last_reported_evicted_voxels = 0;  // last value the capacity WARN reported
+  bool prior_map_pinned_ = false;  // prior map goes into its own non-evictable tier
   std::vector<double> initial_pose_vec_;
   bool initial_pose_full_rpy_override_ = false;
 };

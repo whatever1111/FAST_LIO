@@ -54,9 +54,47 @@ class IVox {
   void set_downsample_param(float leaf) {
     if (leaf > 1e-4f) { downsample_size_ = leaf; inv_ds_ = 1.0f / leaf; }
   }
-  void Build(PointVector& points) { Add_Points(points, true); }
+  // Rebuild the map from `points` alone. ikd-Tree's Build deletes the existing tree first,
+  // and the caller that matters (the guard's "rebuild the local map here" recovery) depends
+  // on that: without the clear, a map the estimate can no longer register against survives
+  // the recovery it was supposed to be dropped by, and the log says "rebuilt" either way.
+  void Build(PointVector& points) {
+    clear();
+    Add_Points(points, true);
+  }
 
-  int Add_Points(PointVector& points, bool downsample_on) {
+  // Drop everything the live scans put here, keep the pinned tier (a preloaded prior map).
+  // This is what the guard's recovery wants once a prior map is loaded: the local map that
+  // no longer fits goes away, the map the operator delivered stays.
+  void clearLive() {
+    for (const Key& k : lru_) {
+      auto it = map_.find(k);
+      if (it == map_.end()) {
+        continue;
+      }
+      for (const auto& q : it->second.pts) occupied_fine_.erase(fineKey(q));
+      num_points_ -= it->second.pts.size();
+      map_.erase(it);
+    }
+    lru_.clear();
+  }
+
+  void clear() {
+    map_.clear();
+    occupied_fine_.clear();
+    lru_.clear();
+    num_points_ = 0;
+    pinned_voxels_ = 0;
+  }
+
+  // Add points that must survive both eviction and clearLive(): a prior map is not something
+  // this run learned, so nothing this run does may drop it.
+  int AddPinnedPoints(PointVector& points) { return addPoints(points, true, true); }
+
+  int Add_Points(PointVector& points, bool downsample_on) { return addPoints(points, downsample_on, false); }
+
+ private:
+  int addPoints(PointVector& points, bool downsample_on, bool pinned) {
     int added = 0;
     for (const auto& p : points) {
       if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
@@ -72,17 +110,29 @@ class IVox {
       auto it = map_.find(k);
       bool was_added = false;
       if (it == map_.end()) {
-        lru_.push_front(k);
         Voxel v;
         v.pts.reserve(8);
         v.pts.push_back(p);
-        v.lru = lru_.begin();
+        v.pinned = pinned;
+        if (pinned) {
+          ++pinned_voxels_;
+        } else {
+          lru_.push_front(k);
+          v.lru = lru_.begin();
+        }
         map_.emplace(k, std::move(v));
         was_added = true;
-        if (map_.size() > max_voxels_) evictOldest();
+        // Only live voxels are evictable, so a full map with nothing live left simply stays
+        // full — the prior-map load guard is what keeps that from being reachable.
+        if (map_.size() > max_voxels_ && !lru_.empty()) evictOldest();
       } else {
         Voxel& v = it->second;
-        lru_.splice(lru_.begin(), lru_, v.lru);  // touch (most-recently-used)
+        if (pinned && !v.pinned) {  // a live voxel the prior map also covers becomes pinned
+          lru_.erase(v.lru);
+          v.pinned = true;
+          ++pinned_voxels_;
+        }
+        if (!v.pinned) lru_.splice(lru_.begin(), lru_, v.lru);  // touch (most-recently-used)
         if (static_cast<int>(v.pts.size()) < per_voxel_cap_) {
           v.pts.push_back(p);
           was_added = true;
@@ -97,6 +147,7 @@ class IVox {
     return added;
   }
 
+ public:
   // Fills `nearest` with up to k closest map points (ascending) and `sqdist` with their
   // squared distances — exactly what ikd-Tree::Nearest_Search returns. h_share rejects when
   // nearest.size() < k or sqdist[k-1] > 5, so returning <k on a sparse query is fine.
@@ -146,6 +197,7 @@ class IVox {
   // report on these counters instead of finding out through a degraded match.
   std::size_t maxVoxels() const { return max_voxels_; }
   std::size_t evictedVoxels() const { return evicted_voxels_; }
+  std::size_t pinnedVoxels() const { return pinned_voxels_; }
   bool atCapacity() const { return map_.size() >= max_voxels_; }
 
  private:
@@ -161,6 +213,7 @@ class IVox {
   struct Voxel {
     PointVector pts;
     typename std::list<Key>::iterator lru;  // dependent type in a class template → typename
+    bool pinned = false;                    // prior-map voxel: never evicted, survives clearLive()
   };
 
   Key key(const PointType& p) const {
@@ -217,6 +270,7 @@ class IVox {
   std::list<Key> lru_;
   std::size_t num_points_ = 0;
   std::size_t evicted_voxels_ = 0;
+  std::size_t pinned_voxels_ = 0;
 };
 
 }  // namespace lio_ivox

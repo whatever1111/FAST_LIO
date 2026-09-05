@@ -4060,6 +4060,25 @@ private:
           rebuild_local_map("REANCHOR");
         }
       }
+      // Release the static hold.  The flag leaves this node as "the platform is
+      // provably parked" (kFeHealthFlagStaticHold), so it has to drop the moment
+      // that stops being true: on a healthy scan, and equally when a degraded
+      // stretch resumes motion.  Left raised while moving, it tells the fusion
+      // node to publish IMU dead reckoning as a pinned pose and to reject the
+      // GNSS displacement that is the platform actually moving.
+      const auto release_static_hold = [&](const char * reason) {
+        if (!zupt_active) {
+          return;
+        }
+        RCLCPP_WARN(this->get_logger(),
+                    "[ZUPT] static hold released after %d scans (%s: effct=%d far_frac=%.2f)",
+                    zupt_hold_scans,
+                    reason,
+                    effct_feat_num,
+                    scan_far_frac);
+        zupt_active = false;
+        zupt_hold_scans = 0;
+      };
       if (reanchor.degraded) {
         state_ikfom st = kf.get_x();
         const double spd = st.vel.norm();
@@ -4086,21 +4105,26 @@ private:
                         zupt_anchor_pos[1],
                         zupt_anchor_pos[2]);
           }
-        } else if (spd > divergence_guard_max_speed) {
-          // A body speed above the platform's physical maximum is a
-          // GUARANTEED-WRONG state, not a bound to enforce. Clamping it to
-          // max_speed (the old behaviour) turned the clamp into an
-          // equilibrium: IMU propagation re-inflated |vel| every scan and the
-          // callback re-clamped it — measured on m20_0814_degrade as spd=3.00
-          // on every scan for 60 s, dragging the state ~3 m/s out of the
-          // frozen map until no re-lock was geometrically possible. The
-          // decisive response is the same one engulfment release uses: ZERO
-          // the velocity so the next correspondences re-estimate it. Costs at
-          // most one scan of re-convergence on a healthy scene; the clamp
-          // guaranteed max_speed of position error per second.
-          st.vel.setZero();
-          kf.change_x(st);
-          state_point = kf.get_x();
+        } else {
+          // Not parked, and the scan still cannot confirm the pose: this is the
+          // stretch the hold must NOT survive into.
+          release_static_hold("moving again while degraded");
+          if (spd > divergence_guard_max_speed) {
+            // A body speed above the platform's physical maximum is a
+            // GUARANTEED-WRONG state, not a bound to enforce. Clamping it to
+            // max_speed (the old behaviour) turned the clamp into an
+            // equilibrium: IMU propagation re-inflated |vel| every scan and the
+            // callback re-clamped it — measured on m20_0814_degrade as spd=3.00
+            // on every scan for 60 s, dragging the state ~3 m/s out of the
+            // frozen map until no re-lock was geometrically possible. The
+            // decisive response is the same one engulfment release uses: ZERO
+            // the velocity so the next correspondences re-estimate it. Costs at
+            // most one scan of re-convergence on a healthy scene; the clamp
+            // guaranteed max_speed of position error per second.
+            st.vel.setZero();
+            kf.change_x(st);
+            state_point = kf.get_x();
+          }
         }
         flio_map_frozen = true;
         flio_degraded_odom = true;
@@ -4133,15 +4157,7 @@ private:
         zupt_anchor_pos = state_point.pos;
         zupt_anchor_rot = state_point.rot;
         zupt_anchor_valid = true;
-        if (zupt_active) {
-          RCLCPP_WARN(this->get_logger(),
-                      "[ZUPT] static hold released after %d scans (effct=%d far_frac=%.2f)",
-                      zupt_hold_scans,
-                      effct_feat_num,
-                      scan_far_frac);
-          zupt_active = false;
-          zupt_hold_scans = 0;
-        }
+        release_static_hold("scan healthy");
       }
 
       /*** Runaway watchdog (runaway_watchdog.hpp): the guard above keys off the

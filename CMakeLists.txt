@@ -210,6 +210,12 @@ if(BUILD_TESTING)
   if(TARGET test_voxel_downsample)
     target_include_directories(test_voxel_downsample PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
+  # Pure header, Eigen only: what a prior map and its initial pose have to prove before
+  # either of them reaches the map backend.
+  ament_add_gtest(test_prior_map_load test/test_prior_map_load.cpp)
+  if(TARGET test_prior_map_load)
+    target_include_directories(test_prior_map_load PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
 endif()
 
 # ---------------- Install --------------- #

@@ -86,6 +86,7 @@
 #include <unordered_map>
 
 #include "IMU_Processing.hpp"
+#include "prior_map_load.hpp"
 #include "reanchor_gate.hpp"
 #include "adaptive_downsample.hpp"
 #include "voxel_downsample.hpp"
@@ -3473,31 +3474,33 @@ private:
           // --- Prior map preload (Scheme 1) ---
           if (!prior_map_pcd_.empty()) {
             // 1. Inject initial pose into EKF if provided
-            if (initial_pose_vec_.size() >= 6) {
+            {
               state_ikfom new_state = kf.get_x();
-              new_state.pos = Eigen::Vector3d(initial_pose_vec_[0], initial_pose_vec_[1], initial_pose_vec_[2]);
-              double roll_rad = initial_pose_vec_[3] * M_PI / 180.0;
-              double pitch_rad = initial_pose_vec_[4] * M_PI / 180.0;
-              double yaw_rad = initial_pose_vec_[5] * M_PI / 180.0;
-              Eigen::Quaterniond q_current(new_state.rot.matrix());
-              Eigen::Vector3d current_rpy = q_current.toRotationMatrix().eulerAngles(0, 1, 2);
-              double applied_roll = initial_pose_full_rpy_override_ ? roll_rad : current_rpy.x();
-              double applied_pitch = initial_pose_full_rpy_override_ ? pitch_rad : current_rpy.y();
-              Eigen::AngleAxisd rollAngle(applied_roll, Eigen::Vector3d::UnitX());
-              Eigen::AngleAxisd pitchAngle(applied_pitch, Eigen::Vector3d::UnitY());
-              Eigen::AngleAxisd yawAngle(yaw_rad, Eigen::Vector3d::UnitZ());
-              Eigen::Quaterniond q_init = yawAngle * pitchAngle * rollAngle;
-              new_state.rot = SO3(q_init);
-              kf.change_x(new_state);
-              state_point = kf.get_x();
-              pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-              RCLCPP_INFO(this->get_logger(),
-                          "Injected initial pose: [%.3f, %.3f, %.3f] yaw_deg=%.1f full_rpy_override=%s",
-                          initial_pose_vec_[0],
-                          initial_pose_vec_[1],
-                          initial_pose_vec_[2],
-                          initial_pose_vec_[5],
-                          initial_pose_full_rpy_override_ ? "true" : "false");
+              const Eigen::Quaterniond q_current(new_state.rot.matrix());
+              const Eigen::Vector3d current_rpy = q_current.toRotationMatrix().eulerAngles(0, 1, 2);
+              const auto injection = fast_lio::resolveInitialPose(
+                initial_pose_vec_, initial_pose_full_rpy_override_, current_rpy.x(), current_rpy.y());
+              if (!injection.valid && !initial_pose_vec_.empty()) {
+                RCLCPP_ERROR(this->get_logger(),
+                             "initial_pose is unusable (%zu element(s), need %zu finite: x,y,z,roll,pitch,yaw) - "
+                             "loading the prior map at the filter's own pose instead",
+                             initial_pose_vec_.size(),
+                             fast_lio::kInitialPoseSize);
+              }
+              if (injection.valid) {
+                new_state.pos = injection.position;
+                new_state.rot = SO3(injection.orientation);
+                kf.change_x(new_state);
+                state_point = kf.get_x();
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                RCLCPP_INFO(this->get_logger(),
+                            "Injected initial pose: [%.3f, %.3f, %.3f] yaw_deg=%.1f full_rpy_override=%s",
+                            injection.position.x(),
+                            injection.position.y(),
+                            injection.position.z(),
+                            injection.applied_yaw_rad * 180.0 / M_PI,
+                            initial_pose_full_rpy_override_ ? "true" : "false");
+              }
             }
 
             // 2. Load prior PCD
@@ -3509,38 +3512,28 @@ private:
               // AABB self-check: helps diagnose wrong-frame PCDs
               // (e.g. a UTM map loaded where ENU was expected).
               // center→origin > ~10 km strongly suggests a global frame.
-              if (!prior_cloud->empty()) {
-                float xmin = std::numeric_limits<float>::max();
-                float ymin = xmin;
-                float zmin = xmin;
-                float xmax = -xmin;
-                float ymax = -xmin;
-                float zmax = -xmin;
-                for (const auto & pt : prior_cloud->points) {
-                  xmin = std::min(xmin, pt.x);
-                  ymin = std::min(ymin, pt.y);
-                  zmin = std::min(zmin, pt.z);
-                  xmax = std::max(xmax, pt.x);
-                  ymax = std::max(ymax, pt.y);
-                  zmax = std::max(zmax, pt.z);
+              {
+                const auto bbox =
+                  fast_lio::computePriorMapBounds(prior_cloud->points.begin(), prior_cloud->points.end());
+                if (!bbox.valid) {
+                  RCLCPP_ERROR(this->get_logger(),
+                               "Prior map holds no finite point (%zu read) - check the PCD",
+                               prior_cloud->size());
+                } else {
+                  RCLCPP_INFO(this->get_logger(),
+                              "Prior map bbox: x=[%.2f..%.2f] y=[%.2f..%.2f] "
+                              "z=[%.2f..%.2f] center→origin=%.1f m%s",
+                              bbox.xmin,
+                              bbox.xmax,
+                              bbox.ymin,
+                              bbox.ymax,
+                              bbox.zmin,
+                              bbox.zmax,
+                              bbox.center_to_origin_m,
+                              bbox.likely_global_frame ? "  (large offset — likely UTM/global frame, "
+                                                         "check coordinate system!)"
+                                                       : "");
                 }
-                const double cx = 0.5 * (xmin + xmax);
-                const double cy = 0.5 * (ymin + ymax);
-                const double cz = 0.5 * (zmin + zmax);
-                const double dist_to_origin = std::sqrt(cx * cx + cy * cy + cz * cz);
-                RCLCPP_INFO(this->get_logger(),
-                            "Prior map bbox: x=[%.2f..%.2f] y=[%.2f..%.2f] "
-                            "z=[%.2f..%.2f] center→origin=%.1f m%s",
-                            xmin,
-                            xmax,
-                            ymin,
-                            ymax,
-                            zmin,
-                            zmax,
-                            dist_to_origin,
-                            dist_to_origin > 10000.0 ? "  (large offset — likely UTM/global frame, "
-                                                       "check coordinate system!)"
-                                                     : "");
               }
 
               // 3. Downsample prior map

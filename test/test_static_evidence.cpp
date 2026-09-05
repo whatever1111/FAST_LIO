@@ -8,6 +8,7 @@
 using fast_lio::bodyIsStatic;
 using fast_lio::ImuWindowStats;
 using fast_lio::StaticEvidenceParams;
+using fast_lio::wheelSampleIsEvidence;
 
 namespace
 {
@@ -81,5 +82,44 @@ TEST(StaticEvidence, EmptyOrNonFiniteWindowIsNeverStatic)
   ImuWindowStats zero_mean = parkedImu();
   zero_mean.acc_mean = 0.0;  // free fall / dead accelerometer
   EXPECT_FALSE(bodyIsStatic(zero_mean, 0.05, 0.0, StaticEvidenceParams{}));
-  EXPECT_FALSE(bodyIsStatic(parkedImu(), 0.05, std::numeric_limits<double>::quiet_NaN(), StaticEvidenceParams{}));
+}
+
+TEST(StaticEvidence, NonFiniteWheelSampleIsTreatedAsNoEvidence)
+{
+  // NaN is the wheelspeed bridge saying "cannot measure": while its legs work, and
+  // permanently if its wheel signs never lock or a sign mismatch latches. It is the
+  // absence of a measurement, so it must land on the same policy as an absent or a
+  // stale sample — not on "not parked", which would silently disable the hold, the
+  // parked-velocity zeroing and the runaway watchdog for the whole run.
+  const double nan_speed = std::numeric_limits<double>::quiet_NaN();
+  StaticEvidenceParams permissive;  // require_wheel = false: the IMU alone may decide
+  EXPECT_TRUE(bodyIsStatic(parkedImu(), 0.05, nan_speed, permissive));
+  EXPECT_EQ(bodyIsStatic(parkedImu(), 0.05, nan_speed, permissive),
+            bodyIsStatic(parkedImu(), -1.0, 0.0, permissive));
+
+  StaticEvidenceParams strict;
+  strict.require_wheel = true;  // no wheel evidence means "not proven"
+  EXPECT_FALSE(bodyIsStatic(parkedImu(), 0.05, nan_speed, strict));
+
+  // A moving IMU still vetoes it: dropping the wheel term never invents a hold.
+  ImuWindowStats turning = parkedImu();
+  turning.gyr_max = 0.2;
+  EXPECT_FALSE(bodyIsStatic(turning, 0.05, nan_speed, permissive));
+
+  // A non-finite AGE is the same story: we cannot tell how old the sample is, so
+  // there is no usable evidence and require_wheel decides.
+  EXPECT_TRUE(bodyIsStatic(parkedImu(), nan_speed, 0.0, permissive));
+  EXPECT_FALSE(bodyIsStatic(parkedImu(), nan_speed, 0.0, strict));
+}
+
+TEST(StaticEvidence, WheelSampleIsEvidenceRejectsAnyNonFiniteComponent)
+{
+  const double nan_v = std::numeric_limits<double>::quiet_NaN();
+  const double inf_v = std::numeric_limits<double>::infinity();
+  EXPECT_TRUE(wheelSampleIsEvidence(0.0, 0.0, 0.0));      // standstill IS a measurement
+  EXPECT_TRUE(wheelSampleIsEvidence(-1.25, 0.0, 0.0));
+  EXPECT_FALSE(wheelSampleIsEvidence(nan_v, 0.0, 0.0));
+  EXPECT_FALSE(wheelSampleIsEvidence(0.0, nan_v, 0.0));
+  EXPECT_FALSE(wheelSampleIsEvidence(0.0, 0.0, nan_v));
+  EXPECT_FALSE(wheelSampleIsEvidence(inf_v, 0.0, 0.0));
 }

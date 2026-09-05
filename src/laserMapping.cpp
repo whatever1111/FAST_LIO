@@ -1211,9 +1211,15 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
 {
   Eigen::Vector3d v(msg_in->twist.linear.x, msg_in->twist.linear.y, msg_in->twist.linear.z);
   std::lock_guard<std::mutex> lk(mtx_twist);
-  twist_buffer.push_back(v);
-  while (twist_buffer.size() > 100)
-    twist_buffer.pop_front();
+  // NaN is the wheelspeed bridge saying "cannot measure", not a number. Only a
+  // real measurement may enter the buffer the iEKF update consumes; what the
+  // absence of one means is decided once, in static_evidence.hpp, which is why
+  // the stamp and speed below are still recorded as they arrive.
+  if (fast_lio::wheelSampleIsEvidence(v(0), v(1), v(2))) {
+    twist_buffer.push_back(v);
+    while (twist_buffer.size() > 100)
+      twist_buffer.pop_front();
+  }
   // Stamped newest sample for the static hold: the wheel-odom fusion below
   // consumes the buffer, but the hold needs to know how OLD the evidence is.
   last_twist_stamp = get_time_sec(msg_in->header.stamp);
@@ -4567,7 +4573,10 @@ private:
             have_twist = true;
           }
         }
-        if (have_twist) {
+        // Belt and braces: twist_cbk already refuses non-finite samples, but one
+        // NaN reaching update_simple poisons every state and never leaves.
+        if (have_twist && fast_lio::wheelSampleIsEvidence(twist_v(0), twist_v(1), twist_v(2)) &&
+            std::isfinite(wheel_speed_scale)) {
           state_ikfom st = kf.get_x();
           M3D Rw = st.rot.toRotationMatrix();     // R_{world←IMU}
           M3D Re_T = R_robot_to_imu.transpose();  // R_{robot←IMU}

@@ -11,8 +11,17 @@
 // wheel stream.
 //
 // The verdict is deliberately conservative: it may only ever be true when the
-// evidence positively says parked. Missing samples, non-finite numbers or a
-// stale wheel sample all fall back to "not proven".
+// evidence positively says parked. A non-finite IMU window is never static.
+//
+// A wheel sample that is ABSENT, STALE or NON-FINITE is the same thing: no wheel
+// evidence. The wheelspeed bridge says "cannot measure" in band, with NaN, and
+// it does so whenever it is gated — while the legs work, and permanently if its
+// wheel signs never lock or a sign mismatch latches. Reading that NaN as "not
+// parked" rather than as "no evidence" is what silently disabled the hold, the
+// parked-velocity zeroing and the runaway watchdog together, in exactly the
+// runs where the bridge was unhealthy and they were needed most. What happens
+// with no wheel evidence is `require_wheel`'s decision, and nothing else's;
+// runaway_watchdog.hpp already folds finiteness into its freshness test.
 //
 // Pure C++. No ROS, no Eigen.
 
@@ -42,6 +51,15 @@ struct ImuWindowStats
   double acc_mean = 0.0;  ///< mean |a| — the scale the span is judged against
 };
 
+/// Is a wheel-odometry sample a measurement at all? The bridge publishes NaN to
+/// mean "cannot measure" — the only in-band way for a Twist to say it, since 0
+/// there is a measurement of standstill. Callers must not feed a sample that
+/// fails this into anything that treats it as a number.
+inline bool wheelSampleIsEvidence(double vx, double vy, double vz)
+{
+  return std::isfinite(vx) && std::isfinite(vy) && std::isfinite(vz);
+}
+
 /// `wheel_age` < 0 means "no wheel sample at all".
 inline bool bodyIsStatic(const ImuWindowStats & imu,
                          double wheel_age,
@@ -64,11 +82,12 @@ inline bool bodyIsStatic(const ImuWindowStats & imu,
   if (!(imu.acc_mean > 0.0) || (imu.acc_max - imu.acc_min) > params.acc_span_ratio * imu.acc_mean) {
     return false;
   }
-  const bool wheel_fresh = wheel_age >= 0.0 && std::isfinite(wheel_age) && wheel_age <= params.wheel_max_age;
-  if (!wheel_fresh) {
+  const bool wheel_usable = wheel_age >= 0.0 && std::isfinite(wheel_age) &&
+                            wheel_age <= params.wheel_max_age && std::isfinite(wheel_speed);
+  if (!wheel_usable) {
     return !params.require_wheel;
   }
-  return std::isfinite(wheel_speed) && wheel_speed <= params.wheel_speed_thresh;
+  return wheel_speed <= params.wheel_speed_thresh;
 }
 
 }  // namespace fast_lio

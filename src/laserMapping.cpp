@@ -3422,6 +3422,22 @@ private:
       if (async_map_en)
         joinMapAdd();
       t_join = omp_get_wtime();
+#ifdef USE_IVOX
+      // Capacity is a silent failure mode: once the grid is full every new voxel costs the
+      // least-recently-written one, and with a prior map loaded those are the parts of it the
+      // robot has not driven through yet. Read here, where the async Add has just been joined.
+      if (ikdtree.evictedVoxels() != last_reported_evicted_voxels) {
+        last_reported_evicted_voxels = ikdtree.evictedVoxels();
+        RCLCPP_WARN_THROTTLE(this->get_logger(),
+                             *this->get_clock(),
+                             30000,
+                             "[IVOX] map at capacity: %zu voxel(s) evicted so far (holding %zu of "
+                             "ivox_max_voxels=%zu). The map no longer keeps everything it has seen.",
+                             last_reported_evicted_voxels,
+                             ikdtree.numVoxels(),
+                             ikdtree.maxVoxels());
+      }
+#endif
 
       /*** Segment the map in lidar FOV ***/
       lasermap_fov_segment();
@@ -3555,6 +3571,29 @@ private:
                           prior_ds->size(),
                           feats_down_size,
                           combined->size());
+#ifdef USE_IVOX
+              // The prior map has to survive the load intact. iVox bounds itself by evicting
+              // the least-recently-WRITTEN voxel, so a map larger than the capacity is
+              // truncated in PCD file order — an arbitrary hole in the map the robot is about
+              // to localize against, with no other symptom than a degraded match later.
+              if (ikdtree.evictedVoxels() > 0) {
+                RCLCPP_FATAL(this->get_logger(),
+                             "Prior map does not fit the map backend: %zu voxel(s) were evicted while loading "
+                             "(capacity ivox_max_voxels=%zu, held=%zu). The loaded map is truncated in PCD file "
+                             "order. Raise ivox_max_voxels, coarsen ivox_grid_resolution, or downsample the PCD "
+                             "(tools/downsample_pcd.py).",
+                             ikdtree.evictedVoxels(),
+                             ikdtree.maxVoxels(),
+                             ikdtree.numVoxels());
+                rclcpp::shutdown();
+                return;
+              }
+              RCLCPP_INFO(this->get_logger(),
+                          "[IVOX] prior map held: %zu voxel(s) of %zu capacity (%.1f%% used)",
+                          ikdtree.numVoxels(),
+                          ikdtree.maxVoxels(),
+                          100.0 * static_cast<double>(ikdtree.numVoxels()) / static_cast<double>(ikdtree.maxVoxels()));
+#endif
             } else {
               RCLCPP_ERROR(this->get_logger(),
                            "Failed to load prior map PCD: %s, falling back to normal init",
@@ -4735,6 +4774,7 @@ private:
   ofstream fout_pre, fout_out, fout_dbg, fout_jump, fout_kalman;
 
   std::string prior_map_pcd_;
+  std::size_t last_reported_evicted_voxels = 0;  // last value the capacity WARN reported
   std::vector<double> initial_pose_vec_;
   bool initial_pose_full_rpy_override_ = false;
 };

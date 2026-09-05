@@ -137,6 +137,17 @@ class IVox {
   bool empty() const { return map_.empty(); }
   std::size_t numVoxels() const { return map_.size(); }
 
+  // --- Capacity accounting ---------------------------------------------------------------
+  // Reaching max_voxels_ is not an error by itself (LRU is how this backend bounds memory),
+  // but it is silent: the oldest-WRITTEN voxel is dropped with no trace, and "oldest written"
+  // is not "furthest away" — Nearest_Search never touches the LRU, so a region the robot is
+  // standing in front of is evicted just the same if nothing has been added to it lately.
+  // A prior map loaded past capacity is therefore truncated in PCD file order. Callers
+  // report on these counters instead of finding out through a degraded match.
+  std::size_t maxVoxels() const { return max_voxels_; }
+  std::size_t evictedVoxels() const { return evicted_voxels_; }
+  bool atCapacity() const { return map_.size() >= max_voxels_; }
+
  private:
   struct Key {
     int x, y, z;
@@ -184,6 +195,7 @@ class IVox {
   void evictOldest() {
     const Key old = lru_.back();
     lru_.pop_back();
+    ++evicted_voxels_;
     auto it = map_.find(old);
     if (it != map_.end()) {
       for (const auto& q : it->second.pts) occupied_fine_.erase(fineKey(q));  // free its fine boxes
@@ -204,6 +216,7 @@ class IVox {
   robin_hood::unordered_flat_set<Key, KeyHash> occupied_fine_;  // global 1-pt-per-fine-box dedup
   std::list<Key> lru_;
   std::size_t num_points_ = 0;
+  std::size_t evicted_voxels_ = 0;
 };
 
 }  // namespace lio_ivox

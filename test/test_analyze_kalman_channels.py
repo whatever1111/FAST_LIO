@@ -39,7 +39,12 @@ def diagnostic_row(channel="lidar", time=1.0, dgrav=(0.1, 0.0, 0.0)):
 def write_rows(path, rows, fieldnames=None):
     names = fieldnames or list(MODULE.REQUIRED_COLUMNS)
     with path.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=names)
+        # extrasaction="ignore": a caller that passes a restricted `fieldnames` is
+        # asking for a CSV that is MISSING those columns. The default ("raise")
+        # made write_rows itself throw a ValueError about the omitted column, so
+        # the missing-column test died in its own setup and never reached the
+        # load_rows call it exists to check.
+        writer = csv.DictWriter(stream, fieldnames=names, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 

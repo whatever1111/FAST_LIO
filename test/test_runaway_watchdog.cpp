@@ -118,6 +118,30 @@ TEST(RunawayWatchdog, TripsOncePerEpisodeThenReArms)
   EXPECT_EQ(s.trips, 3u);
 }
 
+TEST(RunawayWatchdog, ATripTheCallerDoesNotActOnKeepsFiring)
+{
+  // Dog 2, 2026-09-05: the trip response rebuilt the map but left the phantom
+  // velocity in the state, so the identical contradiction re-armed and fired
+  // again — 91 trips, 54 of the 90 intervals landing on hold_sec exactly. The
+  // watchdog re-arms by design; clearing the contradiction is the caller's job.
+  RunawayParams p;
+  RunawayState ignoring;
+  RunawayState acting;
+  double speed = 2.5;  // the phantom velocity the estimate carried
+  int ignored_trips = 0;
+  int acted_trips = 0;
+  for (int i = 0; i < 300; ++i) {  // 30 s parked
+    const double t = i * 0.1;
+    ignored_trips += updateRunawayWatchdog(&ignoring, t, 2.5, true, 0.05, 0.0, p).tripped ? 1 : 0;
+    if (updateRunawayWatchdog(&acting, t, speed, true, 0.05, 0.0, p).tripped) {
+      ++acted_trips;
+      speed = 0.0;  // what the fix does: the wheels and the IMU both say zero
+    }
+  }
+  EXPECT_EQ(ignored_trips, 9);   // every hold_sec, for as long as the state is left alone
+  EXPECT_EQ(acted_trips, 1);     // once, then the contradiction is gone
+}
+
 TEST(RunawayWatchdog, BackwardsClockRestartsTheWindow)
 {
   RunawayState s;

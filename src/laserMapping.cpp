@@ -322,6 +322,8 @@ SO3 zupt_anchor_rot;
 bool zupt_anchor_valid = false;
 bool zupt_active = false;
 int zupt_hold_scans = 0;
+// m/s; a parked ZUPT that shaves off less than this is filter noise, not news.
+constexpr double kZuptPhantomReportSpeed = 0.1;
 double last_twist_stamp = -1.0;  // newest wheel-speed sample time (s); -1 = none yet
 double last_twist_speed = 0.0;   // |v| of the newest wheel sample (m/s)
 // Re-anchor gate: the guard used to unfreeze the map the moment the scene
@@ -4314,6 +4316,10 @@ private:
         zupt_active = false;
         zupt_hold_scans = 0;
       };
+      // One verdict per scan: the static hold, the parked ZUPT on the healthy
+      // branch and the runaway watchdog must all answer "is it parked?" the same
+      // way, and the summary costs an IMU-window pass.
+      const bool body_static = body_is_static(Measures, lidar_end_time);
       if (reanchor.degraded) {
         state_ikfom st = kf.get_x();
         const double spd = st.vel.norm();
@@ -4322,7 +4328,7 @@ private:
         // integrate, and zeroing only the velocity still leaves the position and
         // attitude wherever propagation put them (dog 2, 2026-09-04: −3.9 m of Z
         // in 9 s, unrecoverable once the map unfroze around the wrong pose).
-        const bool static_hold = zupt_en && zupt_anchor_valid && body_is_static(Measures, lidar_end_time);
+        const bool static_hold = zupt_en && zupt_anchor_valid && body_static;
         if (static_hold) {
           st.pos = zupt_anchor_pos;
           st.rot = zupt_anchor_rot;
@@ -4393,6 +4399,34 @@ private:
         zupt_anchor_rot = state_point.rot;
         zupt_anchor_valid = true;
         release_static_hold("scan healthy");
+        // A parked platform has zero velocity, and a healthy-looking scan does not
+        // enforce that: with far_frac 0.84 the correspondences pin rotation and
+        // leave translation nearly free, so the velocity state rides the IMU bias
+        // while effct and the residual stay good. Measured on dog 2 (2026-09-05):
+        // 21 of 22 runaway trips fired with the OEM body velocity at 0.03 m/s and
+        // the estimate claiming 0.4-2.6 m/s — every one of them on this branch,
+        // where nothing consulted the static evidence at all. Zero the velocity
+        // only: the healthy scan owns the pose, so a false "parked" costs one scan
+        // of re-convergence rather than a pin at the wrong place.
+        if (zupt_en && body_static) {
+          state_ikfom st = kf.get_x();
+          const double spd = st.vel.norm();
+          if (spd > 0.0) {
+            st.vel.setZero();
+            kf.change_x(st);
+            state_point = kf.get_x();
+            if (spd > kZuptPhantomReportSpeed) {
+              RCLCPP_WARN_THROTTLE(this->get_logger(),
+                                   *this->get_clock(),
+                                   5000,
+                                   "[ZUPT] parked with a healthy scan: zeroed %.2fm/s of phantom velocity "
+                                   "(effct=%d far_frac=%.2f)",
+                                   spd,
+                                   effct_feat_num,
+                                   scan_far_frac);
+            }
+          }
+        }
       }
 
       /*** Runaway watchdog (runaway_watchdog.hpp): the guard above keys off the
@@ -4412,7 +4446,7 @@ private:
         const auto runaway = fast_lio::updateRunawayWatchdog(&runaway_state,
                                                              lidar_end_time,
                                                              state_point.vel.norm(),
-                                                             body_is_static(Measures, lidar_end_time),
+                                                             body_static,
                                                              wheel_age,
                                                              wheel_speed,
                                                              runaway_params);
@@ -4428,6 +4462,17 @@ private:
                        res_mean_last,
                        runaway_state.trips,
                        runaway_on_trip.c_str());
+          // Clear what tripped it. A kParked trip says the velocity is phantom,
+          // and rebuilding the map around a state that still carries it re-arms
+          // the identical contradiction: dog 2 (2026-09-05) tripped 91 times, 54
+          // of the 90 intervals landing on hold_sec exactly. The IMU and the
+          // wheels both say zero — the map is not the part that is wrong.
+          if (runaway.reason == fast_lio::RunawayReason::kParked) {
+            state_ikfom st = kf.get_x();
+            st.vel.setZero();
+            kf.change_x(st);
+            state_point = kf.get_x();
+          }
           if (runaway_on_trip == "reset_map") {
             rebuild_local_map("RUNAWAY");
           } else if (runaway_on_trip == "fault_exit") {

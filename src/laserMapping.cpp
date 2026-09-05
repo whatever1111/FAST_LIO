@@ -93,6 +93,7 @@
 #include "degeneracy_policy.hpp"
 #include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
+#include "zupt_policy.hpp"
 #include "preprocess.h"
 
 #define INIT_TIME (0.1)
@@ -322,8 +323,6 @@ SO3 zupt_anchor_rot;
 bool zupt_anchor_valid = false;
 bool zupt_active = false;
 int zupt_hold_scans = 0;
-// m/s; a parked ZUPT that shaves off less than this is filter noise, not news.
-constexpr double kZuptPhantomReportSpeed = 0.1;
 double last_twist_stamp = -1.0;  // newest wheel-speed sample time (s); -1 = none yet
 double last_twist_speed = 0.0;   // |v| of the newest wheel sample (m/s)
 // Re-anchor gate: the guard used to unfreeze the map the moment the scene
@@ -4318,18 +4317,25 @@ private:
       };
       // One verdict per scan: the static hold, the parked ZUPT on the healthy
       // branch and the runaway watchdog must all answer "is it parked?" the same
-      // way, and the summary costs an IMU-window pass.
+      // way, and the summary costs an IMU-window pass. What that verdict is
+      // allowed to do to the state is the decision table in zupt_policy.hpp.
       const bool body_static = body_is_static(Measures, lidar_end_time);
+      fast_lio::ZuptPolicyInputs zupt_in;
+      zupt_in.scan_degraded = reanchor.degraded;
+      zupt_in.zupt_enabled = zupt_en;
+      zupt_in.anchor_valid = zupt_anchor_valid;
+      zupt_in.body_static = body_static;
+      zupt_in.speed = kf.get_x().vel.norm();
+      zupt_in.max_speed = divergence_guard_max_speed;
+      const fast_lio::ZuptDecision zupt_verdict = fast_lio::decideZupt(zupt_in);
       if (reanchor.degraded) {
         state_ikfom st = kf.get_x();
-        const double spd = st.vel.norm();
         // Static hold takes precedence over the speed reset: with independent
         // proof that the platform is parked, the blind stretch has nothing to
         // integrate, and zeroing only the velocity still leaves the position and
         // attitude wherever propagation put them (dog 2, 2026-09-04: −3.9 m of Z
         // in 9 s, unrecoverable once the map unfroze around the wrong pose).
-        const bool static_hold = zupt_en && zupt_anchor_valid && body_static;
-        if (static_hold) {
+        if (zupt_verdict.hold) {
           st.pos = zupt_anchor_pos;
           st.rot = zupt_anchor_rot;
           st.vel.setZero();
@@ -4350,7 +4356,7 @@ private:
           // Not parked, and the scan still cannot confirm the pose: this is the
           // stretch the hold must NOT survive into.
           release_static_hold("moving again while degraded");
-          if (spd > divergence_guard_max_speed) {
+          if (zupt_verdict.action == fast_lio::ZuptAction::kZeroVelocity) {
             // A body speed above the platform's physical maximum is a
             // GUARANTEED-WRONG state, not a bound to enforce. Clamping it to
             // max_speed (the old behaviour) turned the clamp into an
@@ -4408,23 +4414,20 @@ private:
         // where nothing consulted the static evidence at all. Zero the velocity
         // only: the healthy scan owns the pose, so a false "parked" costs one scan
         // of re-convergence rather than a pin at the wrong place.
-        if (zupt_en && body_static) {
+        if (zupt_verdict.action == fast_lio::ZuptAction::kZeroVelocity) {
           state_ikfom st = kf.get_x();
-          const double spd = st.vel.norm();
-          if (spd > 0.0) {
-            st.vel.setZero();
-            kf.change_x(st);
-            state_point = kf.get_x();
-            if (spd > kZuptPhantomReportSpeed) {
-              RCLCPP_WARN_THROTTLE(this->get_logger(),
-                                   *this->get_clock(),
-                                   5000,
-                                   "[ZUPT] parked with a healthy scan: zeroed %.2fm/s of phantom velocity "
-                                   "(effct=%d far_frac=%.2f)",
-                                   spd,
-                                   effct_feat_num,
-                                   scan_far_frac);
-            }
+          st.vel.setZero();
+          kf.change_x(st);
+          state_point = kf.get_x();
+          if (zupt_verdict.report) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(),
+                                 *this->get_clock(),
+                                 5000,
+                                 "[ZUPT] parked with a healthy scan: zeroed %.2fm/s of phantom velocity "
+                                 "(effct=%d far_frac=%.2f)",
+                                 zupt_in.speed,
+                                 effct_feat_num,
+                                 scan_far_frac);
           }
         }
       }

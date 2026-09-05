@@ -224,6 +224,12 @@ if(BUILD_TESTING)
   if(TARGET test_prior_map_load)
     target_include_directories(test_prior_map_load PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
+  # Pure header, no ROS: the decision table laserMapping.cpp's two scan branches share
+  # for "the platform is parked — what may that do to the state?".
+  ament_add_gtest(test_zupt_policy test/test_zupt_policy.cpp)
+  if(TARGET test_zupt_policy)
+    target_include_directories(test_zupt_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
 endif()
 
 # ---------------- Install --------------- #

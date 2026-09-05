@@ -89,6 +89,7 @@
 #include "reanchor_gate.hpp"
 #include "adaptive_downsample.hpp"
 #include "voxel_downsample.hpp"
+#include "degeneracy_policy.hpp"
 #include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
 #include "preprocess.h"
@@ -154,7 +155,28 @@ int iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidN
 // divergence (see memory bag2-divergence-is-flio2-frontend).
 double pos_obs_eig_min = 0.0, pos_obs_eig_max = 0.0, pos_obs_z_weak = 0.0;
 Eigen::Matrix3d pos_obs_M = Eigen::Matrix3d::Zero();  // Σ n nᵀ of the last update (world frame), for the [SCAN] trace
-bool degeneracy_debug = false;  // verbose per-frame [DEGEN] diagnostics
+bool degeneracy_debug = false;                        // verbose per-frame [DEGEN] diagnostics
+// The spectrum trace alone, without the per-scan cerr traffic degeneracy_debug carries:
+// throttled, so it costs nothing and can run on a scoring replay. Calibrating the
+// thresholds needs the spectrum of a run that did NOT diverge, which is exactly what
+// the heavier flag cannot give.
+bool degeneracy_spectrum_trace = false;
+
+// Subspace weighting (degeneracy_policy.hpp): hold the LiDAR position update back in
+// the directions this scan does not constrain, instead of trusting or discarding the
+// scan whole. Inert by construction on a healthy scan; default OFF pending bag
+// validation. The scalar defences (guard / ZUPT / re-anchor) stay: this grades the
+// PARTIAL degeneracy of a doorway or corridor, it does not cover a starved scan that
+// constrains nothing at all, and it supplies no information of its own — the released
+// directions fall to IMU propagation until a prior (planar-Z, ZUPT, wheel) fills them.
+fast_lio::DegeneracyParams degeneracy_params;
+fast_lio::DegeneracyResult degeneracy_last;  // last h_share_model verdict, for the traces
+// How much the policy actually did, since a throttled log line cannot say: scans whose
+// final iteration held a direction back, out of scans updated, and the mean per-point
+// weight it applied. Without these the dose is unmeasurable and so is any A/B.
+long degeneracy_scans_engaged = 0, degeneracy_scans_total = 0;
+long degeneracy_point_weighted = 0;
+double degeneracy_point_weight_sum = 0.0;
 
 // Front-end health side-channel (Plan C): per-scan along-motion observability and
 // quality metrics published on /Odometry twist.covariance for the PGO
@@ -2529,6 +2551,49 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     ekfom_data.h(i) = -norm_p.intensity;
   }
 
+  /*** Subspace weighting. Judged on the position information LEFT once rotation has
+   *   been solved for (the Schur complement of H^T H over the rotation columns), taken
+   *   straight off the Jacobian we just built, then applied per point: this plane only
+   *   constrains its own normal, so weight it by how much the policy trusts that
+   *   direction. Row AND residual together — that is what makes it R_i <- R / s^2, a
+   *   weight on the measurement, rather than a claim that the plane faces elsewhere.
+   *   Recomputed every iEKF iteration: the correspondences move with the state. ***/
+  {
+    const auto H_t = ekfom_data.h_x.leftCols(3);
+    const auto H_r = ekfom_data.h_x.middleCols(3, 3);
+    const Eigen::Matrix3d H_tt = H_t.transpose() * H_t;
+    const Eigen::Matrix3d H_tr = H_t.transpose() * H_r;
+    const Eigen::Matrix3d H_rr = H_r.transpose() * H_r;
+    degeneracy_last = fast_lio::computePositionDegeneracy(H_tt, H_tr, H_rr, effct_feat_num, degeneracy_params);
+    if (degeneracy_spectrum_trace) {
+      // Both spectra side by side: the gap between them is what rotation explains away,
+      // and it is the only way to see the coupling the thresholds now have to live with.
+      static rclcpp::Clock degen_spectrum_clock(RCL_STEADY_TIME);
+      const Eigen::Vector3d tt = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(H_tt).eigenvalues();
+      const Eigen::Vector3d & sh = degeneracy_last.lambda_norm;
+      const Eigen::Vector3d & ab = degeneracy_last.lambda_abs;
+      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                           degen_spectrum_clock,
+                           2000,
+                           "[DEGEN-SPECTRUM] shares [%.3f %.3f %.3f] sum=%.3f | judged raw [%.1f %.1f %.1f] | "
+                           "H_tt raw [%.1f %.1f %.1f] | effct=%d far_frac=%.2f",
+                           sh(0), sh(1), sh(2), sh.sum(), ab(0), ab(1), ab(2),
+                           tt(0), tt(1), tt(2), effct_feat_num, scan_far_frac);
+    }
+    if (degeneracy_last.engaged) {
+      for (int i = 0; i < effct_feat_num; i++) {
+        const PointType & np = corr_normvect->points[i];
+        const double point_w = fast_lio::pointWeight(degeneracy_last, Eigen::Vector3d(np.x, np.y, np.z));
+        if (point_w < 1.0) {
+          ekfom_data.h_x.block<1, 12>(i, 0) *= point_w;
+          ekfom_data.h(i) *= point_w;
+          degeneracy_point_weight_sum += point_w;
+          ++degeneracy_point_weighted;
+        }
+      }
+    }
+  }
+
   solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -2555,6 +2620,25 @@ public:
     this->declare_parameter<int>("adaptive_downsample_raise_after", 5);
     this->declare_parameter<int>("adaptive_downsample_lower_after", 100);
     this->declare_parameter<bool>("degeneracy_debug", false);
+    this->declare_parameter<bool>("degeneracy_spectrum_trace", false);
+    // Subspace weighting of the LiDAR position update. The thresholds are SHARES of
+    // the scan's position information (the three normalised eigenvalues sum to 1), so
+    // they must stay well under 1/3 — see degeneracy_policy.hpp.
+    this->declare_parameter<bool>("degeneracy_weighting_en", false);
+    this->declare_parameter<double>("degeneracy_lambda_bad", 0.02);
+    this->declare_parameter<double>("degeneracy_lambda_good", 0.10);
+    this->declare_parameter<double>("degeneracy_min_weight", 0.0);
+    // Absolute test, in effective normals: scales with the downsample density, so it is
+    // a platform value. Compare against R / sigma_pos^2 — below that the propagated
+    // prior already outweighs the scan in that direction. 0/0 disables it.
+    this->declare_parameter<double>("degeneracy_lambda_abs_bad", 2.0);
+    this->declare_parameter<double>("degeneracy_lambda_abs_good", 20.0);
+    // Every weight 0 or 1: the only setting that is also an exact constrained solve.
+    this->declare_parameter<bool>("degeneracy_hard_projection", false);
+    // Judge the Schur complement, so a direction rotation can explain away is not
+    // counted as observed. Changes what both thresholds mean — recalibrate with them.
+    this->declare_parameter<bool>("degeneracy_schur_en", false);
+    this->declare_parameter<double>("degeneracy_schur_ridge", 1e-6);
     this->declare_parameter<bool>("health_pub_en", true);
     this->declare_parameter<bool>("planar_constraint_en", false);
     this->declare_parameter<double>("planar_constraint_noise", 0.1);
@@ -2723,6 +2807,16 @@ public:
     this->get_parameter_or<int>("adaptive_downsample_raise_after", adaptive_ds_params.raise_after, 5);
     this->get_parameter_or<int>("adaptive_downsample_lower_after", adaptive_ds_params.lower_after, 100);
     this->get_parameter_or<bool>("degeneracy_debug", degeneracy_debug, false);
+    this->get_parameter_or<bool>("degeneracy_spectrum_trace", degeneracy_spectrum_trace, false);
+    this->get_parameter_or<bool>("degeneracy_weighting_en", degeneracy_params.enable, false);
+    this->get_parameter_or<double>("degeneracy_lambda_bad", degeneracy_params.lambda_bad, 0.02);
+    this->get_parameter_or<double>("degeneracy_lambda_good", degeneracy_params.lambda_good, 0.10);
+    this->get_parameter_or<double>("degeneracy_min_weight", degeneracy_params.min_weight, 0.0);
+    this->get_parameter_or<double>("degeneracy_lambda_abs_bad", degeneracy_params.lambda_abs_bad, 2.0);
+    this->get_parameter_or<double>("degeneracy_lambda_abs_good", degeneracy_params.lambda_abs_good, 20.0);
+    this->get_parameter_or<bool>("degeneracy_hard_projection", degeneracy_params.hard_projection, false);
+    this->get_parameter_or<bool>("degeneracy_schur_en", degeneracy_params.schur_en, false);
+    this->get_parameter_or<double>("degeneracy_schur_ridge", degeneracy_params.schur_ridge, 1e-6);
     this->get_parameter_or<bool>("health_pub_en", health_pub_en, true);
     this->get_parameter_or<bool>("planar_constraint_en", planar_constraint_en, false);
     this->get_parameter_or<double>("planar_constraint_noise", planar_constraint_noise, 0.1);
@@ -3045,6 +3139,20 @@ public:
                   wheel_speed_scale,
                   wheel_odom_en ? "on" : "off",
                   zupt_en ? "on" : "off");
+    }
+    if (degeneracy_params.enable) {
+      RCLCPP_INFO(this->get_logger(),
+                  "Subspace weighting ON (%s): a position direction is held back only when its share is under %.3f "
+                  "(isotropic = 0.333, full trust at %.3f) AND its raw eigenvalue is under %.1f (full trust at %.1f); "
+                  "floor %.2f",
+                  degeneracy_params.schur_en
+                    ? (degeneracy_params.hard_projection ? "Schur, hard projection" : "Schur, graded")
+                    : (degeneracy_params.hard_projection ? "H_tt, hard projection" : "H_tt, graded"),
+                  degeneracy_params.lambda_bad,
+                  degeneracy_params.lambda_good,
+                  degeneracy_params.lambda_abs_bad,
+                  degeneracy_params.lambda_abs_good,
+                  degeneracy_params.min_weight);
     }
     pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
     pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
@@ -3533,6 +3641,40 @@ private:
       if (kalman_channel_diag_en) {
         writeKalmanChannel(
           "lidar", state_before_update, state_point, lidarCovarianceBefore, lidarDiagnostics, Zero3d, Zero3d);
+      }
+
+      // Held-back directions are otherwise invisible: the pose keeps coming out at the
+      // same rate and the scan keeps matching. Name the direction and what fills it,
+      // because nothing here does — the released axis rides on IMU propagation until a
+      // prior (planar-Z, ZUPT, wheel) supplies it.
+      if (degeneracy_params.enable) {
+        ++degeneracy_scans_total;
+      }
+      if (degeneracy_last.engaged) {
+        ++degeneracy_scans_engaged;
+        const Eigen::Vector3d weak = degeneracy_last.basis.col(0);
+        const double mean_w =
+          degeneracy_point_weighted > 0 ? degeneracy_point_weight_sum / double(degeneracy_point_weighted) : 1.0;
+        RCLCPP_WARN_THROTTLE(this->get_logger(),
+                             *this->get_clock(),
+                             2000,
+                             "[SUBSPACE] LiDAR position held back: weakest dir [%.2f %.2f %.2f] share=%.3f lambda=%.1f "
+                             "weight=%.2f (effct=%d far_frac=%.2f); dose: %ld/%ld scans, mean point weight %.3f over "
+                             "%ld points; that axis is on IMU propagation, planar-Z %s ZUPT %s",
+                             weak.x(),
+                             weak.y(),
+                             weak.z(),
+                             degeneracy_last.lambda_norm(0),
+                             degeneracy_last.lambda_abs(0),
+                             degeneracy_last.weights(0),
+                             effct_feat_num,
+                             scan_far_frac,
+                             degeneracy_scans_engaged,
+                             degeneracy_scans_total,
+                             mean_w,
+                             degeneracy_point_weighted,
+                             planar_constraint_en ? "on" : "OFF",
+                             zupt_en ? "on" : "OFF");
       }
 
       /*** Divergence guard (P1) — two independent divergence signals:

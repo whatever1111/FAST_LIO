@@ -199,6 +199,12 @@ if(BUILD_TESTING)
   if(TARGET test_adaptive_downsample)
     target_include_directories(test_adaptive_downsample PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
+  # Pure header, Eigen only: which directions of the scan's position information are
+  # worth keeping, and by how much to hold back the rest.
+  ament_add_gtest(test_degeneracy_policy test/test_degeneracy_policy.cpp)
+  if(TARGET test_degeneracy_policy)
+    target_include_directories(test_degeneracy_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
   # Pure header, no PCL: one representative per occupied voxel, in one pass.
   ament_add_gtest(test_voxel_downsample test/test_voxel_downsample.cpp)
   if(TARGET test_voxel_downsample)

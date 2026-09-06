@@ -171,3 +171,79 @@ TEST(PriorMapCapacity, FitsWhenUnderOrAtCapacityAndWhenUnbounded)
   EXPECT_FALSE(priorMapFitsCapacity(1001u, 1000u));
   EXPECT_TRUE(priorMapFitsCapacity(9999999u, 0u));  // 0 = unbounded
 }
+
+// --- prior_map_align: where the map-to-front-end transform comes from --------------
+
+TEST(PriorMapAlign, KnownNamesParseAndUnknownOnesAreReported)
+{
+  fast_lio::PriorMapAlign a = fast_lio::PriorMapAlign::kRelocalization;
+  EXPECT_TRUE(fast_lio::parsePriorMapAlign("", &a));
+  EXPECT_EQ(a, fast_lio::PriorMapAlign::kAsDelivered);
+  EXPECT_TRUE(fast_lio::parsePriorMapAlign("as_delivered", &a));
+  EXPECT_EQ(a, fast_lio::PriorMapAlign::kAsDelivered);
+  EXPECT_TRUE(fast_lio::parsePriorMapAlign("none", &a));
+  EXPECT_EQ(a, fast_lio::PriorMapAlign::kAsDelivered);
+  EXPECT_TRUE(fast_lio::parsePriorMapAlign("relocalization", &a));
+  EXPECT_EQ(a, fast_lio::PriorMapAlign::kRelocalization);
+  EXPECT_TRUE(fast_lio::parsePriorMapAlign("reloc", &a));
+  EXPECT_EQ(a, fast_lio::PriorMapAlign::kRelocalization);
+
+  a = fast_lio::PriorMapAlign::kRelocalization;
+  EXPECT_FALSE(fast_lio::parsePriorMapAlign("ndt", &a));
+  EXPECT_EQ(a, fast_lio::PriorMapAlign::kAsDelivered) << "an unknown value must not silently relocalize";
+}
+
+TEST(PriorMapLeaf, ZeroOrNegativeMeansTheLiveMapsDedupGrid)
+{
+  EXPECT_DOUBLE_EQ(fast_lio::priorMapLeaf(0.0, 0.3), 0.3);
+  EXPECT_DOUBLE_EQ(fast_lio::priorMapLeaf(-1.0, 0.3), 0.3);
+  EXPECT_DOUBLE_EQ(fast_lio::priorMapLeaf(0.15, 0.3), 0.15);
+}
+
+// --- reinstalling the prior tier when the alignment moves --------------------------
+
+namespace
+{
+Eigen::Isometry3d se3(double x, double y, double yaw_deg)
+{
+  Eigen::Isometry3d t = Eigen::Isometry3d::Identity();
+  t.linear() = Eigen::AngleAxisd(yaw_deg * M_PI / 180.0, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  t.translation() = Eigen::Vector3d(x, y, 0.0);
+  return t;
+}
+}  // namespace
+
+TEST(PriorMapReinstall, TheFirstAlignmentAlwaysInstalls)
+{
+  EXPECT_TRUE(fast_lio::priorMapReinstallNeeded(false, Eigen::Isometry3d::Identity(), se3(0.0, 0.0, 0.0)))
+    << "nothing installed yet: even an identity alignment is new information";
+}
+
+TEST(PriorMapReinstall, RepublishingTheSameAlignmentDoesNotReinstall)
+{
+  const Eigen::Isometry3d t = se3(3.0, -2.0, 40.0);
+  EXPECT_FALSE(fast_lio::priorMapReinstallNeeded(true, t, t));
+  EXPECT_FALSE(fast_lio::priorMapReinstallNeeded(true, t, se3(3.02, -2.01, 40.1)))
+    << "the producer re-confirms its own answer; that is not a move";
+}
+
+TEST(PriorMapReinstall, AMovedAlignmentReinstalls)
+{
+  const Eigen::Isometry3d t = se3(3.0, -2.0, 40.0);
+  EXPECT_TRUE(fast_lio::priorMapReinstallNeeded(true, t, se3(3.5, -2.0, 40.0))) << "0.5 m is a move";
+  EXPECT_TRUE(fast_lio::priorMapReinstallNeeded(true, t, se3(3.0, -2.0, 42.0))) << "2 deg is a move";
+}
+
+TEST(PriorMapReinstall, TheThresholdsAreTheCallersToSet)
+{
+  const Eigen::Isometry3d t = se3(0.0, 0.0, 0.0);
+  EXPECT_FALSE(fast_lio::priorMapReinstallNeeded(true, t, se3(0.4, 0.0, 0.0), 1.0, 1.0));
+  EXPECT_TRUE(fast_lio::priorMapReinstallNeeded(true, t, se3(0.4, 0.0, 0.0), 0.1, 1.0));
+}
+
+TEST(PriorMapReinstall, YawIsReadFromTheRotationNotTheTranslation)
+{
+  // A pure 180 deg turn with no translation still has to reinstall: the map would
+  // otherwise sit backwards in the front end's frame.
+  EXPECT_TRUE(fast_lio::priorMapReinstallNeeded(true, se3(0.0, 0.0, 0.0), se3(0.0, 0.0, 180.0)));
+}

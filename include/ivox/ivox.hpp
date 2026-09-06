@@ -79,6 +79,23 @@ class IVox {
     lru_.clear();
   }
 
+  // Drop the pinned tier, keep what the live scans put here. The counterpart of
+  // clearLive(): a prior map installed at one alignment has to go away whole before one
+  // installed at a better alignment takes its place, or the two sit in the map together
+  // and every plane fit gets to choose between them.
+  void clearPinned() {
+    for (auto it = map_.begin(); it != map_.end();) {
+      if (!it->second.pinned) {
+        ++it;
+        continue;
+      }
+      for (const auto& q : it->second.pts) occupied_fine_.erase(fineKey(q));
+      num_points_ -= it->second.pts.size();
+      it = map_.erase(it);
+    }
+    pinned_voxels_ = 0;
+  }
+
   void clear() {
     map_.clear();
     occupied_fine_.clear();
@@ -101,6 +118,15 @@ class IVox {
       // GLOBAL fine-grid (downsample_size_) dedup: <=1 point per fine box across the WHOLE
       // map (not per-voxel), so fine boxes straddling NN-voxel borders aren't double-kept.
       // This keeps res=0.5 NN voxels (best probe agreement) at ikd-Tree's 542k map size.
+      //
+      // First point wins, and that includes a live point holding a box a later PINNED add
+      // wants: a prior map fills what this run has not already seen, and does not displace
+      // what it has. That is the right way round — the live points there came from the
+      // scans being matched right now, so they are exactly consistent with them, while the
+      // prior map's are from another run and another trajectory — but it has a consequence
+      // worth knowing: the pinned tier is not a complete copy of the delivered map, and
+      // pinnedVoxels() counts what went in, not what was offered. AddPinnedPoints returns
+      // the same count, so a caller can report the shortfall.
       Key fk{};
       if (downsample_on) {
         fk = fineKey(p);

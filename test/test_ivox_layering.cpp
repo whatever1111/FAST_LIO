@@ -149,3 +149,92 @@ TEST(IvoxLayering, WithoutPinningTheBackendBehavesExactlyAsBefore)
   v.clearLive();
   EXPECT_EQ(v.size(), 0) << "with nothing pinned, clearLive empties the map";
 }
+
+TEST(IvoxLayering, ClearPinnedDropsThePriorTierAndKeepsTheLiveOne)
+{
+  // Reinstalling a prior map at a better alignment: the old tier has to leave whole,
+  // and what this run learned has to stay.
+  Ivox v = makeIvox(1000);
+  Cloud prior = lattice(0.0f, 5);
+  Cloud live = lattice(100.0f, 7);
+  v.AddPinnedPoints(prior);
+  v.Add_Points(live, true);
+  const int total = v.size();
+  ASSERT_EQ(total, 12);
+  EXPECT_EQ(v.pinnedVoxels(), 5u);
+
+  v.clearPinned();
+  EXPECT_EQ(v.pinnedVoxels(), 0u);
+  EXPECT_EQ(v.size(), 7) << "the live points survive the prior tier leaving";
+  Cloud near;
+  std::vector<float> sqdist;
+  v.Nearest_Search(live.front(), 1, near, sqdist);
+  ASSERT_EQ(near.size(), 1u);
+  EXPECT_NEAR(sqdist[0], 0.0f, 1e-6f);
+}
+
+TEST(IvoxLayering, ClearPinnedFreesTheFineGridSoTheSameCellsCanBeRelearned)
+{
+  // The dedup grid is keep-first: if clearPinned left the prior's fine boxes marked,
+  // the reinstalled map could not occupy the cells it just left.
+  Ivox v = makeIvox(1000);
+  Cloud prior = lattice(0.0f, 5);
+  v.AddPinnedPoints(prior);
+  v.clearPinned();
+  EXPECT_EQ(v.size(), 0);
+  Cloud again = lattice(0.0f, 5);
+  EXPECT_EQ(v.AddPinnedPoints(again), 5) << "every cell the cleared tier held is free again";
+  EXPECT_EQ(v.pinnedVoxels(), 5u);
+}
+
+TEST(IvoxLayering, ClearPinnedOnAMapWithNoPriorTierIsANoOp)
+{
+  Ivox v = makeIvox(1000);
+  Cloud live = lattice(0.0f, 6);
+  v.Add_Points(live, true);
+  const int before = v.size();
+  v.clearPinned();
+  EXPECT_EQ(v.size(), before);
+  EXPECT_EQ(v.pinnedVoxels(), 0u);
+}
+
+TEST(IvoxLayering, APriorMapFillsWhatTheLiveMapHasNotAlreadyClaimed)
+{
+  // The dedup grid is first-point-wins, and that applies to a pinned add too: where this
+  // run has already put a point, the delivered map does not displace it. That is the right
+  // way round — those live points came from the scans being matched right now — but it
+  // means the pinned tier is not a complete copy of the delivered map, and the count that
+  // came back is the only honest report of how much of it went in.
+  Ivox v = makeIvox(1000);
+  Cloud live = lattice(0.0f, 3);
+  v.Add_Points(live, true);
+  Cloud prior = lattice(0.0f, 5);  // the same 3 cells, plus 2 the live map never saw
+  EXPECT_EQ(v.AddPinnedPoints(prior), 2) << "only the cells the live map left free are taken";
+  EXPECT_EQ(v.pinnedVoxels(), 2u);
+  EXPECT_EQ(v.size(), 5);
+
+  v.clearPinned();
+  EXPECT_EQ(v.pinnedVoxels(), 0u);
+  EXPECT_EQ(v.size(), 3) << "clearing the prior tier leaves this run's own map standing";
+}
+
+TEST(IvoxLayering, ReinstallingAPriorMapAtANewAlignmentReplacesItWhole)
+{
+  // What the relocalization path does: install, then install again somewhere else. The
+  // second install must not leave the first one in the map beside it.
+  Ivox v = makeIvox(1000);
+  Cloud first = lattice(0.0f, 4);
+  v.AddPinnedPoints(first);
+  EXPECT_EQ(v.pinnedVoxels(), 4u);
+
+  v.clearPinned();
+  Cloud second = lattice(50.0f, 4);  // the same map, 50 m away
+  EXPECT_EQ(v.AddPinnedPoints(second), 4);
+  EXPECT_EQ(v.pinnedVoxels(), 4u);
+  EXPECT_EQ(v.size(), 4) << "one copy of the prior map, at the new alignment";
+
+  Cloud near;
+  std::vector<float> sqdist;
+  v.Nearest_Search(first.front(), 1, near, sqdist);
+  EXPECT_TRUE(near.empty() || sqdist[0] > 1.0f) << "nothing left where the old alignment put it";
+}

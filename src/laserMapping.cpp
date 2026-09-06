@@ -142,6 +142,15 @@ condition_variable sig_buffer;
 string root_dir = string(ROOT_DIR);
 string map_file_path, lid_topic, imu_topic, imu_input_type = "sensor_msgs", imu_bias_topic = "/fixposition/fpa/imubias";
 
+// Frame ids stamped on everything this node publishes. `camera_init` is LOAM's
+// name for a frame that holds no camera: it is simply the origin of the local
+// map, fixed at initialization and free to drift. Kept as the default so the
+// TF graph is unchanged. A profile that renames it must set the PGO's
+// `lidar_odom_frame` to the same string, or the static odom->local-map edge the
+// fusion node broadcasts points at a frame nobody publishes and the tree severs.
+string odom_frame_id = "camera_init";
+string body_frame_id = "body";
+
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 constexpr double kLidarLoopBackSec = 1.0;  // stamp jump back beyond this = real loop back (bag restart), else a stray sample
@@ -1372,7 +1381,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    laserCloudmsg.header.frame_id = odom_frame_id;
     pubLaserCloudFull->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
   }
@@ -1410,7 +1419,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
   sensor_msgs::msg::PointCloud2 laserCloudmsg;
   pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
   laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-  laserCloudmsg.header.frame_id = "body";
+  laserCloudmsg.header.frame_id = body_frame_id;
   pubLaserCloudFull_body->publish(laserCloudmsg);
   publish_count -= PUBFRAME_PERIOD;
 }
@@ -1424,7 +1433,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
   sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
   pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
   laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-  laserCloudFullRes3.header.frame_id = "camera_init";
+  laserCloudFullRes3.header.frame_id = odom_frame_id;
   pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
@@ -1462,7 +1471,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
   pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
   // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
   laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-  laserCloudmsg.header.frame_id = "camera_init";
+  laserCloudmsg.header.frame_id = odom_frame_id;
   pubLaserCloudMap->publish(laserCloudmsg);
 
   // sensor_msgs::msg::PointCloud2 laserCloudMap;
@@ -1499,8 +1508,8 @@ void set_posestamp(T & out)
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped,
                       std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
-  odomAftMapped.header.frame_id = "camera_init";
-  odomAftMapped.child_frame_id = "body";
+  odomAftMapped.header.frame_id = odom_frame_id;
+  odomAftMapped.child_frame_id = body_frame_id;
   odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
   set_posestamp(odomAftMapped.pose);
   // Front-end health side-channel (Plan C) — written BEFORE the publish so it is
@@ -1576,8 +1585,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   }
 
   geometry_msgs::msg::TransformStamped trans;
-  trans.header.frame_id = "camera_init";
-  trans.child_frame_id = "body";
+  trans.header.frame_id = odom_frame_id;
+  trans.child_frame_id = body_frame_id;
   trans.header.stamp = get_ros_time(lidar_end_time);
   trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
   trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
@@ -1593,7 +1602,7 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
   set_posestamp(msg_body_pose);
   msg_body_pose.header.stamp = get_ros_time(lidar_end_time);  // ros::Time().fromSec(lidar_end_time);
-  msg_body_pose.header.frame_id = "camera_init";
+  msg_body_pose.header.frame_id = odom_frame_id;
 
   /*** if path is too large, the rvis will crash ***/
   static int jjj = 0;
@@ -2054,6 +2063,8 @@ public:
     this->declare_parameter<bool>("publish.scan_publish_en", true);
     this->declare_parameter<bool>("publish.dense_publish_en", true);
     this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+    this->declare_parameter<string>("publish.odom_frame_id", "camera_init");
+    this->declare_parameter<string>("publish.body_frame_id", "body");
     this->declare_parameter<int>("max_iteration", 4);
     this->declare_parameter<int>("max_buffered_scans", 100);
     this->declare_parameter<double>("max_scan_backlog_sec", 0.5);
@@ -2202,6 +2213,28 @@ public:
     // relocalization decides. The pinned tier also cannot heal — the delivered map owns its
     // cells for the whole run. iVox backend only (the ikd-Tree build has no tier to pin into).
     this->declare_parameter<bool>("prior_map_pinned", false);
+    // prior_map_align — where the transform that puts the map into THIS run's frame
+    // comes from. The map is delivered in the frame of the run that built it, and that
+    // frame is not a property of the site: a different front-end binary, or the same one
+    // initialising two seconds later while the platform walks, defines a different one.
+    //   "as_delivered" (default) — the caller asserts the two frames coincide; the map is
+    //       added as it is, and initial_pose moves the filter's start pose within it.
+    //   "relocalization"         — nothing is loaded until /relocalization/result says
+    //       where the map is (T_map_camera_init); the map is then installed transformed
+    //       into the front end's own frame, and a later alignment replaces the whole tier.
+    // Measured on the 0831 lobby bag: the delivered map's frame sat 1.22 m / 3.4 deg from
+    // the replaying front end's, and loading it as delivered cost 0.253 -> 2.366 m of 2D
+    // error against RTK. Supplying that offset alone brought it back to 0.717 m.
+    this->declare_parameter<string>("prior_map_align", "as_delivered");
+    // Leaf the prior map is downsampled to. 0 = filter_size_map, the live map's dedup grid,
+    // which is what the map backend enforces anyway. A finer leaf survives that grid only
+    // where the live map is sparse, but it costs nothing to ask for: at 0.3 the prior map
+    // enters as one centroid per cell and the effective correspondence count per scan fell
+    // 25-38% on the 0831 bag (accuracy held there; a starved scene may not).
+    this->declare_parameter<double>("prior_map_voxel", 0.0);
+    // Stop growing the map once a prior map is installed (pure localization). Without this
+    // the map is neither: the prior owns its cells, live scans fill the gaps between them.
+    this->declare_parameter<bool>("prior_map_freeze", false);
     this->declare_parameter<vector<double>>("initial_pose", vector<double>());
     // initial_pose_full_rpy_override:
     //   false (default) — inject only XYZ + yaw from initial_pose; keep
@@ -2226,6 +2259,8 @@ public:
     this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
     this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
     this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+    this->get_parameter_or<string>("publish.odom_frame_id", odom_frame_id, string("camera_init"));
+    this->get_parameter_or<string>("publish.body_frame_id", body_frame_id, string("body"));
     this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
     this->get_parameter_or<int>("max_buffered_scans", max_buffered_scans, 100);
     this->get_parameter_or<double>("max_scan_backlog_sec", max_scan_backlog_sec, 0.5);
@@ -2390,6 +2425,34 @@ public:
     this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
     this->get_parameter_or<string>("prior_map_pcd", prior_map_pcd_, string(""));
     this->get_parameter_or<bool>("prior_map_pinned", prior_map_pinned_, false);
+    this->get_parameter_or<double>("prior_map_voxel", prior_map_voxel_, 0.0);
+    this->get_parameter_or<bool>("prior_map_freeze", prior_map_freeze_, false);
+    {
+      string align_name;
+      this->get_parameter_or<string>("prior_map_align", align_name, string("as_delivered"));
+      if (!fast_lio::parsePriorMapAlign(align_name, &prior_map_align_)) {
+        RCLCPP_ERROR(this->get_logger(),
+                     "prior_map_align='%s' is not a known value (as_delivered | relocalization) - "
+                     "loading the map as delivered",
+                     align_name.c_str());
+      }
+      if (prior_map_align_ == fast_lio::PriorMapAlign::kRelocalization) {
+#ifdef USE_IVOX
+        // The map has to be replaceable as a unit when a better alignment arrives, which is
+        // what the pinned tier is: forcing it here rather than asking the operator to set two
+        // parameters that only work together.
+        prior_map_pinned_ = true;
+        RCLCPP_INFO(this->get_logger(),
+                    "prior_map_align=relocalization: the map waits for /relocalization/result and is "
+                    "installed transformed into this run's frame (pinned tier, replaced on realignment)");
+#else
+        prior_map_align_ = fast_lio::PriorMapAlign::kAsDelivered;
+        RCLCPP_ERROR(this->get_logger(),
+                     "prior_map_align=relocalization needs the iVox backend (it replaces a pinned tier); "
+                     "this build uses ikd-Tree - loading the map as delivered instead");
+#endif
+      }
+    }
     this->get_parameter_or<vector<double>>("initial_pose", initial_pose_vec_, vector<double>());
     {
       bool full_rpy_override = false;
@@ -2423,7 +2486,7 @@ public:
     RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
     path.header.stamp = this->get_clock()->now();
-    path.header.frame_id = "camera_init";
+    path.header.frame_id = odom_frame_id;
 
     // /*** variables definition ***/
     // int effect_feat_num = 0, frame_num = 0;
@@ -2643,6 +2706,36 @@ public:
       },
       mapping_sub_opts);
 
+    // Where the prior map is, in this run's frame. The relocalization node answers that
+    // question and nothing else can: the map's own frame belongs to the run that built it.
+    // Latched, because the answer usually predates nothing — it arrives once, seconds in,
+    // and a subscriber that joined late still needs it.
+    if (!prior_map_pcd_.empty() && prior_map_align_ == fast_lio::PriorMapAlign::kRelocalization) {
+      rclcpp::SubscriptionOptions align_sub_opts;
+      align_sub_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+      prior_map_align_sub_ = this->create_subscription<geometry_msgs::msg::TransformStamped>(
+        "/relocalization/result",
+        rclcpp::QoS(1).transient_local(),
+        [this](geometry_msgs::msg::TransformStamped::SharedPtr msg) {
+          const auto & q = msg->transform.rotation;
+          const auto & t = msg->transform.translation;
+          Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+          T.linear() = Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized().toRotationMatrix();
+          T.translation() = Eigen::Vector3d(t.x, t.y, t.z);
+          if (!T.matrix().allFinite()) {
+            RCLCPP_ERROR(this->get_logger(), "[PRIOR-MAP] relocalization result is not finite - ignored");
+            return;
+          }
+          std::lock_guard<std::mutex> lk(prior_map_align_mtx_);
+          prior_map_pending_T_ = T;
+          prior_map_pending_ = true;
+        },
+        align_sub_opts);
+      RCLCPP_INFO(this->get_logger(),
+                  "[PRIOR-MAP] waiting for /relocalization/result before loading %s",
+                  prior_map_pcd_.c_str());
+    }
+
     RCLCPP_INFO(this->get_logger(), "Node init finished.");
   }
 
@@ -2807,6 +2900,7 @@ private:
       if (async_map_en)
         joinMapAdd();
       t_join = omp_get_wtime();
+      installPriorMap();
 #ifdef USE_IVOX
       // Capacity is a silent failure mode: once the grid is full every new voxel costs the
       // least-recently-written one, and with a prior map loaded those are the parts of it the
@@ -2857,8 +2951,11 @@ private:
         if (feats_down_size > 5) {
           // --- Prior map preload (Scheme 1) ---
           if (!prior_map_pcd_.empty()) {
-            // 1. Inject initial pose into EKF if provided
-            {
+            // 1. Inject initial pose into EKF if provided. Only on the as-delivered path:
+            //    initial_pose places the filter's start inside the MAP's frame, which only
+            //    means anything when that frame is this run's. On the relocalization path
+            //    the map moves to the front end instead, so the start pose stays untouched.
+            if (prior_map_align_ == fast_lio::PriorMapAlign::kAsDelivered) {
               state_ikfom new_state = kf.get_x();
               const Eigen::Quaterniond q_current(new_state.rot.matrix());
               const Eigen::Vector3d current_rpy = q_current.toRotationMatrix().eulerAngles(0, 1, 2);
@@ -2921,13 +3018,18 @@ private:
               }
 
               // 3. Downsample prior map
+              const double prior_leaf = fast_lio::priorMapLeaf(prior_map_voxel_, filter_size_map_min);
               pcl::VoxelGrid<PointType> voxel;
-              voxel.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
+              voxel.setLeafSize(
+                static_cast<float>(prior_leaf), static_cast<float>(prior_leaf), static_cast<float>(prior_leaf));
               voxel.setInputCloud(prior_cloud);
               PointCloudXYZI::Ptr prior_ds(new PointCloudXYZI());
               voxel.filter(*prior_ds);
-              RCLCPP_INFO(
-                this->get_logger(), "Prior map downsampled: %zu → %zu points", prior_cloud->size(), prior_ds->size());
+              RCLCPP_INFO(this->get_logger(),
+                          "Prior map downsampled at %.2f m: %zu → %zu points",
+                          prior_leaf,
+                          prior_cloud->size(),
+                          prior_ds->size());
 
               // 4. Transform current scan to world frame
               ikdtree.set_downsample_param(filter_size_map_min);
@@ -2938,7 +3040,21 @@ private:
 
               // 5. Prior map + current scan → map backend. Pinned, the prior map goes into a
               //    tier of its own; unpinned, it is merged in and lives or dies with the rest.
+              //    On the relocalization path nothing goes in yet: the map is held in its own
+              //    frame until an alignment says where to put it (installPriorMap below).
               size_t map_points = 0;
+              if (prior_map_align_ == fast_lio::PriorMapAlign::kRelocalization) {
+                prior_map_ds_ = prior_ds;
+                ikdtree.Build(feats_down_world->points);
+                RCLCPP_INFO(this->get_logger(),
+                            "map built from the current scan (%d points); the prior map (%zu points) is held "
+                            "until /relocalization/result says where it is",
+                            feats_down_size,
+                            prior_ds->size());
+                Localmap_Initialized = false;
+                prior_map_pcd_.clear();
+                return;
+              }
 #ifdef USE_IVOX
               if (prior_map_pinned_) {
                 ikdtree.AddPinnedPoints(prior_ds->points);
@@ -2965,6 +3081,7 @@ private:
                             map_points);
               }
               Localmap_Initialized = false;
+              prior_map_installed_ = true;
 #ifdef USE_IVOX
               // The prior map has to survive the load intact. iVox bounds itself by evicting
               // the least-recently-WRITTEN voxel, so a map larger than the capacity is
@@ -3848,7 +3965,12 @@ private:
       // growth so the prior map isn't polluted by stationary frames or
       // teleport segments (elevator).  EKF and odometry publishing
       // above continue normally.
-      if (mapping_enabled.load(std::memory_order_relaxed) && !flio_map_frozen) {
+      // prior_map_freeze: with a prior map installed the operator can ask for pure
+      // localization — the delivered map is the only map, and live scans stop being added
+      // to it. Without it the map is neither: the prior owns the cells it covers and live
+      // scans fill the gaps between them.
+      const bool frozen_by_prior = prior_map_freeze_ && prior_map_installed_;
+      if (mapping_enabled.load(std::memory_order_relaxed) && !flio_map_frozen && !frozen_by_prior) {
         map_incremental();
       }
       t5 = omp_get_wtime();
@@ -4018,6 +4140,92 @@ private:
     }
   }
 
+  /// Put the held prior map into the map backend at the alignment relocalization found.
+  ///
+  /// The map is delivered in its own frame; the alignment (T_map_camera_init) says where
+  /// that frame sits in this run's. Transforming the MAP is what keeps the estimate
+  /// continuous: moving the filter instead would teleport /Odometry, and every consumer
+  /// downstream reads that as the platform having jumped. A later alignment replaces the
+  /// tier from the delivered points again, so corrections never compound.
+  ///
+  /// Called from the scan loop only, after joinMapAdd(): the backend has a single-operator
+  /// invariant and the subscription callback is not that operator.
+  void installPriorMap()
+  {
+#ifdef USE_IVOX
+    if (!prior_map_ds_ || prior_map_ds_->empty()) {
+      return;
+    }
+    Eigen::Isometry3d T_map_camera_init;
+    {
+      std::lock_guard<std::mutex> lk(prior_map_align_mtx_);
+      if (!prior_map_pending_) {
+        return;
+      }
+      prior_map_pending_ = false;
+      T_map_camera_init = prior_map_pending_T_;
+    }
+    if (!fast_lio::priorMapReinstallNeeded(prior_map_installed_, prior_map_installed_T_, T_map_camera_init)) {
+      return;  // the producer re-confirming its own answer
+    }
+
+    // Transform by hand rather than through pcl::transformPointCloud: the point type carries
+    // normal fields that esti_plane rewrites per iEKF iteration anyway, and rotating stale
+    // normals into the new frame would only make them look meaningful.
+    const Eigen::Isometry3d T_camera_init_map = T_map_camera_init.inverse();
+    const Eigen::Matrix3f R = T_camera_init_map.linear().cast<float>();
+    const Eigen::Vector3f t_off = T_camera_init_map.translation().cast<float>();
+    PointCloudXYZI::Ptr in_frame(new PointCloudXYZI());
+    in_frame->points.reserve(prior_map_ds_->points.size());
+    for (const auto & p : prior_map_ds_->points) {
+      PointType q = p;
+      const Eigen::Vector3f v = R * Eigen::Vector3f(p.x, p.y, p.z) + t_off;
+      q.x = v.x();
+      q.y = v.y();
+      q.z = v.z();
+      in_frame->points.push_back(q);
+    }
+    in_frame->width = static_cast<uint32_t>(in_frame->points.size());
+    in_frame->height = 1;
+
+    const std::size_t evicted_before = ikdtree.evictedVoxels();
+    const int live_before = ikdtree.size();
+    ikdtree.clearPinned();
+    // What comes back is what actually went in: the map backend's dedup grid is
+    // first-point-wins, so where this run has already put a point the delivered map does not
+    // displace it. Expected, and small early in a run — but a large shortfall means the live
+    // map already covers the area and the prior map is adding little.
+    const int added = ikdtree.AddPinnedPoints(in_frame->points);
+    prior_map_installed_T_ = T_map_camera_init;
+    prior_map_installed_ = true;
+    ++prior_map_installs_;
+
+    const Eigen::Vector3d t = T_map_camera_init.translation();
+    const Eigen::Matrix3d & r = T_map_camera_init.linear();
+    RCLCPP_WARN(this->get_logger(),
+                "[PRIOR-MAP] install #%u at T_map_camera_init=[%.2f %.2f %.2f] yaw=%.1f deg: %d of %zu point(s) "
+                "taken into %zu pinned voxel(s) (the rest fell where this run's map already had one), "
+                "map %d -> %d pts",
+                prior_map_installs_,
+                t.x(),
+                t.y(),
+                t.z(),
+                std::atan2(r(1, 0), r(0, 0)) * 180.0 / M_PI,
+                added,
+                in_frame->size(),
+                ikdtree.pinnedVoxels(),
+                live_before,
+                ikdtree.size());
+    if (ikdtree.evictedVoxels() > evicted_before) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "[PRIOR-MAP] the install evicted %zu live voxel(s): the map backend is at capacity "
+                   "(ivox_max_voxels=%zu). Raise it, or the prior map is competing with this run's own map.",
+                   ikdtree.evictedVoxels() - evicted_before,
+                   ikdtree.maxVoxels());
+    }
+#endif
+  }
+
   void map_publish_callback()
   {
     // publish_map() flattens the ikd-tree (a tree read). This 1 Hz timer shares the
@@ -4081,6 +4289,23 @@ private:
   std::string prior_map_pcd_;
   std::size_t last_reported_evicted_voxels = 0;  // last value the capacity WARN reported
   bool prior_map_pinned_ = false;  // prior map goes into its own non-evictable tier
+  double prior_map_voxel_ = 0.0;   // leaf the prior map is downsampled to (0 = filter_size_map)
+  bool prior_map_freeze_ = false;  // stop growing the map once a prior map is installed
+  fast_lio::PriorMapAlign prior_map_align_ = fast_lio::PriorMapAlign::kAsDelivered;
+  /// Downsampled prior map, held in ITS OWN (delivered) frame so a later, better alignment
+  /// can re-transform the same points instead of compounding onto the last one. Only filled
+  /// on the relocalization path; empty and freed on the as-delivered path.
+  PointCloudXYZI::Ptr prior_map_ds_;
+  /// Alignment currently installed, and the one waiting to be. Written by the
+  /// /relocalization/result callback, read and cleared by the scan loop: the map backend has
+  /// a single-operator invariant and a subscription callback is not that operator.
+  std::mutex prior_map_align_mtx_;
+  Eigen::Isometry3d prior_map_pending_T_ = Eigen::Isometry3d::Identity();  // T_map_camera_init
+  bool prior_map_pending_ = false;
+  Eigen::Isometry3d prior_map_installed_T_ = Eigen::Isometry3d::Identity();
+  bool prior_map_installed_ = false;
+  unsigned prior_map_installs_ = 0;
+  rclcpp::Subscription<geometry_msgs::msg::TransformStamped>::SharedPtr prior_map_align_sub_;
   std::vector<double> initial_pose_vec_;
   bool initial_pose_full_rpy_override_ = false;
 };

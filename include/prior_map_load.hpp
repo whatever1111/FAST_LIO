@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <string>
 #include <vector>
 
 namespace fast_lio
@@ -134,6 +135,75 @@ inline InitialPoseInjection resolveInitialPose(const std::vector<double> & pose_
 inline bool priorMapFitsCapacity(std::size_t voxels, std::size_t capacity)
 {
   return capacity == 0u || voxels <= capacity;
+}
+
+/// Where the transform that puts a prior map into the front end's own frame comes from.
+///
+/// The map is delivered in the frame of the run that built it, and that frame is not a
+/// property of the site: it is wherever the front end that built the map happened to
+/// initialise, with whatever gravity estimate it had. A different binary, or the same
+/// binary started two seconds later while the platform was moving, defines a different
+/// one. Assuming the two coincide is the mistake this enum exists to make explicit.
+enum class PriorMapAlign
+{
+  /// The map is already in this run's frame; load it as delivered (optionally moving the
+  /// filter's start pose with initial_pose). The caller has to know this to be true.
+  kAsDelivered,
+  /// Wait for a relocalization result (T_map_camera_init) and install the map transformed
+  /// into the front end's frame. Nothing is loaded until an alignment exists, and a later,
+  /// better alignment replaces the whole tier rather than adding a second copy.
+  kRelocalization,
+};
+
+/// Parse the prior_map_align parameter. Returns false (and kAsDelivered) on an unknown
+/// value so the caller can report the name it did not recognise.
+inline bool parsePriorMapAlign(const std::string & name, PriorMapAlign * out)
+{
+  if (name.empty() || name == "as_delivered" || name == "none") {
+    *out = PriorMapAlign::kAsDelivered;
+    return true;
+  }
+  if (name == "relocalization" || name == "reloc") {
+    *out = PriorMapAlign::kRelocalization;
+    return true;
+  }
+  *out = PriorMapAlign::kAsDelivered;
+  return false;
+}
+
+/// Leaf size the prior map is downsampled to before it enters the map backend.
+/// `requested` <= 0 means "same as the live map's dedup grid", which is the historical
+/// behaviour; a smaller leaf keeps more of the map so a plane fit has neighbours to
+/// choose from, at the cost of voxels.
+inline double priorMapLeaf(double requested, double filter_size_map)
+{
+  return requested > 0.0 ? requested : filter_size_map;
+}
+
+/// Minimum movement of the alignment before an installed prior map is worth reinstalling.
+/// Reinstalling costs a full clear + add of the tier, and the relocalization producer
+/// republishes the same answer as it re-confirms it.
+inline constexpr double kPriorMapReinstallTransM = 0.10;
+inline constexpr double kPriorMapReinstallYawRad = 0.5 * M_PI / 180.0;
+
+/// Whether a new alignment differs from the installed one by enough to reinstall.
+/// `installed_valid` false means nothing is installed yet, so any alignment counts.
+inline bool priorMapReinstallNeeded(bool installed_valid,
+                                    const Eigen::Isometry3d & installed,
+                                    const Eigen::Isometry3d & candidate,
+                                    double trans_eps_m = kPriorMapReinstallTransM,
+                                    double yaw_eps_rad = kPriorMapReinstallYawRad)
+{
+  if (!installed_valid) {
+    return true;
+  }
+  const Eigen::Isometry3d delta = installed.inverse() * candidate;
+  if (delta.translation().norm() > trans_eps_m) {
+    return true;
+  }
+  const Eigen::Matrix3d & r = delta.linear();
+  const double yaw = std::atan2(r(1, 0), r(0, 0));
+  return std::abs(yaw) > yaw_eps_rad;
 }
 
 }  // namespace fast_lio

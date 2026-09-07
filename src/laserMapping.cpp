@@ -142,13 +142,13 @@ condition_variable sig_buffer;
 string root_dir = string(ROOT_DIR);
 string map_file_path, lid_topic, imu_topic, imu_input_type = "sensor_msgs", imu_bias_topic = "/fixposition/fpa/imubias";
 
-// Frame ids stamped on everything this node publishes. `camera_init` is LOAM's
-// name for a frame that holds no camera: it is simply the origin of the local
-// map, fixed at initialization and free to drift. Kept as the default so the
-// TF graph is unchanged. A profile that renames it must set the PGO's
-// `lidar_odom_frame` to the same string, or the static odom->local-map edge the
-// fusion node broadcasts points at a frame nobody publishes and the tree severs.
-string odom_frame_id = "camera_init";
+// Frame ids stamped on everything this node publishes. The odom frame is the
+// origin of the local map: fixed at initialization, gravity-aligned, and free to
+// drift. Upstream LOAM called it `camera_init` for a frame that holds no camera;
+// a deployment still running a back end that expects that name must set this
+// parameter back to it, because the PGO's `lidar_odom_frame` and this string are
+// the two ends of one TF edge and the tree severs silently if they disagree.
+string odom_frame_id = "lidar_odom";
 string body_frame_id = "body";
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -1477,7 +1477,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
   // sensor_msgs::msg::PointCloud2 laserCloudMap;
   // pcl::toROSMsg(*featsFromMap, laserCloudMap);
   // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-  // laserCloudMap.header.frame_id = "camera_init";
+  // laserCloudMap.header.frame_id = "lidar_odom";
   // pubLaserCloudMap->publish(laserCloudMap);
 }
 
@@ -2063,7 +2063,7 @@ public:
     this->declare_parameter<bool>("publish.scan_publish_en", true);
     this->declare_parameter<bool>("publish.dense_publish_en", true);
     this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
-    this->declare_parameter<string>("publish.odom_frame_id", "camera_init");
+    this->declare_parameter<string>("publish.odom_frame_id", "lidar_odom");
     this->declare_parameter<string>("publish.body_frame_id", "body");
     this->declare_parameter<int>("max_iteration", 4);
     this->declare_parameter<int>("max_buffered_scans", 100);
@@ -2220,7 +2220,7 @@ public:
     //   "as_delivered" (default) — the caller asserts the two frames coincide; the map is
     //       added as it is, and initial_pose moves the filter's start pose within it.
     //   "relocalization"         — nothing is loaded until /relocalization/result says
-    //       where the map is (T_map_camera_init); the map is then installed transformed
+    //       where the map is (T_map_lidar_odom); the map is then installed transformed
     //       into the front end's own frame, and a later alignment replaces the whole tier.
     // Measured on the 0831 lobby bag: the delivered map's frame sat 1.22 m / 3.4 deg from
     // the replaying front end's, and loading it as delivered cost 0.253 -> 2.366 m of 2D
@@ -2259,7 +2259,7 @@ public:
     this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
     this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
     this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
-    this->get_parameter_or<string>("publish.odom_frame_id", odom_frame_id, string("camera_init"));
+    this->get_parameter_or<string>("publish.odom_frame_id", odom_frame_id, string("lidar_odom"));
     this->get_parameter_or<string>("publish.body_frame_id", body_frame_id, string("body"));
     this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
     this->get_parameter_or<int>("max_buffered_scans", max_buffered_scans, 100);
@@ -4142,7 +4142,7 @@ private:
 
   /// Put the held prior map into the map backend at the alignment relocalization found.
   ///
-  /// The map is delivered in its own frame; the alignment (T_map_camera_init) says where
+  /// The map is delivered in its own frame; the alignment (T_map_lidar_odom) says where
   /// that frame sits in this run's. Transforming the MAP is what keeps the estimate
   /// continuous: moving the filter instead would teleport /Odometry, and every consumer
   /// downstream reads that as the platform having jumped. A later alignment replaces the
@@ -4156,25 +4156,25 @@ private:
     if (!prior_map_ds_ || prior_map_ds_->empty()) {
       return;
     }
-    Eigen::Isometry3d T_map_camera_init;
+    Eigen::Isometry3d T_map_lidar_odom;
     {
       std::lock_guard<std::mutex> lk(prior_map_align_mtx_);
       if (!prior_map_pending_) {
         return;
       }
       prior_map_pending_ = false;
-      T_map_camera_init = prior_map_pending_T_;
+      T_map_lidar_odom = prior_map_pending_T_;
     }
-    if (!fast_lio::priorMapReinstallNeeded(prior_map_installed_, prior_map_installed_T_, T_map_camera_init)) {
+    if (!fast_lio::priorMapReinstallNeeded(prior_map_installed_, prior_map_installed_T_, T_map_lidar_odom)) {
       return;  // the producer re-confirming its own answer
     }
 
     // Transform by hand rather than through pcl::transformPointCloud: the point type carries
     // normal fields that esti_plane rewrites per iEKF iteration anyway, and rotating stale
     // normals into the new frame would only make them look meaningful.
-    const Eigen::Isometry3d T_camera_init_map = T_map_camera_init.inverse();
-    const Eigen::Matrix3f R = T_camera_init_map.linear().cast<float>();
-    const Eigen::Vector3f t_off = T_camera_init_map.translation().cast<float>();
+    const Eigen::Isometry3d T_lidar_odom_map = T_map_lidar_odom.inverse();
+    const Eigen::Matrix3f R = T_lidar_odom_map.linear().cast<float>();
+    const Eigen::Vector3f t_off = T_lidar_odom_map.translation().cast<float>();
     PointCloudXYZI::Ptr in_frame(new PointCloudXYZI());
     in_frame->points.reserve(prior_map_ds_->points.size());
     for (const auto & p : prior_map_ds_->points) {
@@ -4196,14 +4196,14 @@ private:
     // displace it. Expected, and small early in a run — but a large shortfall means the live
     // map already covers the area and the prior map is adding little.
     const int added = ikdtree.AddPinnedPoints(in_frame->points);
-    prior_map_installed_T_ = T_map_camera_init;
+    prior_map_installed_T_ = T_map_lidar_odom;
     prior_map_installed_ = true;
     ++prior_map_installs_;
 
-    const Eigen::Vector3d t = T_map_camera_init.translation();
-    const Eigen::Matrix3d & r = T_map_camera_init.linear();
+    const Eigen::Vector3d t = T_map_lidar_odom.translation();
+    const Eigen::Matrix3d & r = T_map_lidar_odom.linear();
     RCLCPP_WARN(this->get_logger(),
-                "[PRIOR-MAP] install #%u at T_map_camera_init=[%.2f %.2f %.2f] yaw=%.1f deg: %d of %zu point(s) "
+                "[PRIOR-MAP] install #%u at T_map_lidar_odom=[%.2f %.2f %.2f] yaw=%.1f deg: %d of %zu point(s) "
                 "taken into %zu pinned voxel(s) (the rest fell where this run's map already had one), "
                 "map %d -> %d pts",
                 prior_map_installs_,
@@ -4300,7 +4300,7 @@ private:
   /// /relocalization/result callback, read and cleared by the scan loop: the map backend has
   /// a single-operator invariant and a subscription callback is not that operator.
   std::mutex prior_map_align_mtx_;
-  Eigen::Isometry3d prior_map_pending_T_ = Eigen::Isometry3d::Identity();  // T_map_camera_init
+  Eigen::Isometry3d prior_map_pending_T_ = Eigen::Isometry3d::Identity();  // T_map_lidar_odom
   bool prior_map_pending_ = false;
   Eigen::Isometry3d prior_map_installed_T_ = Eigen::Isometry3d::Identity();
   bool prior_map_installed_ = false;

@@ -149,7 +149,7 @@ enum class PriorMapAlign
   /// The map is already in this run's frame; load it as delivered (optionally moving the
   /// filter's start pose with initial_pose). The caller has to know this to be true.
   kAsDelivered,
-  /// Wait for a relocalization result (T_map_camera_init) and install the map transformed
+  /// Wait for a relocalization result (T_map_lidar_odom) and install the map transformed
   /// into the front end's frame. Nothing is loaded until an alignment exists, and a later,
   /// better alignment replaces the whole tier rather than adding a second copy.
   kRelocalization,

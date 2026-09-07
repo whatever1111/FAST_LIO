@@ -218,6 +218,14 @@ if(BUILD_TESTING)
                                                           ${EIGEN3_INCLUDE_DIR})
     target_link_libraries(test_ivox_layering ${PCL_LIBRARIES})
   endif()
+  # The map backend's per-voxel occupancy: the dedup-grid relation the per-voxel reserve
+  # is sized from, and the two things that are allowed to exceed it.
+  ament_add_gtest(test_ivox_voxel_occupancy test/test_ivox_voxel_occupancy.cpp)
+  if(TARGET test_ivox_voxel_occupancy)
+    target_include_directories(test_ivox_voxel_occupancy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                                 ${PCL_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR})
+    target_link_libraries(test_ivox_voxel_occupancy ${PCL_LIBRARIES})
+  endif()
   # Pure header, Eigen only: what a prior map and its initial pose have to prove before
   # either of them reaches the map backend.
   ament_add_gtest(test_prior_map_load test/test_prior_map_load.cpp)

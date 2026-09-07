@@ -35,7 +35,10 @@ class IVox {
  public:
   using PointVector = std::vector<PointType, Eigen::aligned_allocator<PointType>>;
 
-  IVox() { setNearby(26); }  // safe defaults; overridden by Init()
+  IVox() {
+    setNearby(26);  // safe defaults; overridden by Init()
+    updateReserve();
+  }
 
   // resolution: voxel edge (m); nearby_type: 6/18/26 (use >=18); per_voxel_cap: backstop
   // on points per voxel; max_voxels: LRU capacity (replaces ikd-Tree FOV box-deletion).
@@ -45,6 +48,7 @@ class IVox {
     per_voxel_cap_ = per_voxel_cap > 0 ? per_voxel_cap : 50;
     max_voxels_ = max_voxels > 0 ? max_voxels : 5000000u;
     setNearby(nearby_type);
+    updateReserve();
   }
 
   // --- ikd-Tree-compatible surface used by laserMapping ---------------------------------
@@ -52,7 +56,7 @@ class IVox {
   // the map inflates ~3x vs ikd-Tree (map_incremental's need_add gate is not a strict dedup),
   // which slows every kNN. downsample_size_ is the fine (sub-voxel) dedup grid.
   void set_downsample_param(float leaf) {
-    if (leaf > 1e-4f) { downsample_size_ = leaf; inv_ds_ = 1.0f / leaf; }
+    if (leaf > 1e-4f) { downsample_size_ = leaf; inv_ds_ = 1.0f / leaf; updateReserve(); }
   }
   // Rebuild the map from `points` alone. ikd-Tree's Build deletes the existing tree first,
   // and the caller that matters (the guard's "rebuild the local map here" recovery) depends
@@ -137,7 +141,7 @@ class IVox {
       bool was_added = false;
       if (it == map_.end()) {
         Voxel v;
-        v.pts.reserve(8);
+        v.pts.reserve(pts_reserve_);
         v.pts.push_back(p);
         v.pinned = pinned;
         if (pinned) {
@@ -253,6 +257,20 @@ class IVox {
                static_cast<int>(std::floor(p.z * inv_ds_))};
   }
 
+  // Points a voxel can actually come to hold: the global fine-grid dedup keeps at most one
+  // point per downsample_size_ box, so a voxel spans (res_/downsample_size_)^3 of them. A
+  // profile that aligns the NN voxel with the dedup grid therefore stores ONE point per
+  // voxel, and a fixed reserve of 8 would hand each of them an eight-slot buffer — at the
+  // map's voxel ceiling that dwarfs every other per-voxel cost. Points added with
+  // downsample_on = false bypass the dedup, so this is a starting size and never a cap:
+  // the vector grows for the few voxels that exceed it, and per_voxel_cap_ is what bounds them.
+  void updateReserve() {
+    // The epsilon keeps an exact integer ratio (0.3/0.3, 0.5/0.25) from rounding up on float noise.
+    const float boxes_per_edge = std::max(1.0f, std::ceil(res_ / downsample_size_ - 1e-4f));
+    const double slots = static_cast<double>(boxes_per_edge) * boxes_per_edge * boxes_per_edge;
+    pts_reserve_ = static_cast<std::size_t>(std::min(slots, static_cast<double>(per_voxel_cap_)));
+  }
+
   void setNearby(int n) {
     nbr_.clear();
     nbr_.push_back({0, 0, 0});
@@ -286,6 +304,7 @@ class IVox {
   float res_ = 0.5f, inv_res_ = 2.0f;
   float downsample_size_ = 0.3f, inv_ds_ = 1.0f / 0.3f;  // fine dedup grid (filter_size_map)
   int per_voxel_cap_ = 50;
+  std::size_t pts_reserve_ = 1;  // derived from res_ / downsample_size_ by updateReserve()
   std::size_t max_voxels_ = 5000000u;
   std::vector<std::array<int, 3>> nbr_;
   // Open-addressing flat map: ~3-5x faster lookups than std::unordered_map (the measured

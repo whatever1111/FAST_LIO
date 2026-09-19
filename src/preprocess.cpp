@@ -1,10 +1,11 @@
 #include "preprocess.h"
 
+#include <pcl/common/common.h>
+
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
-
-#include <pcl/common/common.h>
 
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
@@ -441,23 +442,19 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
   std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
   /*****************************************************************/
 
-  if (pl_orig.points[plsize - 1].time > 0)
-  {
-    given_offset_time = true;
-  }
-  else
-  {
-    given_offset_time = false;
-    double yaw_first = atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578;
-    double yaw_end = yaw_first;
-    int layer_first = pl_orig.points[0].ring;
-    for (uint i = plsize - 1; i > 0; i--)
-    {
-      if (pl_orig.points[i].ring == layer_first)
-      {
-        yaw_end = atan2(pl_orig.points[i].y, pl_orig.points[i].x) * 57.29578;
-        break;
-      }
+  // Field presence is the contract; the last point may legally have time zero
+  // and OEM groups need not be in time order. A malformed present field must
+  // not silently switch to synthesized yaw timestamps.
+  const auto time_field =
+    std::find_if(msg->fields.begin(), msg->fields.end(), [](const auto & field) { return field.name == "time"; });
+  given_offset_time = time_field != msg->fields.end();
+  if (given_offset_time) {
+    if (time_field->datatype != sensor_msgs::msg::PointField::FLOAT32 || time_field->count != 1 ||
+        time_field->offset > msg->point_step || msg->point_step - time_field->offset < sizeof(float))
+      return;
+    for (const auto & point : pl_orig.points) {
+      if (!std::isfinite(point.time) || point.time < 0.0f)
+        return;
     }
   }
 

@@ -66,6 +66,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <fixposition_driver_msgs/msg/fpa_imu.hpp>
@@ -77,6 +78,7 @@
 #include <limits>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include <math.h>
+#include <memory>
 #include <mutex>
 #include <omp.h>
 #include <shm_msgs/msg/point_cloud8m_and_pose.hpp>
@@ -101,6 +103,18 @@
 #define LASER_POINT_COV (0.001)
 #define MAXN (720000)
 #define PUBFRAME_PERIOD (20)
+
+struct FileCloser
+{
+  void operator()(std::FILE * file) const noexcept
+  {
+    if (file != nullptr) {
+      std::fclose(file);
+    }
+  }
+};
+
+using FileHandle = std::unique_ptr<std::FILE, FileCloser>;
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
@@ -153,7 +167,6 @@ string body_frame_id = "body";
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
-constexpr double kLidarLoopBackSec = 1.0;  // stamp jump back beyond this = real loop back (bag restart), else a stray sample
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
@@ -722,6 +735,38 @@ static void trim_lidar_buffer()
   }
 }
 
+rclcpp::Clock input_time_log_clock(RCL_STEADY_TIME);
+fast_lio::InputEpochGuard input_epoch_guard;
+
+// Caller holds mtx_buffer; all ingestion/sync callbacks share one mutually
+// exclusive group. A full estimator/map reset requires explicit restart, not
+// an automatic gravity reinitialization on a possibly moving platform.
+bool acceptInputEpoch(double previous, double current, const char * source)
+{
+  const bool already_faulted = input_epoch_guard.faulted();
+  constexpr double kInputEpochRollbackSec = 1.0;
+  if (input_epoch_guard.observe(previous, current, kInputEpochRollbackSec))
+    return true;
+  lidar_buffer.clear();
+  time_buffer.clear();
+  lidar_receive_time_buffer.clear();
+  imu_buffer.clear();
+  lidar_pushed = false;
+  Measures.imu.clear();
+  Measures.lidar.reset();
+  feats_undistort->clear();
+  flio_map_frozen = true;
+  flio_degraded_odom = true;
+  if (!already_faulted)
+    RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                 "[INPUT-EPOCH] %s clock discontinuity %.9f -> %.9f: input processing and odometry stopped; "
+                 "restart the node after clocks stabilize to reset estimator and map state",
+                 source,
+                 previous,
+                 current);
+  return false;
+}
+
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
   const auto receive_time = SteadyClock::now();
@@ -734,6 +779,10 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
   mtx_buffer.lock();
   scan_count++;
   double cur_time = get_time_sec(msg->header.stamp);
+  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar")) {
+    mtx_buffer.unlock();
+    return;
+  }
   double preprocess_start_time = omp_get_wtime();
   if (degeneracy_debug) {
     // Input-side telemetry for scan-stream holes: callback count + stamp step.
@@ -744,19 +793,14 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
               << " step=" << step << " buf=" << lidar_buffer.size() << std::endl;
   }
   if (!is_first_lidar && cur_time < last_timestamp_lidar) {
-    // A stray out-of-order scan (7 per m20 bag) must not clear the queue —
-    // that throws away the scan waiting for its IMU coverage (a self-inflicted
-    // scan hole). Drop the stray one; only a real jump back clears.
-    if (last_timestamp_lidar - cur_time > kLidarLoopBackSec) {
-      std::cerr << "lidar loop back (" << (last_timestamp_lidar - cur_time) << "s), clear buffer" << std::endl;
-      lidar_buffer.clear();
-      lidar_receive_time_buffer.clear();
-    } else {
-      std::cerr << "lidar scan out of order by " << (last_timestamp_lidar - cur_time) * 1e3 << " ms, dropped"
-                << std::endl;
-      mtx_buffer.unlock();
-      return;
-    }
+    // Late data cannot be replayed into the forward-only estimator.
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                         input_time_log_clock,
+                         5000,
+                         "[INPUT-TIME] late lidar by %.6f seconds, dropped",
+                         last_timestamp_lidar - cur_time);
+    mtx_buffer.unlock();
+    return;
   }
   if (is_first_lidar) {
     is_first_lidar = false;
@@ -789,21 +833,20 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
   mtx_buffer.lock();
   scan_count++;
   double cur_time = get_time_sec(msg->header.stamp);
+  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar")) {
+    mtx_buffer.unlock();
+    return;
+  }
   double preprocess_start_time = omp_get_wtime();
   if (!is_first_lidar && cur_time < last_timestamp_lidar) {
-    // A stray out-of-order scan (7 per m20 bag) must not clear the queue —
-    // that throws away the scan waiting for its IMU coverage (a self-inflicted
-    // scan hole). Drop the stray one; only a real jump back clears.
-    if (last_timestamp_lidar - cur_time > kLidarLoopBackSec) {
-      std::cerr << "lidar loop back (" << (last_timestamp_lidar - cur_time) << "s), clear buffer" << std::endl;
-      lidar_buffer.clear();
-      lidar_receive_time_buffer.clear();
-    } else {
-      std::cerr << "lidar scan out of order by " << (last_timestamp_lidar - cur_time) * 1e3 << " ms, dropped"
-                << std::endl;
-      mtx_buffer.unlock();
-      return;
-    }
+    // Late data cannot be replayed into the forward-only estimator.
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                         input_time_log_clock,
+                         5000,
+                         "[INPUT-TIME] late lidar by %.6f seconds, dropped",
+                         last_timestamp_lidar - cur_time);
+    mtx_buffer.unlock();
+    return;
   }
   if (is_first_lidar) {
     is_first_lidar = false;
@@ -834,22 +877,21 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
   }
   mtx_buffer.lock();
   double cur_time = get_time_sec(msg->header.stamp);
+  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar")) {
+    mtx_buffer.unlock();
+    return;
+  }
   double preprocess_start_time = omp_get_wtime();
   scan_count++;
   if (!is_first_lidar && cur_time < last_timestamp_lidar) {
-    // A stray out-of-order scan (7 per m20 bag) must not clear the queue —
-    // that throws away the scan waiting for its IMU coverage (a self-inflicted
-    // scan hole). Drop the stray one; only a real jump back clears.
-    if (last_timestamp_lidar - cur_time > kLidarLoopBackSec) {
-      std::cerr << "lidar loop back (" << (last_timestamp_lidar - cur_time) << "s), clear buffer" << std::endl;
-      lidar_buffer.clear();
-      lidar_receive_time_buffer.clear();
-    } else {
-      std::cerr << "lidar scan out of order by " << (last_timestamp_lidar - cur_time) * 1e3 << " ms, dropped"
-                << std::endl;
-      mtx_buffer.unlock();
-      return;
-    }
+    // Late data cannot be replayed into the forward-only estimator.
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                         input_time_log_clock,
+                         5000,
+                         "[INPUT-TIME] late lidar by %.6f seconds, dropped",
+                         last_timestamp_lidar - cur_time);
+    mtx_buffer.unlock();
+    return;
   }
   if (is_first_lidar) {
     is_first_lidar = false;
@@ -894,26 +936,19 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
   double timestamp = get_time_sec(msg->header.stamp);
 
   mtx_buffer.lock();
+  if (!acceptInputEpoch(last_timestamp_imu, timestamp, "imu")) {
+    mtx_buffer.unlock();
+    return;
+  }
 
   if (timestamp < last_timestamp_imu) {
-    // A single out-of-order IMU sample (DDS reordering, driver hiccup; 7 per
-    // m20 bag) must not wipe the buffer — that removes the coverage of the scan
-    // waiting in lidar_buffer and the next propagation runs over a hole
-    // (measured 0.9 m jump). Drop the stray sample; only a real jump backwards
-    // (bag restart / clock reset, > kImuLoopBackSec) clears the buffer.
-    constexpr double kImuLoopBackSec = 1.0;
-    if (last_timestamp_imu - timestamp > kImuLoopBackSec) {
-      std::cerr << "imu loop back (" << (last_timestamp_imu - timestamp) << "s), clear buffer" << std::endl;
-      imu_buffer.clear();
-    } else {
-      static int stray_count = 0;
-      if (++stray_count <= 20) {
-        std::cerr << "imu sample out of order by " << (last_timestamp_imu - timestamp) * 1e3 << " ms, dropped"
-                  << std::endl;
-      }
-      mtx_buffer.unlock();
-      return;
-    }
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                         input_time_log_clock,
+                         5000,
+                         "[INPUT-TIME] late IMU by %.6f seconds, dropped",
+                         last_timestamp_imu - timestamp);
+    mtx_buffer.unlock();
+    return;
   }
 
   last_timestamp_imu = timestamp;
@@ -1040,10 +1075,33 @@ bool body_is_static(const MeasureGroup & meas, double now)
   return fast_lio::bodyIsStatic(imu, wheel_age, wheel_speed, params);
 }
 
-double lidar_mean_scantime = 0.0;
-int scan_num = 0;
+double max_scan_duration_s = 0.0;  // 0 disables the device-specific upper bound.
+std::uint64_t invalid_scan_time_count = 0;
+std::uint64_t nonadvancing_scan_count = 0;
+std::uint64_t empty_scan_imu_count = 0;
+std::uint64_t imu_coverage_drop_count = 0;
+
+// Callbacks and sync use the same mutually exclusive callback group.
+void popLidarScan()
+{
+  lidar_buffer.pop_front();
+  time_buffer.pop_front();
+  if (!lidar_receive_time_buffer.empty())
+    lidar_receive_time_buffer.pop_front();
+  lidar_pushed = false;
+}
+void markImuCoverageGap(double end)
+{
+  ++imu_coverage_drop_count;
+  fast_lio::updateReanchorGate(&reanchor_gate, true, 0, 0.0, end, reanchor_params);
+  flio_map_frozen = true;
+  flio_degraded_odom = true;
+}
+
 bool sync_packages(MeasureGroup & meas)
 {
+  if (input_epoch_guard.faulted())
+    return false;
   if (lidar_buffer.empty() || imu_buffer.empty()) {
     return false;
   }
@@ -1063,16 +1121,31 @@ bool sync_packages(MeasureGroup & meas)
     if (!lidar_receive_time_buffer.empty()) {
       current_lidar_receive_time = lidar_receive_time_buffer.front();
     }
-    if (meas.lidar->points.size() <= 1)  // time too little
-    {
-      lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-      std::cerr << "Too few input point cloud!\n";
-    } else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime) {
-      lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-    } else {
-      scan_num++;
-      lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
-      lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+    const auto timing = fast_lio::scanTime(
+      meas.lidar_beg_time, meas.lidar->points, [](const auto & point) { return point.curvature; }, max_scan_duration_s);
+    if (!timing.valid()) {
+      ++invalid_scan_time_count;
+      RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                           input_time_log_clock,
+                           5000,
+                           "[INPUT-TIME] invalid scan timing reason=%d count=%lu",
+                           static_cast<int>(timing.status),
+                           static_cast<unsigned long>(invalid_scan_time_count));
+      meas.imu.clear();
+      popLidarScan();
+      return false;
+    }
+    lidar_end_time = timing.end;
+    if (lidar_end_time <= p_imu->lastProcessedEnd()) {
+      ++nonadvancing_scan_count;
+      RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                           input_time_log_clock,
+                           5000,
+                           "[INPUT-TIME] nonadvancing scan count=%lu",
+                           static_cast<unsigned long>(nonadvancing_scan_count));
+      meas.imu.clear();
+      popLidarScan();
+      return false;
     }
 
     meas.lidar_end_time = lidar_end_time;
@@ -1085,21 +1158,22 @@ bool sync_packages(MeasureGroup & meas)
   }
 
   /*** push imu data, and pop from imu buffer ***/
-  double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
   meas.imu.clear();
-  while ((!imu_buffer.empty()) && (imu_time < lidar_end_time)) {
-    imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-    if (imu_time > lidar_end_time)
-      break;
+  while (!imu_buffer.empty() && get_time_sec(imu_buffer.front()->header.stamp) <= lidar_end_time) {
     meas.imu.push_back(imu_buffer.front());
     imu_buffer.pop_front();
   }
-
-  lidar_buffer.pop_front();
-  time_buffer.pop_front();
-  if (!lidar_receive_time_buffer.empty())
-    lidar_receive_time_buffer.pop_front();
-  lidar_pushed = false;
+  popLidarScan();
+  if (meas.imu.empty()) {
+    ++empty_scan_imu_count;
+    markImuCoverageGap(meas.lidar_end_time);
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                         input_time_log_clock,
+                         5000,
+                         "[INPUT-TIME] empty IMU window count=%lu",
+                         static_cast<unsigned long>(empty_scan_imu_count));
+    return false;
+  }
   return true;
 }
 
@@ -2184,6 +2258,9 @@ public:
     this->declare_parameter<int>("preprocess.scan_line", 16);
     this->declare_parameter<int>("preprocess.timestamp_unit", US);
     this->declare_parameter<int>("preprocess.scan_rate", 10);
+    this->declare_parameter<double>("preprocess.max_scan_duration_s", 0.0);
+    this->declare_parameter<double>("imu_coverage.max_gap_s", 0.0);
+    this->declare_parameter<double>("imu_coverage.max_extrapolation_s", 0.0);
     this->declare_parameter<int>("point_filter_num", 2);
     this->declare_parameter<bool>("nn_refresh_gate_en", false);
     this->declare_parameter<double>("nn_refresh_min_shift", 0.0);
@@ -2381,6 +2458,17 @@ public:
     this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
     this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
     this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
+    this->get_parameter_or<double>("preprocess.max_scan_duration_s", max_scan_duration_s, 0.0);
+    this->get_parameter_or<double>("imu_coverage.max_gap_s", p_imu->coverage_params.max_gap_s, 0.0);
+    this->get_parameter_or<double>("imu_coverage.max_extrapolation_s", p_imu->coverage_params.max_extrapolation_s, 0.0);
+    if (!std::isfinite(p_imu->coverage_params.max_gap_s) || p_imu->coverage_params.max_gap_s < 0.0 ||
+        !std::isfinite(p_imu->coverage_params.max_extrapolation_s) || p_imu->coverage_params.max_extrapolation_s < 0.0)
+      throw std::invalid_argument("imu_coverage limits must be finite and nonnegative");
+    if ((p_imu->coverage_params.max_gap_s > 0.0 || p_imu->coverage_params.max_extrapolation_s > 0.0) &&
+        !reanchor_params.enabled)
+      throw std::invalid_argument("imu_coverage requires reanchor_en for recovery against the frozen map");
+    if (!std::isfinite(max_scan_duration_s) || max_scan_duration_s < 0.0)
+      throw std::invalid_argument("preprocess.max_scan_duration_s must be finite and nonnegative");
     this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
     this->get_parameter_or<bool>("nn_refresh_gate_en", nn_refresh_gate_en, false);
     this->get_parameter_or<double>("nn_refresh_min_shift", nn_refresh_min_shift, 0.0);
@@ -2520,9 +2608,13 @@ public:
     kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
     /*** debug record ***/
-    // FILE *fp;
-    string pos_log_dir = root_dir + "/Log/pos_log.txt";
-    fp = fopen(pos_log_dir.c_str(), "w");
+    if (runtime_pos_log) {
+      const string pos_log_dir = root_dir + "/Log/pos_log.txt";
+      positionLog_ = FileHandle(std::fopen(pos_log_dir.c_str(), "w"));
+      if (!positionLog_) {
+        RCLCPP_WARN(this->get_logger(), "Position logging disabled: failed to open %s", pos_log_dir.c_str());
+      }
+    }
 
     // ofstream fout_pre, fout_out, fout_dbg;
     fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);
@@ -2749,7 +2841,6 @@ public:
     fout_pre.close();
     fout_jump.close();
     fout_kalman.close();
-    fclose(fp);
   }
 
 private:
@@ -2843,7 +2934,21 @@ private:
       svd_time = 0;
       t0 = omp_get_wtime();
 
-      p_imu->Process(Measures, kf, feats_undistort);
+      if (!p_imu->Process(Measures, kf, feats_undistort)) {
+        if (p_imu->lastStatus() == ImuProcess::ProcessStatus::kCoverageGap) {
+          markImuCoverageGap(Measures.lidar_end_time);
+          RCLCPP_WARN_THROTTLE(this->get_logger(),
+                               *this->get_clock(),
+                               5000,
+                               "[IMU-COVERAGE] skip without propagation reason=%d gap=%.6f end_extrap=%.6f count=%lu; "
+                               "map frozen until re-anchored",
+                               static_cast<int>(p_imu->coverage_result.status),
+                               p_imu->coverage_result.max_gap_s,
+                               p_imu->coverage_result.end_extrapolation_s,
+                               static_cast<unsigned long>(imu_coverage_drop_count));
+        }
+        return;
+      }
       t_undist = omp_get_wtime();
       state_point = kf.get_x();
 
@@ -2876,7 +2981,7 @@ private:
       }
       pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
-      if (feats_undistort->empty() || (feats_undistort == NULL)) {
+      if (!feats_undistort || feats_undistort->empty()) {
         if (!diag_first_no_point_logged) {
           RCLCPP_WARN(
             this->get_logger(), "[STARTUP][FAST_LIO] first no-point scan lidar_beg=%.3f", Measures.lidar_beg_time);
@@ -4135,7 +4240,9 @@ private:
                   << " solve_H_ms " << solve_H_time * 1000.0 << " icp_ms " << (t_update_end - t_update_start) * 1000.0
                   << "\n";
         fout_jump.flush();
-        dump_lio_state_to_log(fp);
+        if (positionLog_) {
+          dump_lio_state_to_log(positionLog_.get());
+        }
       }
     }
   }
@@ -4283,7 +4390,7 @@ private:
   bool flg_EKF_converged, EKF_stop_flg = 0;
   double epsi[23] = {0.001};
 
-  FILE * fp;
+  FileHandle positionLog_;
   ofstream fout_pre, fout_out, fout_dbg, fout_jump, fout_kalman;
 
   std::string prior_map_pcd_;
@@ -4341,33 +4448,35 @@ int main(int argc, char ** argv)
 
   if (runtime_pos_log) {
     vector<double> t, s_vec, s_vec2, s_vec3, s_vec4, s_vec5, s_vec6, s_vec7;
-    FILE * fp2;
-    string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
-    fp2 = fopen(log_dir.c_str(), "w");
-    fprintf(fp2,
-            "time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree "
-            "size st, tree size end, add point size, preprocess time\n");
-    for (int i = 0; i < time_log_counter; i++) {
-      fprintf(fp2,
-              "%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",
-              T1[i],
-              s_plot[i],
-              int(s_plot2[i]),
-              s_plot3[i],
-              s_plot4[i],
-              int(s_plot5[i]),
-              s_plot6[i],
-              int(s_plot7[i]),
-              int(s_plot8[i]),
-              int(s_plot10[i]),
-              s_plot11[i]);
-      t.push_back(T1[i]);
-      s_vec.push_back(s_plot9[i]);
-      s_vec2.push_back(s_plot3[i] + s_plot6[i]);
-      s_vec3.push_back(s_plot4[i]);
-      s_vec5.push_back(s_plot[i]);
+    const string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
+    FileHandle timingLog(std::fopen(log_dir.c_str(), "w"));
+    if (!timingLog) {
+      RCLCPP_WARN(rclcpp::get_logger("fastlio_mapping"), "Timing log not written: failed to open %s", log_dir.c_str());
+    } else {
+      fprintf(timingLog.get(),
+              "time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree "
+              "size st, tree size end, add point size, preprocess time\n");
+      for (int i = 0; i < time_log_counter; i++) {
+        fprintf(timingLog.get(),
+                "%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",
+                T1[i],
+                s_plot[i],
+                int(s_plot2[i]),
+                s_plot3[i],
+                s_plot4[i],
+                int(s_plot5[i]),
+                s_plot6[i],
+                int(s_plot7[i]),
+                int(s_plot8[i]),
+                int(s_plot10[i]),
+                s_plot11[i]);
+        t.push_back(T1[i]);
+        s_vec.push_back(s_plot9[i]);
+        s_vec2.push_back(s_plot3[i] + s_plot6[i]);
+        s_vec3.push_back(s_plot4[i]);
+        s_vec5.push_back(s_plot[i]);
+      }
     }
-    fclose(fp2);
   }
 
   return 0;

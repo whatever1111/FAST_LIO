@@ -1,24 +1,30 @@
-#include <cmath>
-#include <math.h>
-#include <deque>
-#include <mutex>
-#include <thread>
-#include <fstream>
-#include <csignal>
-#include <so3_math.h>
-#include <Eigen/Eigen>
-#include <common_lib.h>
-#include <pcl/common/io.h>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
-#include <condition_variable>
+#include <geometry_msgs/msg/vector3.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <pcl/common/transforms.h>
-#include <pcl/kdtree/kdtree_flann.h>
-#include <pcl_conversions/pcl_conversions.h>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <geometry_msgs/msg/vector3.hpp>
+
+#include <pcl_conversions/pcl_conversions.h>
+
+#include <Eigen/Eigen>
+#include <pcl/common/io.h>
+#include <pcl/common/transforms.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+
+#include <cmath>
+#include <common_lib.h>
+#include <condition_variable>
+#include <csignal>
+#include <deque>
+#include <fstream>
+#include <math.h>
+#include <mutex>
+#include <so3_math.h>
+#include <thread>
+
+#include "imu_coverage_policy.hpp"
+#include "scan_time_policy.hpp"
 #include "use-ikfom.hpp"
 
 /// *************Preconfiguration
@@ -47,7 +53,22 @@ class ImuProcess
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
   Eigen::Matrix<double, 12, 12> Q;
-  void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
+  bool Process(const MeasureGroup & meas,
+               esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state,
+               PointCloudXYZI::Ptr pcl_un_);
+
+  enum class ProcessStatus
+  {
+    kRejected,
+    kInitializing,
+    kProcessed,
+    kCoverageGap
+  };
+  ProcessStatus lastStatus() const { return last_status_; }
+  fast_lio::ImuCoverageParams coverage_params;
+  fast_lio::ImuCoverageResult coverage_result;
+
+  double lastProcessedEnd() const { return scan_consumption_.lastEnd(); }
 
   ofstream fout_imu;
   // When true, dump per-sample IMU (bias-corrected, as fed to the filter) to
@@ -95,7 +116,9 @@ class ImuProcess
   V3D angvel_last;
   V3D acc_s_last;
   double start_timestamp_;
-  double last_lidar_end_time_;
+  double last_lidar_end_time_ = -1.0;
+  fast_lio::ScanConsumption scan_consumption_;
+  ProcessStatus last_status_ = ProcessStatus::kRejected;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -115,7 +138,7 @@ ImuProcess::ImuProcess()
   angvel_last     = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
-  last_imu_.reset(new sensor_msgs::msg::Imu());
+  last_imu_ = std::make_shared<sensor_msgs::msg::Imu>();
 }
 
 ImuProcess::~ImuProcess() {}
@@ -131,8 +154,13 @@ void ImuProcess::Reset()
   init_iter_num     = 1;
   v_imu_.clear();
   IMUpose.clear();
-  last_imu_.reset(new sensor_msgs::msg::Imu());
-  cur_pcl_un_.reset(new PointCloudXYZI());
+  last_imu_ = std::make_shared<sensor_msgs::msg::Imu>();
+  cur_pcl_un_ = std::make_shared<PointCloudXYZI>();
+  last_lidar_end_time_ = -1.0;
+  scan_consumption_.reset();
+  last_status_ = ProcessStatus::kRejected;
+  b_first_frame_ = true;
+  acc_s_last = Zero3d;
 }
 
 void ImuProcess::set_extrinsic(const MD(4,4) &T)
@@ -266,6 +294,8 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double dt = 0;
 
   input_ikfom in;
+  in.gyro = angvel_last + imu_state.bg;
+  in.acc = imu_state.rot.inverse() * (acc_s_last - imu_state.grav.get_vect()) + imu_state.ba;
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -321,8 +351,10 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   }
 
   /*** calculated the pos and attitude prediction at the frame-end ***/
-  double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
-  dt = note * (pcl_end_time - imu_end_time);
+  // A short advancing scan can contain only duplicate old IMU samples.
+  // They were already integrated up to last_lidar_end_time_; never integrate
+  // that old interval a second time while extrapolating to this scan's end.
+  dt = pcl_end_time - std::max(imu_end_time, last_lidar_end_time_);
   kf_state.predict(dt, Q, in);
   
   imu_state = kf_state.get_x();
@@ -458,13 +490,31 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   }
 }
 
-void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr cur_pcl_un_)
+bool ImuProcess::Process(const MeasureGroup & meas,
+                         esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state,
+                         PointCloudXYZI::Ptr cur_pcl_un_)
 {
   double t1,t2,t3;
   t1 = omp_get_wtime();
 
-  if(meas.imu.empty()) {return;};
-  assert(meas.lidar != nullptr);
+  last_status_ = ProcessStatus::kRejected;
+  // Always invalidate the caller's previous cloud before any early return.
+  if (!cur_pcl_un_)
+    return false;
+  cur_pcl_un_->clear();
+  if (!meas.lidar || meas.lidar->empty() || meas.imu.empty() || !scan_consumption_.canProcess(meas.lidar_end_time))
+    return false;
+  const auto timing =
+    fast_lio::scanTime(meas.lidar_beg_time, meas.lidar->points, [](const auto & point) { return point.curvature; });
+  if (!timing.valid() || timing.end > meas.lidar_end_time)
+    return false;
+
+  for (const auto & imu : meas.imu) {
+    if (!imu || !std::isfinite(imu->linear_acceleration.x) || !std::isfinite(imu->linear_acceleration.y) ||
+        !std::isfinite(imu->linear_acceleration.z) || !std::isfinite(imu->angular_velocity.x) ||
+        !std::isfinite(imu->angular_velocity.y) || !std::isfinite(imu->angular_velocity.z))
+      return false;
+  }
 
   if (imu_need_init_)
   {
@@ -474,6 +524,9 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
     imu_need_init_ = true;
     
     last_imu_   = meas.imu.back();
+    last_lidar_end_time_ = meas.lidar_end_time;
+    scan_consumption_.commit(meas.lidar_end_time);
+    last_status_ = ProcessStatus::kInitializing;
 
     state_ikfom imu_state = kf_state.get_x();
     if (init_iter_num > MAX_INI_COUNT)
@@ -487,7 +540,7 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
                   << " > " << init_still_tol << ") — restarting init window" << std::endl;
         b_first_frame_ = true;   // next IMU_init call re-seeds mean/cov from fresh samples
         init_iter_num = 1;
-        return;
+        return false;
       }
       if (init_require_still && timed_out && still_ratio > init_still_tol)
         std::cerr << "[IMU-INIT] WARN still-gate timeout after " << init_still_timeout_s
@@ -504,13 +557,39 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
       if (runtime_log_en) fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
     }
 
-    return;
+    return false;
+  }
+
+  std::vector<double> imu_stamps;
+  imu_stamps.reserve(meas.imu.size() + 1);
+  imu_stamps.push_back(rclcpp::Time(last_imu_->header.stamp).seconds());
+  for (const auto & imu : meas.imu)
+    imu_stamps.push_back(rclcpp::Time(imu->header.stamp).seconds());
+  coverage_result = fast_lio::imuCoverage(last_lidar_end_time_, meas.lidar_end_time, imu_stamps, coverage_params);
+  if (!coverage_result.covered()) {
+    // Missing motion cannot be recovered by integrating across the gap. Hold
+    // the state, rebase ONLY the input cursor and require caller-side map
+    // re-anchoring before claiming healthy output again. Do not relearn gravity.
+    // Malformed / unordered samples cannot establish a new temporal anchor.
+    if (coverage_result.status == fast_lio::ImuCoverageStatus::kGap ||
+        coverage_result.status == fast_lio::ImuCoverageStatus::kStart ||
+        coverage_result.status == fast_lio::ImuCoverageStatus::kEnd) {
+      last_imu_ = meas.imu.back();
+      last_lidar_end_time_ = meas.lidar_end_time;
+      scan_consumption_.commit(meas.lidar_end_time);
+      IMUpose.clear();
+    }
+    last_status_ = ProcessStatus::kCoverageGap;
+    return false;
   }
 
   UndistortPcl(meas, kf_state, *cur_pcl_un_);
+  scan_consumption_.commit(meas.lidar_end_time);
 
   t2 = omp_get_wtime();
   t3 = omp_get_wtime();
   
   // cout<<"[ IMU Process ]: Time: "<<t3 - t1<<endl;
+  last_status_ = ProcessStatus::kProcessed;
+  return !cur_pcl_un_->empty();
 }

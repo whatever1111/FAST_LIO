@@ -175,6 +175,23 @@ ament_target_dependencies(fastlio_mapping_component ${dependencies})
 rclcpp_components_register_nodes(fastlio_mapping_component "LaserMappingNode")
 
 if(BUILD_TESTING)
+  ament_add_gtest(test_imu_coverage_policy test/test_imu_coverage_policy.cpp)
+  target_include_directories(test_imu_coverage_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  ament_add_gtest(test_scan_time_policy test/test_scan_time_policy.cpp)
+  target_include_directories(test_scan_time_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  ament_add_gtest(test_imu_process_validity test/test_imu_process_validity.cpp)
+  ament_add_gtest(test_preprocess_timing test/test_preprocess_timing.cpp src/preprocess.cpp)
+  foreach(timing_test test_imu_process_validity test_preprocess_timing)
+    target_include_directories(${timing_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src ${PCL_INCLUDE_DIRS})
+    target_link_libraries(${timing_test} ${PCL_LIBRARIES} Eigen3::Eigen)
+    ament_target_dependencies(${timing_test} ${dependencies})
+    if(cpp_typesupport_target)
+      target_link_libraries(${timing_test} ${cpp_typesupport_target})
+    else()
+      rosidl_target_interfaces(${timing_test} ${PROJECT_NAME} "rosidl_typesupport_cpp")
+    endif()
+  endforeach()
   ament_add_pytest_test(test_analyze_kalman_channels
     test/test_analyze_kalman_channels.py
   )

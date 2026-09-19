@@ -259,6 +259,12 @@ if(BUILD_TESTING)
   if(TARGET test_parked_hold)
     target_include_directories(test_parked_hold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
+
+  ament_add_gtest(test_odom_covariance_contract test/test_odom_covariance_contract.cpp)
+  if(TARGET test_odom_covariance_contract)
+    target_include_directories(test_odom_covariance_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(test_odom_covariance_contract Eigen3::Eigen)
+  endif()
 endif()
 
 # ---------------- Install --------------- #

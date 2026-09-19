@@ -80,6 +80,7 @@
 #include <math.h>
 #include <memory>
 #include <mutex>
+#include <odom_covariance_contract.hpp>
 #include <omp.h>
 #include <shm_msgs/msg/point_cloud8m_and_pose.hpp>
 #include <so3_math.h>
@@ -1586,10 +1587,11 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   odomAftMapped.child_frame_id = body_frame_id;
   odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
   set_posestamp(odomAftMapped.pose);
+  auto P = kf.get_P();
+  odomAftMapped.pose.covariance = fast_lio::makeOdomCovariance(P.block<6, 6>(0, 0), flio_degraded_odom);
   // Front-end health side-channel (Plan C) — written BEFORE the publish so it is
-  // same-scan (unlike pose.covariance below, which fills the persistent global
-  // message after publishing and therefore rides out one scan late). The twist
-  // covariance was always zero here and has no other consumer. Layout contract:
+  // same-scan. The twist covariance was always zero here and has no other
+  // consumer. Layout contract:
   // LIO-SLAM core pgo_factor_kernels.hpp kFeHealth*Cell.
   if (health_pub_en) {
     odomAftMapped.twist.covariance[0] = 1.0;  // sentinel/version
@@ -1636,28 +1638,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
       last_latency_log_time = now;
     }
   }
-  auto P = kf.get_P();
-  for (int i = 0; i < 6; i++) {
-    int k = i < 3 ? i + 3 : i - 3;
-    odomAftMapped.pose.covariance[i * 6 + 0] = P(k, 3);
-    odomAftMapped.pose.covariance[i * 6 + 1] = P(k, 4);
-    odomAftMapped.pose.covariance[i * 6 + 2] = P(k, 5);
-    odomAftMapped.pose.covariance[i * 6 + 3] = P(k, 0);
-    odomAftMapped.pose.covariance[i * 6 + 4] = P(k, 1);
-    odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
-  }
-
-  // Divergence guard (P1): while the front end is dead-reckoning (LiDAR
-  // starved), advertise large position variance on the ROS pose covariance
-  // (x,y,z diagonal) so the PGO back-end down-weights these poses instead of
-  // trusting a bounded-but-uncertain dead-reckoned estimate.
-  if (flio_degraded_odom) {
-    constexpr double kDegradedPosVar = 100.0;              // (10 m)^2
-    odomAftMapped.pose.covariance[0] += kDegradedPosVar;   // x
-    odomAftMapped.pose.covariance[7] += kDegradedPosVar;   // y
-    odomAftMapped.pose.covariance[14] += kDegradedPosVar;  // z
-  }
-
   geometry_msgs::msg::TransformStamped trans;
   trans.header.frame_id = odom_frame_id;
   trans.child_frame_id = body_frame_id;

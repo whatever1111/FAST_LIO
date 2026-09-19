@@ -155,7 +155,7 @@ void ImuProcess::Reset()
   v_imu_.clear();
   IMUpose.clear();
   last_imu_ = std::make_shared<sensor_msgs::msg::Imu>();
-  cur_pcl_un_ = std::make_shared<PointCloudXYZI>();
+  cur_pcl_un_ = PointCloudXYZI{}.makeShared();
   last_lidar_end_time_ = -1.0;
   scan_consumption_.reset();
   last_status_ = ProcessStatus::kRejected;

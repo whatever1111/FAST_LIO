@@ -1611,6 +1611,13 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.twist.covariance[21] = scan_far_frac;
     odomAftMapped.twist.covariance[28] = res_mean_last;
     odomAftMapped.twist.covariance[35] = scan_body_speed;
+    // Gravity side-channel (LIO-SLAM core fe_health.hpp kFeGravity*Cell): the S2
+    // gravity state, world frame, m/s^2. The world frame was levelled from the
+    // start-up accelerometer mean; this is where the filter now puts "down", and
+    // downstream attitude references are levelled by it.
+    odomAftMapped.twist.covariance[2] = state_point.grav[0];
+    odomAftMapped.twist.covariance[3] = state_point.grav[1];
+    odomAftMapped.twist.covariance[4] = state_point.grav[2];
   }
   pubOdomAftMapped->publish(odomAftMapped);
   if (!diag_first_odom_pub_logged) {

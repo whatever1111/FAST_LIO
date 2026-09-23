@@ -263,6 +263,10 @@ double gravity_align_grav_leak = 1.0;      // [v4] per-engaged-scan multiplicati
 // 0826 111/131 s; docs/PGO_LOOP_TUNING.md §7). The true vertical does not
 // change in those seconds; the attitude is what the degraded prior is for.
 bool gravity_align_grav_freeze_degraded = false;
+// [v5] Whether the last scan's levelling update ran at the degraded/held strength;
+// published in the health flags so a pose-graph consumer can leave those
+// keyframes' roll/pitch unpinned.
+bool gravity_align_degraded_active = false;
 double gravity_align_grav_cap_deg = 3.0;   // [v4] leak cap: grav tangent std ceiling (deg) — bounds how far
                                            // the gravity state may be steered per run
 bool imu_init_require_still_ = false;      // quasi-static IMU-init gate (see IMU_Processing.hpp)
@@ -1615,6 +1619,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
       health_flags |= 1u << 1;  // kFeHealthFlagStaticHold
     if (reanchor_gate.state == fast_lio::ReanchorState::kLost)
       health_flags |= 1u << 2;  // kFeHealthFlagLost
+    if (gravity_align_degraded_active)
+      health_flags |= 1u << 3;  // kFeHealthFlagLevelling: roll/pitch pulled onto the accel window mean
     odomAftMapped.twist.covariance[1] = static_cast<double>(health_flags);
     odomAftMapped.twist.covariance[7] = scan_obs_along;
     odomAftMapped.twist.covariance[14] = static_cast<double>(effct_feat_num);
@@ -3448,6 +3454,7 @@ private:
         if (ga_trig) { gravity_align_last_trig = lidar_end_time; }
         const bool ga_held = gravity_align_hold_s > 0.0 && !ga_trig &&
                              lidar_end_time - gravity_align_last_trig <= gravity_align_hold_s;
+        gravity_align_degraded_active = (ga_trig || ga_held) && gravity_align_noise_degraded > 0.0;
         if (ga_trig || ga_held || gravity_align_continuous) {
           // Measurement vector: window mean ([L2]) or legacy last-sample.
           V3D f_meas = V3D::Zero();

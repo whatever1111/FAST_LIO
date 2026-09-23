@@ -253,6 +253,16 @@ double gravity_align_noise_degraded = 0.0; // [L1] tighter sigma while triggered
 double gravity_align_mag_ref = 0.0;        // magnitude-gate anchor; 0 = IMU-init g (biased if init in motion)
 double gravity_align_grav_leak = 1.0;      // [v4] per-engaged-scan multiplicative variance leak on the S2
                                            // gravity block (fading memory); 1.0 = off
+// [v5] Freeze the S2 gravity state while the levelling prior runs at its
+// degraded strength (trigger or hold): only attitude takes the update then.
+// The leak makes the gravity block a fading-memory filter whose steady-state
+// gain is ~(leak-1) per engaged scan whatever the sigma (P* = (leak-1)·σ²), so
+// at 1.05 the gravity state is a ~2 s low-pass of the accelerometer direction
+// and inside blind re-anchor windows it swings 1.5-2° with the walking
+// dynamics while the vendor INS attitude stays put (m20 0825 133/151/164 s,
+// 0826 111/131 s; docs/PGO_LOOP_TUNING.md §7). The true vertical does not
+// change in those seconds; the attitude is what the degraded prior is for.
+bool gravity_align_grav_freeze_degraded = false;
 double gravity_align_grav_cap_deg = 3.0;   // [v4] leak cap: grav tangent std ceiling (deg) — bounds how far
                                            // the gravity state may be steered per run
 bool imu_init_require_still_ = false;      // quasi-static IMU-init gate (see IMU_Processing.hpp)
@@ -2172,6 +2182,7 @@ public:
     this->declare_parameter<double>("gravity_align_mag_ref", 0.0);
     this->declare_parameter<double>("gravity_align_grav_leak", 1.0);
     this->declare_parameter<double>("gravity_align_grav_cap_deg", 3.0);
+    this->declare_parameter<bool>("gravity_align_grav_freeze_degraded", false);
     this->declare_parameter<bool>("imu_init_require_still", false);
     this->declare_parameter<double>("imu_init_still_tol", 0.03);
     this->declare_parameter<double>("imu_init_still_timeout_s", 20.0);
@@ -2362,6 +2373,7 @@ public:
     this->get_parameter_or<double>("gravity_align_mag_ref", gravity_align_mag_ref, 0.0);
     this->get_parameter_or<double>("gravity_align_grav_leak", gravity_align_grav_leak, 1.0);
     this->get_parameter_or<double>("gravity_align_grav_cap_deg", gravity_align_grav_cap_deg, 3.0);
+    this->get_parameter_or<bool>("gravity_align_grav_freeze_degraded", gravity_align_grav_freeze_degraded, false);
     this->get_parameter_or<bool>("imu_init_require_still", imu_init_require_still_, false);
     this->get_parameter_or<double>("imu_init_still_tol", imu_init_still_tol_, 0.03);
     this->get_parameter_or<double>("imu_init_still_timeout_s", imu_init_still_timeout_s_, 20.0);
@@ -3481,6 +3493,9 @@ private:
             if (residual.norm() <= 0.5) {  // ~30° outlier gate (never inject a wild window)
             Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
             H.block<3, 3>(0, 3) = skew_sym_mat(g_body);  // ∂h/∂(rot); yaw in null space
+            // [v5] degraded/held strength is an attitude measure; the gravity
+            // state neither takes the residual nor leaks while it is in force.
+            const bool grav_frozen = gravity_align_grav_freeze_degraded && (ga_trig || ga_held);
             // [v4] gravity-state observability: h = Rᵀ·(−g/‖g‖) also depends on the
             // S2 gravity state — without these two columns a motion-biased gravity
             // INIT is permanently unobservable (m20_0831: the bag starts walking →
@@ -3490,7 +3505,7 @@ private:
             // in, the Kalman gain splits the residual by covariance: rot follows
             // the (tight) lidar, grav follows the absolute accel reference.
             // ∂h/∂δg = −(1/‖g‖)·Rᵀ·M(g), M = S2_Mx (same helper df_dx uses).
-            {
+            if (!grav_frozen) {
               Eigen::Matrix<state_ikfom::scalar, 2, 1> dz0 = Eigen::Matrix<state_ikfom::scalar, 2, 1>::Zero();
               Eigen::Matrix<state_ikfom::scalar, 3, 2> Mg;
               st.S2_Mx(Mg, dz0, 21);
@@ -3501,7 +3516,7 @@ private:
             // grav variance collapses and even a correct H routes nothing into it.
             // Gentle multiplicative leak (congruence row/col scaling — correlations
             // and PSD preserved, no covariance shock) capped at (3°)².
-            if (gravity_align_grav_leak > 1.0) {
+            if (gravity_align_grav_leak > 1.0 && !grav_frozen) {
               const double kGravVarCap = std::pow(gravity_align_grav_cap_deg * M_PI / 180.0, 2);
               auto Pg = kf.get_P();
               const double lam = std::sqrt(gravity_align_grav_leak);

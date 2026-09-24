@@ -331,7 +331,12 @@ double gravity_align_last_trig = -1e18;
 // the state 0.4-1.7° per scan (docs/PGO_LOOP_TUNING.md §7.5). Decided once per scan before the
 // update from the previous scan's guard verdicts and this scan's far-field share.
 fast_lio::AttitudeHoldParams attitude_hold_params;
-bool lidar_attitude_hold_active = false;  // this scan's verdict; read by h_share_model
+bool lidar_attitude_hold_active = false;  // this scan's scene-rule verdict; read by h_share_model
+bool lidar_attitude_hold_allowed = false; // release conditions satisfied this scan (starvation, age, holes)
+double lidar_attitude_hold_min_rp_info = 0.0;   // [v9] information rule: hold when the scan's own roll/pitch
+                                                // information (attitude_hold.hpp rollPitchInformation) is below this; 0 = off
+bool lidar_attitude_hold_info_active = false;   // the information rule held on the last h_share_model call
+double lidar_rot_obs_rp_min = 0.0;              // telemetry: last scan's roll/pitch information
 int lidar_attitude_hold_scans = 0;        // telemetry
 double lidar_attitude_hold_since = -1.0;  // lidar_end_time when the current hold began (-1 = off)
 
@@ -2116,11 +2121,31 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   ekfom_data.h.resize(effct_feat_num);
   // [v8] attitude hold: the vertical in the body frame (the gravity state's own up), recomputed per
   // iteration; every rotation row below is projected onto it so the update cannot move roll/pitch.
+  // [v9] the information rule decides from this iteration's own rows: Σ AAᵀ restricted to the
+  // roll/pitch plane, its weakest eigenvalue against lidar_attitude_hold_min_rp_info.
   V3D hold_up = V3D::Zero();
-  if (lidar_attitude_hold_active) {
+  {
     V3D grav_w(s.grav[0], s.grav[1], s.grav[2]);
     const V3D up_w = grav_w.norm() > 1e-6 ? V3D(-grav_w.normalized()) : V3D(0.0, 0.0, 1.0);
     hold_up = (s.rot.conjugate() * up_w).normalized();
+  }
+  bool hold_rows = lidar_attitude_hold_active;
+  {
+    M3D rot_info = M3D::Zero();
+    for (int i = 0; i < effct_feat_num; i++) {
+      const PointType & laser_p = laserCloudOri->points[i];
+      const V3D point_this = s.offset_R_L_I * V3D(laser_p.x, laser_p.y, laser_p.z) + s.offset_T_L_I;
+      const PointType & norm_p = corr_normvect->points[i];
+      const V3D C(s.rot.conjugate() * V3D(norm_p.x, norm_p.y, norm_p.z));
+      const V3D A(point_this.cross(C));
+      rot_info += A * A.transpose();
+    }
+    lidar_rot_obs_rp_min = fast_lio::rollPitchInformation(rot_info, hold_up);
+    if (lidar_attitude_hold_allowed && lidar_attitude_hold_min_rp_info > 0.0 &&
+        lidar_rot_obs_rp_min < lidar_attitude_hold_min_rp_info) {
+      hold_rows = true;
+      lidar_attitude_hold_info_active = true;
+    }
   }
 
   for (int i = 0; i < effct_feat_num; i++) {
@@ -2139,7 +2164,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     /*** calculate the Measuremnt Jacobian matrix H ***/
     V3D C(s.rot.conjugate() * norm_vec);
     V3D A(point_crossmat * C);
-    if (lidar_attitude_hold_active) { A = fast_lio::projectRotationRowToYaw(A, hold_up); }
+    if (hold_rows) { A = fast_lio::projectRotationRowToYaw(A, hold_up); }
     if (extrinsic_est_en) {
       V3D B(point_be_crossmat * s.offset_R_L_I.conjugate() * C);  // s.rot.conjugate()*norm_vec);
       ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B),
@@ -2265,6 +2290,7 @@ public:
     this->declare_parameter<int>("lidar_attitude_hold_min_effct", 100);
     this->declare_parameter<double>("lidar_attitude_hold_max_s", 3.0);
     this->declare_parameter<double>("lidar_attitude_hold_max_scan_gap_s", 0.3);
+    this->declare_parameter<double>("lidar_attitude_hold_min_rp_info", 0.0);
     this->declare_parameter<double>("lidar_attitude_hold_z_weak", 0.9);
     this->declare_parameter<bool>("gravity_align_lin_accel_comp", false);
     this->declare_parameter<double>("gravity_align_vel_sigma_scale", 0.0);
@@ -2472,6 +2498,7 @@ public:
     this->get_parameter_or<int>("lidar_attitude_hold_min_effct", attitude_hold_params.min_effct, 100);
     this->get_parameter_or<double>("lidar_attitude_hold_max_s", attitude_hold_params.max_hold_s, 3.0);
     this->get_parameter_or<double>("lidar_attitude_hold_max_scan_gap_s", attitude_hold_params.max_scan_gap_s, 0.3);
+    this->get_parameter_or<double>("lidar_attitude_hold_min_rp_info", lidar_attitude_hold_min_rp_info, 0.0);
     this->get_parameter_or<double>("lidar_attitude_hold_z_weak", attitude_hold_params.z_weak_min, 0.9);
     this->get_parameter_or<bool>("gravity_align_lin_accel_comp", gravity_align_lin_accel_comp, false);
     this->get_parameter_or<double>("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale, 0.0);
@@ -2761,7 +2788,7 @@ public:
                   << "p_grav_pos,p_grav_rot,p_grav_vel,p_grav_ba,p_ba_pos,p_ba_rot,p_ba_vel,"
                   << "p_grav_diag0_before,p_grav_diag1_before,p_grav_diag0_after,p_grav_diag1_after,"
                   << "p_ba_x_before,p_ba_y_before,p_ba_z_before,p_ba_x_after,p_ba_y_after,p_ba_z_after,"
-                  << "drot_x,drot_y,drot_z\n";
+                  << "drot_x,drot_y,drot_z,rot_obs_rp_min\n";
       RCLCPP_INFO(this->get_logger(),
                   "Kalman channel diagnostics enabled: %s (schema v1)",
                   DEBUG_FILE_DIR("kalman_channels.csv").c_str());
@@ -3031,7 +3058,7 @@ private:
                 << covarianceBlockNorm(covarianceBefore, 18, 3, 12, 3) << ',' << pBefore(21) << ',' << pBefore(22)
                 << ',' << pAfter(21) << ',' << pAfter(22) << ',' << pBefore(18) << ',' << pBefore(19) << ','
                 << pBefore(20) << ',' << pAfter(18) << ',' << pAfter(19) << ',' << pAfter(20) << ',' << drot.x() << ','
-                << drot.y() << ',' << drot.z() << '\n';
+                << drot.y() << ',' << drot.z() << ',' << lidar_rot_obs_rp_min << '\n';
     fout_kalman.flush();
   }
 
@@ -3431,6 +3458,10 @@ private:
         hold_in.far_frac = scan_far_frac;
         hold_in.z_weak_prev = pos_obs_z_weak;
         lidar_attitude_hold_active = fast_lio::holdAttitudeThisScan(attitude_hold_params, hold_in);
+        fast_lio::AttitudeHoldInputs allowed_in = hold_in;
+        allowed_in.engulf_latched = true;  // the release conditions alone: would a latch be honoured?
+        lidar_attitude_hold_allowed = fast_lio::holdAttitudeThisScan(attitude_hold_params, allowed_in);
+        lidar_attitude_hold_info_active = false;
       }
       if (lidar_attitude_hold_active) {
         if (lidar_attitude_hold_since < 0.0) { lidar_attitude_hold_since = lidar_end_time; }
@@ -3446,8 +3477,6 @@ private:
                              pos_obs_z_weak,
                              lidar_end_time - lidar_attitude_hold_since,
                              lidar_attitude_hold_scans);
-      } else {
-        lidar_attitude_hold_since = -1.0;
       }
       EkfUpdateDiagnostics lidarDiagnostics;
       Eigen::Matrix<double, 23, 23> lidarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
@@ -3457,6 +3486,21 @@ private:
         LASER_POINT_COV, solve_H_time, kalman_channel_diag_en ? &lidarDiagnostics : nullptr);
 
       state_point = kf.get_x();
+      if (!lidar_attitude_hold_active && !lidar_attitude_hold_info_active) { lidar_attitude_hold_since = -1.0; }
+      if (lidar_attitude_hold_info_active && !lidar_attitude_hold_active) {
+        if (lidar_attitude_hold_since < 0.0) { lidar_attitude_hold_since = lidar_end_time; }
+        ++lidar_attitude_hold_scans;
+        RCLCPP_INFO_THROTTLE(this->get_logger(),
+                             *this->get_clock(),
+                             2000,
+                             "[ATT-HOLD] information rule: roll/pitch info %.1f < %.1f, update restricted to "
+                             "translation+yaw (effct=%d far_frac=%.2f, %d scans so far)",
+                             lidar_rot_obs_rp_min,
+                             lidar_attitude_hold_min_rp_info,
+                             effct_feat_num,
+                             scan_far_frac,
+                             lidar_attitude_hold_scans);
+      }
       if (kalman_channel_diag_en) {
         writeKalmanChannel(
           "lidar", state_before_update, state_point, lidarCovarianceBefore, lidarDiagnostics, Zero3d, Zero3d);

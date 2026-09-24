@@ -21,7 +21,9 @@
 #pragma once
 
 #include <Eigen/Core>
+#include <Eigen/Eigenvalues>
 
+#include <algorithm>
 #include <cmath>
 
 namespace fast_lio
@@ -77,6 +79,30 @@ inline bool holdAttitudeThisScan(const AttitudeHoldParams & p, const AttitudeHol
     return true;
   }
   return false;
+}
+
+/// How much this scan's correspondences say about roll and pitch: the smaller of
+/// the two eigenvalues of the rotation information Σ AAᵀ restricted to the plane
+/// orthogonal to the vertical `up` (unit, body frame). Rows are the point-to-plane
+/// rotation Jacobians A_i = p_i × Rᵀn_i; a floor at range r contributes ~r² per
+/// point to this subspace, a near-field wall only its points' vertical offsets
+/// squared, so a doorway transition sits two orders of magnitude below a healthy
+/// scan. Units: m² per point (before the point covariance). Returns 0 for a
+/// degenerate input.
+inline double rollPitchInformation(const Eigen::Matrix3d & rotation_information, const Eigen::Vector3d & up)
+{
+  if (!rotation_information.allFinite() || !up.allFinite() || up.norm() < 1e-9) {
+    return 0.0;
+  }
+  const Eigen::Vector3d u = up.normalized();
+  const Eigen::Matrix3d proj = Eigen::Matrix3d::Identity() - u * u.transpose();
+  const Eigen::Matrix3d m = proj * rotation_information * proj;
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(m);
+  if (es.info() != Eigen::Success) {
+    return 0.0;
+  }
+  // ascending: the first is the (numerically zero) direction along up, the second the weakest roll/pitch axis
+  return std::max(es.eigenvalues()(1), 0.0);
 }
 
 /// A point's rotation Jacobian row projected onto the vertical axis `up` (unit,

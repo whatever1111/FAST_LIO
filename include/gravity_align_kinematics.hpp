@@ -120,6 +120,35 @@ inline double legEdgeVariance(double vx_mean, bool body_static, double leg_vel_s
   return leg_vel_sigma * leg_vel_sigma;
 }
 
+/// What the levelling measurement's sigma describes.
+///  kScene:       the legacy rule — tight (noise_degraded) whenever the LiDAR is Z-degenerate or the
+///                guard is degraded (and for a hold after), loose (noise) otherwise. Keyed on who else
+///                constrains roll/pitch, not on the measurement's own error; on the m20 it is in force
+///                on 82 % of scans with a 6-15x mismatch against the residual while moving.
+///  kMeasurement: the sigma describes the 1 s specific-force mean itself — exact at rest, a gait floor
+///                while moving — and the Kalman gain, through the attitude covariance, decides how much
+///                of it to use where the LiDAR is weak.
+enum class LevellingSigmaPolicy
+{
+  kScene,
+  kMeasurement,
+};
+
+/// The levelling measurement's sigma, unit-vector units (rad).
+inline double levellingSigma(LevellingSigmaPolicy policy,
+                             bool scene_degraded_or_held,
+                             bool body_static,
+                             double noise,
+                             double noise_degraded,
+                             double noise_static,
+                             double noise_moving)
+{
+  if (policy == LevellingSigmaPolicy::kMeasurement) {
+    return body_static ? noise_static : noise_moving;
+  }
+  return (scene_degraded_or_held && noise_degraded > 0.0) ? noise_degraded : noise;
+}
+
 /// The lean, in radians, that a horizontal acceleration error of this size puts on
 /// the measured vertical — for logs and tests, not for the update.
 inline double leanOfAcceleration(const Eigen::Vector3d & accel, double gravity)

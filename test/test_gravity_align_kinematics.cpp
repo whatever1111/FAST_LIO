@@ -11,6 +11,8 @@ using fast_lio::leanOfAcceleration;
 using fast_lio::legEdgeValid;
 using fast_lio::legEdgeVariance;
 using fast_lio::legEdgeVelocity;
+using fast_lio::levellingSigma;
+using fast_lio::LevellingSigmaPolicy;
 using fast_lio::LevellingWindowScan;
 using fast_lio::LinearAccelerationTerm;
 using fast_lio::linearAccelerationTerm;
@@ -175,4 +177,25 @@ TEST(GravityAlignKinematics, LegEdgeVarianceIsExactZeroOnlyWhenParked)
   EXPECT_DOUBLE_EQ(legEdgeVariance(0.0, false, 0.15), 0.15 * 0.15);
   EXPECT_DOUBLE_EQ(legEdgeVariance(1.0, true, 0.15), 0.15 * 0.15);
   EXPECT_DOUBLE_EQ(legEdgeVariance(1.0, false, 0.15), 0.15 * 0.15);
+}
+
+// ── Sigma policy ─────────────────────────────────────────────────────────────
+// The scene policy is the legacy rule, bit for bit; the measurement policy never
+// looks at the scene and answers only "is the body static?".
+TEST(GravityAlignKinematics, ScenePolicyReproducesTheLegacyRule)
+{
+  const auto P = LevellingSigmaPolicy::kScene;
+  EXPECT_DOUBLE_EQ(levellingSigma(P, true, false, 0.03, 0.008, 0.01, 0.045), 0.008);
+  EXPECT_DOUBLE_EQ(levellingSigma(P, true, true, 0.03, 0.008, 0.01, 0.045), 0.008);
+  EXPECT_DOUBLE_EQ(levellingSigma(P, false, false, 0.03, 0.008, 0.01, 0.045), 0.03);
+  EXPECT_DOUBLE_EQ(levellingSigma(P, true, false, 0.03, 0.0, 0.01, 0.045), 0.03);  // degraded sigma 0 = unused
+}
+
+TEST(GravityAlignKinematics, MeasurementPolicyIgnoresTheSceneAndFollowsTheBody)
+{
+  const auto P = LevellingSigmaPolicy::kMeasurement;
+  for (const bool scene : {false, true}) {
+    EXPECT_DOUBLE_EQ(levellingSigma(P, scene, true, 0.03, 0.008, 0.01, 0.045), 0.01);
+    EXPECT_DOUBLE_EQ(levellingSigma(P, scene, false, 0.03, 0.008, 0.01, 0.045), 0.045);
+  }
 }

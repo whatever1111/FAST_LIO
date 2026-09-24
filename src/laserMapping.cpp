@@ -298,6 +298,16 @@ bool gravity_align_prev_edge_valid = false;
 // remove it (docs/PGO_LOOP_TUNING.md §7.3-7.4). With this on the prior is withheld there; the
 // attitude rides on the gyro (0.1-1° over such a window) instead of being levelled onto acceleration.
 bool gravity_align_withhold_blind_moving = false;
+// [v7] What sigma describes (gravity_align_kinematics.hpp LevellingSigmaPolicy): "scene" is the legacy
+// rule above; "measurement" makes sigma the measurement's own error — noise_static at rest,
+// noise_moving while moving — and withholds the prior where the acceleration is unobservable
+// (map frozen and body moving); the attitude covariance decides the rest.
+std::string gravity_align_sigma_policy = "scene";
+double gravity_align_noise_static = 0.008;   // rad-equivalent; the specific-force mean is exact at rest (0.06° measured)
+double gravity_align_noise_moving = 0.045;   // ≈2.6°: the gait floor of a compensated 1 s mean while walking
+// [diag] the previous scan's final state, so the IMU propagation can be logged as its own channel
+state_ikfom kalman_last_final_state;
+bool kalman_last_final_valid = false;
 std::deque<std::pair<double, double>> gravity_align_leg_hist;  // (stamp, forward speed) under mtx_twist
 std::deque<std::pair<double, V3D>> gravity_align_gyro_hist;    // (stamp, raw body rate) scan-thread only
 double gravity_align_grav_cap_deg = 3.0;   // [v4] leak cap: grav tangent std ceiling (deg) — bounds how far
@@ -2235,6 +2245,9 @@ public:
     this->declare_parameter<double>("gravity_align_vel_sigma_scale", 0.0);
     this->declare_parameter<std::string>("gravity_align_lin_accel_source", "leg");
     this->declare_parameter<bool>("gravity_align_withhold_blind_moving", false);
+    this->declare_parameter<std::string>("gravity_align_sigma_policy", "scene");
+    this->declare_parameter<double>("gravity_align_noise_static", 0.008);
+    this->declare_parameter<double>("gravity_align_noise_moving", 0.045);
     this->declare_parameter<double>("gravity_align_leg_vel_sigma", 0.15);
     this->declare_parameter<double>("gravity_align_leg_edge_window_s", 0.2);
     this->declare_parameter<std::vector<double>>("gravity_align_leg_lever_arm", std::vector<double>{0.0, 0.0, 0.0});
@@ -2433,6 +2446,14 @@ public:
     this->get_parameter_or<double>("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale, 0.0);
     this->get_parameter_or<std::string>("gravity_align_lin_accel_source", gravity_align_lin_accel_source, std::string("leg"));
     this->get_parameter_or<bool>("gravity_align_withhold_blind_moving", gravity_align_withhold_blind_moving, false);
+    this->get_parameter_or<std::string>("gravity_align_sigma_policy", gravity_align_sigma_policy, std::string("scene"));
+    this->get_parameter_or<double>("gravity_align_noise_static", gravity_align_noise_static, 0.008);
+    this->get_parameter_or<double>("gravity_align_noise_moving", gravity_align_noise_moving, 0.045);
+    if (gravity_align_sigma_policy != "scene" && gravity_align_sigma_policy != "measurement") {
+      RCLCPP_FATAL(this->get_logger(), "gravity_align_sigma_policy must be 'scene' or 'measurement', got '%s'",
+                   gravity_align_sigma_policy.c_str());
+      throw std::invalid_argument("gravity_align_sigma_policy");
+    }
     this->get_parameter_or<double>("gravity_align_leg_vel_sigma", gravity_align_leg_vel_sigma, 0.15);
     this->get_parameter_or<double>("gravity_align_leg_edge_window_s", gravity_align_leg_edge_window_s, 0.2);
     this->get_parameter_or<std::vector<double>>("gravity_align_leg_lever_arm", gravity_align_leg_lever_arm_vec,
@@ -2708,7 +2729,8 @@ public:
                   << "gain_rot,gain_vel,gain_ba,gain_grav,projection_rot,projection_vel,projection_ba,projection_grav,"
                   << "p_grav_pos,p_grav_rot,p_grav_vel,p_grav_ba,p_ba_pos,p_ba_rot,p_ba_vel,"
                   << "p_grav_diag0_before,p_grav_diag1_before,p_grav_diag0_after,p_grav_diag1_after,"
-                  << "p_ba_x_before,p_ba_y_before,p_ba_z_before,p_ba_x_after,p_ba_y_after,p_ba_z_after\n";
+                  << "p_ba_x_before,p_ba_y_before,p_ba_z_before,p_ba_x_after,p_ba_y_after,p_ba_z_after,"
+                  << "drot_x,drot_y,drot_z\n";
       RCLCPP_INFO(this->get_logger(),
                   "Kalman channel diagnostics enabled: %s (schema v1)",
                   DEBUG_FILE_DIR("kalman_channels.csv").c_str());
@@ -2946,6 +2968,8 @@ private:
     const V3D dvel = after.vel - before.vel;
     const V3D dba = after.ba - before.ba;
     const V3D dgrav(after.grav[0] - before.grav[0], after.grav[1] - before.grav[1], after.grav[2] - before.grav[2]);
+    // the rotation the channel applied, body frame (rad): what the iterated update's last_dx does not carry
+    const V3D drot = Log(M3D(before.rot.toRotationMatrix().transpose() * after.rot.toRotationMatrix()));
     const auto & dx = diagnostics.last_dx;
     const auto & gain = diagnostics.gain_row_norm;
     const auto & projection = diagnostics.correction_projection_row_norm;
@@ -2975,7 +2999,8 @@ private:
                 << covarianceBlockNorm(covarianceBefore, 18, 3, 3, 3) << ','
                 << covarianceBlockNorm(covarianceBefore, 18, 3, 12, 3) << ',' << pBefore(21) << ',' << pBefore(22)
                 << ',' << pAfter(21) << ',' << pAfter(22) << ',' << pBefore(18) << ',' << pBefore(19) << ','
-                << pBefore(20) << ',' << pAfter(18) << ',' << pAfter(19) << ',' << pAfter(20) << '\n';
+                << pBefore(20) << ',' << pAfter(18) << ',' << pAfter(19) << ',' << pAfter(20) << ',' << drot.x() << ','
+                << drot.y() << ',' << drot.z() << '\n';
     fout_kalman.flush();
   }
 
@@ -3352,6 +3377,12 @@ private:
 
       /*** iterated state estimation ***/
       const auto state_before_update = state_point;
+      if (kalman_channel_diag_en && kalman_last_final_valid) {
+        // the IMU propagation from the previous scan's final state to this scan's prior, as its own channel
+        EkfUpdateDiagnostics propagationDiagnostics;
+        writeKalmanChannel("propagation", kalman_last_final_state, state_before_update,
+                           Eigen::Matrix<double, 23, 23>::Zero(), propagationDiagnostics, Zero3d, Zero3d);
+      }
       const V3D euler_before_update = SO3ToEuler(state_before_update.rot);
       const V3D pos_before_update = state_before_update.pos;
       double t_update_start = omp_get_wtime();
@@ -3500,6 +3531,8 @@ private:
         M3D Rw = st.rot.toRotationMatrix();
         const V3D bg_now(st.bg[0], st.bg[1], st.bg[2]);
         const V3D v_body_now = Rw.transpose() * st.vel;  // velocity in IMU frame
+        const bool body_static_now = body_is_static(Measures, lidar_end_time);  // one verdict for this block
+        const bool sigma_by_measurement = gravity_align_sigma_policy == "measurement";
         // [v6] velocity covariance trace at this scan's end (the compensation sigma's input)
         const double vel_var_now =
           gravity_align_vel_sigma_scale > 0.0 ? kf.get_P().block<3, 3>(12, 12).trace() : 0.0;
@@ -3548,7 +3581,6 @@ private:
             const double vx_mean = n_leg > 0 ? vx_sum / double(n_leg) * wheel_speed_scale : 0.0;
             V3D w_mean = V3D::Zero();
             if (n_w > 0) { w_mean = w_sum / double(n_w) - bg_now; }
-            const bool body_static_now = body_is_static(Measures, lidar_end_time);
             edge_valid = fast_lio::legEdgeValid(n_leg, vx_mean, body_static_now);
             v_edge = fast_lio::legEdgeVelocity(vx_mean, R_robot_to_imu, w_mean, gravity_align_leg_lever_arm);
             var_edge = fast_lio::legEdgeVariance(vx_mean, body_static_now, gravity_align_leg_vel_sigma);
@@ -3585,7 +3617,8 @@ private:
         if (ga_trig) { gravity_align_last_trig = lidar_end_time; }
         const bool ga_held = gravity_align_hold_s > 0.0 && !ga_trig &&
                              lidar_end_time - gravity_align_last_trig <= gravity_align_hold_s;
-        gravity_align_degraded_active = (ga_trig || ga_held) && gravity_align_noise_degraded > 0.0;
+        gravity_align_degraded_active =
+          !sigma_by_measurement && (ga_trig || ga_held) && gravity_align_noise_degraded > 0.0;
         if (ga_trig || ga_held || gravity_align_continuous) {
           // Measurement vector: window mean ([L2]) or legacy last-sample.
           V3D f_meas = V3D::Zero();
@@ -3641,8 +3674,8 @@ private:
           const bool lin_ok = !gravity_align_lin_accel_comp || gravity_align_window_s <= 0.0 || lin_term.valid ||
                               !leg_stream_alive;
           // [v6] blind stretch with the body moving: the acceleration is unobservable, so is the vertical
-          const bool blind_moving = gravity_align_withhold_blind_moving && flio_in_degraded &&
-                                    !body_is_static(Measures, lidar_end_time);
+          const bool blind_moving = (gravity_align_withhold_blind_moving || sigma_by_measurement) &&
+                                    flio_in_degraded && !body_static_now;
           if (degeneracy_debug && blind_moving) {
             std::cerr << "[GALIGN] withheld: blind stretch, body moving" << std::endl;
           }
@@ -3696,9 +3729,10 @@ private:
               }
               if (leaked) { kf.change_P(Pg); }
             }
-            const double sigma = (ga_trig || ga_held) && gravity_align_noise_degraded > 0.0
-                                     ? gravity_align_noise_degraded
-                                     : gravity_align_noise;
+            const double sigma = fast_lio::levellingSigma(
+              sigma_by_measurement ? fast_lio::LevellingSigmaPolicy::kMeasurement : fast_lio::LevellingSigmaPolicy::kScene,
+              ga_trig || ga_held, body_static_now, gravity_align_noise, gravity_align_noise_degraded,
+              gravity_align_noise_static, gravity_align_noise_moving);
             // [v6] the compensation's own uncertainty widens the measurement (quadrature)
             const double n2 = sigma * sigma + (lin_term.valid ? lin_term.sigma * lin_term.sigma : 0.0);
             Eigen::Vector3d R_diag(n2, n2, n2);
@@ -4227,6 +4261,8 @@ private:
 
       /*** Scan-hole guard bookkeeping: this scan's posterior is the next hole's anchor ***/
       hole_last_scan_end = lidar_end_time;
+      kalman_last_final_state = state_point;
+      kalman_last_final_valid = true;
       hole_vel_pre = state_point.vel;
       hole_pos_pre = state_point.pos;
 

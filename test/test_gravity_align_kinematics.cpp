@@ -5,7 +5,12 @@
 
 #include "gravity_align_kinematics.hpp"
 
+using fast_lio::kLegEdgeMinSamples;
+using fast_lio::kLegEdgeStandstillSpeed;
 using fast_lio::leanOfAcceleration;
+using fast_lio::legEdgeValid;
+using fast_lio::legEdgeVariance;
+using fast_lio::legEdgeVelocity;
 using fast_lio::LevellingWindowScan;
 using fast_lio::LinearAccelerationTerm;
 using fast_lio::linearAccelerationTerm;
@@ -125,4 +130,49 @@ TEST(GravityAlignKinematics, LeanOfAccelerationUsesTheHorizontalPartOnly)
   EXPECT_NEAR(leanOfAcceleration({0.0, 0.0, 3.0}, kG), 0.0, 1e-12);
   EXPECT_DOUBLE_EQ(leanOfAcceleration({1.0, 0.0, 0.0}, 0.0), 0.0);
   EXPECT_DOUBLE_EQ(leanOfAcceleration({kNaN, 0.0, 0.0}, kG), 0.0);
+}
+
+// ── Leg-odometry edges ───────────────────────────────────────────────────────
+// m20: the legs measure the dog centre, the IMU sits 0.254 m ahead and 0.279 m
+// above it (FP_POI→FP_VRTK). A body pitching at ω_y moves the IMU point along x
+// and z relative to the centre; the edge velocity must carry that.
+TEST(GravityAlignKinematics, LegEdgeVelocityCarriesTheLeverArm)
+{
+  const Eigen::Vector3d r(0.2538, 0.0, 0.2793);
+  const Eigen::Matrix3d I = Eigen::Matrix3d::Identity();
+  const Eigen::Vector3d v0 = legEdgeVelocity(1.0, I, Eigen::Vector3d::Zero(), r);
+  EXPECT_NEAR((v0 - Eigen::Vector3d(1.0, 0.0, 0.0)).norm(), 0.0, 1e-15);
+  const Eigen::Vector3d v1 = legEdgeVelocity(1.0, I, Eigen::Vector3d(0.0, 0.5, 0.0), r);
+  // ω×r with ω = 0.5 about y: (0.5·0.2793, 0, −0.5·0.2538)
+  EXPECT_NEAR(v1.x(), 1.0 + 0.5 * 0.2793, 1e-12);
+  EXPECT_NEAR(v1.y(), 0.0, 1e-12);
+  EXPECT_NEAR(v1.z(), -0.5 * 0.2538, 1e-12);
+  // a yawed robot→IMU mounting rotates the forward speed into the IMU axes
+  Eigen::Matrix3d Rz;
+  Rz << 0, -1, 0, 1, 0, 0, 0, 0, 1;
+  const Eigen::Vector3d v2 = legEdgeVelocity(0.8, Rz, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+  EXPECT_NEAR(v2.x(), 0.0, 1e-12);
+  EXPECT_NEAR(v2.y(), 0.8, 1e-12);
+}
+
+// The doorway case: the legs read ~0 while the IMU says the body moves — that is
+// the bridge's "cannot measure", not a measurement. Parked and reading 0 is fine.
+TEST(GravityAlignKinematics, LegEdgeIsInvalidWhenZeroOnAMovingBody)
+{
+  EXPECT_TRUE(legEdgeValid(10, 0.86, false));
+  EXPECT_TRUE(legEdgeValid(10, 0.0, true));
+  EXPECT_FALSE(legEdgeValid(10, 0.0, false));
+  EXPECT_FALSE(legEdgeValid(10, 0.5 * kLegEdgeStandstillSpeed, false));
+  EXPECT_FALSE(legEdgeValid(kLegEdgeMinSamples - 1, 0.86, false));
+  EXPECT_TRUE(legEdgeValid(kLegEdgeMinSamples, 0.86, false));
+  EXPECT_FALSE(legEdgeValid(10, kNaN, false));
+  EXPECT_FALSE(legEdgeValid(10, kNaN, true));
+}
+
+TEST(GravityAlignKinematics, LegEdgeVarianceIsExactZeroOnlyWhenParked)
+{
+  EXPECT_DOUBLE_EQ(legEdgeVariance(0.0, true, 0.15), 0.0);
+  EXPECT_DOUBLE_EQ(legEdgeVariance(0.0, false, 0.15), 0.15 * 0.15);
+  EXPECT_DOUBLE_EQ(legEdgeVariance(1.0, true, 0.15), 0.15 * 0.15);
+  EXPECT_DOUBLE_EQ(legEdgeVariance(1.0, false, 0.15), 0.15 * 0.15);
 }

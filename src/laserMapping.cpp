@@ -281,6 +281,19 @@ bool gravity_align_vel_overwritten = false;   // the state velocity was assigned
 double gravity_align_prev_t = -1.0;           // previous scan's lidar_end_time (-1 = none yet)
 V3D gravity_align_prev_v_body = V3D::Zero();  // previous scan's body-frame velocity (posterior)
 double gravity_align_prev_var = 0.0;          // previous scan's velocity covariance trace
+// [v6] velocity source for the term: "leg" (default) takes the leg-odometry forward speed
+// (wheel_topic) averaged over the last gravity_align_leg_edge_window_s at each scan end,
+// moved to the IMU point over gravity_align_leg_lever_arm; "filter" takes the iEKF's own
+// velocity — which drifts with the attitude error where the LiDAR does not observe it and
+// then cancels the gravity leakage the prior exists to correct (m20 0831: +3° frame tilt).
+std::string gravity_align_lin_accel_source = "leg";
+double gravity_align_leg_vel_sigma = 0.15;      // m/s; gait residual of the edge mean while moving
+double gravity_align_leg_edge_window_s = 0.2;   // s; trailing mean at each scan end
+std::vector<double> gravity_align_leg_lever_arm_vec;
+V3D gravity_align_leg_lever_arm = V3D::Zero();  // m, IMU frame; IMU point minus the legs' reference point
+bool gravity_align_prev_edge_valid = false;
+std::deque<std::pair<double, double>> gravity_align_leg_hist;  // (stamp, forward speed) under mtx_twist
+std::deque<std::pair<double, V3D>> gravity_align_gyro_hist;    // (stamp, raw body rate) scan-thread only
 double gravity_align_grav_cap_deg = 3.0;   // [v4] leak cap: grav tangent std ceiling (deg) — bounds how far
                                            // the gravity state may be steered per run
 bool imu_init_require_still_ = false;      // quasi-static IMU-init gate (see IMU_Processing.hpp)
@@ -1064,6 +1077,14 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
   // consumes the buffer, but the hold needs to know how OLD the evidence is.
   last_twist_stamp = get_time_sec(msg_in->header.stamp);
   last_twist_speed = v.norm();
+  // [v6] stamped forward-speed history for the levelling prior's leg-velocity edges
+  if (std::isfinite(v(0))) {
+    gravity_align_leg_hist.emplace_back(last_twist_stamp, v(0));
+    while (!gravity_align_leg_hist.empty() &&
+           (gravity_align_leg_hist.front().first < last_twist_stamp - 2.5 || gravity_align_leg_hist.size() > 500)) {
+      gravity_align_leg_hist.pop_front();
+    }
+  }
 }
 
 // Independent, front-end-agnostic evidence that the platform is parked. The
@@ -2206,6 +2227,10 @@ public:
     this->declare_parameter<bool>("gravity_align_grav_freeze_degraded", false);
     this->declare_parameter<bool>("gravity_align_lin_accel_comp", false);
     this->declare_parameter<double>("gravity_align_vel_sigma_scale", 0.0);
+    this->declare_parameter<std::string>("gravity_align_lin_accel_source", "leg");
+    this->declare_parameter<double>("gravity_align_leg_vel_sigma", 0.15);
+    this->declare_parameter<double>("gravity_align_leg_edge_window_s", 0.2);
+    this->declare_parameter<std::vector<double>>("gravity_align_leg_lever_arm", std::vector<double>{0.0, 0.0, 0.0});
     this->declare_parameter<bool>("imu_init_require_still", false);
     this->declare_parameter<double>("imu_init_still_tol", 0.03);
     this->declare_parameter<double>("imu_init_still_timeout_s", 20.0);
@@ -2399,6 +2424,23 @@ public:
     this->get_parameter_or<bool>("gravity_align_grav_freeze_degraded", gravity_align_grav_freeze_degraded, false);
     this->get_parameter_or<bool>("gravity_align_lin_accel_comp", gravity_align_lin_accel_comp, false);
     this->get_parameter_or<double>("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale, 0.0);
+    this->get_parameter_or<std::string>("gravity_align_lin_accel_source", gravity_align_lin_accel_source, std::string("leg"));
+    this->get_parameter_or<double>("gravity_align_leg_vel_sigma", gravity_align_leg_vel_sigma, 0.15);
+    this->get_parameter_or<double>("gravity_align_leg_edge_window_s", gravity_align_leg_edge_window_s, 0.2);
+    this->get_parameter_or<std::vector<double>>("gravity_align_leg_lever_arm", gravity_align_leg_lever_arm_vec,
+                                                std::vector<double>{0.0, 0.0, 0.0});
+    if (gravity_align_leg_lever_arm_vec.size() != 3u) {
+      RCLCPP_FATAL(this->get_logger(), "gravity_align_leg_lever_arm must have exactly 3 elements, got %zu",
+                   gravity_align_leg_lever_arm_vec.size());
+      throw std::invalid_argument("gravity_align_leg_lever_arm size mismatch");
+    }
+    gravity_align_leg_lever_arm = V3D(gravity_align_leg_lever_arm_vec[0], gravity_align_leg_lever_arm_vec[1],
+                                      gravity_align_leg_lever_arm_vec[2]);
+    if (gravity_align_lin_accel_source != "leg" && gravity_align_lin_accel_source != "filter") {
+      RCLCPP_FATAL(this->get_logger(), "gravity_align_lin_accel_source must be 'leg' or 'filter', got '%s'",
+                   gravity_align_lin_accel_source.c_str());
+      throw std::invalid_argument("gravity_align_lin_accel_source");
+    }
     this->get_parameter_or<bool>("imu_init_require_still", imu_init_require_still_, false);
     this->get_parameter_or<double>("imu_init_still_tol", imu_init_still_tol_, 0.03);
     this->get_parameter_or<double>("imu_init_still_timeout_s", imu_init_still_timeout_s_, 20.0);
@@ -3460,17 +3502,61 @@ private:
           GravWinAgg agg{lidar_end_time, Eigen::Vector3d::Zero(), 0, 0.0};
           // [v6] this scan's IMU span runs from the previous scan's end to this one's;
           // the body velocity at both edges is what the linear-acceleration term needs.
+          V3D v_edge = v_body_now;
+          double var_edge = vel_var_now;
+          bool edge_valid = !gravity_align_vel_overwritten;
+          if (gravity_align_lin_accel_comp && gravity_align_lin_accel_source == "leg") {
+            // trailing edge means of the leg forward speed and the body rate over the same span
+            for (const auto & imu : Measures.imu) {
+              gravity_align_gyro_hist.emplace_back(
+                get_time_sec(imu->header.stamp),
+                V3D(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z));
+            }
+            while (!gravity_align_gyro_hist.empty() &&
+                   (gravity_align_gyro_hist.front().first < lidar_end_time - 2.5 ||
+                    gravity_align_gyro_hist.size() > 1000)) {
+              gravity_align_gyro_hist.pop_front();
+            }
+            const double t_lo = lidar_end_time - gravity_align_leg_edge_window_s;
+            double vx_sum = 0.0;
+            int n_leg = 0;
+            {
+              std::lock_guard<std::mutex> lk(mtx_twist);
+              for (const auto & sample : gravity_align_leg_hist) {
+                if (sample.first >= t_lo && sample.first <= lidar_end_time + 0.02) {
+                  vx_sum += sample.second;
+                  ++n_leg;
+                }
+              }
+            }
+            V3D w_sum = V3D::Zero();
+            int n_w = 0;
+            for (const auto & sample : gravity_align_gyro_hist) {
+              if (sample.first >= t_lo && sample.first <= lidar_end_time) {
+                w_sum += sample.second;
+                ++n_w;
+              }
+            }
+            const double vx_mean = n_leg > 0 ? vx_sum / double(n_leg) * wheel_speed_scale : 0.0;
+            V3D w_mean = V3D::Zero();
+            if (n_w > 0) { w_mean = w_sum / double(n_w) - bg_now; }
+            const bool body_static_now = body_is_static(Measures, lidar_end_time);
+            edge_valid = fast_lio::legEdgeValid(n_leg, vx_mean, body_static_now);
+            v_edge = fast_lio::legEdgeVelocity(vx_mean, R_robot_to_imu, w_mean, gravity_align_leg_lever_arm);
+            var_edge = fast_lio::legEdgeVariance(vx_mean, body_static_now, gravity_align_leg_vel_sigma);
+          }
           agg.edge.t_start = gravity_align_prev_t;
           agg.edge.t_end = lidar_end_time;
           agg.edge.v_start = gravity_align_prev_v_body;
-          agg.edge.v_end = v_body_now;
+          agg.edge.v_end = v_edge;
           agg.edge.var_start = gravity_align_prev_var;
-          agg.edge.var_end = vel_var_now;
-          agg.edge.velocity_overwritten = gravity_align_vel_overwritten || gravity_align_prev_t < 0.0;
+          agg.edge.var_end = var_edge;
+          agg.edge.velocity_overwritten = !edge_valid || !gravity_align_prev_edge_valid || gravity_align_prev_t < 0.0;
           gravity_align_vel_overwritten = false;
           gravity_align_prev_t = lidar_end_time;
-          gravity_align_prev_v_body = v_body_now;
-          gravity_align_prev_var = vel_var_now;
+          gravity_align_prev_v_body = v_edge;
+          gravity_align_prev_var = var_edge;
+          gravity_align_prev_edge_valid = edge_valid;
           for (const auto & imu : Measures.imu) {
             V3D a_i(imu->linear_acceleration.x, imu->linear_acceleration.y, imu->linear_acceleration.z);
             V3D w_i(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z);
@@ -3514,8 +3600,10 @@ private:
             // raw accelerometer units like the ω×v term. A window with an overwritten velocity has no
             // derivative — the term is invalid and the prior is withheld below.
             if (gravity_align_lin_accel_comp && !grav_win.empty()) {
-              lin_term = fast_lio::linearAccelerationTerm(
-                grav_win.front().edge, grav_win.back().edge, overwritten, G_m_s2, gravity_align_vel_sigma_scale);
+              const bool leg_source = gravity_align_lin_accel_source == "leg";
+              lin_term = fast_lio::linearAccelerationTerm(grav_win.front().edge, grav_win.back().edge,
+                                                          leg_source ? false : overwritten, G_m_s2,
+                                                          gravity_align_vel_sigma_scale);
               if (lin_term.valid) { f_meas -= lin_term.accel * (g_raw / G_m_s2); }
             }
           } else {
@@ -3538,8 +3626,12 @@ private:
           const double g_ref = gravity_align_mag_ref > 1e-3 ? gravity_align_mag_ref : g_raw;
           const bool span_ok = gravity_align_window_s <= 0.0 ||
                                (win_span >= 0.7 * gravity_align_window_s && win_n >= 20);
-          // [v6] with the compensation on, a window whose velocity history is broken cannot be levelled to
-          const bool lin_ok = !gravity_align_lin_accel_comp || gravity_align_window_s <= 0.0 || lin_term.valid;
+          // [v6] with the compensation on, a window whose velocity history is broken cannot be levelled to.
+          // A platform with no leg stream at all keeps the legacy measurement (the stream, not an edge, is absent).
+          const bool leg_stream_alive = gravity_align_lin_accel_source != "leg" ||
+                                        (last_twist_stamp > 0.0 && lidar_end_time - last_twist_stamp < 1.0);
+          const bool lin_ok = !gravity_align_lin_accel_comp || gravity_align_window_s <= 0.0 || lin_term.valid ||
+                              !leg_stream_alive;
           if (degeneracy_debug && !lin_ok) {
             std::cerr << "[GALIGN] withheld: velocity overwritten inside the window" << std::endl;
           }

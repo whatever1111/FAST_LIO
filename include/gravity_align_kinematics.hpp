@@ -79,6 +79,46 @@ inline LinearAccelerationTerm linearAccelerationTerm(const LevellingWindowScan &
   return term;
 }
 
+/// Leg-odometry edge: the velocity of the IMU point from the legs' base-link forward
+/// speed. The legs measure the dog centre; the IMU rides on a lever arm r from it,
+/// so v_imu = R_robot_to_imu · (vx, 0, 0) + ω × r with ω the bias-corrected body rate
+/// averaged over the same edge window as the speed. The filter's own velocity is
+/// deliberately NOT used here: where the LiDAR does not observe velocity it drifts
+/// with the attitude error, and subtracting that drift cancels the very gravity
+/// leakage the prior exists to correct (m20 0831, corridor: +3° frame tilt).
+inline Eigen::Vector3d legEdgeVelocity(double vx_mean,
+                                       const Eigen::Matrix3d & R_robot_to_imu,
+                                       const Eigen::Vector3d & omega_mean,
+                                       const Eigen::Vector3d & lever_arm)
+{
+  return R_robot_to_imu * Eigen::Vector3d(vx_mean, 0.0, 0.0) + omega_mean.cross(lever_arm);
+}
+
+/// m/s; a leg speed below this on a body the IMU says is moving is the bridge's
+/// "cannot measure" (threshold crossing, slip), not a measurement.
+constexpr double kLegEdgeStandstillSpeed = 0.05;
+/// samples; fewer than this inside the edge window is no edge (50 Hz → 10 per 0.2 s).
+constexpr int kLegEdgeMinSamples = 3;
+
+/// Whether a leg edge is usable: enough samples, finite, and not "zero while moving".
+inline bool legEdgeValid(int samples, double vx_mean, bool body_static)
+{
+  if (samples < kLegEdgeMinSamples || !std::isfinite(vx_mean)) {
+    return false;
+  }
+  return !(std::abs(vx_mean) < kLegEdgeStandstillSpeed && !body_static);
+}
+
+/// (m/s)²; the edge's velocity variance: the gait residual of the edge mean while
+/// moving, exact zero when the legs and the IMU agree the body is parked.
+inline double legEdgeVariance(double vx_mean, bool body_static, double leg_vel_sigma)
+{
+  if (std::abs(vx_mean) < kLegEdgeStandstillSpeed && body_static) {
+    return 0.0;
+  }
+  return leg_vel_sigma * leg_vel_sigma;
+}
+
 /// The lean, in radians, that a horizontal acceleration error of this size puts on
 /// the measured vertical — for logs and tests, not for the update.
 inline double leanOfAcceleration(const Eigen::Vector3d & accel, double gravity)

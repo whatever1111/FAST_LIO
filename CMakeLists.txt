@@ -259,6 +259,13 @@ if(BUILD_TESTING)
   if(TARGET test_parked_hold)
     target_include_directories(test_parked_hold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
+  # Pure header, Eigen only: the window-mean linear acceleration the levelling prior
+  # subtracts from the specific-force mean, and when it must be withheld
+  # (docs/PGO_LOOP_TUNING.md section 7.3).
+  ament_add_gtest(test_gravity_align_kinematics test/test_gravity_align_kinematics.cpp)
+  if(TARGET test_gravity_align_kinematics)
+    target_include_directories(test_gravity_align_kinematics PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
 
   ament_add_gtest(test_odom_covariance_contract test/test_odom_covariance_contract.cpp)
   if(TARGET test_odom_covariance_contract)

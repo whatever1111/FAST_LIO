@@ -93,6 +93,7 @@
 #include "adaptive_downsample.hpp"
 #include "parked_hold.hpp"
 #include "preprocess.h"
+#include "gravity_align_kinematics.hpp"
 #include "reanchor_gate.hpp"
 #include "voxel_downsample.hpp"
 #include "degeneracy_policy.hpp"
@@ -267,6 +268,19 @@ bool gravity_align_grav_freeze_degraded = false;
 // published in the health flags so a pose-graph consumer can leave those
 // keyframes' roll/pitch unpinned.
 bool gravity_align_degraded_active = false;
+// [v6] Kinematic compensation of the levelling measurement (gravity_align_kinematics.hpp):
+// f = dv_b/dt + ω×v_b − Rᵀg + b_a, and only the ω×v_b term was subtracted. The window mean
+// of dv_b/dt is (v_b(end) − v_b(start))/span — 4-7° of lean at a doorway stop/start on the
+// m20, taken as a 0.46° measurement (docs/PGO_LOOP_TUNING.md §7.3). With the option on the
+// term comes from the filter's own per-scan body-velocity history, the prior is withheld
+// while a velocity overwrite (reset/pin/clamp) lies inside the window, and the velocity
+// covariance at the window edges widens the measurement sigma (scale 0 = off).
+bool gravity_align_lin_accel_comp = false;
+double gravity_align_vel_sigma_scale = 0.0;
+bool gravity_align_vel_overwritten = false;   // the state velocity was assigned outside an update since the last scan
+double gravity_align_prev_t = -1.0;           // previous scan's lidar_end_time (-1 = none yet)
+V3D gravity_align_prev_v_body = V3D::Zero();  // previous scan's body-frame velocity (posterior)
+double gravity_align_prev_var = 0.0;          // previous scan's velocity covariance trace
 double gravity_align_grav_cap_deg = 3.0;   // [v4] leak cap: grav tangent std ceiling (deg) — bounds how far
                                            // the gravity state may be steered per run
 bool imu_init_require_still_ = false;      // quasi-static IMU-init gate (see IMU_Processing.hpp)
@@ -277,6 +291,7 @@ struct GravWinAgg {
   Eigen::Vector3d sum;
   int n;
   double max_w;
+  fast_lio::LevellingWindowScan edge;  // [v6] body velocity at both ends of this scan's IMU span
 };
 std::deque<GravWinAgg> grav_win;           // scan-thread only
 double gravity_align_last_trig = -1e18;
@@ -2189,6 +2204,8 @@ public:
     this->declare_parameter<double>("gravity_align_grav_leak", 1.0);
     this->declare_parameter<double>("gravity_align_grav_cap_deg", 3.0);
     this->declare_parameter<bool>("gravity_align_grav_freeze_degraded", false);
+    this->declare_parameter<bool>("gravity_align_lin_accel_comp", false);
+    this->declare_parameter<double>("gravity_align_vel_sigma_scale", 0.0);
     this->declare_parameter<bool>("imu_init_require_still", false);
     this->declare_parameter<double>("imu_init_still_tol", 0.03);
     this->declare_parameter<double>("imu_init_still_timeout_s", 20.0);
@@ -2380,6 +2397,8 @@ public:
     this->get_parameter_or<double>("gravity_align_grav_leak", gravity_align_grav_leak, 1.0);
     this->get_parameter_or<double>("gravity_align_grav_cap_deg", gravity_align_grav_cap_deg, 3.0);
     this->get_parameter_or<bool>("gravity_align_grav_freeze_degraded", gravity_align_grav_freeze_degraded, false);
+    this->get_parameter_or<bool>("gravity_align_lin_accel_comp", gravity_align_lin_accel_comp, false);
+    this->get_parameter_or<double>("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale, 0.0);
     this->get_parameter_or<bool>("imu_init_require_still", imu_init_require_still_, false);
     this->get_parameter_or<double>("imu_init_still_tol", imu_init_still_tol_, 0.03);
     this->get_parameter_or<double>("imu_init_still_timeout_s", imu_init_still_timeout_s_, 20.0);
@@ -2968,6 +2987,7 @@ private:
           const double dv_n = dv.norm();
           if (dv_n > dv_max) {
             st.vel = hole_vel_pre + dv * (dv_max / dv_n);
+            gravity_align_vel_overwritten = true;
           }
           const V3D pos_imu = st.pos;
           if (guard_hole_reanchor_pos) {
@@ -3384,6 +3404,7 @@ private:
               // Discard the blind stretch's velocity (see block comment).
               state_ikfom st = kf.get_x();
               st.vel.setZero();
+              gravity_align_vel_overwritten = true;
               kf.change_x(st);
               state_point = kf.get_x();
               RCLCPP_WARN(this->get_logger(),
@@ -3429,11 +3450,27 @@ private:
         M3D Rw = st.rot.toRotationMatrix();
         const V3D bg_now(st.bg[0], st.bg[1], st.bg[2]);
         const V3D v_body_now = Rw.transpose() * st.vel;  // velocity in IMU frame
+        // [v6] velocity covariance trace at this scan's end (the compensation sigma's input)
+        const double vel_var_now =
+          gravity_align_vel_sigma_scale > 0.0 ? kf.get_P().block<3, 3>(12, 12).trace() : 0.0;
         // [L2] per-scan aggregate of kinematically-compensated specific force
         // (centripetal ω×v_body subtracted per sample — transport theorem; the
         // scan-end velocity serves every sample, walking-speed error << gates).
         if (gravity_align_window_s > 0.0) {
           GravWinAgg agg{lidar_end_time, Eigen::Vector3d::Zero(), 0, 0.0};
+          // [v6] this scan's IMU span runs from the previous scan's end to this one's;
+          // the body velocity at both edges is what the linear-acceleration term needs.
+          agg.edge.t_start = gravity_align_prev_t;
+          agg.edge.t_end = lidar_end_time;
+          agg.edge.v_start = gravity_align_prev_v_body;
+          agg.edge.v_end = v_body_now;
+          agg.edge.var_start = gravity_align_prev_var;
+          agg.edge.var_end = vel_var_now;
+          agg.edge.velocity_overwritten = gravity_align_vel_overwritten || gravity_align_prev_t < 0.0;
+          gravity_align_vel_overwritten = false;
+          gravity_align_prev_t = lidar_end_time;
+          gravity_align_prev_v_body = v_body_now;
+          gravity_align_prev_var = vel_var_now;
           for (const auto & imu : Measures.imu) {
             V3D a_i(imu->linear_acceleration.x, imu->linear_acceleration.y, imu->linear_acceleration.z);
             V3D w_i(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z);
@@ -3460,9 +3497,12 @@ private:
           V3D f_meas = V3D::Zero();
           double win_span = 0.0;
           int win_n = 0;
+          fast_lio::LinearAccelerationTerm lin_term;  // [v6] invalid unless the option is on and the window is clean
           if (gravity_align_window_s > 0.0) {
             double t_old = lidar_end_time;
+            bool overwritten = false;
             for (const auto & a : grav_win) {
+              overwritten = overwritten || a.edge.velocity_overwritten;
               if (a.n == 0) { continue; }  // scan fully rejected by the per-sample gyro filter
               f_meas += a.sum;
               win_n += a.n;
@@ -3470,6 +3510,14 @@ private:
             }
             if (win_n > 0) { f_meas /= double(win_n); }
             win_span = lidar_end_time - t_old + 0.1;
+            // [v6] window-mean linear acceleration from the velocity history: (v_b(end) − v_b(start))/span,
+            // raw accelerometer units like the ω×v term. A window with an overwritten velocity has no
+            // derivative — the term is invalid and the prior is withheld below.
+            if (gravity_align_lin_accel_comp && !grav_win.empty()) {
+              lin_term = fast_lio::linearAccelerationTerm(
+                grav_win.front().edge, grav_win.back().edge, overwritten, G_m_s2, gravity_align_vel_sigma_scale);
+              if (lin_term.valid) { f_meas -= lin_term.accel * (g_raw / G_m_s2); }
+            }
           } else {
             const auto & imu_last = Measures.imu.back();
             V3D a_raw(imu_last->linear_acceleration.x, imu_last->linear_acceleration.y,
@@ -3490,7 +3538,12 @@ private:
           const double g_ref = gravity_align_mag_ref > 1e-3 ? gravity_align_mag_ref : g_raw;
           const bool span_ok = gravity_align_window_s <= 0.0 ||
                                (win_span >= 0.7 * gravity_align_window_s && win_n >= 20);
-          if (g_ref > 1e-3 && win_n > 0 && a_norm > 1e-6 && span_ok &&
+          // [v6] with the compensation on, a window whose velocity history is broken cannot be levelled to
+          const bool lin_ok = !gravity_align_lin_accel_comp || gravity_align_window_s <= 0.0 || lin_term.valid;
+          if (degeneracy_debug && !lin_ok) {
+            std::cerr << "[GALIGN] withheld: velocity overwritten inside the window" << std::endl;
+          }
+          if (g_ref > 1e-3 && win_n > 0 && a_norm > 1e-6 && span_ok && lin_ok &&
               std::abs(a_norm - g_ref) <= gravity_align_accel_tol * g_ref) {
             V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
             V3D u_world = -grav_w.normalized();              // world up (unit)
@@ -3540,22 +3593,24 @@ private:
             const double sigma = (ga_trig || ga_held) && gravity_align_noise_degraded > 0.0
                                      ? gravity_align_noise_degraded
                                      : gravity_align_noise;
-            const double n2 = sigma * sigma;
+            // [v6] the compensation's own uncertainty widens the measurement (quadrature)
+            const double n2 = sigma * sigma + (lin_term.valid ? lin_term.sigma * lin_term.sigma : 0.0);
             Eigen::Vector3d R_diag(n2, n2, n2);
             if (degeneracy_debug) {
               V3D tilt = g_body.cross(m_body);  // axis*sin(angle), body frame
               const double ang_deg = std::asin(std::min(1.0, tilt.norm())) * 57.2958;
-              V3D eul_before = SO3ToEuler(st.rot);
+              V3D eul_before = SO3ToEuler(st.rot);  // degrees
               kf.update_simple(H, residual, R_diag);
               state_point = kf.get_x();
               V3D eul_after = SO3ToEuler(state_point.rot);
               V3D deul = eul_after - eul_before;
               std::cerr << "[GALIGN] z_weak=" << pos_obs_z_weak << " degr=" << flio_in_degraded
                         << " trig=" << ga_trig << " held=" << ga_held << " win_n=" << win_n
-                        << " span=" << win_span << " sigma=" << sigma << " gvar=" << kf.get_P()(21, 21)
-                        << " tilt_deg=" << ang_deg
-                        << " dRPY_deg=[" << deul.x() * 57.2958 << "," << deul.y() * 57.2958 << ","
-                        << deul.z() * 57.2958 << "]"
+                        << " span=" << win_span << " sigma=" << sigma << " sig_eff=" << std::sqrt(n2)
+                        << " gvar=" << kf.get_P()(21, 21) << " tilt_deg=" << ang_deg
+                        << " alin=" << (lin_term.valid ? lin_term.accel.norm() : 0.0)
+                        << " alin_deg=" << (lin_term.valid ? fast_lio::leanOfAcceleration(lin_term.accel, G_m_s2) * 57.2958 : 0.0)
+                        << " dRPY_deg=[" << deul.x() << "," << deul.y() << "," << deul.z() << "]"
                         << " posZ=" << state_point.pos[2] << "m" << std::endl;
             } else {
               kf.update_simple(H, residual, R_diag);
@@ -3730,6 +3785,7 @@ private:
           st.pos = zupt_anchor_pos;
           st.rot = zupt_anchor_rot;
           st.vel.setZero();
+          gravity_align_vel_overwritten = true;
           kf.change_x(st);
           state_point = kf.get_x();
           ++zupt_hold_scans;
@@ -3760,6 +3816,7 @@ private:
             // most one scan of re-convergence on a healthy scene; the clamp
             // guaranteed max_speed of position error per second.
             st.vel.setZero();
+            gravity_align_vel_overwritten = true;
             kf.change_x(st);
             state_point = kf.get_x();
           }
@@ -3815,6 +3872,7 @@ private:
         if (zupt_verdict.action == fast_lio::ZuptAction::kZeroVelocity) {
           state_ikfom st = kf.get_x();
           st.vel.setZero();
+          gravity_align_vel_overwritten = true;
           kf.change_x(st);
           state_point = kf.get_x();
           if (zupt_verdict.report) {
@@ -3908,6 +3966,7 @@ private:
           if (runaway.reason == fast_lio::RunawayReason::kParked) {
             state_ikfom st = kf.get_x();
             st.vel.setZero();
+            gravity_align_vel_overwritten = true;
             kf.change_x(st);
             state_point = kf.get_x();
           }

@@ -273,6 +273,20 @@ if(BUILD_TESTING)
     target_include_directories(test_attitude_hold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
 
+  # Pure header, Eigen only: the covariance side of a state assignment made outside an update (the
+  # velocity block after a release, ZUPT or hole clamp) — docs/PGO_LOOP_TUNING.md section 7.7.
+  ament_add_gtest(test_covariance_reset test/test_covariance_reset.cpp)
+  if(TARGET test_covariance_reset)
+    target_include_directories(test_covariance_reset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
+
+  # Pure header, Eigen only: the innovation test a point-to-plane correspondence has to pass
+  # (docs/PGO_LOOP_TUNING.md section 7.7).
+  ament_add_gtest(test_correspondence_gate test/test_correspondence_gate.cpp)
+  if(TARGET test_correspondence_gate)
+    target_include_directories(test_correspondence_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
+
   ament_add_gtest(test_odom_covariance_contract test/test_odom_covariance_contract.cpp)
   if(TARGET test_odom_covariance_contract)
     target_include_directories(test_odom_covariance_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

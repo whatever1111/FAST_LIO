@@ -94,6 +94,8 @@
 #include "parked_hold.hpp"
 #include "preprocess.h"
 #include "attitude_hold.hpp"
+#include "covariance_reset.hpp"
+#include "correspondence_gate.hpp"
 #include "gravity_align_kinematics.hpp"
 #include "reanchor_gate.hpp"
 #include "voxel_downsample.hpp"
@@ -331,13 +333,25 @@ double gravity_align_last_trig = -1e18;
 // the state 0.4-1.7° per scan (docs/PGO_LOOP_TUNING.md §7.5). Decided once per scan before the
 // update from the previous scan's guard verdicts and this scan's far-field share.
 // [diag] per-correspondence dump (corr_dump_en, corr_dump_windows "t1:t2,t3:t4" in lidar_end_time seconds):
-// after each lidar update inside a window, one row per downsampled point with its range, residual,
-// nearest-map distances, plane fit and whether it was effective — the data a per-correspondence
-// admission rule is designed from (docs/PGO_LOOP_TUNING.md §7.7).
+// inside a window every iEKF iteration writes one row per effective correspondence (every point on the
+// first iteration) to corr_dump.csv: the point in the IMU frame, the matched plane's normal, the signed
+// residual, the rotation Jacobian row before any hold projection, the nearest-map distances, the 5-NN
+// patch scatter eigenvalues, the point's in-plane offset from the patch, the view cosine and the
+// degeneracy weight. corr_iter.csv carries one row per iteration (hold verdict, roll/pitch information,
+// the vertical in the body frame), corr_scan.csv one row per scan (the applied rotation and translation,
+// the prior covariance diagonals) — the data a per-correspondence admission rule is designed from
+// (docs/PGO_LOOP_TUNING.md §7.7).
+// [v11] correspondence gate (correspondence_gate.hpp): a match is admitted only when its residual lies
+// within corr_innov_gate_k sigma of its own predicted variance H P Hᵀ + R (and, separately, when its
+// nearest map point is within corr_nn0_max). Both 0 = the legacy s > 0.9 test alone.
+fast_lio::CorrespondenceGateParams corr_gate;
+std::atomic<int> corr_gate_rejected{0};  // matches the gate refused on the last h_share_model call
 bool corr_dump_en = false;
 std::string corr_dump_windows_str;
 std::vector<std::pair<double, double>> corr_dump_windows;
-std::ofstream fout_corr;
+std::ofstream fout_corr, fout_corr_iter, fout_corr_scan;
+bool corr_dump_scan_active = false;  // this scan lies inside a dump window (set before the update)
+int corr_dump_iter = 0;              // h_share_model calls so far on this scan
 fast_lio::AttitudeHoldParams attitude_hold_params;
 bool lidar_attitude_hold_active = false;  // this scan's scene-rule verdict; read by h_share_model
 bool lidar_attitude_hold_allowed = false; // release conditions satisfied this scan (starvation, age, holes)
@@ -625,6 +639,26 @@ M3D Lidar_R_wrt_IMU(Eye3d);
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
+
+// [v10] The covariance side of a velocity assignment (covariance_reset.hpp). Every st.vel assignment below
+// goes through change_x(), which leaves P as it was: the velocity still "known" to a few cm/s and still
+// correlated with roll/pitch through the gravity leak of the blind stretch, so the first position
+// innovations after a release are explained as a roll error (docs/PGO_LOOP_TUNING.md §7.7). With a
+// sigma > 0 the assigned velocity gets that 1-σ and no cross terms; 0 keeps the legacy behaviour bit for bit.
+double guard_vel_reset_sigma = 0.0;  // m/s; a discarded velocity: engulfment release, hole clamp, runaway/parked
+double zupt_vel_reset_sigma = 0.0;   // m/s; a velocity zeroed on static evidence (ZUPT, parked hold)
+int vel_cov_resets = 0;
+inline void resetVelocityCovariance(double sigma_v)
+{
+  if (!(sigma_v > 0.0)) {
+    return;
+  }
+  auto P = kf.get_P();
+  if (fast_lio::resetVelocityBlock(P, sigma_v)) {
+    kf.change_P(P);
+    ++vel_cov_resets;
+  }
+}
 state_ikfom state_point;
 vect3 pos_lid;
 
@@ -1793,6 +1827,14 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   corr_normvect->clear();
   total_residual = 0.0;
 
+  // [v11] the gate judges every residual against the prior's [pos, rot] covariance, which IKFoM keeps
+  // unchanged through the iterations; read it once per call.
+  Eigen::Matrix<double, 6, 6> gate_P6 = Eigen::Matrix<double, 6, 6>::Zero();
+  if (corr_gate.innovation_k > 0.0) {
+    gate_P6 = kf.get_P().block<6, 6>(0, 0);
+  }
+  corr_gate_rejected.store(0, std::memory_order_relaxed);
+
 /** closest surface search and residual computation **/
   if (static_cast<int>(plane_cache.size()) < feats_down_size) {
     plane_cache.resize(feats_down_size);
@@ -1849,9 +1891,26 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     point_selected_surf[i] = false;
     if (plane_cache_ok[i]) {
       float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
+      // [v11] innovation / nearest-neighbour gate, computed while `s` still names the state
+      bool gate_ok = true;
+      if (corr_gate.innovation_k > 0.0 || corr_gate.nn0_max > 0.0) {
+        const V3D n_w(pabcd(0), pabcd(1), pabcd(2));
+        const V3D point_this = s.offset_R_L_I * p_body + s.offset_T_L_I;
+        const V3D A = point_this.cross(V3D(s.rot.conjugate() * n_w));
+        const double var =
+          corr_gate.innovation_k > 0.0 ? fast_lio::residualVariance(n_w, A, gate_P6, LASER_POINT_COV) : 0.0;
+        double nn0 = 0.0;
+        if (corr_gate.nn0_max > 0.0 && !points_near.empty()) {
+          nn0 = (V3D(points_near[0].x, points_near[0].y, points_near[0].z) - p_global).norm();
+        }
+        gate_ok = fast_lio::correspondenceAdmitted(corr_gate, pd2, var, nn0);
+        if (!gate_ok) {
+          corr_gate_rejected.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
       float s = 1 - 0.9 * fabs(pd2) / body_range_sqrt[i];
 
-      if (s > 0.9) {
+      if (s > 0.9 && gate_ok) {
         point_selected_surf[i] = true;
         normvec->points[i].x = pabcd(0);
         normvec->points[i].y = pabcd(1);
@@ -2229,6 +2288,82 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     }
   }
 
+  if (corr_dump_scan_active && fout_corr.is_open()) {
+    const int iter = corr_dump_iter++;
+    const V3D sensor_w = s.rot * s.offset_T_L_I + s.pos;
+    fout_corr_iter << std::setprecision(15) << lidar_end_time << ',' << iter << ',' << effct_feat_num << ','
+                   << int(hold_rows) << ',' << std::setprecision(6) << lidar_rot_obs_rp_min << ',' << hold_up(0) << ','
+                   << hold_up(1) << ',' << hold_up(2) << ',' << int(searching) << ',' << int(degeneracy_last.engaged)
+                   << '\n';
+    for (int i = 0; i < feats_down_size; i++) {
+      const bool eff = point_selected_surf[i];
+      if (!eff && iter > 0) { continue; }
+      const auto & pb = feats_down_body->points[i];
+      const V3D p_body(pb.x, pb.y, pb.z);
+      const V3D point_this = s.offset_R_L_I * p_body + s.offset_T_L_I;
+      const auto & pwp = feats_down_world->points[i];
+      const V3D pw(pwp.x, pwp.y, pwp.z);
+      const auto & near = Nearest_Points[i];
+      const int n_near = static_cast<int>(near.size());
+      double nn0 = -1.0, nn4 = -1.0, lam0 = -1.0, lam1 = -1.0, lam2 = -1.0, d_in = -1.0, plane_rms = -1.0;
+      if (n_near > 0) {
+        nn0 = (V3D(near[0].x, near[0].y, near[0].z) - pw).norm();
+        if (n_near >= NUM_MATCH_POINTS) {
+          const auto & q = near[NUM_MATCH_POINTS - 1];
+          nn4 = (V3D(q.x, q.y, q.z) - pw).norm();
+        }
+        V3D c = V3D::Zero();
+        for (const auto & q : near) { c += V3D(q.x, q.y, q.z); }
+        c /= double(n_near);
+        M3D S = M3D::Zero();
+        for (const auto & q : near) {
+          const V3D d = V3D(q.x, q.y, q.z) - c;
+          S += d * d.transpose();
+        }
+        S /= double(n_near);
+        Eigen::SelfAdjointEigenSolver<M3D> es(S);
+        lam0 = es.eigenvalues()(0);
+        lam1 = es.eigenvalues()(1);
+        lam2 = es.eigenvalues()(2);
+        const V3D nrm = es.eigenvectors().col(0);
+        const V3D d = pw - c;
+        d_in = (d - nrm * nrm.dot(d)).norm();
+        if (plane_cache_ok[i]) {
+          const VF(4) & pl = plane_cache[i];
+          double ss = 0.0;
+          for (const auto & q : near) {
+            const double dd = pl(0) * q.x + pl(1) * q.y + pl(2) * q.z + pl(3);
+            ss += dd * dd;
+          }
+          plane_rms = std::sqrt(ss / double(n_near));
+        }
+      }
+      double pd2 = 0.0, nx = 0.0, ny = 0.0, nz = 0.0, ax = 0.0, ay = 0.0, az = 0.0, cosv = 0.0, w = 1.0;
+      if (eff) {
+        const auto & np = normvec->points[i];
+        nx = np.x;
+        ny = np.y;
+        nz = np.z;
+        pd2 = np.intensity;
+        const V3D n(nx, ny, nz);
+        const V3D C = s.rot.conjugate() * n;
+        const V3D A = point_this.cross(C);
+        ax = A(0);
+        ay = A(1);
+        az = A(2);
+        const V3D dv = pw - sensor_w;
+        cosv = dv.norm() > 1e-6 ? std::abs(n.dot(dv)) / dv.norm() : 0.0;
+        if (degeneracy_last.engaged) { w = fast_lio::pointWeight(degeneracy_last, n); }
+      }
+      fout_corr << std::setprecision(15) << lidar_end_time << ',' << iter << ',' << i << ',' << int(eff)
+                << std::setprecision(5) << ',' << p_body.norm() << ',' << point_this(0) << ',' << point_this(1) << ','
+                << point_this(2) << ',' << nx << ',' << ny << ',' << nz << ',' << pd2 << ',' << ax << ',' << ay << ','
+                << az << ',' << nn0 << ',' << nn4 << ',' << n_near << ',' << int(plane_cache_ok[i]) << ',' << plane_rms
+                << ',' << lam0 << ',' << lam1 << ',' << lam2 << ',' << d_in << ',' << cosv << ',' << w << ',' << pw(2)
+                << ',' << pw(0) << ',' << pw(1) << '\n';
+    }
+  }
+
   solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -2294,6 +2429,8 @@ public:
     this->declare_parameter<double>("gravity_align_grav_cap_deg", 3.0);
     this->declare_parameter<bool>("gravity_align_grav_freeze_degraded", false);
     this->declare_parameter<bool>("lidar_attitude_hold_en", false);
+    this->declare_parameter<double>("corr_innov_gate_k", 0.0);
+    this->declare_parameter<double>("corr_nn0_max", 0.0);
     this->declare_parameter<bool>("corr_dump_en", false);
     this->declare_parameter<std::string>("corr_dump_windows", "");
     this->declare_parameter<double>("lidar_attitude_hold_far_frac", 0.0);
@@ -2301,6 +2438,8 @@ public:
     this->declare_parameter<double>("lidar_attitude_hold_max_s", 3.0);
     this->declare_parameter<double>("lidar_attitude_hold_max_scan_gap_s", 0.3);
     this->declare_parameter<double>("lidar_attitude_hold_min_rp_info", 0.0);
+    this->declare_parameter<double>("guard_vel_reset_sigma", 0.0);
+    this->declare_parameter<double>("zupt_vel_reset_sigma", 0.0);
     this->declare_parameter<double>("lidar_attitude_hold_z_weak", 0.9);
     this->declare_parameter<bool>("gravity_align_lin_accel_comp", false);
     this->declare_parameter<double>("gravity_align_vel_sigma_scale", 0.0);
@@ -2504,6 +2643,8 @@ public:
     this->get_parameter_or<double>("gravity_align_grav_cap_deg", gravity_align_grav_cap_deg, 3.0);
     this->get_parameter_or<bool>("gravity_align_grav_freeze_degraded", gravity_align_grav_freeze_degraded, false);
     this->get_parameter_or<bool>("lidar_attitude_hold_en", attitude_hold_params.enabled, false);
+    this->get_parameter_or<double>("corr_innov_gate_k", corr_gate.innovation_k, 0.0);
+    this->get_parameter_or<double>("corr_nn0_max", corr_gate.nn0_max, 0.0);
     this->get_parameter_or<bool>("corr_dump_en", corr_dump_en, false);
     this->get_parameter_or<std::string>("corr_dump_windows", corr_dump_windows_str, std::string(""));
     if (corr_dump_en) {
@@ -2515,7 +2656,19 @@ public:
         corr_dump_windows.emplace_back(std::stod(item.substr(0, colon)), std::stod(item.substr(colon + 1)));
       }
       fout_corr.open(DEBUG_FILE_DIR("corr_dump.csv"), std::ios::out);
-      fout_corr << "t,i,range,eff,res,nn0,nn4,n_near,plane_ok,plane_rms,plane_span,nz,pz,px,py\n";
+      fout_corr << "t,iter,i,eff,range,bx,by,bz,nx,ny,nz,pd2,ax,ay,az,nn0,nn4,n_near,plane_ok,plane_rms,lam0,lam1,lam2,"
+                   "d_in,cosv,w,pz,px,py\n";
+      fout_corr_iter.open(DEBUG_FILE_DIR("corr_iter.csv"), std::ios::out);
+      fout_corr_iter << "t,iter,effct,held,rp_info,ux,uy,uz,searching,degen\n";
+      fout_corr_scan.open(DEBUG_FILE_DIR("corr_scan.csv"), std::ios::out);
+      fout_corr_scan << "t,tk,iters,effct,hold_scene,hold_info,rp_info,drot_x,drot_y,drot_z,dpos_x,dpos_y,dpos_z,"
+                        "far_frac,z_weak,P_rx,P_ry,P_rz,P_px,P_py,P_pz,dvel_x,dvel_y,dvel_z";
+      // the prior covariance over [pos(0-2), rot(3-5), vel(12-14)] as a 9x9 block, row-major: the exact
+      // iteration-0 update of pos/rot needs the pos-rot block, the vel rows show the blind-window coupling
+      for (int a = 0; a < 9; a++) {
+        for (int b = 0; b < 9; b++) { fout_corr_scan << ",P" << a << b; }
+      }
+      fout_corr_scan << "\n";
       RCLCPP_INFO(this->get_logger(), "Correspondence dump enabled: %zu window(s) -> %s", corr_dump_windows.size(),
                   DEBUG_FILE_DIR("corr_dump.csv").c_str());
     }
@@ -2524,6 +2677,8 @@ public:
     this->get_parameter_or<double>("lidar_attitude_hold_max_s", attitude_hold_params.max_hold_s, 3.0);
     this->get_parameter_or<double>("lidar_attitude_hold_max_scan_gap_s", attitude_hold_params.max_scan_gap_s, 0.3);
     this->get_parameter_or<double>("lidar_attitude_hold_min_rp_info", lidar_attitude_hold_min_rp_info, 0.0);
+    this->get_parameter_or<double>("guard_vel_reset_sigma", guard_vel_reset_sigma, 0.0);
+    this->get_parameter_or<double>("zupt_vel_reset_sigma", zupt_vel_reset_sigma, 0.0);
     this->get_parameter_or<double>("lidar_attitude_hold_z_weak", attitude_hold_params.z_weak_min, 0.9);
     this->get_parameter_or<bool>("gravity_align_lin_accel_comp", gravity_align_lin_accel_comp, false);
     this->get_parameter_or<double>("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale, 0.0);
@@ -3146,6 +3301,7 @@ private:
           if (dv_n > dv_max) {
             st.vel = hole_vel_pre + dv * (dv_max / dv_n);
             gravity_align_vel_overwritten = true;
+            resetVelocityCovariance(guard_vel_reset_sigma);
           }
           const V3D pos_imu = st.pos;
           if (guard_hole_reanchor_pos) {
@@ -3503,9 +3659,19 @@ private:
                              lidar_end_time - lidar_attitude_hold_since,
                              lidar_attitude_hold_scans);
       }
+      corr_dump_scan_active = false;
+      corr_dump_iter = 0;
+      if (corr_dump_en && fout_corr.is_open()) {
+        for (const auto & w : corr_dump_windows) {
+          if (lidar_end_time >= w.first && lidar_end_time <= w.second) {
+            corr_dump_scan_active = true;
+            break;
+          }
+        }
+      }
       EkfUpdateDiagnostics lidarDiagnostics;
       Eigen::Matrix<double, 23, 23> lidarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
-      if (kalman_channel_diag_en)
+      if (kalman_channel_diag_en || corr_dump_scan_active)
         lidarCovarianceBefore = kf.get_P();
       kf.update_iterated_dyn_share_modified(
         LASER_POINT_COV, solve_H_time, kalman_channel_diag_en ? &lidarDiagnostics : nullptr);
@@ -3530,50 +3696,38 @@ private:
         writeKalmanChannel(
           "lidar", state_before_update, state_point, lidarCovarianceBefore, lidarDiagnostics, Zero3d, Zero3d);
       }
-      if (corr_dump_en && fout_corr.is_open()) {
-        bool in_window = false;
-        for (const auto & w : corr_dump_windows) {
-          if (lidar_end_time >= w.first && lidar_end_time <= w.second) { in_window = true; break; }
+      if ((corr_gate.innovation_k > 0.0 || corr_gate.nn0_max > 0.0) && corr_gate_rejected.load() > 0) {
+        RCLCPP_INFO_THROTTLE(this->get_logger(),
+                             *this->get_clock(),
+                             5000,
+                             "[CORR-GATE] refused %d matches on the last iteration (effct=%d, k=%.1f, nn0_max=%.2f)",
+                             corr_gate_rejected.load(),
+                             effct_feat_num,
+                             corr_gate.innovation_k,
+                             corr_gate.nn0_max);
+      }
+      if (corr_dump_scan_active && fout_corr_scan.is_open()) {
+        const M3D dR = state_before_update.rot.toRotationMatrix().transpose() * state_point.rot.toRotationMatrix();
+        const V3D drot = Log(dR);
+        const V3D dpos = state_point.pos - state_before_update.pos;
+        fout_corr_scan << std::setprecision(15) << lidar_end_time << ',' << std::setprecision(9)
+                       << Measures.lidar_beg_time - first_lidar_time << ',' << corr_dump_iter << ',' << effct_feat_num
+                       << ',' << int(lidar_attitude_hold_active) << ',' << int(lidar_attitude_hold_info_active) << ','
+                       << std::setprecision(6) << lidar_rot_obs_rp_min << ',' << drot(0) << ',' << drot(1) << ','
+                       << drot(2) << ',' << dpos(0) << ',' << dpos(1) << ',' << dpos(2) << ',' << scan_far_frac << ','
+                       << pos_obs_z_weak << ',' << lidarCovarianceBefore(3, 3) << ',' << lidarCovarianceBefore(4, 4)
+                       << ',' << lidarCovarianceBefore(5, 5) << ',' << lidarCovarianceBefore(0, 0) << ','
+                       << lidarCovarianceBefore(1, 1) << ',' << lidarCovarianceBefore(2, 2);
+        const V3D dvel = state_point.vel - state_before_update.vel;
+        fout_corr_scan << ',' << dvel(0) << ',' << dvel(1) << ',' << dvel(2);
+        const int blk[9] = {0, 1, 2, 3, 4, 5, 12, 13, 14};
+        for (int a = 0; a < 9; a++) {
+          for (int b = 0; b < 9; b++) { fout_corr_scan << ',' << lidarCovarianceBefore(blk[a], blk[b]); }
         }
-        if (in_window) {
-          const M3D Rw = state_point.rot.toRotationMatrix();
-          const M3D Rl = state_point.offset_R_L_I.toRotationMatrix();
-          for (int i = 0; i < feats_down_size; i++) {
-            const auto & pb = feats_down_body->points[i];
-            const V3D p_body(pb.x, pb.y, pb.z);
-            const V3D pw = Rw * (Rl * p_body + state_point.offset_T_L_I) + state_point.pos;
-            const auto & near = Nearest_Points[i];
-            const int n_near = static_cast<int>(near.size());
-            auto dist = [&](int k) {
-              const V3D q(near[k].x, near[k].y, near[k].z);
-              return (q - pw).norm();
-            };
-            const double nn0 = n_near > 0 ? dist(0) : -1.0;
-            const double nn4 = n_near >= 5 ? dist(4) : -1.0;
-            double plane_rms = -1.0, plane_span = -1.0;
-            if (n_near >= 3) {
-              const VF(4) & pl = plane_cache[i];
-              double ss = 0.0;
-              V3D mean = V3D::Zero();
-              for (const auto & q : near) {
-                const double d = pl(0) * q.x + pl(1) * q.y + pl(2) * q.z + pl(3);
-                ss += d * d;
-                mean += V3D(q.x, q.y, q.z);
-              }
-              mean /= double(n_near);
-              double span = 0.0;
-              for (const auto & q : near) { span = std::max(span, (V3D(q.x, q.y, q.z) - mean).norm()); }
-              plane_rms = std::sqrt(ss / double(n_near));
-              plane_span = span;
-            }
-            const bool eff = point_selected_surf[i];
-            fout_corr << std::setprecision(10) << lidar_end_time << ',' << i << ',' << std::setprecision(5) << p_body.norm()
-                      << ',' << int(eff) << ',' << (eff ? res_last[i] : -1.0f) << ',' << nn0 << ',' << nn4 << ',' << n_near
-                      << ',' << int(plane_cache_ok[i]) << ',' << plane_rms << ',' << plane_span << ','
-                      << (eff ? normvec->points[i].z : 0.0f) << ',' << pw.z() << ',' << pw.x() << ',' << pw.y() << '\n';
-          }
-          fout_corr.flush();
-        }
+        fout_corr_scan << '\n';
+        fout_corr.flush();
+        fout_corr_iter.flush();
+        fout_corr_scan.flush();
       }
 
       // Held-back directions are otherwise invisible: the pose keeps coming out at the
@@ -3659,6 +3813,7 @@ private:
               st.vel.setZero();
               gravity_align_vel_overwritten = true;
               kf.change_x(st);
+              resetVelocityCovariance(guard_vel_reset_sigma);
               state_point = kf.get_x();
               RCLCPP_WARN(this->get_logger(),
                           "[DIVERGENCE-GUARD] engulfment released (far_frac=%.2f for %d scans): "
@@ -4111,6 +4266,7 @@ private:
           st.vel.setZero();
           gravity_align_vel_overwritten = true;
           kf.change_x(st);
+          resetVelocityCovariance(zupt_vel_reset_sigma);
           state_point = kf.get_x();
           ++zupt_hold_scans;
           if (!zupt_active) {
@@ -4142,6 +4298,7 @@ private:
             st.vel.setZero();
             gravity_align_vel_overwritten = true;
             kf.change_x(st);
+            resetVelocityCovariance(zupt_vel_reset_sigma);
             state_point = kf.get_x();
           }
         }
@@ -4198,6 +4355,7 @@ private:
           st.vel.setZero();
           gravity_align_vel_overwritten = true;
           kf.change_x(st);
+          resetVelocityCovariance(zupt_vel_reset_sigma);
           state_point = kf.get_x();
           if (zupt_verdict.report) {
             RCLCPP_WARN_THROTTLE(this->get_logger(),
@@ -4292,6 +4450,7 @@ private:
             st.vel.setZero();
             gravity_align_vel_overwritten = true;
             kf.change_x(st);
+            resetVelocityCovariance(guard_vel_reset_sigma);
             state_point = kf.get_x();
           }
           if (runaway_on_trip == "reset_map") {

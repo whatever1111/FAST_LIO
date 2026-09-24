@@ -346,6 +346,14 @@ double gravity_align_last_trig = -1e18;
 // nearest map point is within corr_nn0_max). Both 0 = the legacy s > 0.9 test alone.
 fast_lio::CorrespondenceGateParams corr_gate;
 std::atomic<int> corr_gate_rejected{0};  // matches the gate refused on the last h_share_model call
+double corr_gate_scan_sigma = 0.0;       // the scan's robust residual scale on the last call (1.4826 MAD)
+std::vector<double> gate_var, gate_nn0, gate_w, corr_weight;  // per point / per effective row
+// [v11] optional robust kernel on the admitted rows (corr_kernel none|gm|cauchy): IRLS weight on the
+// squared residual with scale c = max(corr_kernel_mad_scale * scan scale, corr_kernel_min_scale); the row
+// and its residual are scaled by sqrt(w), i.e. R_i <- R / w.
+std::string corr_kernel_str = "none";
+int corr_kernel = 0;  // 0 none, 1 Geman-McClure, 2 Cauchy
+double corr_kernel_mad_scale = 3.0, corr_kernel_min_scale = 0.03;
 bool corr_dump_en = false;
 std::string corr_dump_windows_str;
 std::vector<std::pair<double, double>> corr_dump_windows;
@@ -1830,8 +1838,9 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   // [v11] the gate judges every residual against the prior's [pos, rot] covariance, which IKFoM keeps
   // unchanged through the iterations; read it once per call.
   Eigen::Matrix<double, 6, 6> gate_P6 = Eigen::Matrix<double, 6, 6>::Zero();
+  const bool gate_on = corr_gate.innovation_k > 0.0 || corr_gate.nn0_max > 0.0;
   if (corr_gate.innovation_k > 0.0) {
-    gate_P6 = kf.get_P().block<6, 6>(0, 0);
+    gate_P6 = fast_lio::flooredPriorBlock(kf.get_P().block<6, 6>(0, 0), corr_gate.rot_sigma_floor_deg * M_PI / 180.0);
   }
   corr_gate_rejected.store(0, std::memory_order_relaxed);
 
@@ -1840,6 +1849,10 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     plane_cache.resize(feats_down_size);
     plane_cache_ok.resize(feats_down_size);
     body_range_sqrt.resize(feats_down_size);
+    gate_var.resize(feats_down_size);
+    gate_nn0.resize(feats_down_size);
+    gate_w.resize(feats_down_size);
+    corr_weight.resize(feats_down_size);
   }
 
 #ifdef MP_EN
@@ -1891,32 +1904,66 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     point_selected_surf[i] = false;
     if (plane_cache_ok[i]) {
       float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
-      // [v11] innovation / nearest-neighbour gate, computed while `s` still names the state
-      bool gate_ok = true;
-      if (corr_gate.innovation_k > 0.0 || corr_gate.nn0_max > 0.0) {
+      // [v11] the gate's inputs, computed while `s` still names the state; the decision waits for the
+      // whole scan's residual scale (below the loop)
+      if (gate_on) {
         const V3D n_w(pabcd(0), pabcd(1), pabcd(2));
         const V3D point_this = s.offset_R_L_I * p_body + s.offset_T_L_I;
         const V3D A = point_this.cross(V3D(s.rot.conjugate() * n_w));
-        const double var =
+        gate_var[i] =
           corr_gate.innovation_k > 0.0 ? fast_lio::residualVariance(n_w, A, gate_P6, LASER_POINT_COV) : 0.0;
-        double nn0 = 0.0;
+        gate_nn0[i] = 0.0;
         if (corr_gate.nn0_max > 0.0 && !points_near.empty()) {
-          nn0 = (V3D(points_near[0].x, points_near[0].y, points_near[0].z) - p_global).norm();
-        }
-        gate_ok = fast_lio::correspondenceAdmitted(corr_gate, pd2, var, nn0);
-        if (!gate_ok) {
-          corr_gate_rejected.fetch_add(1, std::memory_order_relaxed);
+          gate_nn0[i] = (V3D(points_near[0].x, points_near[0].y, points_near[0].z) - p_global).norm();
         }
       }
       float s = 1 - 0.9 * fabs(pd2) / body_range_sqrt[i];
 
-      if (s > 0.9 && gate_ok) {
+      if (s > 0.9) {
         point_selected_surf[i] = true;
         normvec->points[i].x = pabcd(0);
         normvec->points[i].y = pabcd(1);
         normvec->points[i].z = pabcd(2);
         normvec->points[i].intensity = pd2;
         res_last[i] = abs(pd2);
+      }
+    }
+  }
+
+  // [v11] gate decision and kernel weights: the scan's robust residual scale is known only now.
+  corr_gate_scan_sigma = 0.0;
+  if (gate_on || corr_kernel != 0) {
+    if (corr_gate.mad_scale > 0.0 || corr_kernel != 0) {
+      std::vector<double> res;
+      res.reserve(feats_down_size);
+      for (int i = 0; i < feats_down_size; i++) {
+        if (point_selected_surf[i]) {
+          res.push_back(normvec->points[i].intensity);
+        }
+      }
+      corr_gate_scan_sigma = fast_lio::robustResidualScale(res);
+    }
+    const double scan_floor = corr_gate.mad_scale * corr_gate_scan_sigma;
+    const double kernel_c =
+      corr_kernel != 0 ? std::max(corr_kernel_mad_scale * corr_gate_scan_sigma, corr_kernel_min_scale) : 0.0;
+#ifdef MP_EN
+#pragma omp parallel for
+#endif
+    for (int i = 0; i < feats_down_size; i++) {
+      gate_w[i] = 1.0;
+      if (!point_selected_surf[i]) {
+        continue;
+      }
+      const double pd2 = normvec->points[i].intensity;
+      if (gate_on && !fast_lio::correspondenceAdmitted(corr_gate, pd2, gate_var[i], gate_nn0[i], scan_floor)) {
+        point_selected_surf[i] = false;
+        corr_gate_rejected.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      if (corr_kernel == 1) {
+        gate_w[i] = fast_lio::gemanMcClureWeight(pd2, kernel_c);
+      } else if (corr_kernel == 2) {
+        gate_w[i] = fast_lio::cauchyWeight(pd2, kernel_c);
       }
     }
   }
@@ -2140,6 +2187,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     if (point_selected_surf[i]) {
       laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
       corr_normvect->points[effct_feat_num] = normvec->points[i];
+      corr_weight[effct_feat_num] = corr_kernel != 0 ? gate_w[i] : 1.0;
       total_residual += res_last[i];
       if (degeneracy_debug) {
         const PointType & pb = feats_down_body->points[i];
@@ -2243,6 +2291,11 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
 
     /*** Measuremnt: distance to the closest surface/corner ***/
     ekfom_data.h(i) = -norm_p.intensity;
+    if (corr_kernel != 0 && corr_weight[i] < 1.0) {
+      const double sw = std::sqrt(std::max(corr_weight[i], 0.0));
+      ekfom_data.h_x.block<1, 12>(i, 0) *= sw;
+      ekfom_data.h(i) *= sw;
+    }
   }
 
   /*** Subspace weighting. Judged on the position information LEFT once rotation has
@@ -2431,6 +2484,11 @@ public:
     this->declare_parameter<bool>("lidar_attitude_hold_en", false);
     this->declare_parameter<double>("corr_innov_gate_k", 0.0);
     this->declare_parameter<double>("corr_nn0_max", 0.0);
+    this->declare_parameter<double>("corr_gate_mad_scale", 0.0);
+    this->declare_parameter<double>("corr_gate_rot_sigma_floor_deg", 0.0);
+    this->declare_parameter<std::string>("corr_kernel", "none");
+    this->declare_parameter<double>("corr_kernel_mad_scale", 3.0);
+    this->declare_parameter<double>("corr_kernel_min_scale", 0.03);
     this->declare_parameter<bool>("corr_dump_en", false);
     this->declare_parameter<std::string>("corr_dump_windows", "");
     this->declare_parameter<double>("lidar_attitude_hold_far_frac", 0.0);
@@ -2645,6 +2703,15 @@ public:
     this->get_parameter_or<bool>("lidar_attitude_hold_en", attitude_hold_params.enabled, false);
     this->get_parameter_or<double>("corr_innov_gate_k", corr_gate.innovation_k, 0.0);
     this->get_parameter_or<double>("corr_nn0_max", corr_gate.nn0_max, 0.0);
+    this->get_parameter_or<double>("corr_gate_mad_scale", corr_gate.mad_scale, 0.0);
+    this->get_parameter_or<double>("corr_gate_rot_sigma_floor_deg", corr_gate.rot_sigma_floor_deg, 0.0);
+    this->get_parameter_or<std::string>("corr_kernel", corr_kernel_str, std::string("none"));
+    this->get_parameter_or<double>("corr_kernel_mad_scale", corr_kernel_mad_scale, 3.0);
+    this->get_parameter_or<double>("corr_kernel_min_scale", corr_kernel_min_scale, 0.03);
+    corr_kernel = corr_kernel_str == "gm" ? 1 : corr_kernel_str == "cauchy" ? 2 : 0;
+    if (corr_kernel_str != "none" && corr_kernel == 0) {
+      RCLCPP_WARN(this->get_logger(), "corr_kernel '%s' unknown (none|gm|cauchy): kernel off", corr_kernel_str.c_str());
+    }
     this->get_parameter_or<bool>("corr_dump_en", corr_dump_en, false);
     this->get_parameter_or<std::string>("corr_dump_windows", corr_dump_windows_str, std::string(""));
     if (corr_dump_en) {
@@ -3700,11 +3767,13 @@ private:
         RCLCPP_INFO_THROTTLE(this->get_logger(),
                              *this->get_clock(),
                              5000,
-                             "[CORR-GATE] refused %d matches on the last iteration (effct=%d, k=%.1f, nn0_max=%.2f)",
+                             "[CORR-GATE] refused %d matches on the last iteration (effct=%d, k=%.1f, nn0_max=%.2f, "
+                             "scan sigma=%.3f m)",
                              corr_gate_rejected.load(),
                              effct_feat_num,
                              corr_gate.innovation_k,
-                             corr_gate.nn0_max);
+                             corr_gate.nn0_max,
+                             corr_gate_scan_sigma);
       }
       if (corr_dump_scan_active && fout_corr_scan.is_open()) {
         const M3D dR = state_before_update.rot.toRotationMatrix().transpose() * state_point.rot.toRotationMatrix();

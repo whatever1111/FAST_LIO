@@ -3688,11 +3688,14 @@ private:
             // [v6] the compensation's own uncertainty widens the measurement (quadrature)
             const double n2 = sigma * sigma + (lin_term.valid ? lin_term.sigma * lin_term.sigma : 0.0);
             Eigen::Vector3d R_diag(n2, n2, n2);
+            EkfUpdateDiagnostics gravityDiagnostics;
+            Eigen::Matrix<double, 23, 23> gravityCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
+            if (kalman_channel_diag_en) gravityCovarianceBefore = kf.get_P();
             if (degeneracy_debug) {
               V3D tilt = g_body.cross(m_body);  // axis*sin(angle), body frame
               const double ang_deg = std::asin(std::min(1.0, tilt.norm())) * 57.2958;
               V3D eul_before = SO3ToEuler(st.rot);  // degrees
-              kf.update_simple(H, residual, R_diag);
+              kf.update_simple(H, residual, R_diag, kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
               state_point = kf.get_x();
               V3D eul_after = SO3ToEuler(state_point.rot);
               V3D deul = eul_after - eul_before;
@@ -3705,8 +3708,11 @@ private:
                         << " dRPY_deg=[" << deul.x() << "," << deul.y() << "," << deul.z() << "]"
                         << " posZ=" << state_point.pos[2] << "m" << std::endl;
             } else {
-              kf.update_simple(H, residual, R_diag);
+              kf.update_simple(H, residual, R_diag, kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
               state_point = kf.get_x();
+            }
+            if (kalman_channel_diag_en) {
+              writeKalmanChannel("gravity", st, state_point, gravityCovarianceBefore, gravityDiagnostics, m_body, g_body);
             }
             }  // outlier gate
           }
@@ -3733,8 +3739,14 @@ private:
         H.block<3, 3>(0, 3) = skew_sym_mat(v_body);  // dh/d(rot)
         H.block<3, 3>(0, 12) = Rw.transpose();       // dh/d(vel)
         Eigen::Vector3d R_diag(1e6, 1e6, planar_constraint_noise * planar_constraint_noise);
-        kf.update_simple(H, residual, R_diag);
+        EkfUpdateDiagnostics planarDiagnostics;
+        Eigen::Matrix<double, 23, 23> planarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
+        if (kalman_channel_diag_en) planarCovarianceBefore = kf.get_P();
+        kf.update_simple(H, residual, R_diag, kalman_channel_diag_en ? &planarDiagnostics : nullptr);
         state_point = kf.get_x();
+        if (kalman_channel_diag_en) {
+          writeKalmanChannel("planar", st, state_point, planarCovarianceBefore, planarDiagnostics, Zero3d, v_body);
+        }
       }
 
       /*** Divergence guard (P1) — bound the runaway while degraded. A ground

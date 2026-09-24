@@ -292,6 +292,12 @@ double gravity_align_leg_edge_window_s = 0.2;   // s; trailing mean at each scan
 std::vector<double> gravity_align_leg_lever_arm_vec;
 V3D gravity_align_leg_lever_arm = V3D::Zero();  // m, IMU frame; IMU point minus the legs' reference point
 bool gravity_align_prev_edge_valid = false;
+// [v6] While the map is frozen (blind stretch) and the body moves, nothing observes the body's
+// acceleration: not the frozen-map near-field registration, not the legs at a threshold, not the
+// FP. The 1 s specific-force mean then leans 5-12° with the stop/start and no compensation can
+// remove it (docs/PGO_LOOP_TUNING.md §7.3-7.4). With this on the prior is withheld there; the
+// attitude rides on the gyro (0.1-1° over such a window) instead of being levelled onto acceleration.
+bool gravity_align_withhold_blind_moving = false;
 std::deque<std::pair<double, double>> gravity_align_leg_hist;  // (stamp, forward speed) under mtx_twist
 std::deque<std::pair<double, V3D>> gravity_align_gyro_hist;    // (stamp, raw body rate) scan-thread only
 double gravity_align_grav_cap_deg = 3.0;   // [v4] leak cap: grav tangent std ceiling (deg) — bounds how far
@@ -2228,6 +2234,7 @@ public:
     this->declare_parameter<bool>("gravity_align_lin_accel_comp", false);
     this->declare_parameter<double>("gravity_align_vel_sigma_scale", 0.0);
     this->declare_parameter<std::string>("gravity_align_lin_accel_source", "leg");
+    this->declare_parameter<bool>("gravity_align_withhold_blind_moving", false);
     this->declare_parameter<double>("gravity_align_leg_vel_sigma", 0.15);
     this->declare_parameter<double>("gravity_align_leg_edge_window_s", 0.2);
     this->declare_parameter<std::vector<double>>("gravity_align_leg_lever_arm", std::vector<double>{0.0, 0.0, 0.0});
@@ -2425,6 +2432,7 @@ public:
     this->get_parameter_or<bool>("gravity_align_lin_accel_comp", gravity_align_lin_accel_comp, false);
     this->get_parameter_or<double>("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale, 0.0);
     this->get_parameter_or<std::string>("gravity_align_lin_accel_source", gravity_align_lin_accel_source, std::string("leg"));
+    this->get_parameter_or<bool>("gravity_align_withhold_blind_moving", gravity_align_withhold_blind_moving, false);
     this->get_parameter_or<double>("gravity_align_leg_vel_sigma", gravity_align_leg_vel_sigma, 0.15);
     this->get_parameter_or<double>("gravity_align_leg_edge_window_s", gravity_align_leg_edge_window_s, 0.2);
     this->get_parameter_or<std::vector<double>>("gravity_align_leg_lever_arm", gravity_align_leg_lever_arm_vec,
@@ -3632,10 +3640,16 @@ private:
                                         (last_twist_stamp > 0.0 && lidar_end_time - last_twist_stamp < 1.0);
           const bool lin_ok = !gravity_align_lin_accel_comp || gravity_align_window_s <= 0.0 || lin_term.valid ||
                               !leg_stream_alive;
+          // [v6] blind stretch with the body moving: the acceleration is unobservable, so is the vertical
+          const bool blind_moving = gravity_align_withhold_blind_moving && flio_in_degraded &&
+                                    !body_is_static(Measures, lidar_end_time);
+          if (degeneracy_debug && blind_moving) {
+            std::cerr << "[GALIGN] withheld: blind stretch, body moving" << std::endl;
+          }
           if (degeneracy_debug && !lin_ok) {
             std::cerr << "[GALIGN] withheld: velocity overwritten inside the window" << std::endl;
           }
-          if (g_ref > 1e-3 && win_n > 0 && a_norm > 1e-6 && span_ok && lin_ok &&
+          if (g_ref > 1e-3 && win_n > 0 && a_norm > 1e-6 && span_ok && lin_ok && !blind_moving &&
               std::abs(a_norm - g_ref) <= gravity_align_accel_tol * g_ref) {
             V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
             V3D u_world = -grav_w.normalized();              // world up (unit)

@@ -93,6 +93,7 @@
 #include "adaptive_downsample.hpp"
 #include "parked_hold.hpp"
 #include "preprocess.h"
+#include "attitude_hold.hpp"
 #include "gravity_align_kinematics.hpp"
 #include "reanchor_gate.hpp"
 #include "voxel_downsample.hpp"
@@ -324,6 +325,14 @@ struct GravWinAgg {
 };
 std::deque<GravWinAgg> grav_win;           // scan-thread only
 double gravity_align_last_trig = -1e18;
+// [v8] Attitude hold (attitude_hold.hpp): scans registered against a frozen map (or, optionally,
+// near-field-only scans with no horizontal surface in view) may update translation and yaw but not
+// roll/pitch — the point-to-plane residuals carry no vertical information there and were tilting
+// the state 0.4-1.7° per scan (docs/PGO_LOOP_TUNING.md §7.5). Decided once per scan before the
+// update from the previous scan's guard verdicts and this scan's far-field share.
+fast_lio::AttitudeHoldParams attitude_hold_params;
+bool lidar_attitude_hold_active = false;  // this scan's verdict; read by h_share_model
+int lidar_attitude_hold_scans = 0;        // telemetry
 
 // Divergence guard (P1): when LiDAR correspondences collapse (scan starvation
 // under CPU/IO load, or feature-poor geometry), the iEKF runs on IMU
@@ -2104,6 +2113,14 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
   ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12);  // 23
   ekfom_data.h.resize(effct_feat_num);
+  // [v8] attitude hold: the vertical in the body frame (the gravity state's own up), recomputed per
+  // iteration; every rotation row below is projected onto it so the update cannot move roll/pitch.
+  V3D hold_up = V3D::Zero();
+  if (lidar_attitude_hold_active) {
+    V3D grav_w(s.grav[0], s.grav[1], s.grav[2]);
+    const V3D up_w = grav_w.norm() > 1e-6 ? V3D(-grav_w.normalized()) : V3D(0.0, 0.0, 1.0);
+    hold_up = (s.rot.conjugate() * up_w).normalized();
+  }
 
   for (int i = 0; i < effct_feat_num; i++) {
     const PointType & laser_p = laserCloudOri->points[i];
@@ -2121,6 +2138,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     /*** calculate the Measuremnt Jacobian matrix H ***/
     V3D C(s.rot.conjugate() * norm_vec);
     V3D A(point_crossmat * C);
+    if (lidar_attitude_hold_active) { A = fast_lio::projectRotationRowToYaw(A, hold_up); }
     if (extrinsic_est_en) {
       V3D B(point_be_crossmat * s.offset_R_L_I.conjugate() * C);  // s.rot.conjugate()*norm_vec);
       ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B),
@@ -2241,6 +2259,9 @@ public:
     this->declare_parameter<double>("gravity_align_grav_leak", 1.0);
     this->declare_parameter<double>("gravity_align_grav_cap_deg", 3.0);
     this->declare_parameter<bool>("gravity_align_grav_freeze_degraded", false);
+    this->declare_parameter<bool>("lidar_attitude_hold_en", false);
+    this->declare_parameter<double>("lidar_attitude_hold_far_frac", 0.0);
+    this->declare_parameter<double>("lidar_attitude_hold_z_weak", 0.9);
     this->declare_parameter<bool>("gravity_align_lin_accel_comp", false);
     this->declare_parameter<double>("gravity_align_vel_sigma_scale", 0.0);
     this->declare_parameter<std::string>("gravity_align_lin_accel_source", "leg");
@@ -2442,6 +2463,9 @@ public:
     this->get_parameter_or<double>("gravity_align_grav_leak", gravity_align_grav_leak, 1.0);
     this->get_parameter_or<double>("gravity_align_grav_cap_deg", gravity_align_grav_cap_deg, 3.0);
     this->get_parameter_or<bool>("gravity_align_grav_freeze_degraded", gravity_align_grav_freeze_degraded, false);
+    this->get_parameter_or<bool>("lidar_attitude_hold_en", attitude_hold_params.enabled, false);
+    this->get_parameter_or<double>("lidar_attitude_hold_far_frac", attitude_hold_params.far_frac_max, 0.0);
+    this->get_parameter_or<double>("lidar_attitude_hold_z_weak", attitude_hold_params.z_weak_min, 0.9);
     this->get_parameter_or<bool>("gravity_align_lin_accel_comp", gravity_align_lin_accel_comp, false);
     this->get_parameter_or<double>("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale, 0.0);
     this->get_parameter_or<std::string>("gravity_align_lin_accel_source", gravity_align_lin_accel_source, std::string("leg"));
@@ -3391,6 +3415,21 @@ private:
       const uint64_t prof_rb_cnt0 = g_ikd_rebuild_count.load(std::memory_order_relaxed);
       const uint64_t prof_inl_us0 = g_ikd_inline_rebuild_us.load(std::memory_order_relaxed);
       double solve_H_time = 0;
+      lidar_attitude_hold_active = fast_lio::holdAttitudeThisScan(
+        attitude_hold_params, flio_map_frozen, engulf_latched, scan_far_frac, pos_obs_z_weak);
+      if (lidar_attitude_hold_active) {
+        ++lidar_attitude_hold_scans;
+        RCLCPP_INFO_THROTTLE(this->get_logger(),
+                             *this->get_clock(),
+                             2000,
+                             "[ATT-HOLD] lidar update restricted to translation+yaw (map_frozen=%d engulfed=%d "
+                             "far_frac=%.2f z_weak_prev=%.2f, %d scans so far)",
+                             flio_map_frozen,
+                             engulf_latched,
+                             scan_far_frac,
+                             pos_obs_z_weak,
+                             lidar_attitude_hold_scans);
+      }
       EkfUpdateDiagnostics lidarDiagnostics;
       Eigen::Matrix<double, 23, 23> lidarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
       if (kalman_channel_diag_en)

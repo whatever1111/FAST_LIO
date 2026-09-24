@@ -266,6 +266,12 @@ if(BUILD_TESTING)
   if(TARGET test_gravity_align_kinematics)
     target_include_directories(test_gravity_align_kinematics PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
+  # Pure header, Eigen only: whether a scan's lidar update may rotate roll/pitch, and the
+  # Jacobian projection that enforces it (docs/PGO_LOOP_TUNING.md section 7.5).
+  ament_add_gtest(test_attitude_hold test/test_attitude_hold.cpp)
+  if(TARGET test_attitude_hold)
+    target_include_directories(test_attitude_hold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
 
   ament_add_gtest(test_odom_covariance_contract test/test_odom_covariance_contract.cpp)
   if(TARGET test_odom_covariance_contract)

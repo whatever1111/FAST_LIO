@@ -330,6 +330,14 @@ double gravity_align_last_trig = -1e18;
 // roll/pitch — the point-to-plane residuals carry no vertical information there and were tilting
 // the state 0.4-1.7° per scan (docs/PGO_LOOP_TUNING.md §7.5). Decided once per scan before the
 // update from the previous scan's guard verdicts and this scan's far-field share.
+// [diag] per-correspondence dump (corr_dump_en, corr_dump_windows "t1:t2,t3:t4" in lidar_end_time seconds):
+// after each lidar update inside a window, one row per downsampled point with its range, residual,
+// nearest-map distances, plane fit and whether it was effective — the data a per-correspondence
+// admission rule is designed from (docs/PGO_LOOP_TUNING.md §7.7).
+bool corr_dump_en = false;
+std::string corr_dump_windows_str;
+std::vector<std::pair<double, double>> corr_dump_windows;
+std::ofstream fout_corr;
 fast_lio::AttitudeHoldParams attitude_hold_params;
 bool lidar_attitude_hold_active = false;  // this scan's scene-rule verdict; read by h_share_model
 bool lidar_attitude_hold_allowed = false; // release conditions satisfied this scan (starvation, age, holes)
@@ -2286,6 +2294,8 @@ public:
     this->declare_parameter<double>("gravity_align_grav_cap_deg", 3.0);
     this->declare_parameter<bool>("gravity_align_grav_freeze_degraded", false);
     this->declare_parameter<bool>("lidar_attitude_hold_en", false);
+    this->declare_parameter<bool>("corr_dump_en", false);
+    this->declare_parameter<std::string>("corr_dump_windows", "");
     this->declare_parameter<double>("lidar_attitude_hold_far_frac", 0.0);
     this->declare_parameter<int>("lidar_attitude_hold_min_effct", 100);
     this->declare_parameter<double>("lidar_attitude_hold_max_s", 3.0);
@@ -2494,6 +2504,21 @@ public:
     this->get_parameter_or<double>("gravity_align_grav_cap_deg", gravity_align_grav_cap_deg, 3.0);
     this->get_parameter_or<bool>("gravity_align_grav_freeze_degraded", gravity_align_grav_freeze_degraded, false);
     this->get_parameter_or<bool>("lidar_attitude_hold_en", attitude_hold_params.enabled, false);
+    this->get_parameter_or<bool>("corr_dump_en", corr_dump_en, false);
+    this->get_parameter_or<std::string>("corr_dump_windows", corr_dump_windows_str, std::string(""));
+    if (corr_dump_en) {
+      std::stringstream ws(corr_dump_windows_str);
+      std::string item;
+      while (std::getline(ws, item, ',')) {
+        const auto colon = item.find(':');
+        if (colon == std::string::npos) { continue; }
+        corr_dump_windows.emplace_back(std::stod(item.substr(0, colon)), std::stod(item.substr(colon + 1)));
+      }
+      fout_corr.open(DEBUG_FILE_DIR("corr_dump.csv"), std::ios::out);
+      fout_corr << "t,i,range,eff,res,nn0,nn4,n_near,plane_ok,plane_rms,plane_span,nz,pz,px,py\n";
+      RCLCPP_INFO(this->get_logger(), "Correspondence dump enabled: %zu window(s) -> %s", corr_dump_windows.size(),
+                  DEBUG_FILE_DIR("corr_dump.csv").c_str());
+    }
     this->get_parameter_or<double>("lidar_attitude_hold_far_frac", attitude_hold_params.far_frac_max, 0.0);
     this->get_parameter_or<int>("lidar_attitude_hold_min_effct", attitude_hold_params.min_effct, 100);
     this->get_parameter_or<double>("lidar_attitude_hold_max_s", attitude_hold_params.max_hold_s, 3.0);
@@ -3504,6 +3529,51 @@ private:
       if (kalman_channel_diag_en) {
         writeKalmanChannel(
           "lidar", state_before_update, state_point, lidarCovarianceBefore, lidarDiagnostics, Zero3d, Zero3d);
+      }
+      if (corr_dump_en && fout_corr.is_open()) {
+        bool in_window = false;
+        for (const auto & w : corr_dump_windows) {
+          if (lidar_end_time >= w.first && lidar_end_time <= w.second) { in_window = true; break; }
+        }
+        if (in_window) {
+          const M3D Rw = state_point.rot.toRotationMatrix();
+          const M3D Rl = state_point.offset_R_L_I.toRotationMatrix();
+          for (int i = 0; i < feats_down_size; i++) {
+            const auto & pb = feats_down_body->points[i];
+            const V3D p_body(pb.x, pb.y, pb.z);
+            const V3D pw = Rw * (Rl * p_body + state_point.offset_T_L_I) + state_point.pos;
+            const auto & near = Nearest_Points[i];
+            const int n_near = static_cast<int>(near.size());
+            auto dist = [&](int k) {
+              const V3D q(near[k].x, near[k].y, near[k].z);
+              return (q - pw).norm();
+            };
+            const double nn0 = n_near > 0 ? dist(0) : -1.0;
+            const double nn4 = n_near >= 5 ? dist(4) : -1.0;
+            double plane_rms = -1.0, plane_span = -1.0;
+            if (n_near >= 3) {
+              const VF(4) & pl = plane_cache[i];
+              double ss = 0.0;
+              V3D mean = V3D::Zero();
+              for (const auto & q : near) {
+                const double d = pl(0) * q.x + pl(1) * q.y + pl(2) * q.z + pl(3);
+                ss += d * d;
+                mean += V3D(q.x, q.y, q.z);
+              }
+              mean /= double(n_near);
+              double span = 0.0;
+              for (const auto & q : near) { span = std::max(span, (V3D(q.x, q.y, q.z) - mean).norm()); }
+              plane_rms = std::sqrt(ss / double(n_near));
+              plane_span = span;
+            }
+            const bool eff = point_selected_surf[i];
+            fout_corr << std::setprecision(10) << lidar_end_time << ',' << i << ',' << std::setprecision(5) << p_body.norm()
+                      << ',' << int(eff) << ',' << (eff ? res_last[i] : -1.0f) << ',' << nn0 << ',' << nn4 << ',' << n_near
+                      << ',' << int(plane_cache_ok[i]) << ',' << plane_rms << ',' << plane_span << ','
+                      << (eff ? normvec->points[i].z : 0.0f) << ',' << pw.z() << ',' << pw.x() << ',' << pw.y() << '\n';
+          }
+          fout_corr.flush();
+        }
       }
 
       // Held-back directions are otherwise invisible: the pose keeps coming out at the

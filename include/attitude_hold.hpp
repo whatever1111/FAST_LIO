@@ -30,28 +30,50 @@ namespace fast_lio
 struct AttitudeHoldParams
 {
   bool enabled = false;       ///< lidar_attitude_hold_en
-  double far_frac_max = 0.0;  ///< also hold on unfrozen scans whose far-field share is below this (0 = never)
+  int min_effct = 100;        ///< release when the previous scan matched fewer points: a starved scan needs all six
+                              ///< degrees of freedom to re-lock, and the hold has no trustworthy attitude to hold
+  double max_hold_s = 3.0;    ///< release after this long on the gyro alone
+  double max_scan_gap_s = 0.3;  ///< a scan hole longer than this means the propagation itself is suspect
+  double far_frac_max = 0.0;  ///< also hold on unlatched scans whose far-field share is below this (0 = never)
   double z_weak_min = 0.9;    ///< ...and whose previous scan saw no horizontal surface (pos_obs_z_weak above this)
 };
 
+/// What the caller knows about this scan when it decides.
+struct AttitudeHoldInputs
+{
+  bool engulf_latched = false;  ///< the guard's sticky far-field-collapse state (this scan's, computed last scan)
+  int effct_prev = 0;           ///< effective correspondences of the previous scan
+  double hold_age_s = 0.0;      ///< how long the hold has already been on (0 if it is off)
+  double scan_gap_s = 0.1;      ///< time since the previous processed scan
+  double far_frac = 1.0;        ///< this scan's far-field share
+  double z_weak_prev = 0.0;     ///< previous scan's pos_obs_z_weak
+};
+
 /// Whether this scan's lidar update is restricted to translation and yaw.
-/// `map_frozen` and `z_weak_prev` are the previous scan's verdicts (the guard and
-/// the observability run after the update); `engulf_latched` is the sticky
-/// engulfment state; `far_frac` is this scan's own far-field share.
-inline bool holdAttitudeThisScan(const AttitudeHoldParams & p,
-                                 bool map_frozen,
-                                 bool engulf_latched,
-                                 double far_frac,
-                                 double z_weak_prev)
+///
+/// The hold is for one situation: a still-locked front end whose scan has just
+/// collapsed into the near field (engulfment). It must not engage where the
+/// attitude it would hold is not trustworthy or cannot be propagated — the
+/// re-anchor verification at start-up (m20 0825: held from scan 1 with a
+/// walking-start init, the tilt grew to 143° and the guard never re-locked),
+/// scan starvation (a lost front end needs six degrees of freedom to find the
+/// map again), scan holes, or a hold that has already run for seconds.
+inline bool holdAttitudeThisScan(const AttitudeHoldParams & p, const AttitudeHoldInputs & in)
 {
   if (!p.enabled) {
     return false;
   }
-  if (map_frozen || engulf_latched) {
+  if (!std::isfinite(in.hold_age_s) || !std::isfinite(in.scan_gap_s)) {
+    return false;
+  }
+  if (in.effct_prev < p.min_effct || in.hold_age_s > p.max_hold_s || in.scan_gap_s > p.max_scan_gap_s) {
+    return false;
+  }
+  if (in.engulf_latched) {
     return true;
   }
-  if (p.far_frac_max > 0.0 && std::isfinite(far_frac) && std::isfinite(z_weak_prev) && far_frac < p.far_frac_max &&
-      z_weak_prev > p.z_weak_min) {
+  if (p.far_frac_max > 0.0 && std::isfinite(in.far_frac) && std::isfinite(in.z_weak_prev) &&
+      in.far_frac < p.far_frac_max && in.z_weak_prev > p.z_weak_min) {
     return true;
   }
   return false;

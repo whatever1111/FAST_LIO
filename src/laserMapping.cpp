@@ -333,6 +333,7 @@ double gravity_align_last_trig = -1e18;
 fast_lio::AttitudeHoldParams attitude_hold_params;
 bool lidar_attitude_hold_active = false;  // this scan's verdict; read by h_share_model
 int lidar_attitude_hold_scans = 0;        // telemetry
+double lidar_attitude_hold_since = -1.0;  // lidar_end_time when the current hold began (-1 = off)
 
 // Divergence guard (P1): when LiDAR correspondences collapse (scan starvation
 // under CPU/IO load, or feature-poor geometry), the iEKF runs on IMU
@@ -2261,6 +2262,9 @@ public:
     this->declare_parameter<bool>("gravity_align_grav_freeze_degraded", false);
     this->declare_parameter<bool>("lidar_attitude_hold_en", false);
     this->declare_parameter<double>("lidar_attitude_hold_far_frac", 0.0);
+    this->declare_parameter<int>("lidar_attitude_hold_min_effct", 100);
+    this->declare_parameter<double>("lidar_attitude_hold_max_s", 3.0);
+    this->declare_parameter<double>("lidar_attitude_hold_max_scan_gap_s", 0.3);
     this->declare_parameter<double>("lidar_attitude_hold_z_weak", 0.9);
     this->declare_parameter<bool>("gravity_align_lin_accel_comp", false);
     this->declare_parameter<double>("gravity_align_vel_sigma_scale", 0.0);
@@ -2465,6 +2469,9 @@ public:
     this->get_parameter_or<bool>("gravity_align_grav_freeze_degraded", gravity_align_grav_freeze_degraded, false);
     this->get_parameter_or<bool>("lidar_attitude_hold_en", attitude_hold_params.enabled, false);
     this->get_parameter_or<double>("lidar_attitude_hold_far_frac", attitude_hold_params.far_frac_max, 0.0);
+    this->get_parameter_or<int>("lidar_attitude_hold_min_effct", attitude_hold_params.min_effct, 100);
+    this->get_parameter_or<double>("lidar_attitude_hold_max_s", attitude_hold_params.max_hold_s, 3.0);
+    this->get_parameter_or<double>("lidar_attitude_hold_max_scan_gap_s", attitude_hold_params.max_scan_gap_s, 0.3);
     this->get_parameter_or<double>("lidar_attitude_hold_z_weak", attitude_hold_params.z_weak_min, 0.9);
     this->get_parameter_or<bool>("gravity_align_lin_accel_comp", gravity_align_lin_accel_comp, false);
     this->get_parameter_or<double>("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale, 0.0);
@@ -3415,20 +3422,32 @@ private:
       const uint64_t prof_rb_cnt0 = g_ikd_rebuild_count.load(std::memory_order_relaxed);
       const uint64_t prof_inl_us0 = g_ikd_inline_rebuild_us.load(std::memory_order_relaxed);
       double solve_H_time = 0;
-      lidar_attitude_hold_active = fast_lio::holdAttitudeThisScan(
-        attitude_hold_params, flio_map_frozen, engulf_latched, scan_far_frac, pos_obs_z_weak);
+      {
+        fast_lio::AttitudeHoldInputs hold_in;
+        hold_in.engulf_latched = engulf_latched;
+        hold_in.effct_prev = effct_feat_num;  // previous scan's count at this point
+        hold_in.hold_age_s = lidar_attitude_hold_since >= 0.0 ? lidar_end_time - lidar_attitude_hold_since : 0.0;
+        hold_in.scan_gap_s = hole_last_scan_end > 0.0 ? Measures.lidar_beg_time - hole_last_scan_end : 0.1;
+        hold_in.far_frac = scan_far_frac;
+        hold_in.z_weak_prev = pos_obs_z_weak;
+        lidar_attitude_hold_active = fast_lio::holdAttitudeThisScan(attitude_hold_params, hold_in);
+      }
       if (lidar_attitude_hold_active) {
+        if (lidar_attitude_hold_since < 0.0) { lidar_attitude_hold_since = lidar_end_time; }
         ++lidar_attitude_hold_scans;
         RCLCPP_INFO_THROTTLE(this->get_logger(),
                              *this->get_clock(),
                              2000,
-                             "[ATT-HOLD] lidar update restricted to translation+yaw (map_frozen=%d engulfed=%d "
-                             "far_frac=%.2f z_weak_prev=%.2f, %d scans so far)",
-                             flio_map_frozen,
+                             "[ATT-HOLD] lidar update restricted to translation+yaw (engulfed=%d effct_prev=%d "
+                             "far_frac=%.2f z_weak_prev=%.2f age=%.1fs, %d scans so far)",
                              engulf_latched,
+                             effct_feat_num,
                              scan_far_frac,
                              pos_obs_z_weak,
+                             lidar_end_time - lidar_attitude_hold_since,
                              lidar_attitude_hold_scans);
+      } else {
+        lidar_attitude_hold_since = -1.0;
       }
       EkfUpdateDiagnostics lidarDiagnostics;
       Eigen::Matrix<double, 23, 23> lidarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();

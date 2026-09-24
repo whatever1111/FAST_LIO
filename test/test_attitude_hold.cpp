@@ -7,6 +7,7 @@
 
 #include "attitude_hold.hpp"
 
+using fast_lio::AttitudeHoldInputs;
 using fast_lio::AttitudeHoldParams;
 using fast_lio::holdAttitudeThisScan;
 using fast_lio::projectRotationRowToYaw;
@@ -21,37 +22,91 @@ AttitudeHoldParams enabled()
   p.enabled = true;
   return p;
 }
+
+// A locked front end that just collapsed into the near field: the case the hold is for.
+AttitudeHoldInputs engulfed()
+{
+  AttitudeHoldInputs in;
+  in.engulf_latched = true;
+  in.effct_prev = 500;
+  in.hold_age_s = 0.5;
+  in.scan_gap_s = 0.1;
+  in.far_frac = 0.1;
+  in.z_weak_prev = 1.0;
+  return in;
+}
 }  // namespace
 
 // Off by default: nothing holds, whatever the scene says.
 TEST(AttitudeHold, DisabledNeverHolds)
 {
   const AttitudeHoldParams p;
-  EXPECT_FALSE(holdAttitudeThisScan(p, true, true, 0.0, 1.0));
+  EXPECT_FALSE(holdAttitudeThisScan(p, engulfed()));
 }
 
-// The m20 doorway: the guard froze the map on the previous scan, or the
-// engulfment latch is still set — either alone holds roll/pitch.
-TEST(AttitudeHold, FrozenMapOrEngulfmentHolds)
+TEST(AttitudeHold, EngulfmentOnALockedFrontEndHolds)
+{
+  EXPECT_TRUE(holdAttitudeThisScan(enabled(), engulfed()));
+  AttitudeHoldInputs in = engulfed();
+  in.engulf_latched = false;
+  EXPECT_FALSE(holdAttitudeThisScan(enabled(), in));  // far_frac_max 0: the near-field rule is off
+}
+
+// m20 0825: the re-anchor verification at start-up froze the map on scan 1 while the
+// init attitude was still wrong; a hold there is a deadlock. The hold is keyed on the
+// engulfment latch, never on the map being frozen.
+TEST(AttitudeHold, AFrozenMapAloneIsNotAReasonToHold)
+{
+  AttitudeHoldInputs in = engulfed();
+  in.engulf_latched = false;
+  in.far_frac = 0.95;
+  EXPECT_FALSE(holdAttitudeThisScan(enabled(), in));
+}
+
+// A starved scan, a long hold, or a scan hole each release the hold: the first two
+// mean the attitude being held is no longer trustworthy, the third that the gyro
+// propagation across the gap is not either.
+TEST(AttitudeHold, StarvationAgeAndHolesRelease)
 {
   const AttitudeHoldParams p = enabled();
-  EXPECT_TRUE(holdAttitudeThisScan(p, true, false, 0.95, 0.1));
-  EXPECT_TRUE(holdAttitudeThisScan(p, false, true, 0.95, 0.1));
-  EXPECT_FALSE(holdAttitudeThisScan(p, false, false, 0.95, 0.1));
+  AttitudeHoldInputs in = engulfed();
+  in.effct_prev = p.min_effct - 1;
+  EXPECT_FALSE(holdAttitudeThisScan(p, in));
+  in = engulfed();
+  in.hold_age_s = p.max_hold_s + 0.1;
+  EXPECT_FALSE(holdAttitudeThisScan(p, in));
+  in = engulfed();
+  in.scan_gap_s = p.max_scan_gap_s + 0.1;
+  EXPECT_FALSE(holdAttitudeThisScan(p, in));
+  in = engulfed();
+  in.hold_age_s = kNaN;
+  EXPECT_FALSE(holdAttitudeThisScan(p, in));
+  in = engulfed();
+  in.scan_gap_s = kNaN;
+  EXPECT_FALSE(holdAttitudeThisScan(p, in));
 }
 
 // The optional near-field rule needs both a low far-field share on this scan and
-// no horizontal surface on the previous one; it is off while far_frac_max is 0.
+// no horizontal surface on the previous one, and obeys the same release conditions.
 TEST(AttitudeHold, NearFieldRuleNeedsBothConditionsAndAThreshold)
 {
   AttitudeHoldParams p = enabled();
-  EXPECT_FALSE(holdAttitudeThisScan(p, false, false, 0.2, 1.0));  // far_frac_max 0: rule off
+  AttitudeHoldInputs in = engulfed();
+  in.engulf_latched = false;
+  in.far_frac = 0.2;
+  EXPECT_FALSE(holdAttitudeThisScan(p, in));  // far_frac_max 0: rule off
   p.far_frac_max = 0.5;
-  EXPECT_TRUE(holdAttitudeThisScan(p, false, false, 0.2, 1.0));
-  EXPECT_FALSE(holdAttitudeThisScan(p, false, false, 0.2, 0.5));  // horizontal surface was seen
-  EXPECT_FALSE(holdAttitudeThisScan(p, false, false, 0.8, 1.0));  // far field is healthy
-  EXPECT_FALSE(holdAttitudeThisScan(p, false, false, kNaN, 1.0));
-  EXPECT_FALSE(holdAttitudeThisScan(p, false, false, 0.2, kNaN));
+  EXPECT_TRUE(holdAttitudeThisScan(p, in));
+  in.z_weak_prev = 0.5;
+  EXPECT_FALSE(holdAttitudeThisScan(p, in));  // horizontal surface was seen
+  in.z_weak_prev = 1.0;
+  in.far_frac = 0.8;
+  EXPECT_FALSE(holdAttitudeThisScan(p, in));  // far field is healthy
+  in.far_frac = kNaN;
+  EXPECT_FALSE(holdAttitudeThisScan(p, in));
+  in.far_frac = 0.2;
+  in.effct_prev = 10;
+  EXPECT_FALSE(holdAttitudeThisScan(p, in));  // starved: released like the latch case
 }
 
 // The projection keeps exactly the yaw component of a row and nothing else.

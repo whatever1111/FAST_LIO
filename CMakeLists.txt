@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.16)
 project(fast_lio)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -18,11 +18,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-message("Current CPU archtecture: ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "Current CPU architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 
 include(ProcessorCount)
 ProcessorCount(N)
-message("Processer number:  ${N}")
+message(STATUS "Processor number: ${N}")
 
 # MP_PROC_NUM is overridable from cache (e.g. -DMP_PROC_NUM_VAL=6 for Jetson Orin)
 if(NOT DEFINED MP_PROC_NUM_VAL)
@@ -41,7 +41,7 @@ if(MP_PROC_NUM_VAL GREATER 1)
   add_definitions(-DMP_EN)
 endif()
 add_definitions(-DMP_PROC_NUM=${MP_PROC_NUM_VAL})
-message("core for MP: ${MP_PROC_NUM_VAL}")
+message(STATUS "core for MP: ${MP_PROC_NUM_VAL}")
 
 find_package(OpenMP QUIET)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
@@ -90,7 +90,7 @@ set(dependencies
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io)
 
-message(Eigen: ${EIGEN3_INCLUDE_DIR})
+message(STATUS "Eigen: ${EIGEN3_INCLUDE_DIR}")
 message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
 
 set(msg_files

@@ -39,7 +39,6 @@
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <Eigen/Sparse>
-#include <boost/bind.hpp>
 
 #include <cstdlib>
 #include <vector>

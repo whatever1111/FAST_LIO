@@ -24,6 +24,7 @@
 #include <thread>
 
 #include "imu_coverage_policy.hpp"
+#include "imu_gap_prior.hpp"
 #include "scan_time_policy.hpp"
 #include "use-ikfom.hpp"
 
@@ -67,8 +68,24 @@ class ImuProcess
   ProcessStatus lastStatus() const { return last_status_; }
   fast_lio::ImuCoverageParams coverage_params;
   fast_lio::ImuCoverageResult coverage_result;
+  // IMU-gap prior (imu_gap_prior.hpp): intervals longer than gap_params.min_gap_s inside the coverage limit are
+  // bridged with the gyro average, a held velocity and an inflated P. gap_summary says what the last Process() call
+  // bridged (empty unless it returned true).
+  fast_lio::ImuGapPriorParams gap_params;
+  fast_lio::ImuGapSummary gap_summary;
 
   double lastProcessedEnd() const { return scan_consumption_.lastEnd(); }
+  /// Whether the IMU-gap prior carries a scan with no IMU sample at all (gap_params.empty_scans): the filter is
+  /// initialised, and the IMU silence up to the scan end is inside the coverage limit.
+  bool bridgesEmptyScan(double lidar_end_time) const
+  {
+    if (!gap_params.enabled || !gap_params.empty_scans || imu_need_init_ || !last_imu_)
+      return false;
+    const double last_stamp = rclcpp::Time(last_imu_->header.stamp).seconds();
+    const double silence = lidar_end_time - last_stamp;
+    return last_stamp > 0.0 && std::isfinite(silence) && silence > 0.0 &&
+           (!(coverage_params.max_gap_s > 0.0) || silence <= coverage_params.max_gap_s);
+  }
 
   ofstream fout_imu;
   // When true, dump per-sample IMU (bias-corrected, as fed to the filter) to
@@ -285,7 +302,6 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   /*** Initialize IMU pose ***/
   state_ikfom imu_state = kf_state.get_x();
   IMUpose.clear();
-  IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
 
   /*** forward propagation at each imu point ***/
   V3D angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
@@ -296,6 +312,68 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   input_ikfom in;
   in.gyro = angvel_last + imu_state.bg;
   in.acc = imu_state.rot.inverse() * (acc_s_last - imu_state.grav.get_vect()) + imu_state.ba;
+
+  // IMU-gap prior (imu_gap_prior.hpp). Across an interval longer than gap_params.min_gap_s the state is rotated with
+  // the bracketing gyro average, its world-frame velocity is held, and P is inflated for the whole gap once it ends.
+  // With the prior off (the default) no branch below differs from the upstream integration.
+  double prop_time = last_lidar_end_time_;  // the state is propagated up to here
+  double gap_run = 0.0;                     // length of the gap being bridged; inflated when it ends
+  double gap_interval = 0.0;                // the IMU interval that gap belongs to (it may start in an earlier scan)
+  const auto gap_input = [&kf_state](const V3D & gyro) {
+    const state_ikfom s = kf_state.get_x();
+    input_ikfom gin;
+    gin.gyro = gyro;
+    gin.acc = fast_lio::zeroAccelerationInput(s.rot.toRotationMatrix(), s.ba, s.grav.get_vect());
+    return gin;
+  };
+  const auto close_gap = [&]() {
+    if (gap_run <= 0.0)
+      return;
+    const state_ikfom s = kf_state.get_x();
+    const V3D up = -s.grav.get_vect();
+    const fast_lio::ImuGapInflation inflation =
+      fast_lio::imuGapInflation(gap_run, up, s.rot.toRotationMatrix(), gap_params);
+    auto P = kf_state.get_P();
+    if (fast_lio::applyImuGapInflation(P, inflation))
+      kf_state.change_P(P);
+    fast_lio::recordImuGap(&gap_summary, inflation, gap_interval);
+    gap_run = 0.0;
+    gap_interval = 0.0;
+  };
+  // A gap that covers the start of this scan (the scans in between had an empty IMU window and were dropped): carry
+  // the state to the scan start first, so that the first deskew pose is where the platform was at pcl_beg_time and
+  // not where it was when the last processed scan ended (0826: 0.9 s and 1.1 m earlier).
+  if (gap_params.enabled && prop_time > 0.0 && prop_time < pcl_beg_time)
+  {
+    for (size_t i = 1; i < v_imu.size(); ++i)
+    {
+      const double first_stamp = rclcpp::Time(v_imu[i]->header.stamp).seconds();
+      if (first_stamp < prop_time)
+        continue;
+      const double before_stamp = rclcpp::Time(v_imu[i - 1]->header.stamp).seconds();
+      if (first_stamp > pcl_beg_time && fast_lio::isImuGap(first_stamp - before_stamp, gap_params))
+      {
+        const auto & w0 = v_imu[i - 1]->angular_velocity;
+        const auto & w1 = v_imu[i]->angular_velocity;
+        const V3D gyro_avr(0.5 * (w0.x + w1.x), 0.5 * (w0.y + w1.y), 0.5 * (w0.z + w1.z));
+        Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
+        Q.block<3, 3>(3, 3).diagonal() = cov_acc;
+        Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
+        Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
+        in = gap_input(gyro_avr);
+        double dt_start = pcl_beg_time - prop_time;
+        kf_state.predict(dt_start, Q, in);
+        gap_run += dt_start;
+        gap_interval = std::max(gap_interval, first_stamp - before_stamp);
+        prop_time = pcl_beg_time;
+        imu_state = kf_state.get_x();
+        angvel_last = gyro_avr - imu_state.bg;
+        acc_s_last = Zero3d;
+      }
+      break;
+    }
+  }
+  IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -320,9 +398,9 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
 
     acc_avr     = acc_avr * G_m_s2 / mean_acc.norm(); // - state_inout.ba;
 
-    if(head_stamp < last_lidar_end_time_)
+    if(head_stamp < prop_time)
     {
-      dt = tail_stamp - last_lidar_end_time_;
+      dt = tail_stamp - prop_time;
       // dt = tail->header.stamp.toSec() - pcl_beg_time;
     }
     else
@@ -330,21 +408,41 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
       dt = tail_stamp - head_stamp;
     }
     
-    in.acc = acc_avr;
-    in.gyro = angvel_avr;
+    const bool gap = fast_lio::isImuGap(tail_stamp - head_stamp, gap_params);
     Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
     Q.block<3, 3>(3, 3).diagonal() = cov_acc;
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
-    kf_state.predict(dt, Q, in);
+    if (gap)
+    {
+      // Gyro average as upstream; the bracketing accelerometer mean is NOT integrated over the gap.
+      in = gap_input(angvel_avr);
+      kf_state.predict(dt, Q, in);
+      gap_run += std::max(dt, 0.0);
+      gap_interval = std::max(gap_interval, tail_stamp - head_stamp);
+    }
+    else
+    {
+      close_gap();
+      in.acc = acc_avr;
+      in.gyro = angvel_avr;
+      kf_state.predict(dt, Q, in);
+    }
 
     /* save the poses at each IMU measurements */
     imu_state = kf_state.get_x();
     angvel_last = angvel_avr - imu_state.bg;
-    acc_s_last  = imu_state.rot * (acc_avr - imu_state.ba);
-    for(int i=0; i<3; i++)
+    if (gap)
     {
-      acc_s_last[i] += imu_state.grav[i];
+      acc_s_last = Zero3d;  // the held velocity: no world acceleration inside the gap, for the deskew as well
+    }
+    else
+    {
+      acc_s_last  = imu_state.rot * (acc_avr - imu_state.ba);
+      for(int i=0; i<3; i++)
+      {
+        acc_s_last[i] += imu_state.grav[i];
+      }
     }
     double &&offs_t = tail_stamp - pcl_beg_time;
     IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
@@ -354,11 +452,35 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   // A short advancing scan can contain only duplicate old IMU samples.
   // They were already integrated up to last_lidar_end_time_; never integrate
   // that old interval a second time while extrapolating to this scan's end.
-  dt = pcl_end_time - std::max(imu_end_time, last_lidar_end_time_);
-  kf_state.predict(dt, Q, in);
-  
+  dt = pcl_end_time - std::max(imu_end_time, prop_time);
+  if (fast_lio::isImuGap(dt, gap_params))
+  {
+    // The IMU stops before the scan ends: hold the velocity to the end as well, carry on only the rotation about
+    // gravity (imu_gap_prior.hpp: rotationAboutGravityInput), and give the points past the last sample a deskew pose
+    // that moves the way the state did.
+    const state_ikfom s_end = kf_state.get_x();
+    const V3D gyro_last = fast_lio::rotationAboutGravityInput(
+      V3D(in.gyro), s_end.bg, s_end.rot.toRotationMatrix(), s_end.grav.get_vect());
+    in = gap_input(gyro_last);
+    kf_state.predict(dt, Q, in);
+    gap_run += dt;
+    gap_interval = std::max(gap_interval, pcl_end_time - imu_end_time);
+    close_gap();
+    imu_state = kf_state.get_x();
+    angvel_last = gyro_last - imu_state.bg;
+    acc_s_last = Zero3d;
+    IMUpose.push_back(set_pose6d(pcl_end_time - pcl_beg_time, acc_s_last, angvel_last, imu_state.vel, imu_state.pos,
+                                 imu_state.rot.toRotationMatrix()));
+  }
+  else
+  {
+    close_gap();
+    kf_state.predict(dt, Q, in);
+  }
+
   imu_state = kf_state.get_x();
-  last_imu_ = meas.imu.back();
+  if (!meas.imu.empty())
+    last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
 
   /*** undistort each lidar point (backward propagation). Restructured from
@@ -498,11 +620,14 @@ bool ImuProcess::Process(const MeasureGroup & meas,
   t1 = omp_get_wtime();
 
   last_status_ = ProcessStatus::kRejected;
+  gap_summary = fast_lio::ImuGapSummary{};
   // Always invalidate the caller's previous cloud before any early return.
   if (!cur_pcl_un_)
     return false;
   cur_pcl_un_->clear();
-  if (!meas.lidar || meas.lidar->empty() || meas.imu.empty() || !scan_consumption_.canProcess(meas.lidar_end_time))
+  const bool bridged_empty = meas.imu.empty() && bridgesEmptyScan(meas.lidar_end_time);
+  if (!meas.lidar || meas.lidar->empty() || (meas.imu.empty() && !bridged_empty) ||
+      !scan_consumption_.canProcess(meas.lidar_end_time))
     return false;
   const auto timing =
     fast_lio::scanTime(meas.lidar_beg_time, meas.lidar->points, [](const auto & point) { return point.curvature; });
@@ -565,7 +690,12 @@ bool ImuProcess::Process(const MeasureGroup & meas,
   imu_stamps.push_back(rclcpp::Time(last_imu_->header.stamp).seconds());
   for (const auto & imu : meas.imu)
     imu_stamps.push_back(rclcpp::Time(imu->header.stamp).seconds());
-  coverage_result = fast_lio::imuCoverage(last_lidar_end_time_, meas.lidar_end_time, imu_stamps, coverage_params);
+  // With empty scans carried by the prior, the stretch past the last sample is a gap like any other: bounded by
+  // max_gap_s, not by the one-scan extrapolation limit.
+  fast_lio::ImuCoverageParams limits = coverage_params;
+  if (gap_params.enabled && gap_params.empty_scans && limits.max_gap_s > 0.0 && limits.max_extrapolation_s > 0.0)
+    limits.max_extrapolation_s = std::max(limits.max_extrapolation_s, limits.max_gap_s);
+  coverage_result = fast_lio::imuCoverage(last_lidar_end_time_, meas.lidar_end_time, imu_stamps, limits);
   if (!coverage_result.covered()) {
     // Missing motion cannot be recovered by integrating across the gap. Hold
     // the state, rebase ONLY the input cursor and require caller-side map
@@ -574,7 +704,8 @@ bool ImuProcess::Process(const MeasureGroup & meas,
     if (coverage_result.status == fast_lio::ImuCoverageStatus::kGap ||
         coverage_result.status == fast_lio::ImuCoverageStatus::kStart ||
         coverage_result.status == fast_lio::ImuCoverageStatus::kEnd) {
-      last_imu_ = meas.imu.back();
+      if (!meas.imu.empty())
+        last_imu_ = meas.imu.back();
       last_lidar_end_time_ = meas.lidar_end_time;
       scan_consumption_.commit(meas.lidar_end_time);
       IMUpose.clear();

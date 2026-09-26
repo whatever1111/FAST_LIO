@@ -51,6 +51,7 @@ struct GapFixture
   {
     process.coverage_params = {2.0, 0.1};
     process.gap_params.enabled = prior;
+    process.gap_params.min_gap_s = 0.05;  // the 80 ms stretches below are gaps
     process.set_acc_cov(V3D::Constant(0.1));
     process.set_gyr_cov(V3D::Constant(0.1));
     double epsilon[23];

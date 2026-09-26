@@ -52,8 +52,12 @@ constexpr double kImuGapDegToRad = 0.017453292519943295;
 
 struct ImuGapPriorParams
 {
-  bool enabled = false;      ///< imu_gap_prior_en
-  double min_gap_s = 0.05;   ///< imu_gap_min_s: an IMU interval longer than this is a gap (the nominal period is 5 ms)
+  bool enabled = false;  ///< imu_gap_prior_en
+  /// imu_gap_min_s: an IMU interval longer than this is a gap (the nominal period is 5 ms). 0.1 s is what the
+  /// coverage check used to skip. Bridging the 50-85 ms gaps of a walking platform too (0.05 s) cost m20 0831
+  /// +0.8 cm of FIX XY RMS and a 0.67 m output step: every bridged gap drops the cross terms the lidar updates had
+  /// built, and for such a short gap nothing is gained in exchange.
+  double min_gap_s = 0.1;
   double accel_max = 1.0;    ///< imu_gap_accel_max (m/s^2): 1-sigma horizontal acceleration inside a gap
   double accel_max_z = 0.2;  ///< imu_gap_accel_max_z (m/s^2): the same along gravity (a walking platform stays level)
   double rate_rp_max = 0.0;  ///< rad/s (imu_gap_rate_rp_max is in deg/s): roll/pitch rate the gyro average misses

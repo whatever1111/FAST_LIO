@@ -2613,7 +2613,7 @@ public:
     this->declare_parameter<double>("imu_coverage.max_gap_s", 0.0);
     this->declare_parameter<double>("imu_coverage.max_extrapolation_s", 0.0);
     this->declare_parameter<bool>("imu_gap_prior_en", false);
-    this->declare_parameter<double>("imu_gap_min_s", 0.05);
+    this->declare_parameter<double>("imu_gap_min_s", 0.1);
     this->declare_parameter<double>("imu_gap_accel_max", 1.0);
     this->declare_parameter<double>("imu_gap_accel_max_z", 0.2);
     this->declare_parameter<double>("imu_gap_rate_rp_max", 0.0);
@@ -2922,7 +2922,7 @@ public:
       throw std::invalid_argument("imu_coverage requires reanchor_en for recovery against the frozen map");
     {
       this->get_parameter_or<bool>("imu_gap_prior_en", p_imu->gap_params.enabled, false);
-      this->get_parameter_or<double>("imu_gap_min_s", p_imu->gap_params.min_gap_s, 0.05);
+      this->get_parameter_or<double>("imu_gap_min_s", p_imu->gap_params.min_gap_s, 0.1);
       this->get_parameter_or<double>("imu_gap_accel_max", p_imu->gap_params.accel_max, 1.0);
       this->get_parameter_or<double>("imu_gap_accel_max_z", p_imu->gap_params.accel_max_z, 0.2);
       double rate_rp_deg = 0.0;

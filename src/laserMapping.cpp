@@ -429,6 +429,7 @@ fast_lio::RollPitchConsiderParams rp_consider_params;
 bool rp_consider_active = false;      // this scan's verdict
 double rp_consider_since = -1.0;      // start of the current considering stretch
 int rp_consider_scans = 0;            // scans considered so far (telemetry)
+int rp_consider_indefinite = 0;       // considered scans whose prior P had a negative eigenvalue (telemetry)
 // Scan-hole guard: when the gap between consecutive processed scans exceeds
 // guard_hole_min_sec, the IMU-only propagation across the hole is replaced by
 // a bounded constant-velocity hold from the pre-hole state before the lidar
@@ -3838,17 +3839,28 @@ private:
         } else {
           if (rp_consider_since < 0.0) { rp_consider_since = lidar_end_time; }
           ++rp_consider_scans;
+          // covariance health while considering: the prior's smallest eigenvalue and the sigmas that matter
+          const auto & Pc = kf.get_P();
+          Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 23, 23>> es(Pc);
+          const double p_min = es.info() == Eigen::Success ? es.eigenvalues().minCoeff() : std::nan("");
+          if (!(p_min > -1e-12)) { ++rp_consider_indefinite; }
           RCLCPP_INFO_THROTTLE(this->get_logger(),
                                *this->get_clock(),
                                2000,
                                "[RP-CONSIDER] roll/pitch left to the gyro this scan (engulfed=%d since_release=%.1fs "
-                               "rp_info_prev=%.0f z_weak_prev=%.2f age=%.1fs, %d scans so far)",
+                               "rp_info_prev=%.0f z_weak_prev=%.2f age=%.1fs, %d scans so far); P: pos %.3f m rot "
+                               "%.2f deg vel %.2f m/s, min eig %.2e (%d indefinite so far)",
                                engulf_latched,
                                consider_in.since_release_s,
                                lidar_rot_obs_rp_min,
                                pos_obs_z_weak,
                                consider_in.consider_age_s,
-                               rp_consider_scans);
+                               rp_consider_scans,
+                               std::sqrt(std::max(0.0, Pc.template block<3, 3>(0, 0).trace() / 3.0)),
+                               std::sqrt(std::max(0.0, Pc.template block<3, 3>(3, 3).trace() / 3.0)) * 57.2958,
+                               std::sqrt(std::max(0.0, Pc.template block<3, 3>(12, 12).trace() / 3.0)),
+                               p_min,
+                               rp_consider_indefinite);
         }
       }
       kf.update_iterated_dyn_share_modified(

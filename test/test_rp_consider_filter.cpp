@@ -175,3 +175,45 @@ TEST(ConsiderFilter, InvalidIndexOrProjectorIsIgnored)
   f.filter.setConsiderRotation(21, Eigen::Matrix3d::Identity());
   EXPECT_FALSE(f.filter.considerRotationActive());
 }
+
+TEST(ConsiderFilter, HundredsOfConsideredUpdatesKeepTheCovarianceDefiniteAndTheStateBounded)
+{
+  // Considered updates in a row, with a propagation step between them: the m20 doorway windows are 25-40 scans
+  // of it. The first implementation (the P - M A - A^T M + M A M shortcut mixed with the tangent-space Jacobians)
+  // left P indefinite after a few dozen scans and the state ran away 12 m in one scan; the Joseph form must not.
+  Fixture f;
+  const auto proj = fast_lio::yawOnlyProjector(f.up_body);
+  ASSERT_TRUE(proj.valid);
+  input_ikfom in;
+  in.acc = Eigen::Vector3d(0.0, 0.0, 9.81);  // the specific force of a body at rest, world = IMU frame
+  in.gyro = Eigen::Vector3d::Zero();
+  Eigen::Matrix<double, 12, 12> Q = Eigen::Matrix<double, 12, 12>::Identity() * 1e-4;
+  double solve_time = 0.0;
+  double min_eig = 1.0;
+  double dt = 0.005;
+  for (int cycle = 0; cycle < 300; ++cycle) {
+    // a little gait-like noise in the input keeps the linearisation point moving
+    in.gyro = Eigen::Vector3d(0.02 * std::sin(0.3 * cycle), 0.03 * std::cos(0.2 * cycle), 0.05);
+    for (int step = 0; step < 20; ++step) {
+      f.filter.predict(dt, Q, in);
+    }
+    f.filter.setConsiderRotation(3, proj.keep);
+    f.filter.update_iterated_dyn_share_modified(0.001, solve_time);
+    f.filter.clearConsiderRotation();
+    const Filter::cov P = f.filter.get_P();
+    ASSERT_TRUE(P.allFinite()) << "cycle " << cycle;
+    ASSERT_LT((P - P.transpose()).norm(), 1e-9 * (1.0 + P.norm())) << "cycle " << cycle;
+    Eigen::SelfAdjointEigenSolver<Filter::cov> es(P);
+    ASSERT_EQ(es.info(), Eigen::Success);
+    min_eig = std::min(min_eig, es.eigenvalues().minCoeff());
+    ASSERT_GT(es.eigenvalues().minCoeff(), -1e-12) << "cycle " << cycle;
+    const state_ikfom x = f.filter.get_x();
+    ASSERT_LT((x.pos - f.t_true).norm(), 0.5) << "cycle " << cycle;
+    ASSERT_TRUE(x.vel.allFinite());
+  }
+  EXPECT_GT(min_eig, -1e-12);
+  // roll/pitch never estimated: their variance only grew with the process noise, the position's did not run away
+  const Filter::cov P = f.filter.get_P();
+  EXPECT_GT(P(4, 4), 1e-4 * 0.9);
+  EXPECT_LT(P(0, 0), 1.0);
+}

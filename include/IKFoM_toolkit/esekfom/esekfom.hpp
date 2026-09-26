@@ -1614,6 +1614,12 @@ public:
 
     Matrix<scalar_type, n, 1> K_h;
     Matrix<scalar_type, n, n> K_x;
+    // For the consider update's Joseph form: K R Kᵀ = R G HᵀH Gᵀ with K = G h_xᵀ (large-measurement branch) or
+    // R K_ K_ᵀ (small one); the gain factors are kept from the branch that computed K_x.
+    Matrix<scalar_type, n, 12> consider_G = Matrix<scalar_type, n, 12>::Zero();
+    Matrix<scalar_type, 12, 12> consider_HTH = Matrix<scalar_type, 12, 12>::Zero();
+    Matrix<scalar_type, n, n> consider_KKt = Matrix<scalar_type, n, n>::Zero();
+    bool consider_small_branch = false;
 
     vectorized_state dx_new = vectorized_state::Zero();
     for (int i = -1; i < maximum_iter; i++) {
@@ -1735,6 +1741,10 @@ public:
           R;
         K_h = K_ * dyn_share.h;
         K_x = K_ * h_x_cur;
+        if (consider_rot_en_) {
+          consider_KKt = K_ * K_.transpose();
+          consider_small_branch = true;
+        }
         // #else
         //	K_= P_ * h_x.transpose() * (h_x * P_ * h_x.transpose() + h_v * R * h_v.transpose()).inverse();
         // #endif
@@ -1809,6 +1819,11 @@ public:
         // HTH_cur. template block<12, 12>(0, 0) = HTH;
         K_x.setZero();  // = cov::Zero();
         K_x.template block<n, 12>(0, 0) = P_inv.template block<n, 12>(0, 0) * HTH;
+        if (consider_rot_en_) {
+          consider_G = P_inv.template block<n, 12>(0, 0);
+          consider_HTH = HTH;
+          consider_small_branch = false;
+        }
         // K_= (h_x_.transpose() * h_x_ + (P_/R).inverse()).inverse()*h_x_.transpose();
 #endif
       }
@@ -1858,6 +1873,24 @@ public:
 
       if (t > 1 || i == maximum_iter - 1) {
         L_ = P_;
+        // Consider update (rp_consider.hpp): the Joseph form of the projected gain, (I − M K H) P (I − M K H)ᵀ +
+        // M K R Kᵀ M, evaluated on the covariance of this linearisation point before the tangent-space
+        // transformation below, which then carries it exactly as it carries L_. Two positive semi-definite terms:
+        // the update cannot leave P indefinite however many considered scans follow each other.
+        cov P_consider = cov::Zero();
+        if (consider_rot_en_) {
+          cov IMKH = cov::Identity() - K_x;
+          // rows of the considered block: I − keep · (K H)
+          IMKH.template block<3, n>(consider_rot_index_, 0) =
+            cov::Identity().template block<3, n>(consider_rot_index_, 0) -
+            consider_rot_keep_ * K_x.template block<3, n>(consider_rot_index_, 0);
+          cov KRKt = consider_small_branch ? cov(R * consider_KKt)
+                                          : cov(R * consider_G * consider_HTH * consider_G.transpose());
+          cov M = cov::Identity();
+          M.template block<3, 3>(consider_rot_index_, consider_rot_index_) = consider_rot_keep_;
+          P_consider = IMKH * P_ * IMKH.transpose() + M * KRKt * M;
+          P_consider = cov(0.5 * (P_consider + P_consider.transpose()));
+        }
         // std::cout << "iteration time" << t << "," << i << std::endl;
         Matrix<scalar_type, 3, 3> res_temp_SO3;
         MTK::vect<3, scalar_type> seg_SO3;
@@ -1870,6 +1903,15 @@ public:
           res_temp_SO3 = MTK::A_matrix(seg_SO3).transpose();
           for (int i = 0; i < n; i++) {
             L_.template block<3, 1>(idx, i) = res_temp_SO3 * (P_.template block<3, 1>(idx, i));
+          }
+          if (consider_rot_en_) {
+            for (int i = 0; i < n; i++) {
+              P_consider.template block<3, 1>(idx, i) = res_temp_SO3 * (P_consider.template block<3, 1>(idx, i));
+            }
+            for (int i = 0; i < n; i++) {
+              P_consider.template block<1, 3>(i, idx) =
+                (P_consider.template block<1, 3>(i, idx)) * res_temp_SO3.transpose();
+            }
           }
           // if(n > dof_Measurement)
           // {
@@ -1906,6 +1948,15 @@ public:
           res_temp_S2 = Nx * Mx;
           for (int i = 0; i < n; i++) {
             L_.template block<2, 1>(idx, i) = res_temp_S2 * (P_.template block<2, 1>(idx, i));
+          }
+          if (consider_rot_en_) {
+            for (int i = 0; i < n; i++) {
+              P_consider.template block<2, 1>(idx, i) = res_temp_S2 * (P_consider.template block<2, 1>(idx, i));
+            }
+            for (int i = 0; i < n; i++) {
+              P_consider.template block<1, 2>(i, idx) =
+                (P_consider.template block<1, 2>(i, idx)) * res_temp_S2.transpose();
+            }
           }
           // if(n > dof_Measurement)
           // {
@@ -1949,12 +2000,7 @@ public:
         // else
         //{
         if (consider_rot_en_) {
-          // Joseph form with the projected gain (rp_consider.hpp): the considered block keeps its variance, the
-          // cross terms shrink as the Schmidt filter prescribes; M = I would give the line below.
-          const cov A_full = K_x.template block<n, 12>(0, 0) * P_.template block<12, n>(0, 0);
-          cov M = cov::Identity();
-          M.template block<3, 3>(consider_rot_index_, consider_rot_index_) = consider_rot_keep_;
-          P_ = fast_lio::considerCovariance(L_, A_full, M);
+          P_ = P_consider;
         } else {
           P_ = L_ - K_x.template block<n, 12>(0, 0) * P_.template block<12, n>(0, 0);
         }

@@ -97,6 +97,7 @@
 #include "covariance_reset.hpp"
 #include "correspondence_gate.hpp"
 #include "gravity_align_kinematics.hpp"
+#include "imu_gap_prior.hpp"
 #include "reanchor_gate.hpp"
 #include "voxel_downsample.hpp"
 #include "degeneracy_policy.hpp"
@@ -462,6 +463,13 @@ double last_twist_speed = 0.0;   // |v| of the newest wheel sample (m/s)
 // estimate. Verify against the still-frozen map first (reanchor_gate.hpp).
 fast_lio::ReanchorParams reanchor_params;
 fast_lio::ReanchorGate reanchor_gate;
+// What a healthy scan looks like right now: running medians of the residual and the correspondence count of
+// the scans the gate called healthy, the reference of the relative verification (reanchor_max_res_ratio,
+// reanchor_min_eff_ratio). A registration from a wrong prior passes the absolute 0.10 m ceiling at 1.2-2.2x
+// the healthy residual (m20 0826 after the data hole).
+constexpr std::size_t kReanchorHealthyMinScans = 20;
+fast_lio::HealthyScanWindow reanchor_healthy_res;
+fast_lio::HealthyScanWindow reanchor_healthy_eff;
 // What to do when verification never converges: "hold" keeps the map frozen and
 // the odometry flagged (an external relocalisation has to solve it), while
 // "reset_map" rebuilds the local map at the current pose — the robot keeps
@@ -1229,6 +1237,16 @@ void markImuCoverageGap(double end)
   flio_map_frozen = true;
   flio_degraded_odom = true;
 }
+// IMU-gap prior (imu_gap_prior.hpp, p_imu->gap_params): the scan is propagated across the gap instead of
+// skipped, and an IMU interval longer than imu_gap_verify_s still sends the re-anchor gate to blind, so the map
+// stays frozen until the scans after the gap have re-registered against it — the protection the coverage skip
+// gave, without the lost motion.
+double imu_gap_verify_s = 0.3;
+std::uint64_t imu_gap_bridged_count = 0;
+void markImuGapBridged(double end)
+{
+  fast_lio::updateReanchorGate(&reanchor_gate, true, 0, 0.0, end, reanchor_params);
+}
 
 bool sync_packages(MeasureGroup & meas)
 {
@@ -1296,6 +1314,11 @@ bool sync_packages(MeasureGroup & meas)
     imu_buffer.pop_front();
   }
   popLidarScan();
+  if (meas.imu.empty() && p_imu->bridgesEmptyScan(meas.lidar_end_time)) {
+    // No IMU sample in this scan, but the lidar kept recording through the IMU dropout: the IMU-gap prior carries
+    // the state across it (imu_gap_empty_scans) and the scan is registered instead of dropped.
+    return true;
+  }
   if (meas.imu.empty()) {
     ++empty_scan_imu_count;
     markImuCoverageGap(meas.lidar_end_time);
@@ -2544,6 +2567,10 @@ public:
     this->declare_parameter<int>("reanchor_confirm_scans", 3);
     this->declare_parameter<double>("reanchor_timeout_sec", 5.0);
     this->declare_parameter<std::string>("reanchor_on_fail", "hold");
+    this->declare_parameter<double>("reanchor_max_res_ratio", 0.0);
+    this->declare_parameter<double>("reanchor_res_floor", 0.04);
+    this->declare_parameter<double>("reanchor_min_eff_ratio", 0.0);
+    this->declare_parameter<int>("reanchor_healthy_window", 100);
     this->declare_parameter<bool>("runaway_watchdog_en", true);
     this->declare_parameter<double>("runaway_parked_speed_thresh", 0.3);
     this->declare_parameter<double>("runaway_wheel_speed_margin", 1.0);
@@ -2585,6 +2612,14 @@ public:
     this->declare_parameter<double>("preprocess.max_scan_duration_s", 0.0);
     this->declare_parameter<double>("imu_coverage.max_gap_s", 0.0);
     this->declare_parameter<double>("imu_coverage.max_extrapolation_s", 0.0);
+    this->declare_parameter<bool>("imu_gap_prior_en", false);
+    this->declare_parameter<double>("imu_gap_min_s", 0.05);
+    this->declare_parameter<double>("imu_gap_accel_max", 1.0);
+    this->declare_parameter<double>("imu_gap_accel_max_z", 0.2);
+    this->declare_parameter<double>("imu_gap_rate_rp_max", 0.0);
+    this->declare_parameter<double>("imu_gap_rate_yaw_max", 10.0);
+    this->declare_parameter<double>("imu_gap_verify_s", 0.3);
+    this->declare_parameter<bool>("imu_gap_empty_scans", false);
     this->declare_parameter<int>("point_filter_num", 2);
     this->declare_parameter<bool>("nn_refresh_gate_en", false);
     this->declare_parameter<double>("nn_refresh_min_shift", 0.0);
@@ -2809,6 +2844,24 @@ public:
     this->get_parameter_or<int>("reanchor_confirm_scans", reanchor_params.confirm_scans, 3);
     this->get_parameter_or<double>("reanchor_timeout_sec", reanchor_params.timeout_sec, 5.0);
     this->get_parameter_or<std::string>("reanchor_on_fail", reanchor_on_fail, std::string("hold"));
+    this->get_parameter_or<double>("reanchor_max_res_ratio", reanchor_params.max_res_ratio, 0.0);
+    this->get_parameter_or<double>("reanchor_res_floor", reanchor_params.res_floor, 0.04);
+    this->get_parameter_or<double>("reanchor_min_eff_ratio", reanchor_params.min_eff_ratio, 0.0);
+    int reanchor_healthy_window = 100;
+    this->get_parameter_or<int>("reanchor_healthy_window", reanchor_healthy_window, 100);
+    if (!std::isfinite(reanchor_params.max_res_ratio) || reanchor_params.max_res_ratio < 0.0 ||
+        !std::isfinite(reanchor_params.res_floor) || reanchor_params.res_floor < 0.0 ||
+        !std::isfinite(reanchor_params.min_eff_ratio) || reanchor_params.min_eff_ratio < 0.0 ||
+        reanchor_healthy_window < 1) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "reanchor_max_res_ratio / reanchor_res_floor / reanchor_min_eff_ratio must be finite and "
+                   "nonnegative and reanchor_healthy_window at least 1");
+      throw std::invalid_argument("reanchor relative verification parameters");
+    }
+    reanchor_healthy_res =
+      fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
+    reanchor_healthy_eff =
+      fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
     this->get_parameter_or<bool>("runaway_watchdog_en", runaway_params.enabled, true);
     this->get_parameter_or<double>("runaway_parked_speed_thresh", runaway_params.parked_speed_thresh, 0.3);
     this->get_parameter_or<double>("runaway_wheel_speed_margin", runaway_params.wheel_speed_margin, 1.0);
@@ -2867,6 +2920,46 @@ public:
     if ((p_imu->coverage_params.max_gap_s > 0.0 || p_imu->coverage_params.max_extrapolation_s > 0.0) &&
         !reanchor_params.enabled)
       throw std::invalid_argument("imu_coverage requires reanchor_en for recovery against the frozen map");
+    {
+      this->get_parameter_or<bool>("imu_gap_prior_en", p_imu->gap_params.enabled, false);
+      this->get_parameter_or<double>("imu_gap_min_s", p_imu->gap_params.min_gap_s, 0.05);
+      this->get_parameter_or<double>("imu_gap_accel_max", p_imu->gap_params.accel_max, 1.0);
+      this->get_parameter_or<double>("imu_gap_accel_max_z", p_imu->gap_params.accel_max_z, 0.2);
+      double rate_rp_deg = 0.0;
+      double rate_yaw_deg = 10.0;
+      this->get_parameter_or<double>("imu_gap_rate_rp_max", rate_rp_deg, 0.0);
+      this->get_parameter_or<double>("imu_gap_rate_yaw_max", rate_yaw_deg, 10.0);
+      p_imu->gap_params.rate_rp_max = rate_rp_deg * fast_lio::kImuGapDegToRad;
+      p_imu->gap_params.rate_yaw_max = rate_yaw_deg * fast_lio::kImuGapDegToRad;
+      this->get_parameter_or<double>("imu_gap_verify_s", imu_gap_verify_s, 0.3);
+      this->get_parameter_or<bool>("imu_gap_empty_scans", p_imu->gap_params.empty_scans, false);
+      if (p_imu->gap_params.enabled && (!fast_lio::imuGapPriorParamsValid(p_imu->gap_params) ||
+                                        !std::isfinite(imu_gap_verify_s) || imu_gap_verify_s < 0.0)) {
+        RCLCPP_FATAL(this->get_logger(),
+                     "imu_gap_min_s must be positive and imu_gap_accel_max(_z), imu_gap_rate_*_max and "
+                     "imu_gap_verify_s finite and nonnegative");
+        throw std::invalid_argument("imu_gap_* parameters");
+      }
+      if (p_imu->gap_params.enabled) {
+        RCLCPP_INFO(this->get_logger(),
+                    "[IMU-GAP] prior on: IMU intervals > %.3fs up to imu_coverage.max_gap_s %.2fs are bridged "
+                    "(gyro average, velocity held; 1-sigma accel %.2f / %.2f m/s^2 horizontal / vertical, rate "
+                    "roll/pitch %.1f yaw %.1f deg/s), scans without IMU samples %s; gaps > %.2fs are re-verified "
+                    "against the frozen map",
+                    p_imu->gap_params.min_gap_s,
+                    p_imu->coverage_params.max_gap_s,
+                    p_imu->gap_params.accel_max,
+                    p_imu->gap_params.accel_max_z,
+                    rate_rp_deg,
+                    rate_yaw_deg,
+                    p_imu->gap_params.empty_scans ? "carried" : "dropped",
+                    imu_gap_verify_s);
+        if (!(p_imu->coverage_params.max_gap_s > 0.0)) {
+          RCLCPP_WARN(this->get_logger(),
+                      "[IMU-GAP] imu_coverage.max_gap_s is 0: gaps of any length are bridged by dead reckoning");
+        }
+      }
+    }
     if (!std::isfinite(max_scan_duration_s) || max_scan_duration_s < 0.0)
       throw std::invalid_argument("preprocess.max_scan_duration_s must be finite and nonnegative");
     this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
@@ -3355,6 +3448,34 @@ private:
       }
       t_undist = omp_get_wtime();
       state_point = kf.get_x();
+      if (p_imu->gap_summary.gaps > 0) {
+        const fast_lio::ImuGapSummary & gaps = p_imu->gap_summary;
+        ++imu_gap_bridged_count;
+        // The IMU interval, not the stretch this scan bridged: a dropout carried through several empty scans is
+        // bridged 0.1 s at a time.
+        const bool verify = gaps.longest_interval_s > imu_gap_verify_s;
+        if (verify) {
+          markImuGapBridged(Measures.lidar_end_time);
+        }
+        RCLCPP_WARN_THROTTLE(this->get_logger(),
+                             *this->get_clock(),
+                             500,
+                             "[IMU-GAP] bridged %d IMU gap(s), longest %.3fs of a %.3fs IMU interval (total "
+                             "%.3fs)%s: gyro average, velocity held at %.2fm/s; the longest added 1-sigma pos %.3fm "
+                             "vel %.2fm/s yaw %.2fdeg roll/pitch %.2fdeg%s (scans with gaps: %lu)",
+                             gaps.gaps,
+                             gaps.longest_s,
+                             gaps.longest_interval_s,
+                             gaps.total_s,
+                             Measures.imu.empty() ? " in a scan without IMU samples" : "",
+                             state_point.vel.norm(),
+                             gaps.longest.sigma_pos_h,
+                             gaps.longest.sigma_vel_h,
+                             gaps.longest.sigma_yaw * 180.0 / M_PI,
+                             gaps.longest.sigma_rp * 180.0 / M_PI,
+                             verify ? "; map frozen until re-anchored" : "",
+                             static_cast<unsigned long>(imu_gap_bridged_count));
+      }
 
       /*** Scan-hole guard: bound the IMU-only excursion across a gap ***/
       if (guard_hole_en && flg_EKF_inited && hole_last_scan_end > 0.0) {
@@ -3376,13 +3497,17 @@ private:
           }
           kf.change_x(st);
           state_point = kf.get_x();
+          // With the IMU-gap prior the part of the hole without IMU samples was already crossed at the held
+          // velocity, so |dv| here is what the samples that do exist integrated and the clamp rarely engages.
           RCLCPP_WARN(this->get_logger(),
-                      "[HOLE-GUARD] scan hole %.2fs: imu-only vel %.2f m/s (pre-hole %.2f) -> held %.2f; pos re-anchored by %.2fm",
+                      "[HOLE-GUARD] scan hole %.2fs: imu-only vel %.2f m/s (pre-hole %.2f) -> held %.2f; pos "
+                      "re-anchored by %.2fm%s",
                       gap,
                       spd_imu,
                       hole_vel_pre.norm(),
                       state_point.vel.norm(),
-                      guard_hole_reanchor_pos ? (pos_imu - state_point.pos).norm() : 0.0);
+                      guard_hole_reanchor_pos ? (pos_imu - state_point.pos).norm() : 0.0,
+                      p_imu->gap_summary.gaps > 0 ? " (IMU gap bridged, velocity held across it)" : "");
         }
       }
       pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -4260,14 +4385,32 @@ private:
         }
       };
 
-      const auto reanchor = fast_lio::updateReanchorGate(
-        &reanchor_gate, flio_in_degraded, effct_feat_num, res_mean_last, lidar_end_time, reanchor_params);
+      // The relative tests need what healthy scans look like; only a gate that is verifying asks (the medians
+      // are also logged at the release). The tests themselves stay off unless their ratios are set.
+      fast_lio::ReanchorReference reanchor_reference;
+      if (reanchor_gate.state == fast_lio::ReanchorState::kBlind ||
+          reanchor_gate.state == fast_lio::ReanchorState::kVerifying) {
+        reanchor_reference.res_median = reanchor_healthy_res.median();
+        reanchor_reference.eff_median = reanchor_healthy_eff.median();
+      }
+      const auto reanchor = fast_lio::updateReanchorGate(&reanchor_gate,
+                                                         flio_in_degraded,
+                                                         effct_feat_num,
+                                                         res_mean_last,
+                                                         lidar_end_time,
+                                                         reanchor_params,
+                                                         reanchor_reference);
+      if (!reanchor.degraded && !reanchor.just_reanchored && effct_feat_num >= reanchor_params.min_eff) {
+        reanchor_healthy_res.push(res_mean_last);
+        reanchor_healthy_eff.push(static_cast<double>(effct_feat_num));
+      }
       if (reanchor.just_reanchored) {
         RCLCPP_WARN(this->get_logger(),
-                    "[REANCHOR] re-registered against the frozen map (effct=%d res=%.3fm) after %u blind stretch(es): "
-                    "map unfrozen",
+                    "[REANCHOR] re-registered against the frozen map (effct=%d res=%.3fm, healthy median %.3fm) "
+                    "after %u blind stretch(es): map unfrozen",
                     effct_feat_num,
                     res_mean_last,
+                    reanchor_reference.res_median,
                     reanchor_gate.reanchors);
       }
       if (reanchor.just_lost) {

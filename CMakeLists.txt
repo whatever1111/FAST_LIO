@@ -287,6 +287,11 @@ if(BUILD_TESTING)
     target_include_directories(test_correspondence_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
 
+  ament_add_gtest(test_engulf_release test/test_engulf_release.cpp)
+  if(TARGET test_engulf_release)
+    target_include_directories(test_engulf_release PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
+
   ament_add_gtest(test_odom_covariance_contract test/test_odom_covariance_contract.cpp)
   if(TARGET test_odom_covariance_contract)
     target_include_directories(test_odom_covariance_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

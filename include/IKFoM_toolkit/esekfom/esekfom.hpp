@@ -48,6 +48,7 @@
 #include "../mtk/types/S2.hpp"
 #include "../mtk/types/SOn.hpp"
 #include "../mtk/types/vect.hpp"
+#include "../../rp_consider.hpp"
 #include "util.hpp"
 
 // #define USE_sparse
@@ -1813,7 +1814,20 @@ public:
       }
 
       // K_x = K_ * h_x_;
-      Matrix<scalar_type, n, 1> dx_ = K_h + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new;
+      // Consider update (rp_consider.hpp): the gain rows of the considered rotation directions are projected out
+      // of the increment; K_x itself stays the full gain, the covariance below needs it that way.
+      Matrix<scalar_type, n, 1> dx_;
+      if (consider_rot_en_) {
+        Matrix<scalar_type, n, 1> K_h_c = K_h;
+        Matrix<scalar_type, n, n> K_x_c = K_x;
+        K_h_c.template block<3, 1>(consider_rot_index_, 0) =
+          consider_rot_keep_ * K_h.template block<3, 1>(consider_rot_index_, 0);
+        K_x_c.template block<3, n>(consider_rot_index_, 0) =
+          consider_rot_keep_ * K_x.template block<3, n>(consider_rot_index_, 0);
+        dx_ = K_h_c + (K_x_c - Matrix<scalar_type, n, n>::Identity()) * dx_new;
+      } else {
+        dx_ = K_h + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new;
+      }
       if (diagnostics != nullptr) {
         diagnostics->last_dx = dx_;
         diagnostics->innovation_dx = K_h;
@@ -1934,7 +1948,16 @@ public:
         // }
         // else
         //{
-        P_ = L_ - K_x.template block<n, 12>(0, 0) * P_.template block<12, n>(0, 0);
+        if (consider_rot_en_) {
+          // Joseph form with the projected gain (rp_consider.hpp): the considered block keeps its variance, the
+          // cross terms shrink as the Schmidt filter prescribes; M = I would give the line below.
+          const cov A_full = K_x.template block<n, 12>(0, 0) * P_.template block<12, n>(0, 0);
+          cov M = cov::Identity();
+          M.template block<3, 3>(consider_rot_index_, consider_rot_index_) = consider_rot_keep_;
+          P_ = fast_lio::considerCovariance(L_, A_full, M);
+        } else {
+          P_ = L_ - K_x.template block<n, 12>(0, 0) * P_.template block<12, n>(0, 0);
+        }
         //}
         if (diagnostics != nullptr) {
           diagnostics->covariance_diag_after = P_.diagonal();
@@ -2000,6 +2023,19 @@ public:
   const state & get_x() const { return x_; }
   const cov & get_P() const { return P_; }
 
+  /// Consider (Schmidt-Kalman) update for the rotation block at `index`: the next
+  /// update_iterated_dyn_share_modified() applies `keep` to the rotation rows of its gain (u uᵀ keeps yaw only),
+  /// leaves the other rows as computed with the full P, and updates P in Joseph form (rp_consider.hpp). Stays in
+  /// force until cleared.
+  void setConsiderRotation(int index, const Eigen::Matrix<scalar_type, 3, 3> & keep)
+  {
+    consider_rot_en_ = index >= 0 && index + 3 <= n && keep.allFinite();
+    consider_rot_index_ = index;
+    consider_rot_keep_ = keep;
+  }
+  void clearConsiderRotation() { consider_rot_en_ = false; }
+  bool considerRotationActive() const { return consider_rot_en_; }
+
 private:
   state x_;
   measurement m_;
@@ -2028,6 +2064,9 @@ private:
 
   int maximum_iter = 0;
   scalar_type limit[n];
+  bool consider_rot_en_ = false;
+  int consider_rot_index_ = -1;
+  Eigen::Matrix<scalar_type, 3, 3> consider_rot_keep_ = Eigen::Matrix<scalar_type, 3, 3>::Identity();
 
   template<typename T>
   T check_safe_update(T _temp_vec)

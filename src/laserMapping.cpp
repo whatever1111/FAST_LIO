@@ -96,6 +96,7 @@
 #include "attitude_hold.hpp"
 #include "covariance_reset.hpp"
 #include "engulf_release.hpp"
+#include "rp_consider.hpp"
 #include "correspondence_gate.hpp"
 #include "gravity_align_kinematics.hpp"
 #include "reanchor_gate.hpp"
@@ -421,6 +422,13 @@ double engulf_latch_time = -1.0;              // lidar_end_time of the scan that
 // covariance grows for it. Defaults reproduce the legacy "zero velocity, P untouched".
 fast_lio::ReleaseVelocityParams release_vel_params;
 fast_lio::ReleaseInflationParams release_inflate_params;
+double engulf_release_time = -1.0;  // lidar_end_time of the last engulfment release
+// Consider update for roll/pitch (rp_consider.hpp): on the scans the policy names, the lidar update leaves the
+// horizontal rotation at the propagated (gyro) value and updates everything else with the full-P gain.
+fast_lio::RollPitchConsiderParams rp_consider_params;
+bool rp_consider_active = false;      // this scan's verdict
+double rp_consider_since = -1.0;      // start of the current considering stretch
+int rp_consider_scans = 0;            // scans considered so far (telemetry)
 // Scan-hole guard: when the gap between consecutive processed scans exceeds
 // guard_hole_min_sec, the IMU-only propagation across the hole is replaced by
 // a bounded constant-velocity hold from the pre-hole state before the lidar
@@ -2542,6 +2550,12 @@ public:
     this->declare_parameter<double>("guard_release_rp_sigma_rate_deg", 0.3);
     this->declare_parameter<double>("guard_release_rp_sigma_max_deg", 3.0);
     this->declare_parameter<double>("guard_release_yaw_sigma_deg", 0.0);
+    this->declare_parameter<bool>("lidar_consider_rp_en", false);
+    this->declare_parameter<bool>("lidar_consider_rp_while_engulfed", true);
+    this->declare_parameter<double>("lidar_consider_rp_post_release_s", 0.0);
+    this->declare_parameter<double>("lidar_consider_rp_min_info", 0.0);
+    this->declare_parameter<double>("lidar_consider_rp_z_weak_min", 1.1);
+    this->declare_parameter<double>("lidar_consider_rp_max_s", 0.0);
     this->declare_parameter<bool>("guard_hole_en", false);
     this->declare_parameter<double>("guard_hole_min_sec", 0.3);
     this->declare_parameter<double>("guard_hole_max_accel", 1.0);
@@ -2829,6 +2843,22 @@ public:
     this->get_parameter_or<double>("guard_release_rp_sigma_rate_deg", release_inflate_params.rp_sigma_rate_deg, 0.3);
     this->get_parameter_or<double>("guard_release_rp_sigma_max_deg", release_inflate_params.rp_sigma_max_deg, 3.0);
     this->get_parameter_or<double>("guard_release_yaw_sigma_deg", release_inflate_params.yaw_sigma_deg, 0.0);
+    this->get_parameter_or<bool>("lidar_consider_rp_en", rp_consider_params.enabled, false);
+    this->get_parameter_or<bool>("lidar_consider_rp_while_engulfed", rp_consider_params.while_engulfed, true);
+    this->get_parameter_or<double>("lidar_consider_rp_post_release_s", rp_consider_params.post_release_s, 0.0);
+    this->get_parameter_or<double>("lidar_consider_rp_min_info", rp_consider_params.min_rp_info, 0.0);
+    this->get_parameter_or<double>("lidar_consider_rp_z_weak_min", rp_consider_params.z_weak_min, 1.1);
+    this->get_parameter_or<double>("lidar_consider_rp_max_s", rp_consider_params.max_consider_s, 0.0);
+    if (rp_consider_params.enabled) {
+      RCLCPP_INFO(this->get_logger(),
+                  "[RP-CONSIDER] lidar update considers roll/pitch while engulfed=%d, %.1fs after a release, when the "
+                  "previous scan's roll/pitch information < %.0f or z_weak >= %.2f (cap %.1fs)",
+                  rp_consider_params.while_engulfed,
+                  rp_consider_params.post_release_s,
+                  rp_consider_params.min_rp_info,
+                  rp_consider_params.z_weak_min,
+                  rp_consider_params.max_consider_s);
+    }
     this->get_parameter_or<bool>("guard_hole_en", guard_hole_en, false);
     this->get_parameter_or<double>("guard_hole_min_sec", guard_hole_min_sec, 0.3);
     this->get_parameter_or<double>("guard_hole_max_accel", guard_hole_max_accel, 1.0);
@@ -3783,8 +3813,47 @@ private:
       Eigen::Matrix<double, 23, 23> lidarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
       if (kalman_channel_diag_en || corr_dump_scan_active)
         lidarCovarianceBefore = kf.get_P();
+      {
+        // Consider roll/pitch on this scan? Decided from what the previous scan left (its roll/pitch information
+        // and z_weak), the guard's latch and the time since the last release (rp_consider.hpp).
+        fast_lio::RollPitchConsiderInputs consider_in;
+        consider_in.engulf_latched = engulf_latched;
+        consider_in.since_release_s = engulf_release_time > 0.0 ? lidar_end_time - engulf_release_time : -1.0;
+        consider_in.rp_info_prev = lidar_rot_obs_rp_min;
+        consider_in.z_weak_prev = pos_obs_z_weak;
+        consider_in.consider_age_s = rp_consider_since >= 0.0 ? lidar_end_time - rp_consider_since : 0.0;
+        rp_consider_active = fast_lio::considerRollPitchThisScan(rp_consider_params, consider_in);
+        if (rp_consider_active) {
+          const V3D grav_w(state_point.grav[0], state_point.grav[1], state_point.grav[2]);
+          const V3D up_body = state_point.rot.toRotationMatrix().transpose() * (-grav_w.normalized());
+          const auto proj = fast_lio::yawOnlyProjector(up_body);
+          rp_consider_active = proj.valid;
+          if (proj.valid) {
+            kf.setConsiderRotation(3, proj.keep);
+          }
+        }
+        if (!rp_consider_active) {
+          kf.clearConsiderRotation();
+          rp_consider_since = -1.0;
+        } else {
+          if (rp_consider_since < 0.0) { rp_consider_since = lidar_end_time; }
+          ++rp_consider_scans;
+          RCLCPP_INFO_THROTTLE(this->get_logger(),
+                               *this->get_clock(),
+                               2000,
+                               "[RP-CONSIDER] roll/pitch left to the gyro this scan (engulfed=%d since_release=%.1fs "
+                               "rp_info_prev=%.0f z_weak_prev=%.2f age=%.1fs, %d scans so far)",
+                               engulf_latched,
+                               consider_in.since_release_s,
+                               lidar_rot_obs_rp_min,
+                               pos_obs_z_weak,
+                               consider_in.consider_age_s,
+                               rp_consider_scans);
+        }
+      }
       kf.update_iterated_dyn_share_modified(
         LASER_POINT_COV, solve_H_time, kalman_channel_diag_en ? &lidarDiagnostics : nullptr);
+      kf.clearConsiderRotation();  // never leaks into the gravity / planar / wheel / parked updates (update_simple)
 
       state_point = kf.get_x();
       if (!lidar_attitude_hold_active && !lidar_attitude_hold_info_active) { lidar_attitude_hold_since = -1.0; }
@@ -3944,6 +4013,7 @@ private:
               // grow the position and roll/pitch variance by that duration (yaw alone) before the far field
               // gets its say and before anything is inserted again.
               const double blind_s = engulf_latch_time > 0.0 ? lidar_end_time - engulf_latch_time : 0.0;
+              engulf_release_time = lidar_end_time;
               bool inflated = false;
               if (release_inflate_params.enabled) {
                 auto P = kf.get_P();

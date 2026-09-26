@@ -15,12 +15,26 @@
 // verification that never converges is a lost front end, which is a fact the
 // rest of the system needs to hear rather than a state to paper over.
 //
+// The absolute bounds are not enough on their own. A registration started from
+// a wrong prior converges to a self-consistent wrong minimum whose residual is
+// well under reanchor_max_res and still clearly worse than what the same scene
+// gives when healthy (m20 0826 after the data hole: res 0.045-0.083 m against a
+// healthy 0.03-0.04). The optional relative test judges the residual (and the
+// correspondence count) against running medians of recent healthy scans, the
+// way KISS-ICP adapts its threshold to the running statistics of its own
+// corrections, with a floor so that a very clean scene does not demand the
+// impossible.
+//
 // Pure C++. No ROS, no Eigen.
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <vector>
 
 namespace fast_lio
 {
@@ -40,6 +54,92 @@ struct ReanchorParams
   double max_res = 0.10;     ///< m; mean point-to-plane residual of a trustworthy match
   int confirm_scans = 3;     ///< consecutive good scans before the map may grow again
   double timeout_sec = 5.0;  ///< give up verifying after this long
+  /// > 0: a verification scan must also have res_mean <= max(res_floor, max_res_ratio x the healthy median
+  /// residual). 0 = off, the absolute bounds above decide alone.
+  double max_res_ratio = 0.0;
+  double res_floor = 0.04;  ///< m; the relative residual bound never tightens below this
+  /// > 0: a verification scan must also have effct >= min_eff_ratio x the healthy median effct. 0 = off.
+  double min_eff_ratio = 0.0;
+};
+
+/// What a healthy scan looks like right now: running medians the caller keeps (HealthyScanWindow). NaN means not
+/// known yet, and the relative tests are then skipped.
+struct ReanchorReference
+{
+  double res_median = std::numeric_limits<double>::quiet_NaN();
+  double eff_median = std::numeric_limits<double>::quiet_NaN();
+};
+
+/// Whether one scan's match against the frozen map counts as re-registration evidence.
+inline bool reanchorMatchOk(int effct,
+                            double res_mean,
+                            const ReanchorParams & params,
+                            const ReanchorReference & reference = ReanchorReference{})
+{
+  if (effct < params.min_eff || !std::isfinite(res_mean) || res_mean < 0.0 || res_mean > params.max_res) {
+    return false;
+  }
+  if (params.max_res_ratio > 0.0 && std::isfinite(reference.res_median) && reference.res_median > 0.0) {
+    const double bound = std::max(params.res_floor, params.max_res_ratio * reference.res_median);
+    if (res_mean > bound) {
+      return false;
+    }
+  }
+  if (params.min_eff_ratio > 0.0 && std::isfinite(reference.eff_median) && reference.eff_median > 0.0 &&
+      static_cast<double>(effct) < params.min_eff_ratio * reference.eff_median) {
+    return false;
+  }
+  return true;
+}
+
+/// Median of the last `capacity` finite values pushed; NaN until `min_count` of them have been seen. The caller
+/// pushes the res_mean / effct of scans the gate called healthy.
+class HealthyScanWindow
+{
+public:
+  explicit HealthyScanWindow(std::size_t capacity = 100, std::size_t min_count = 20)
+      : capacity_(std::max<std::size_t>(capacity, 1)), min_count_(std::max<std::size_t>(min_count, 1))
+  {
+    values_.reserve(capacity_);
+  }
+
+  void push(double value)
+  {
+    if (!std::isfinite(value)) {
+      return;
+    }
+    if (values_.size() < capacity_) {
+      values_.push_back(value);
+    } else {
+      values_[next_] = value;
+    }
+    next_ = (next_ + 1) % capacity_;
+  }
+
+  double median() const
+  {
+    if (values_.size() < min_count_) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    std::vector<double> sorted = values_;
+    const auto mid = sorted.begin() + static_cast<std::ptrdiff_t>(sorted.size() / 2);
+    std::nth_element(sorted.begin(), mid, sorted.end());
+    return *mid;
+  }
+
+  std::size_t size() const { return values_.size(); }
+
+  void clear()
+  {
+    values_.clear();
+    next_ = 0;
+  }
+
+private:
+  std::size_t capacity_;
+  std::size_t min_count_;
+  std::size_t next_ = 0;
+  std::vector<double> values_;
 };
 
 struct ReanchorGate
@@ -61,13 +161,15 @@ struct ReanchorDecision
 
 /// One scan of gate bookkeeping. `guard_degraded` is the divergence guard's own
 /// verdict (starvation / engulfment / velocity runaway); `effct` and `res_mean`
-/// describe the match this scan achieved against the (still frozen) map.
+/// describe the match this scan achieved against the (still frozen) map;
+/// `reference` is what healthy scans look like (only read by the relative tests).
 inline ReanchorDecision updateReanchorGate(ReanchorGate * gate,
                                            bool guard_degraded,
                                            int effct,
                                            double res_mean,
                                            double now,
-                                           const ReanchorParams & params)
+                                           const ReanchorParams & params,
+                                           const ReanchorReference & reference = ReanchorReference{})
 {
   ReanchorDecision decision;
   if (gate == nullptr) {
@@ -107,8 +209,7 @@ inline ReanchorDecision updateReanchorGate(ReanchorGate * gate,
       [[fallthrough]];
 
     case ReanchorState::kVerifying: {
-      const bool match_ok =
-        effct >= params.min_eff && std::isfinite(res_mean) && res_mean >= 0.0 && res_mean <= params.max_res;
+      const bool match_ok = reanchorMatchOk(effct, res_mean, params, reference);
       gate->ok_streak = match_ok ? gate->ok_streak + 1 : 0;
       if (gate->ok_streak >= params.confirm_scans) {
         gate->state = ReanchorState::kHealthy;

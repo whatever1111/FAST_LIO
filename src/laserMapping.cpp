@@ -95,6 +95,7 @@
 #include "preprocess.h"
 #include "attitude_hold.hpp"
 #include "covariance_reset.hpp"
+#include "engulf_release.hpp"
 #include "correspondence_gate.hpp"
 #include "gravity_align_kinematics.hpp"
 #include "reanchor_gate.hpp"
@@ -415,6 +416,11 @@ double guard_engulf_far_frac_release = 0.35;  // release needs far field this he
 int guard_engulf_release_scans = 5;           // ...for this many consecutive scans
 int consec_engulf_clear = 0;                  // running healthy-scan streak while latched
 bool engulf_latched = false;                  // sticky engulfed state (entered, not yet released)
+double engulf_latch_time = -1.0;              // lidar_end_time of the scan that latched (blind duration at release)
+// Release policy (engulf_release.hpp): what velocity leaves the blind stretch and how much the pose's
+// covariance grows for it. Defaults reproduce the legacy "zero velocity, P untouched".
+fast_lio::ReleaseVelocityParams release_vel_params;
+fast_lio::ReleaseInflationParams release_inflate_params;
 // Scan-hole guard: when the gap between consecutive processed scans exceeds
 // guard_hole_min_sec, the IMU-only propagation across the hole is replaced by
 // a bounded constant-velocity hold from the pre-hole state before the lidar
@@ -455,6 +461,7 @@ fast_lio::ParkedHoldParams parked_hold_params;
 fast_lio::ParkedHoldState parked_hold_state;
 double last_twist_stamp = -1.0;  // newest wheel-speed sample time (s); -1 = none yet
 double last_twist_speed = 0.0;   // |v| of the newest wheel sample (m/s)
+V3D last_twist_v_body = V3D::Zero();  // the newest finite wheel sample, body frame (m/s), under mtx_twist
 // Re-anchor gate: the guard used to unfreeze the map the moment the scene
 // looked healthy again, which is where a recoverable blind stretch became a
 // permanent runaway — the pose error survived the release, the map was rebuilt
@@ -1158,6 +1165,9 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
   // consumes the buffer, but the hold needs to know how OLD the evidence is.
   last_twist_stamp = get_time_sec(msg_in->header.stamp);
   last_twist_speed = v.norm();
+  if (v.allFinite()) {
+    last_twist_v_body = v;
+  }
   // [v6] stamped forward-speed history for the levelling prior's leg-velocity edges
   if (std::isfinite(v(0))) {
     gravity_align_leg_hist.emplace_back(last_twist_stamp, v(0));
@@ -2520,6 +2530,18 @@ public:
     this->declare_parameter<int>("guard_engulf_streak", 2);
     this->declare_parameter<double>("guard_engulf_far_frac_release", 0.35);
     this->declare_parameter<int>("guard_engulf_release_scans", 5);
+    this->declare_parameter<std::string>("guard_release_vel_source", "zero");
+    this->declare_parameter<double>("guard_release_leg_max_age_s", 0.5);
+    this->declare_parameter<double>("guard_release_leg_sigma", 0.3);
+    this->declare_parameter<double>("guard_release_keep_sigma", 0.5);
+    this->declare_parameter<bool>("guard_release_inflate_en", false);
+    this->declare_parameter<double>("guard_release_pos_sigma_min", 0.1);
+    this->declare_parameter<double>("guard_release_pos_sigma_rate", 0.2);
+    this->declare_parameter<double>("guard_release_pos_sigma_max", 1.0);
+    this->declare_parameter<double>("guard_release_rp_sigma_deg", 0.5);
+    this->declare_parameter<double>("guard_release_rp_sigma_rate_deg", 0.3);
+    this->declare_parameter<double>("guard_release_rp_sigma_max_deg", 3.0);
+    this->declare_parameter<double>("guard_release_yaw_sigma_deg", 0.0);
     this->declare_parameter<bool>("guard_hole_en", false);
     this->declare_parameter<double>("guard_hole_min_sec", 0.3);
     this->declare_parameter<double>("guard_hole_max_accel", 1.0);
@@ -2786,6 +2808,27 @@ public:
     this->get_parameter_or<int>("guard_engulf_streak", guard_engulf_streak, 2);
     this->get_parameter_or<double>("guard_engulf_far_frac_release", guard_engulf_far_frac_release, 0.35);
     this->get_parameter_or<int>("guard_engulf_release_scans", guard_engulf_release_scans, 5);
+    {
+      std::string release_source;
+      this->get_parameter_or<std::string>("guard_release_vel_source", release_source, "zero");
+      release_vel_params.source = release_source == "leg"    ? fast_lio::ReleaseVelocitySource::kLeg
+                                  : release_source == "keep" ? fast_lio::ReleaseVelocitySource::kKeep
+                                                             : fast_lio::ReleaseVelocitySource::kZero;
+      if (release_source != "leg" && release_source != "keep" && release_source != "zero") {
+        RCLCPP_WARN(this->get_logger(), "guard_release_vel_source '%s' unknown: using 'zero'", release_source.c_str());
+      }
+    }
+    this->get_parameter_or<double>("guard_release_leg_max_age_s", release_vel_params.leg_max_age_s, 0.5);
+    this->get_parameter_or<double>("guard_release_leg_sigma", release_vel_params.leg_sigma, 0.3);
+    this->get_parameter_or<double>("guard_release_keep_sigma", release_vel_params.keep_sigma, 0.5);
+    this->get_parameter_or<bool>("guard_release_inflate_en", release_inflate_params.enabled, false);
+    this->get_parameter_or<double>("guard_release_pos_sigma_min", release_inflate_params.pos_sigma_min, 0.1);
+    this->get_parameter_or<double>("guard_release_pos_sigma_rate", release_inflate_params.pos_sigma_rate, 0.2);
+    this->get_parameter_or<double>("guard_release_pos_sigma_max", release_inflate_params.pos_sigma_max, 1.0);
+    this->get_parameter_or<double>("guard_release_rp_sigma_deg", release_inflate_params.rp_sigma_min_deg, 0.5);
+    this->get_parameter_or<double>("guard_release_rp_sigma_rate_deg", release_inflate_params.rp_sigma_rate_deg, 0.3);
+    this->get_parameter_or<double>("guard_release_rp_sigma_max_deg", release_inflate_params.rp_sigma_max_deg, 3.0);
+    this->get_parameter_or<double>("guard_release_yaw_sigma_deg", release_inflate_params.yaw_sigma_deg, 0.0);
     this->get_parameter_or<bool>("guard_hole_en", guard_hole_en, false);
     this->get_parameter_or<double>("guard_hole_min_sec", guard_hole_min_sec, 0.3);
     this->get_parameter_or<double>("guard_hole_max_accel", guard_hole_max_accel, 1.0);
@@ -3867,6 +3910,7 @@ private:
             if (consec_engulf >= guard_engulf_streak) {
               engulf_latched = true;
               consec_engulf_clear = 0;
+              engulf_latch_time = lidar_end_time;
             }
           } else {
             // Latched: release only on a SUSTAINED healthy far field (hysteresis).
@@ -3877,17 +3921,52 @@ private:
             if (consec_engulf_clear >= guard_engulf_release_scans) {
               engulf_latched = false;
               consec_engulf = 0;
-              // Discard the blind stretch's velocity (see block comment).
+              // The blind stretch's velocity: the legacy policy discards it (see block comment); the release
+              // policy (engulf_release.hpp) can take the legs or keep the estimate, each with the 1-σ the
+              // assignment deserves, so the next innovations are not forced through stale cross terms.
               state_ikfom st = kf.get_x();
-              st.vel.setZero();
+              V3D leg_v = V3D::Zero();
+              double leg_age = -1.0;
+              {
+                std::lock_guard<std::mutex> lk(mtx_twist);
+                leg_v = last_twist_v_body;
+                leg_age = last_twist_stamp > 0.0 ? lidar_end_time - last_twist_stamp : -1.0;
+              }
+              release_vel_params.zero_sigma = guard_vel_reset_sigma;
+              release_vel_params.max_speed = divergence_guard_max_speed;
+              const auto rel =
+                fast_lio::releaseVelocity(st.vel, st.rot.toRotationMatrix(), leg_v, leg_age, release_vel_params);
+              st.vel = rel.velocity;
               gravity_align_vel_overwritten = true;
               kf.change_x(st);
-              resetVelocityCovariance(guard_vel_reset_sigma);
+              resetVelocityCovariance(rel.sigma);
+              // The pose drifted against the frozen map for the whole blind stretch while P kept shrinking:
+              // grow the position and roll/pitch variance by that duration (yaw alone) before the far field
+              // gets its say and before anything is inserted again.
+              const double blind_s = engulf_latch_time > 0.0 ? lidar_end_time - engulf_latch_time : 0.0;
+              bool inflated = false;
+              if (release_inflate_params.enabled) {
+                auto P = kf.get_P();
+                const V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);
+                const V3D up_body = st.rot.toRotationMatrix().transpose() * (-grav_w.normalized());
+                inflated = fast_lio::inflateReleaseCovariance(P, blind_s, up_body, release_inflate_params);
+                if (inflated) {
+                  kf.change_P(P);
+                }
+              }
               state_point = kf.get_x();
               RCLCPP_WARN(this->get_logger(),
-                          "[DIVERGENCE-GUARD] engulfment released (far_frac=%.2f for %d scans): "
-                          "map unfrozen, velocity reset",
-                          scan_far_frac, guard_engulf_release_scans);
+                          "[DIVERGENCE-GUARD] engulfment released (far_frac=%.2f for %d scans, blind %.1fs): "
+                          "map unfrozen, velocity %s (%.2f m/s, sigma %.2f)%s",
+                          scan_far_frac,
+                          guard_engulf_release_scans,
+                          blind_s,
+                          rel.used == fast_lio::ReleaseVelocitySource::kLeg    ? "from legs"
+                          : rel.used == fast_lio::ReleaseVelocitySource::kKeep ? "kept"
+                                                                               : "reset",
+                          state_point.vel.norm(),
+                          rel.sigma,
+                          inflated ? ", P inflated" : "");
             }
           }
           flio_engulfed = engulf_latched;

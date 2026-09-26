@@ -181,7 +181,9 @@ if(BUILD_TESTING)
   target_include_directories(test_scan_time_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   ament_add_gtest(test_imu_process_validity test/test_imu_process_validity.cpp)
   ament_add_gtest(test_preprocess_timing test/test_preprocess_timing.cpp src/preprocess.cpp)
-  foreach(timing_test test_imu_process_validity test_preprocess_timing)
+  # the consider update on the real estimator (use-ikfom.hpp pulls in the same dependencies)
+  ament_add_gtest(test_rp_consider_filter test/test_rp_consider_filter.cpp)
+  foreach(timing_test test_imu_process_validity test_preprocess_timing test_rp_consider_filter)
     target_include_directories(${timing_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                ${CMAKE_CURRENT_SOURCE_DIR}/src ${PCL_INCLUDE_DIRS})
     target_link_libraries(${timing_test} ${PCL_LIBRARIES} Eigen3::Eigen)
@@ -290,6 +292,13 @@ if(BUILD_TESTING)
   ament_add_gtest(test_engulf_release test/test_engulf_release.cpp)
   if(TARGET test_engulf_release)
     target_include_directories(test_engulf_release PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
+
+  # Pure header, Eigen only: the lidar update as a consider (Schmidt) update for roll/pitch — policy, projector and
+  # the Joseph-form covariance checked against the explicit form (docs/PGO_LOOP_TUNING.md section 7.8).
+  ament_add_gtest(test_rp_consider test/test_rp_consider.cpp)
+  if(TARGET test_rp_consider)
+    target_include_directories(test_rp_consider PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
 
   ament_add_gtest(test_odom_covariance_contract test/test_odom_covariance_contract.cpp)

@@ -287,6 +287,13 @@ if(BUILD_TESTING)
     target_include_directories(test_correspondence_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
 
+  # Pure header, Eigen only: carrying the state across an IMU dropout — gyro average, held velocity and the
+  # covariance that says so (the m20 0826 data hole, docs/PGO_LOOP_TUNING.md section 7.8).
+  ament_add_gtest(test_imu_gap_prior test/test_imu_gap_prior.cpp)
+  if(TARGET test_imu_gap_prior)
+    target_include_directories(test_imu_gap_prior PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
+
   ament_add_gtest(test_odom_covariance_contract test/test_odom_covariance_contract.cpp)
   if(TARGET test_odom_covariance_contract)
     target_include_directories(test_odom_covariance_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

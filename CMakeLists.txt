@@ -235,7 +235,10 @@ if(BUILD_TESTING)
     endif()
     # One actual component activation per process: production globals are not reset between nodes.
     foreach(capacity_case negative zero small)
-      ament_add_gtest(test_ivox_node_capacity_${capacity_case} test/test_ivox_node_capacity.cpp TIMEOUT 30)
+      # Direct linking and ClassLoader must resolve the same physical build DSO.
+      # APPEND_LIBRARY_DIRS would leave the installed copy ahead of this directory.
+      ament_add_gtest(test_ivox_node_capacity_${capacity_case} test/test_ivox_node_capacity.cpp TIMEOUT 30
+        ENV "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:fastlio_mapping_component>:$ENV{LD_LIBRARY_PATH}")
       target_include_directories(test_ivox_node_capacity_${capacity_case} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${PCL_INCLUDE_DIRS})
       target_compile_definitions(test_ivox_node_capacity_${capacity_case} PRIVATE

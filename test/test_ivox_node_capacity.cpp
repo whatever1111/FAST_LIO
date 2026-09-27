@@ -4,6 +4,7 @@
 #include <class_loader/class_loader.hpp>
 #include <gtest/gtest.h>
 #include <stdexcept>
+#include <vector>
 
 #include "ivox/ivox.hpp"
 #include "laser_mapping_test_types.hpp"
@@ -26,7 +27,10 @@ protected:
     ASSERT_EQ(names.size(), 1u);
     auto factory = loader.createInstance<rclcpp_components::NodeFactory>(names.front());
     rclcpp::NodeOptions options;
-    options.parameter_overrides({rclcpp::Parameter("ivox_max_voxels", requested)});
+    options.parameter_overrides(
+      {rclcpp::Parameter("ivox_max_voxels", requested),
+       rclcpp::Parameter("mapping.extrinsic_T", std::vector<double>{0.0, 0.0, 0.0}),
+       rclcpp::Parameter("mapping.extrinsic_R", std::vector<double>{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0})});
     if (requested < 0) {
       EXPECT_THROW(factory->create_node_instance(options), std::invalid_argument);
       return;

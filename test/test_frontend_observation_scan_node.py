@@ -214,15 +214,31 @@ def test_real_scans_idle_duplicate_rollback_restart():
                 if hasattr(odom_subscription, "get_publisher_count"):
                     wait(lambda: odom_subscription.get_publisher_count() == 1)
                 start = 10_000_000_000
-                positive = None
-                for _ in range(15):
+                record["warmup_issued_stamps_ns"] = []  # bounded by the fixed 15-scan input below
+                for warmup_index in range(15):
+                    record["warmup_issued_stamps_ns"].append(start)
                     send_scan(start)
-                    sample = completed_near(start)
-                    if sample and sample.has_effective_feature_count and sample.effective_feature_count > 0:
-                        positive = sample
-                        break
-                    start += 100_000_000
-                assert positive is not None, "warmup did not produce a real positive-row measurement"
+                    if warmup_index < 14:
+                        start += 100_000_000
+                # Drain through the last issued scan before sending the zero-row scan.
+                # Do not select an older positive sample while warmup scans remain queued.
+                wait_started = time.monotonic()
+                try:
+                    wait(lambda: completed_near(start) is not None)
+                finally:
+                    matching = completed_near(start)
+                    latest = next((sample for sample in reversed(samples) if sample.has_pose), None)
+                    record["warmup_wait"] = {
+                        "last_issued_start_ns": start,
+                        "expected_end_ns": start + 50_000_000,
+                        "timeout_seconds": 8.0,
+                        "steady_elapsed_seconds": time.monotonic() - wait_started,
+                        "matching_stamp_ns": matching.observation_stamp_ns if matching else None,
+                        "latest_completed": evidence(latest) if latest else None,
+                    }
+                positive = completed_near(start)
+                assert positive is not None, "warmup did not complete its last issued scan"
+                assert positive.has_effective_feature_count and positive.effective_feature_count > 0
                 verify_completed(positive)
                 assert positive.has_mean_residual and math.isfinite(positive.mean_residual_m)
                 assert positive.mean_residual_m >= 0

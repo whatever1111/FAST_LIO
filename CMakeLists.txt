@@ -267,7 +267,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_frontend_observation_node test/test_frontend_observation_node.py TIMEOUT 90)
   ament_add_pytest_test(test_frontend_observation_scan_node test/test_frontend_observation_scan_node.py
     TIMEOUT 120
-    APPEND_ENV FASTLIO_SCAN_CONTRACT_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/test_results/fast_lio/scan_contract)
+    ENV FASTLIO_SCAN_CONTRACT_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/test_results/fast_lio/scan_contract)
   ament_add_gtest(test_frontend_observation test/test_frontend_observation.cpp)
   target_include_directories(test_frontend_observation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(test_frontend_observation OpenSSL::Crypto)

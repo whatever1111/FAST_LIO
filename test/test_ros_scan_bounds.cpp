@@ -1,5 +1,7 @@
 #include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 
+#include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/node_factory.hpp>
 
@@ -7,10 +9,12 @@
 #include <chrono>
 #include <class_loader/class_loader.hpp>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "laser_mapping_test_hooks.hpp"
@@ -130,7 +134,7 @@ protected:
     const auto through = static_cast<std::int64_t>(std::llround((start + 0.06) * 1e9));
     for (; nextImu <= through; nextImu += 5000000) {
       sensor_msgs::msg::Imu message;
-      message.header.stamp = rclcpp::Time(nextImu).to_msg();
+      message.header.stamp = rclcpp::Time(nextImu);
       message.linear_acceleration.z = 9.81;
       imu->publish(message);
       executor->spin_some();
@@ -148,7 +152,7 @@ protected:
     }
     auto message = std::make_unique<sensor_msgs::msg::PointCloud2>();
     pcl::toROSMsg(cloud, *message);
-    message->header.stamp = rclcpp::Time(static_cast<std::int64_t>(std::llround(start * 1e9))).to_msg();
+    message->header.stamp = rclcpp::Time(static_cast<std::int64_t>(std::llround(start * 1e9)));
     message->header.frame_id = "lidar";
     lidar->publish(std::move(message));
   }

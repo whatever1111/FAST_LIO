@@ -4,6 +4,7 @@
 #include <future>
 #include <gtest/gtest.h>
 #include <mutex>
+#include <utility>
 
 #include "delayed_map_insertion.hpp"
 #include "ivox/ivox.hpp"

@@ -63,6 +63,7 @@
 #include <Python.h>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -70,6 +71,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <fast_lio_interfaces/msg/frontend_observation.hpp>
 #include <fixposition_driver_msgs/msg/fpa_imu.hpp>
 #include <fixposition_driver_msgs/msg/fpa_imubias.hpp>
 #include <fstream>
@@ -85,29 +87,31 @@
 #include <omp.h>
 #include <shm_msgs/msg/point_cloud8m_and_pose.hpp>
 #include <so3_math.h>
+#include <sys/random.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
 
 #include "IMU_Processing.hpp"
-#include "prior_map_load.hpp"
 #include "adaptive_downsample.hpp"
-#include "parked_hold.hpp"
-#include "preprocess.h"
 #include "attitude_hold.hpp"
-#include "covariance_reset.hpp"
-#include "engulf_release.hpp"
-#include "rp_consider.hpp"
 #include "correspondence_gate.hpp"
 #include "correspondence_compaction.hpp"
 #include "cached_plane.hpp"
+#include "covariance_reset.hpp"
+#include "degeneracy_policy.hpp"
+#include "engulf_release.hpp"
+#include "frontend_observation.hpp"
 #include "gravity_align_kinematics.hpp"
 #include "imu_gap_prior.hpp"
+#include "parked_hold.hpp"
+#include "preprocess.h"
+#include "prior_map_load.hpp"
 #include "reanchor_gate.hpp"
-#include "voxel_downsample.hpp"
-#include "degeneracy_policy.hpp"
+#include "rp_consider.hpp"
 #include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
+#include "voxel_downsample.hpp"
 #include "zupt_policy.hpp"
 
 #define INIT_TIME (0.1)
@@ -847,6 +851,34 @@ void lasermap_fov_segment()
 // held; every callback of this node shares one mutually-exclusive callback
 // group, so sync_packages is never mid-flight here. The one exception is the
 // scan it has already taken (lidar_pushed) and not yet popped — that one stays.
+// All observation bookkeeping shares the estimator's mutually exclusive callback group.
+// Queue sizes are read under mtx_buffer; no worker accesses this telemetry.
+bool frontend_observation_en = false;
+std::string frontend_clock_domain;
+std::int64_t frontend_idle_period_ns = 500000000;
+std::array<std::uint8_t, 16> frontend_instance{};
+bool frontend_has_instance = false;
+bool frontend_runaway = false;
+fast_lio::FrontendProgress frontend_progress;
+fast_lio::FrontendPublicationGuard frontend_publication_guard;
+rclcpp::Publisher<fast_lio_interfaces::msg::FrontendObservation>::SharedPtr frontend_publisher;
+void publishFrontendObservation(bool completed, bool scanEvent = false, double eventTime = 0.0) noexcept;
+
+void frontendAdmit(const builtin_interfaces::msg::Time & stamp)
+{
+  if (!frontend_observation_en)
+    return;
+  std::int64_t ns = 0;
+  const bool known = fast_lio::frontendStamp(stamp.sec, stamp.nanosec, ns);
+  frontend_progress.admit(ns, known);
+}
+
+void frontendDrop(std::uint64_t count = 1)
+{
+  if (frontend_observation_en)
+    frontend_progress.increment(frontend_progress.dropped, count);
+}
+
 static void trim_lidar_buffer()
 {
   const bool count_bounded = max_buffered_scans > 0;
@@ -873,6 +905,7 @@ static void trim_lidar_buffer()
   }
   if (dropped == 0) return;
   dropped_scan_total += dropped;
+  frontendDrop(dropped);
   static double last_warn_time = 0.0;
   const double now = omp_get_wtime();
   if (now - last_warn_time > 5.0) {
@@ -896,6 +929,7 @@ bool acceptInputEpoch(double previous, double current, const char * source)
   constexpr double kInputEpochRollbackSec = 1.0;
   if (input_epoch_guard.observe(previous, current, kInputEpochRollbackSec))
     return true;
+  frontendDrop(lidar_buffer.size() + imu_buffer.size() + 1);
   lidar_buffer.clear();
   time_buffer.clear();
   lidar_receive_time_buffer.clear();
@@ -930,6 +964,8 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
   double cur_time = get_time_sec(msg->header.stamp);
   if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar")) {
     mtx_buffer.unlock();
+    if (frontend_observation_en)
+      publishFrontendObservation(false);
     return;
   }
   double preprocess_start_time = omp_get_wtime();
@@ -948,6 +984,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
                          5000,
                          "[INPUT-TIME] late lidar by %.6f seconds, dropped",
                          last_timestamp_lidar - cur_time);
+    frontendDrop();
     mtx_buffer.unlock();
     return;
   }
@@ -958,6 +995,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
   lidar_buffer.push_back(ptr);
+  frontendAdmit(msg->header.stamp);
   time_buffer.push_back(cur_time);
   lidar_receive_time_buffer.push_back(receive_time);
   trim_lidar_buffer();
@@ -984,6 +1022,8 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
   double cur_time = get_time_sec(msg->header.stamp);
   if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar")) {
     mtx_buffer.unlock();
+    if (frontend_observation_en)
+      publishFrontendObservation(false);
     return;
   }
   double preprocess_start_time = omp_get_wtime();
@@ -994,6 +1034,7 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
                          5000,
                          "[INPUT-TIME] late lidar by %.6f seconds, dropped",
                          last_timestamp_lidar - cur_time);
+    frontendDrop();
     mtx_buffer.unlock();
     return;
   }
@@ -1004,6 +1045,7 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
   lidar_buffer.push_back(ptr);
+  frontendAdmit(msg->header.stamp);
   time_buffer.push_back(cur_time);
   lidar_receive_time_buffer.push_back(receive_time);
   trim_lidar_buffer();
@@ -1028,6 +1070,8 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
   double cur_time = get_time_sec(msg->header.stamp);
   if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar")) {
     mtx_buffer.unlock();
+    if (frontend_observation_en)
+      publishFrontendObservation(false);
     return;
   }
   double preprocess_start_time = omp_get_wtime();
@@ -1039,6 +1083,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
                          5000,
                          "[INPUT-TIME] late lidar by %.6f seconds, dropped",
                          last_timestamp_lidar - cur_time);
+    frontendDrop();
     mtx_buffer.unlock();
     return;
   }
@@ -1062,6 +1107,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
   lidar_buffer.push_back(ptr);
+  frontendAdmit(msg->header.stamp);
   time_buffer.push_back(last_timestamp_lidar);
   lidar_receive_time_buffer.push_back(receive_time);
   trim_lidar_buffer();
@@ -1087,6 +1133,8 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
   mtx_buffer.lock();
   if (!acceptInputEpoch(last_timestamp_imu, timestamp, "imu")) {
     mtx_buffer.unlock();
+    if (frontend_observation_en)
+      publishFrontendObservation(false);
     return;
   }
 
@@ -1096,6 +1144,7 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
                          5000,
                          "[INPUT-TIME] late IMU by %.6f seconds, dropped",
                          last_timestamp_imu - timestamp);
+    frontendDrop();
     mtx_buffer.unlock();
     return;
   }
@@ -1103,8 +1152,11 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
   last_timestamp_imu = timestamp;
 
   imu_buffer.push_back(msg);
+  frontendAdmit(msg->header.stamp);
   mtx_buffer.unlock();
   sig_buffer.notify_all();
+  if (frontend_observation_en)
+    publishFrontendObservation(false);
 }
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
@@ -1295,6 +1347,7 @@ bool sync_packages(MeasureGroup & meas)
       meas.lidar_beg_time, meas.lidar->points, [](const auto & point) { return point.curvature; }, max_scan_duration_s);
     if (!timing.valid()) {
       ++invalid_scan_time_count;
+      frontendDrop();
       RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
                            input_time_log_clock,
                            5000,
@@ -1308,6 +1361,7 @@ bool sync_packages(MeasureGroup & meas)
     lidar_end_time = timing.end;
     if (lidar_end_time <= p_imu->lastProcessedEnd()) {
       ++nonadvancing_scan_count;
+      frontendDrop();
       RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
                            input_time_log_clock,
                            5000,
@@ -1341,7 +1395,10 @@ bool sync_packages(MeasureGroup & meas)
   }
   if (meas.imu.empty()) {
     ++empty_scan_imu_count;
+    frontendDrop();
     markImuCoverageGap(meas.lidar_end_time);
+    if (frontend_observation_en)
+      publishFrontendObservation(false, true, meas.lidar_end_time);
     RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
                          input_time_log_clock,
                          5000,
@@ -1885,6 +1942,149 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
   trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
   tf_br->sendTransform(trans);
+}
+
+void buildAndPublishFrontendObservation(bool completed, bool scanEvent, double eventTime)
+{
+  if (!frontend_publisher)
+    return;
+  // Bounded identifiers fail closed; never silently shorten the source identity.
+  if (odom_frame_id.size() > 64 || body_frame_id.size() > 64)
+    return;
+  fast_lio::FrontendFacts facts;
+  facts.completed = completed;
+  facts.initialized = flg_EKF_inited;
+  facts.lost = reanchor_gate.state == fast_lio::ReanchorState::kLost;
+  facts.blind = reanchor_gate.state == fast_lio::ReanchorState::kBlind;
+  facts.verifying = reanchor_gate.state == fast_lio::ReanchorState::kVerifying;
+  facts.degraded = flio_degraded_odom;
+  facts.staticHold = zupt_active || parked_hold_state.active;
+  facts.runaway = frontend_runaway;
+  facts.levelling = gravity_align_degraded_active;
+  facts.blocked = input_epoch_guard.faulted();
+  facts.contextKnown = frontend_has_instance && !odom_frame_id.empty() && !body_frame_id.empty() &&
+                       !frontend_clock_domain.empty() && !facts.blocked;
+  std::int64_t poseStamp = 0;
+  if (completed) {
+    facts.stampKnown =
+      fast_lio::frontendStamp(odomAftMapped.header.stamp.sec, odomAftMapped.header.stamp.nanosec, poseStamp);
+    const auto & p = odomAftMapped.pose.pose;
+    facts.pose = {
+      {p.position.x, p.position.y, p.position.z, p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w}};
+  }
+  const auto verdict = fast_lio::frontendVerdict(facts);
+  if (!completed && (!frontend_progress.hasInputStamp ||
+                     !frontend_progress.idleDue(frontend_progress.inputStamp, frontend_idle_period_ns, verdict)))
+    return;
+  if (completed) {
+    frontend_progress.finish(verdict);
+    frontend_progress.hasIdleStamp = facts.stampKnown;
+    frontend_progress.idleStamp = poseStamp;
+    frontend_progress.previousHealth = verdict.health;
+    frontend_progress.previousState = verdict.state;
+    frontend_progress.previousActivity = verdict.activity;
+    frontend_progress.previousSubstate = verdict.substate;
+  }
+  frontend_progress.increment(frontend_progress.sample);
+  fast_lio_interfaces::msg::FrontendObservation message;
+  message.schema_version = 1;
+  message.identity_version = 1;
+  message.has_source_instance = frontend_has_instance;
+  message.source_instance = frontend_instance;
+  message.has_sample_sequence = frontend_progress.valid;
+  message.sample_sequence = frontend_progress.sample;
+  message.clock_domain = frontend_clock_domain;
+  message.frame_id = odom_frame_id;
+  message.child_frame_id = body_frame_id;
+  message.has_coordinate_epoch = facts.contextKnown;
+  message.coordinate_epoch = facts.contextKnown ? 1 : 0;  // map replacements do not change the pose frame
+  message.has_input_stamp = frontend_progress.hasInputStamp;
+  message.input_stamp_ns = frontend_progress.inputStamp;
+  message.has_pose = completed;
+  message.has_observation_stamp = completed && facts.stampKnown;
+  message.observation_stamp_ns = message.has_observation_stamp ? poseStamp : 0;
+  message.has_effective_observation_stamp = !facts.blocked && (completed ? facts.stampKnown : message.has_input_stamp);
+  message.effective_observation_stamp_ns =
+    message.has_effective_observation_stamp ? (completed ? message.observation_stamp_ns : message.input_stamp_ns) : 0;
+  if (scanEvent && !facts.blocked) {
+    message.has_effective_observation_stamp =
+      fast_lio::frontendSecondsStamp(eventTime, message.effective_observation_stamp_ns);
+  }
+  if (completed) {
+    message.pose.pose = odomAftMapped.pose.pose;
+    message.has_observation_id = fast_lio::frontendObservationId(frontend_instance,
+                                                                 frontend_has_instance && frontend_progress.valid,
+                                                                 frontend_progress.completion,
+                                                                 poseStamp,
+                                                                 facts.stampKnown,
+                                                                 frontend_clock_domain,
+                                                                 message.observation_id);
+  }
+  // Neither legacy twist (unfilled) nor the EKF attitude-error covariance has a verified wire contract.
+  message.has_pose_covariance = false;
+  message.has_twist = false;
+  message.has_twist_covariance = false;
+  message.output_validity = verdict.validity;
+  message.axis_validity_bits = verdict.axes;
+  message.estimator_state = verdict.state;
+  message.activity = verdict.activity;
+  message.fe_substate = verdict.substate;
+  message.has_guard_reason_bits = true;
+  message.guard_reason_bits = verdict.guards;
+  message.has_health_flags = true;
+  message.health_flags = verdict.health;
+  // Per-scan metrics cannot be borrowed by an idle sample.
+  if (completed) {
+    message.has_observability_along = std::isfinite(scan_obs_along) && scan_obs_along >= 0.0 && scan_obs_along <= 1.0;
+    if (message.has_observability_along)
+      message.observability_along = scan_obs_along;
+    message.has_effective_feature_count = effct_feat_num >= 0;
+    if (message.has_effective_feature_count)
+      message.effective_feature_count = static_cast<std::uint32_t>(effct_feat_num);
+    message.has_far_point_fraction = std::isfinite(scan_far_frac) && scan_far_frac >= 0.0 && scan_far_frac <= 1.0;
+    if (message.has_far_point_fraction)
+      message.far_point_fraction = scan_far_frac;
+    message.has_mean_residual = std::isfinite(res_mean_last) && res_mean_last >= 0.0;
+    if (message.has_mean_residual)
+      message.mean_residual_m = res_mean_last;
+    message.has_body_speed = std::isfinite(scan_body_speed) && scan_body_speed >= 0.0;
+    if (message.has_body_speed)
+      message.body_speed_mps = scan_body_speed;
+    message.has_gravity =
+      std::isfinite(state_point.grav[0]) && std::isfinite(state_point.grav[1]) && std::isfinite(state_point.grav[2]);
+    if (message.has_gravity)
+      message.gravity_world_mps2 = {{state_point.grav[0], state_point.grav[1], state_point.grav[2]}};
+  }
+  message.has_input_sequence = frontend_progress.valid;
+  message.input_sequence = frontend_progress.input;
+  message.has_completion_sequence = frontend_progress.valid;
+  message.completion_sequence = frontend_progress.completion;
+  message.has_output_sequence = frontend_progress.valid;
+  message.output_sequence = frontend_progress.output;
+  // The legacy preprocessing/IMU initialization paths do not expose a complete
+  // per-input discard ledger. Partial node-level accounting cannot certify a total.
+  message.has_dropped_count = false;
+  message.dropped_count = 0;
+  {
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+    const auto pending = static_cast<std::uint64_t>(imu_buffer.size()) + lidar_buffer.size();
+    message.has_queue_count = pending <= std::numeric_limits<std::uint32_t>::max();
+    if (message.has_queue_count)
+      message.queue_count = static_cast<std::uint32_t>(pending);
+  }
+  frontend_publisher->publish(message);
+}
+
+void publishFrontendObservation(bool completed, bool scanEvent, double eventTime) noexcept
+{
+  frontend_publication_guard.run([&] { buildAndPublishFrontendObservation(completed, scanEvent, eventTime); },
+                                 [](const char * reason) {
+                                   frontend_observation_en = false;
+                                   RCLCPP_ERROR(
+                                     rclcpp::get_logger("laser_mapping"),
+                                     "Frontend observation disabled for this activation after telemetry failure: %s",
+                                     reason);
+                                 });
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -2667,6 +2867,37 @@ public:
     this->declare_parameter<double>("reanchor_res_floor", 0.04);
     this->declare_parameter<double>("reanchor_min_eff_ratio", 0.0);
     this->declare_parameter<int>("reanchor_healthy_window", 100);
+    frontend_observation_en = this->declare_parameter<bool>("publish.frontend_observation", false);
+    frontend_clock_domain = this->declare_parameter<std::string>("publish.frontend_clock_domain", "");
+    const double frontendIdlePeriod = this->declare_parameter<double>("publish.frontend_idle_period_sec", 0.5);
+    if (frontend_observation_en) {
+      if (!fast_lio::frontendIdentifier(frontend_clock_domain, 48) || !std::isfinite(frontendIdlePeriod) ||
+          frontendIdlePeriod < 1e-9 || frontendIdlePeriod > 3600.0) {
+        throw std::invalid_argument(
+          "frontend observation requires an explicit clock domain (1..48 bytes) and idle period 1ns..3600s");
+      }
+      frontend_idle_period_ns = static_cast<std::int64_t>(frontendIdlePeriod * 1e9);
+      frontend_progress = fast_lio::FrontendProgress{};
+      frontend_publication_guard = fast_lio::FrontendPublicationGuard{};
+      frontend_instance.fill(0);
+      std::size_t randomBytes = 0;
+      while (randomBytes < frontend_instance.size()) {
+        const auto count = getrandom(frontend_instance.data() + randomBytes, frontend_instance.size() - randomBytes, 0);
+        if (count < 0 && errno == EINTR)
+          continue;
+        if (count <= 0)
+          break;
+        randomBytes += static_cast<std::size_t>(count);
+      }
+      frontend_has_instance = randomBytes == frontend_instance.size();
+      if (!frontend_has_instance) {
+        frontend_instance.fill(0);
+        RCLCPP_ERROR(this->get_logger(), "Frontend activation UUID unavailable; typed identity remains unknown");
+      }
+      const auto frontendQos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
+      frontend_publisher = this->create_publisher<fast_lio_interfaces::msg::FrontendObservation>(
+        "/lio_slam/frontend_observation", frontendQos);
+    }
     this->declare_parameter<bool>("runaway_watchdog_en", true);
     this->declare_parameter<double>("runaway_parked_speed_thresh", 0.3);
     this->declare_parameter<double>("runaway_wheel_speed_margin", 1.0);
@@ -3344,6 +3575,10 @@ public:
     pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
     pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
     pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
+    if (frontend_observation_en &&
+        (!fast_lio::frontendIdentifier(odom_frame_id, 64) || !fast_lio::frontendIdentifier(body_frame_id, 64))) {
+      throw std::invalid_argument("frontend observation frame identifiers must contain 1..64 bytes");
+    }
     pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
     pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -3464,6 +3699,8 @@ public:
     // component (offline replay, composed pipelines) nobody else joins it before the
     // library unloads → std::terminate. Idempotent with the standalone main's call.
     stopMapWorker();
+    frontend_publisher.reset();
+    frontend_observation_en = false;
     fout_out.close();
     fout_pre.close();
     fout_jump.close();
@@ -3538,6 +3775,7 @@ private:
   void timer_callback()
   {
     if (sync_packages(Measures)) {
+      frontend_runaway = false;
       if (flg_first_scan) {
         first_lidar_time = Measures.lidar_beg_time;
         p_imu->first_lidar_time = first_lidar_time;
@@ -3569,6 +3807,9 @@ private:
       if (!p_imu->Process(Measures, kf, feats_undistort)) {
         if (p_imu->lastStatus() == ImuProcess::ProcessStatus::kCoverageGap) {
           markImuCoverageGap(Measures.lidar_end_time);
+          frontendDrop();
+          if (frontend_observation_en)
+            publishFrontendObservation(false, true, Measures.lidar_end_time);
           RCLCPP_WARN_THROTTLE(this->get_logger(),
                                *this->get_clock(),
                                5000,
@@ -3654,6 +3895,7 @@ private:
           diag_first_no_point_logged = true;
         }
         RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+        frontendDrop();
         return;
       }
 
@@ -3926,6 +4168,7 @@ private:
       /*** ICP and iterated Kalman filter update ***/
       if (feats_down_size < 5) {
         RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+        frontendDrop();
         return;
       }
 
@@ -4858,6 +5101,7 @@ private:
                                                              wheel_speed,
                                                              runaway_params);
         if (runaway.tripped) {
+          frontend_runaway = true;
           RCLCPP_ERROR(this->get_logger(),
                        "[RUNAWAY] estimate contradicted for %.1fs (%s): speed=%.2fm/s wheel=%.2fm/s effct=%d "
                        "res=%.3fm — trip #%u, policy=%s",
@@ -5044,6 +5288,8 @@ private:
 
       /******* Publish odometry *******/
       publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+      if (frontend_observation_en)
+        publishFrontendObservation(true);
 
       /*** add the feature points to map kdtree ***/
       t3 = omp_get_wtime();

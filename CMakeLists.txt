@@ -68,6 +68,8 @@ find_package(tf2_ros REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
 find_package(fixposition_driver_msgs REQUIRED)
 find_package(shm_msgs REQUIRED)
+find_package(fast_lio_interfaces REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(rosidl_default_generators REQUIRED)
 
 set(dependencies
@@ -84,6 +86,7 @@ set(dependencies
   livox_ros_driver2
   fixposition_driver_msgs
   shm_msgs
+  fast_lio_interfaces
 )
 
 # Thirdparty libraries
@@ -108,7 +111,7 @@ target_include_directories(fastlio_mapping PUBLIC
   $<INSTALL_INTERFACE:include>
   ${PCL_INCLUDE_DIRS}
 )
-target_link_libraries(fastlio_mapping ${PCL_LIBRARIES} Eigen3::Eigen)
+target_link_libraries(fastlio_mapping ${PCL_LIBRARIES} Eigen3::Eigen OpenSSL::Crypto)
 if(PythonLibs_FOUND)
   target_link_libraries(fastlio_mapping ${PYTHON_LIBRARIES})
   target_include_directories(fastlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
@@ -154,7 +157,7 @@ target_include_directories(fastlio_mapping_component PUBLIC
   $<INSTALL_INTERFACE:include>
   ${PCL_INCLUDE_DIRS}
 )
-target_link_libraries(fastlio_mapping_component ${PCL_LIBRARIES} Eigen3::Eigen)
+target_link_libraries(fastlio_mapping_component ${PCL_LIBRARIES} Eigen3::Eigen OpenSSL::Crypto)
 if(PythonLibs_FOUND)
   target_link_libraries(fastlio_mapping_component ${PYTHON_LIBRARIES})
   target_include_directories(fastlio_mapping_component PRIVATE ${PYTHON_INCLUDE_DIRS})
@@ -195,7 +198,7 @@ if(BUILD_TESTING)
       FASTLIO_AS_COMPONENT FASTLIO_TEST_HOOKS USE_IVOX)
     target_include_directories(fastlio_mapping_test_component PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})
-    target_link_libraries(fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen)
+    target_link_libraries(fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen OpenSSL::Crypto)
     ament_target_dependencies(fastlio_mapping_test_component ${dependencies})
     if(PythonLibs_FOUND)
       target_link_libraries(fastlio_mapping_test_component ${PYTHON_LIBRARIES})
@@ -258,6 +261,10 @@ if(BUILD_TESTING)
   target_include_directories(test_correspondence_compaction PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                              ${PCL_INCLUDE_DIRS})
   target_link_libraries(test_correspondence_compaction ${PCL_LIBRARIES})
+  ament_add_pytest_test(test_frontend_observation_node test/test_frontend_observation_node.py TIMEOUT 90)
+  ament_add_gtest(test_frontend_observation test/test_frontend_observation.cpp)
+  target_include_directories(test_frontend_observation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(test_frontend_observation OpenSSL::Crypto)
   ament_add_gtest(test_imu_coverage_policy test/test_imu_coverage_policy.cpp)
   target_include_directories(test_imu_coverage_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   ament_add_gtest(test_scan_time_policy test/test_scan_time_policy.cpp)

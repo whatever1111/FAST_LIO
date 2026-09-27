@@ -149,7 +149,7 @@ bool ikd_profile = false;  // [ikd-profile] per-scan rebuild-split line, gated b
 std::atomic<bool> mapping_enabled{true};
 /**************************/
 
-float res_last[100000] = {0.0};
+std::vector<float> res_last;
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
@@ -540,7 +540,7 @@ double ground_recover_sector_tol = 0.25;   // sector-vs-global plane height agre
 int ground_recover_max_rows = 4000;        // per-scan cap on recovered rows
 int canopy_ground_recovered = 0;           // diag: rows recovered last h_share call
 
-bool point_selected_surf[100000] = {0};
+std::vector<std::uint8_t> point_selected_surf;
 bool lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool is_first_lidar = true;
@@ -1845,6 +1845,21 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
   }
 }
 
+// Called once at the real downsampled-scan boundary, before any int-indexed
+// scan loop. No scratch allocation occurs in the parallel measurement loop.
+bool prepareScanCorrespondenceStorage(std::size_t count)
+{
+  if (!fast_lio::prepareCorrespondenceScratch(count, point_selected_surf, res_last, feats_down_size))
+    return false;
+  if (plane_cache.size() < count) {
+    plane_cache.resize(count);
+    gate_var.resize(count);
+    gate_nn0.resize(count);
+    gate_w.resize(count);
+  }
+  return true;
+}
+
 void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_data)
 {
   double match_start = omp_get_wtime();
@@ -1880,13 +1895,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   }
   corr_gate_rejected.store(0, std::memory_order_relaxed);
 
-/** closest surface search and residual computation **/
-  if (static_cast<int>(plane_cache.size()) < feats_down_size) {
-    plane_cache.resize(feats_down_size);
-    gate_var.resize(feats_down_size);
-    gate_nn0.resize(feats_down_size);
-    gate_w.resize(feats_down_size);
-  }
+  /** closest surface search and residual computation **/
 
 #ifdef MP_EN
   // Respect OMP_NUM_THREADS when set so the runtime CPU budget (cgroup
@@ -3145,12 +3154,8 @@ public:
 
     _featsArray.reset(new PointCloudXYZI());
 
-    memset(point_selected_surf, true, sizeof(point_selected_surf));
-    memset(res_last, -1000.0f, sizeof(res_last));
     downSizeFilterSurf.setLeaf(filter_size_surf_min);
     downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
-    memset(point_selected_surf, true, sizeof(point_selected_surf));
-    memset(res_last, -1000.0f, sizeof(res_last));
 
     Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
     Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
@@ -3628,11 +3633,16 @@ private:
 
       /*** downsample the feature points in a scan ***/
       downSizeFilterSurf.filter(feats_undistort->points, feats_down_body->points);
-      feats_down_body->width = static_cast<uint32_t>(feats_down_body->points.size());
+      const std::size_t downsampled_count = feats_down_body->points.size();
+      if (!prepareScanCorrespondenceStorage(downsampled_count)) {
+        RCLCPP_ERROR(
+          this->get_logger(), "Downsampled scan exceeds int-indexed estimator capacity: %zu points", downsampled_count);
+        return;
+      }
+      feats_down_body->width = static_cast<uint32_t>(downsampled_count);
       feats_down_body->height = 1;
       feats_down_body->is_dense = true;
       t1 = omp_get_wtime();
-      feats_down_size = feats_down_body->points.size();
       /*** Engulfment telemetry: far-field fraction of the raw downsampled scan ***/
       if (feats_down_size > 0) {
         int far_cnt = 0;

@@ -1,0 +1,67 @@
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp_components/node_factory.hpp>
+
+#include <class_loader/class_loader.hpp>
+#include <gtest/gtest.h>
+
+#include "common_lib.h"
+#include "ivox/ivox.hpp"
+
+extern lio_ivox::IVox<PointType> ikdtree;
+
+namespace
+{
+// Each case has its own CTest process: the production node owns file-scope state.
+class IVoxNodeCapacity : public ::testing::Test
+{
+protected:
+  void SetUp() override { rclcpp::init(0, nullptr); }
+  void TearDown() override { rclcpp::shutdown(); }
+
+  void constructAndCheck(int requested, std::size_t expected)
+  {
+    class_loader::ClassLoader loader(FASTLIO_COMPONENT_PATH);
+    const auto names = loader.getAvailableClasses<rclcpp_components::NodeFactory>();
+    ASSERT_EQ(names.size(), 1u);
+    auto factory = loader.createInstance<rclcpp_components::NodeFactory>(names.front());
+    rclcpp::NodeOptions options;
+    options.parameter_overrides({rclcpp::Parameter("ivox_max_voxels", requested)});
+    if (requested < 0) {
+      EXPECT_THROW(factory->create_node_instance(options), std::invalid_argument);
+      return;
+    }
+    auto node = factory->create_node_instance(options);
+    ASSERT_NE(node.get_node_base_interface(), nullptr);
+    EXPECT_EQ(ikdtree.maxVoxels(), expected);
+    if (requested > 0) {
+      PointVector points;
+      for (int i = 0; i < requested + 2; ++i) {
+        PointType point{};
+        point.x = static_cast<float>(i * 10);
+        points.push_back(point);
+      }
+      ikdtree.Add_Points(points, false);
+      EXPECT_EQ(ikdtree.numVoxels(), expected);
+      EXPECT_EQ(ikdtree.evictedVoxels(), 2u);
+    }
+  }
+};
+#ifdef FASTLIO_CAPACITY_negative
+TEST_F(IVoxNodeCapacity, NegativeRejected)
+{
+  constructAndCheck(-1, 0);
+}
+#endif
+#ifdef FASTLIO_CAPACITY_zero
+TEST_F(IVoxNodeCapacity, ZeroSelectsDefault)
+{
+  constructAndCheck(0, 5000000u);
+}
+#endif
+#ifdef FASTLIO_CAPACITY_small
+TEST_F(IVoxNodeCapacity, SmallCapacityIsEnforced)
+{
+  constructAndCheck(2, 2u);
+}
+#endif
+}  // namespace

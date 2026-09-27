@@ -1,12 +1,29 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
 namespace fast_lio
 {
+
+// Check before narrowing to the estimator's int-indexed loops. A rejected size
+// leaves the current scan's storage and count unchanged.
+inline bool prepareCorrespondenceScratch(std::size_t count,
+                                         std::vector<std::uint8_t> & selected,
+                                         std::vector<float> & residuals,
+                                         int & scanCount)
+{
+  if (count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    return false;
+  selected.resize(count, std::uint8_t{0});
+  residuals.resize(count, 0.0f);
+  scanCount = static_cast<int>(count);
+  return true;
+}
 
 // Compact admitted rows without changing selection, row order or weights. The observer
 // sees each selected source index in that same order (residual sums / diagnostics).

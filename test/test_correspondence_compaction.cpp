@@ -12,6 +12,28 @@ namespace
 {
 using Cloud = pcl::PointCloud<pcl::PointXYZINormal>;
 
+TEST(CorrespondenceScratch, CheckedSizeAndDeterministicNewElements)
+{
+  std::vector<std::uint8_t> selected;
+  std::vector<float> residuals;
+  int count = -1;
+  ASSERT_TRUE(fast_lio::prepareCorrespondenceScratch(100001, selected, residuals, count));
+  EXPECT_EQ(count, 100001);
+  EXPECT_EQ(selected.back(), 0u);
+  EXPECT_EQ(residuals.back(), 0.0f);
+  selected.back() = 1;
+  residuals.back() = 0.25f;
+  EXPECT_FALSE(fast_lio::prepareCorrespondenceScratch(
+    static_cast<std::size_t>(std::numeric_limits<int>::max()) + 1, selected, residuals, count));
+  EXPECT_EQ(count, 100001);
+  EXPECT_EQ(selected.back(), 1u);
+  EXPECT_EQ(residuals.back(), 0.25f);
+  ASSERT_TRUE(fast_lio::prepareCorrespondenceScratch(0, selected, residuals, count));
+  EXPECT_EQ(count, 0);
+  EXPECT_TRUE(selected.empty());
+  EXPECT_TRUE(residuals.empty());
+}
+
 class CorrespondenceCompaction : public ::testing::Test
 {
 protected:

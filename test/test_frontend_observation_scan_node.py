@@ -294,9 +294,11 @@ def test_real_scans_idle_duplicate_rollback_restart():
                 original_error = sys.exc_info()[1]
                 killed = False
                 cleanup_error = None
+                shutdown_signal = signal.SIGINT if index == 0 else signal.SIGTERM
+                shutdown_started = time.monotonic()
                 try:
                     if process.poll() is None:
-                        process.send_signal(signal.SIGINT)
+                        process.send_signal(shutdown_signal)
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
@@ -307,6 +309,8 @@ def test_real_scans_idle_duplicate_rollback_restart():
                     cleanup_error = repr(error)
                 record.update(
                     returncode=process.returncode,
+                    shutdown_signal=shutdown_signal.name,
+                    shutdown_elapsed_seconds=time.monotonic() - shutdown_started,
                     sigkill=killed,
                     cleanup_error=cleanup_error,
                     original_error=repr(original_error) if original_error else None,

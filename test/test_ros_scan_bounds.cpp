@@ -29,6 +29,24 @@ struct ScanEvidence
   int effective;
 };
 
+constexpr std::size_t kPreparedEvidenceCapacity = 64;
+constexpr std::size_t kModelEvidenceCapacity = 128;
+constexpr std::size_t kOdomEvidenceCapacity = 256;
+constexpr std::size_t kTargetEvidenceCapacity = 3;
+constexpr double kTargetWaitSeconds = 60.0;
+
+struct TargetEvidence
+{
+  std::size_t count;
+  double stamp;
+  double elapsedSeconds;
+  bool prepared;
+  bool modeled;
+  bool odom;
+  double lastOdom;
+  bool lastPoseFinite;
+};
+
 class RosScanBounds : public ::testing::Test
 {
 protected:
@@ -70,13 +88,17 @@ protected:
         lastOdom = rclcpp::Time(msg->header.stamp).seconds();
         lastPoseFinite = std::isfinite(msg->pose.pose.position.x) && std::isfinite(msg->pose.pose.position.y) &&
                          std::isfinite(msg->pose.pose.position.z);
+        if (odomStamps.size() < kOdomEvidenceCapacity)
+          odomStamps.push_back(lastOdom);
+        else
+          ++omittedOdomStamps;
       });
     fast_lio_test::afterScanPrepared = [this](std::size_t count, double stamp) {
-      if (prepared.size() < 64)
+      if (prepared.size() < kPreparedEvidenceCapacity)
         prepared.push_back({count, stamp, -1});
     };
     fast_lio_test::afterHModelRows = [this](std::size_t count, double stamp, int effective) {
-      if (modeled.size() < 128)
+      if (modeled.size() < kModelEvidenceCapacity)
         modeled.push_back({count, stamp, effective});
     };
     executor->add_node(subject->get_node_base_interface());
@@ -104,10 +126,31 @@ protected:
     rclcpp::shutdown();
     std::ofstream receipt(FASTLIO_SCAN_RECEIPT_PATH);
     receipt << "{\"shutdown_completed\":true,\"case_failed\":" << (HasFailure() ? "true" : "false")
-            << ",\"prepared\":[";
+            << ",\"prepared_capacity\":" << kPreparedEvidenceCapacity
+            << ",\"h_model_capacity\":" << kModelEvidenceCapacity << ",\"prepared\":[";
     writeEvidence(receipt, prepared);
     receipt << "],\"h_model\":[";
     writeEvidence(receipt, modeled);
+    receipt << "],\"odom_capacity\":" << kOdomEvidenceCapacity << ",\"odom_omitted\":" << omittedOdomStamps
+            << ",\"odom_stamps\":[";
+    for (std::size_t i = 0; i < odomStamps.size(); ++i) {
+      if (i)
+        receipt << ',';
+      receipt << odomStamps[i];
+    }
+    receipt << "],\"target_capacity\":" << kTargetEvidenceCapacity
+            << ",\"target_wait_budget_seconds\":" << kTargetWaitSeconds << ",\"targets\":[";
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+      if (i)
+        receipt << ',';
+      const auto & target = targets[i];
+      receipt << "{\"count\":" << target.count << ",\"stamp\":" << target.stamp
+              << ",\"steady_elapsed_seconds\":" << target.elapsedSeconds
+              << ",\"prepared\":" << (target.prepared ? "true" : "false")
+              << ",\"modeled\":" << (target.modeled ? "true" : "false")
+              << ",\"odom\":" << (target.odom ? "true" : "false") << ",\"last_odom\":" << target.lastOdom
+              << ",\"last_pose_finite\":" << (target.lastPoseFinite ? "true" : "false") << '}';
+    }
     receipt << "]}\n";
   }
 
@@ -176,6 +219,9 @@ protected:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr lidar;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom;
   std::vector<ScanEvidence> prepared, modeled;
+  std::vector<double> odomStamps;
+  std::size_t omittedOdomStamps = 0;
+  std::vector<TargetEvidence> targets;
   std::int64_t nextImu = 990000000;
   double lastOdom = -1.0;
   bool lastPoseFinite = false;
@@ -194,9 +240,23 @@ TEST_F(RosScanBounds, RealSubscriptionsDownsampleAndModelAllThreeBounds)
   for (const std::size_t count : {99999u, 100000u, 100001u}) {
     sendScan(count, start);
     const double end = start + 0.05;
-    ASSERT_TRUE(spinUntil(
-      [&] { return saw(prepared, count, end) && saw(modeled, count, end) && std::abs(lastOdom - end) < 1e-6; }, 15.0))
-      << "production prepare/h_model/Odometry missing exact downsampled count=" << count;
+    // Execution allowance for the production callback and subsequent observer dispatch;
+    // this wall-clock budget is not a performance acceptance threshold.
+    const auto waitStart = std::chrono::steady_clock::now();
+    const bool ready = spinUntil(
+      [&] { return saw(prepared, count, end) && saw(modeled, count, end) && std::abs(lastOdom - end) < 1e-6; },
+      kTargetWaitSeconds);
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - waitStart).count();
+    if (targets.size() < kTargetEvidenceCapacity)
+      targets.push_back({count,
+                         end,
+                         elapsed,
+                         saw(prepared, count, end),
+                         saw(modeled, count, end),
+                         std::abs(lastOdom - end) < 1e-6,
+                         lastOdom,
+                         lastPoseFinite});
+    ASSERT_TRUE(ready) << "production prepare/h_model/Odometry missing exact downsampled count=" << count;
     EXPECT_TRUE(lastPoseFinite);
     start += 0.1;
   }

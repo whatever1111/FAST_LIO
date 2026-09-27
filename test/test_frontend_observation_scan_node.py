@@ -296,9 +296,11 @@ def test_real_scans_idle_duplicate_rollback_restart():
                 cleanup_error = None
                 shutdown_signal = signal.SIGINT if index == 0 else signal.SIGTERM
                 shutdown_started = time.monotonic()
+                shutdown_signal_sent = False
                 try:
                     if process.poll() is None:
                         process.send_signal(shutdown_signal)
+                        shutdown_signal_sent = True
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
@@ -310,6 +312,7 @@ def test_real_scans_idle_duplicate_rollback_restart():
                 record.update(
                     returncode=process.returncode,
                     shutdown_signal=shutdown_signal.name,
+                    shutdown_signal_sent=shutdown_signal_sent,
                     shutdown_elapsed_seconds=time.monotonic() - shutdown_started,
                     sigkill=killed,
                     cleanup_error=cleanup_error,
@@ -324,7 +327,7 @@ def test_real_scans_idle_duplicate_rollback_restart():
                         file=sys.stderr,
                     )
                 else:
-                    assert cleanup_error is None and not killed and process.returncode == 0, record
+                    assert shutdown_signal_sent and cleanup_error is None and not killed and process.returncode == 0, record
                     wait(lambda: imu.get_subscription_count() == lidar.get_subscription_count() == 0)
                     settle(0.1)
 

@@ -5,10 +5,10 @@
 #include <gtest/gtest.h>
 #include <mutex>
 
-#include "common_lib.h"
 #include "delayed_map_insertion.hpp"
 #include "ivox/ivox.hpp"
 #include "laser_mapping_test_hooks.hpp"
+#include "laser_mapping_test_types.hpp"
 
 extern lio_ivox::IVox<PointType> ikdtree;
 extern PointCloudXYZI::Ptr feats_down_body;

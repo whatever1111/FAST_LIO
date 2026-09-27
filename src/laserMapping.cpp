@@ -2035,16 +2035,16 @@ void buildAndPublishFrontendObservation(bool completed, bool scanEvent, double e
   message.health_flags = verdict.health;
   // Per-scan metrics cannot be borrowed by an idle sample.
   if (completed) {
-    message.has_observability_along = std::isfinite(scan_obs_along) && scan_obs_along >= 0.0 && scan_obs_along <= 1.0;
+    message.has_observability_along = fast_lio::frontendHasObservabilityAlong(ekf_iters, scan_obs_along);
     if (message.has_observability_along)
       message.observability_along = scan_obs_along;
-    message.has_effective_feature_count = effct_feat_num >= 0;
+    message.has_effective_feature_count = fast_lio::frontendHasEffectiveFeatureCount(ekf_iters, effct_feat_num);
     if (message.has_effective_feature_count)
       message.effective_feature_count = static_cast<std::uint32_t>(effct_feat_num);
     message.has_far_point_fraction = std::isfinite(scan_far_frac) && scan_far_frac >= 0.0 && scan_far_frac <= 1.0;
     if (message.has_far_point_fraction)
       message.far_point_fraction = scan_far_frac;
-    message.has_mean_residual = std::isfinite(res_mean_last) && res_mean_last >= 0.0;
+    message.has_mean_residual = fast_lio::frontendHasMeanResidual(ekf_iters, effct_feat_num, res_mean_last);
     if (message.has_mean_residual)
       message.mean_residual_m = res_mean_last;
     message.has_body_speed = std::isfinite(scan_body_speed) && scan_body_speed >= 0.0;

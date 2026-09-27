@@ -142,6 +142,23 @@ inline std::uint8_t frontendWire(Enum value)
   return static_cast<std::uint8_t>(value);
 }
 
+inline bool frontendHasEffectiveFeatureCount(int measurementIterations, int effectiveFeatures)
+{
+  return measurementIterations > 0 && effectiveFeatures >= 0;
+}
+
+inline bool frontendHasObservabilityAlong(int measurementIterations, double observability)
+{
+  return measurementIterations > 0 && std::isfinite(observability) && observability >= 0.0 && observability <= 1.0;
+}
+
+// Legacy residual storage survives a scan with no admitted measurement rows.
+// Require evidence from this scan before exposing it as an observation metric.
+inline bool frontendHasMeanResidual(int measurementIterations, int effectiveFeatures, double residual)
+{
+  return measurementIterations > 0 && effectiveFeatures > 0 && std::isfinite(residual) && residual >= 0.0;
+}
+
 struct FrontendFacts
 {
   bool completed = false;

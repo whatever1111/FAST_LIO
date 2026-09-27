@@ -153,6 +153,39 @@ TEST(FrontendObservation, ProgressSeparatesCompletionOutputAndIdle)
   EXPECT_EQ(progress.input, std::numeric_limits<std::uint64_t>::max());
 }
 
+TEST(FrontendObservation, MetricsRequireCurrentScanMeasurements)
+{
+  EXPECT_TRUE(fast_lio::frontendHasEffectiveFeatureCount(2, 10));
+  EXPECT_TRUE(fast_lio::frontendHasObservabilityAlong(2, 0.75));
+  EXPECT_FALSE(fast_lio::frontendHasEffectiveFeatureCount(0, 10));
+  EXPECT_FALSE(fast_lio::frontendHasObservabilityAlong(0, 0.75));
+  EXPECT_TRUE(fast_lio::frontendHasEffectiveFeatureCount(1, 0));
+  EXPECT_TRUE(fast_lio::frontendHasObservabilityAlong(1, 0.0));
+  EXPECT_TRUE(fast_lio::frontendHasObservabilityAlong(1, 1.0));
+  EXPECT_FALSE(fast_lio::frontendHasEffectiveFeatureCount(1, -1));
+  EXPECT_FALSE(fast_lio::frontendHasEffectiveFeatureCount(-1, 10));
+  EXPECT_FALSE(fast_lio::frontendHasObservabilityAlong(-1, 0.75));
+  EXPECT_FALSE(fast_lio::frontendHasObservabilityAlong(1, -0.1));
+  EXPECT_FALSE(fast_lio::frontendHasObservabilityAlong(1, 1.1));
+  EXPECT_FALSE(fast_lio::frontendHasObservabilityAlong(1, std::numeric_limits<double>::quiet_NaN()));
+  EXPECT_FALSE(fast_lio::frontendHasObservabilityAlong(1, std::numeric_limits<double>::infinity()));
+  EXPECT_FALSE(fast_lio::frontendHasObservabilityAlong(1, -std::numeric_limits<double>::infinity()));
+  const double previousResidual = 0.25;
+  EXPECT_TRUE(fast_lio::frontendHasMeanResidual(2, 10, previousResidual));
+  // The next scan can retain the same legacy value after admitting no rows,
+  // or without invoking the measurement callback at all.
+  EXPECT_FALSE(fast_lio::frontendHasMeanResidual(1, 0, previousResidual));
+  EXPECT_FALSE(fast_lio::frontendHasMeanResidual(0, 10, previousResidual));
+  EXPECT_FALSE(fast_lio::frontendHasMeanResidual(-1, 10, previousResidual));
+  EXPECT_FALSE(fast_lio::frontendHasMeanResidual(1, -1, previousResidual));
+  EXPECT_FALSE(fast_lio::frontendHasMeanResidual(1, 10, -0.1));
+  EXPECT_FALSE(fast_lio::frontendHasMeanResidual(1, 10, std::numeric_limits<double>::quiet_NaN()));
+  EXPECT_FALSE(fast_lio::frontendHasMeanResidual(1, 10, std::numeric_limits<double>::infinity()));
+  EXPECT_FALSE(fast_lio::frontendHasMeanResidual(1, 10, -std::numeric_limits<double>::infinity()));
+  EXPECT_TRUE(fast_lio::frontendHasMeanResidual(1, 1, 0.0));
+  EXPECT_TRUE(fast_lio::frontendHasMeanResidual(3, 20, 0.125));
+}
+
 TEST(FrontendObservation, ExactStampAndHashGoldenVector)
 {
   std::int64_t stamp = 0;

@@ -42,18 +42,21 @@ protected:
     factory = loader->createInstance<rclcpp_components::NodeFactory>(names.front());
     rclcpp::NodeOptions options;
     options.use_intra_process_comms(true);
-    options.parameter_overrides({rclcpp::Parameter("common.lid_topic", "/test_scan_bounds/points"),
-                                 rclcpp::Parameter("common.imu_topic", "/test_scan_bounds/imu"),
-                                 rclcpp::Parameter("preprocess.lidar_type", 3),
-                                 rclcpp::Parameter("preprocess.timestamp_unit", 3),
-                                 rclcpp::Parameter("point_filter_num", 1),
-                                 rclcpp::Parameter("feature_extract_enable", false),
-                                 rclcpp::Parameter("filter_size_surf", 0.001),
-                                 rclcpp::Parameter("filter_size_map", 0.05),
-                                 rclcpp::Parameter("imu_init_require_still", false),
-                                 rclcpp::Parameter("publish.scan_publish_en", false),
-                                 rclcpp::Parameter("publish.path_en", false),
-                                 rclcpp::Parameter("runtime_pos_log_enable", false)});
+    options.parameter_overrides(
+      {rclcpp::Parameter("mapping.extrinsic_T", std::vector<double>{0.0, 0.0, 0.0}),
+       rclcpp::Parameter("mapping.extrinsic_R", std::vector<double>{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}),
+       rclcpp::Parameter("common.lid_topic", "/test_scan_bounds/points"),
+       rclcpp::Parameter("common.imu_topic", "/test_scan_bounds/imu"),
+       rclcpp::Parameter("preprocess.lidar_type", 3),
+       rclcpp::Parameter("preprocess.timestamp_unit", 3),
+       rclcpp::Parameter("point_filter_num", 1),
+       rclcpp::Parameter("feature_extract_enable", false),
+       rclcpp::Parameter("filter_size_surf", 0.001),
+       rclcpp::Parameter("filter_size_map", 0.05),
+       rclcpp::Parameter("imu_init_require_still", false),
+       rclcpp::Parameter("publish.scan_publish_en", false),
+       rclcpp::Parameter("publish.path_en", false),
+       rclcpp::Parameter("runtime_pos_log_enable", false)});
     subject.emplace(factory->create_node_instance(options));
     rclcpp::NodeOptions observerOptions;
     observerOptions.use_intra_process_comms(true);

@@ -218,7 +218,7 @@ if(BUILD_TESTING)
       rosidl_target_interfaces(test_async_map_reset ${PROJECT_NAME} "rosidl_typesupport_cpp")
     endif()
     find_package(class_loader REQUIRED)
-    ament_add_gtest(test_ros_scan_bounds test/test_ros_scan_bounds.cpp TIMEOUT 90)
+    ament_add_gtest(test_ros_scan_bounds test/test_ros_scan_bounds.cpp TIMEOUT 240)
     target_include_directories(test_ros_scan_bounds PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
       ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})

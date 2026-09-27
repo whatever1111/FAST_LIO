@@ -218,6 +218,21 @@ if(BUILD_TESTING)
       rosidl_target_interfaces(test_async_map_reset ${PROJECT_NAME} "rosidl_typesupport_cpp")
     endif()
     find_package(class_loader REQUIRED)
+    ament_add_gtest(test_ros_scan_bounds test/test_ros_scan_bounds.cpp TIMEOUT 90)
+    target_include_directories(test_ros_scan_bounds PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test_results/${PROJECT_NAME})
+    target_compile_definitions(test_ros_scan_bounds PRIVATE
+      FASTLIO_TEST_COMPONENT_PATH="$<TARGET_FILE:fastlio_mapping_test_component>"
+      FASTLIO_SCAN_RECEIPT_PATH="${CMAKE_CURRENT_BINARY_DIR}/test_results/${PROJECT_NAME}/ros_scan_bounds_receipt.json")
+    target_link_libraries(test_ros_scan_bounds fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen)
+    ament_target_dependencies(test_ros_scan_bounds ${dependencies} class_loader)
+    if(cpp_typesupport_target)
+      target_link_libraries(test_ros_scan_bounds ${cpp_typesupport_target})
+    else()
+      rosidl_target_interfaces(test_ros_scan_bounds ${PROJECT_NAME} "rosidl_typesupport_cpp")
+    endif()
     # One actual component activation per process: production globals are not reset between nodes.
     foreach(capacity_case negative zero small)
       ament_add_gtest(test_ivox_node_capacity_${capacity_case} test/test_ivox_node_capacity.cpp TIMEOUT 30)

@@ -1399,6 +1399,8 @@ namespace fast_lio_test
 std::function<void()> beforeMapAdd;
 std::function<void()> beforeResetJoin;
 std::function<void()> afterPendingReset;
+std::function<void(std::size_t, double)> afterScanPrepared;
+std::function<void(std::size_t, double, int)> afterHModelRows;
 }  // namespace fast_lio_test
 #endif
 
@@ -2294,6 +2296,11 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
         res_bin_ss[b] += double(res_last[i]) * res_last[i];
       }
     }));
+
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::afterHModelRows)
+    fast_lio_test::afterHModelRows(static_cast<std::size_t>(feats_down_size), lidar_end_time, effct_feat_num);
+#endif
 
   // Position-observability metric (degeneracy detector): eigenvalues of the
   // normal information matrix M = sum(n n^T) over effective points. The min
@@ -3694,6 +3701,10 @@ private:
           this->get_logger(), "Downsampled scan exceeds int-indexed estimator capacity: %zu points", downsampled_count);
         return;
       }
+#ifdef FASTLIO_TEST_HOOKS
+      if (fast_lio_test::afterScanPrepared)
+        fast_lio_test::afterScanPrepared(downsampled_count, lidar_end_time);
+#endif
       feats_down_body->width = static_cast<uint32_t>(downsampled_count);
       feats_down_body->height = 1;
       feats_down_body->is_dense = true;

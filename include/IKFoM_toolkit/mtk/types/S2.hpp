@@ -274,7 +274,7 @@ public:
 		else{
 			vect_type Bu = Bx*delta;
 			SO3_type exp_delta;
-			exp_delta.w() = MTK::exp<scalar, 3>(exp_delta.vec(), Bu, scalar(1/2));
+			exp_delta.w() = MTK::exp<scalar, 3>(exp_delta.vec(), Bu, scalar(0.5));
 			res = -exp_delta.toRotationMatrix()*MTK::hat(vec)*MTK::A_matrix(Bu).transpose()*Bx;
 		}
 	}

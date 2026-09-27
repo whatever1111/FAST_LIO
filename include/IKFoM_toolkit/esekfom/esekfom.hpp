@@ -2047,8 +2047,28 @@ public:
         diagnostics->correction_projection_row_norm(row) = correction_projection.row(row).norm();
       }
     }
+    const cov conditioned = (cov::Identity() - K * H) * P_;
+    state x_before = x_;
     x_.boxplus(dx);
-    P_ = (cov::Identity() - K * H) * P_;
+
+    // The conditional covariance still uses the pre-injection error coordinates. Move every
+    // block (including cross-covariances) into the tangent space at the new nominal state.
+    cov reset = cov::Identity();
+    for (const auto & entry : x_.SO3_state) {
+      const int idx = entry.first;
+      const MTK::vect<3, scalar_type> rotation_delta = dx.template segment<3>(idx);
+      reset.template block<3, 3>(idx, idx) = MTK::A_matrix(rotation_delta).transpose();
+    }
+    for (const auto & entry : x_.S2_state) {
+      const int idx = entry.first;
+      const MTK::vect<2, scalar_type> direction_delta = dx.template segment<2>(idx);
+      Eigen::Matrix<scalar_type, 2, 3> Nx;
+      Eigen::Matrix<scalar_type, 3, 2> Mx;
+      x_.S2_Nx_yy(Nx, idx);
+      x_before.S2_Mx(Mx, direction_delta, idx);
+      reset.template block<2, 2>(idx, idx) = Nx * Mx;
+    }
+    P_ = reset * conditioned * reset.transpose();
     if (diagnostics != nullptr) {
       diagnostics->covariance_diag_after = P_.diagonal();
     }

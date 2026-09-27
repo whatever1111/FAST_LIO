@@ -32,6 +32,7 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
+#include "delayed_map_insertion.hpp"
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
@@ -98,6 +99,8 @@
 #include "engulf_release.hpp"
 #include "rp_consider.hpp"
 #include "correspondence_gate.hpp"
+#include "correspondence_compaction.hpp"
+#include "cached_plane.hpp"
 #include "gravity_align_kinematics.hpp"
 #include "imu_gap_prior.hpp"
 #include "reanchor_gate.hpp"
@@ -555,8 +558,7 @@ vector<BoxPointType> cub_needrm;
 vector<PointVector> Nearest_Points;
 // The neighbour set only moves on the iterations that search, so the 5x3 plane fit and the
 // body-range scale in the residual gate are invariant in between and are kept per point.
-vector<VF(4), Eigen::aligned_allocator<VF(4)>> plane_cache;
-vector<char> plane_cache_ok;
+vector<fast_lio::CachedPlane, Eigen::aligned_allocator<fast_lio::CachedPlane>> plane_cache;
 // Neighbour refresh: the filter searches again once it declares itself converged, but if the
 // state barely moved since the last search the neighbour sets cannot have changed, and that
 // second 5-NN pass over the scan is the single most expensive item in the front end.
@@ -568,7 +570,6 @@ M3D nn_last_search_rot = M3D::Identity();
 bool nn_have_last_search = false;
 double nn_max_shift = 0.0;  // per-scan telemetry: largest would-be refresh shift (m)
 int nn_skips = 0;
-vector<float> body_range_sqrt;
 vector<double> extrinT(3, 0.0);
 vector<double> extrinR(9, 0.0);
 using SteadyClock = std::chrono::steady_clock;
@@ -1379,7 +1380,7 @@ bool async_map_en = true;  // gated by env FLIO_ASYNC_MAP ("0" disables)
 // its length depends on scheduling (non-reproducible). This makes the lag
 // explicit: same benefit, bit-reproducible.
 int map_insert_delay_scans = 0;
-std::deque<std::pair<PointVector, PointVector>> map_insert_pending;
+fast_lio::DelayedMapInsertion<PointVector> map_insert_pending;
 std::mutex map_add_mtx;
 std::condition_variable map_add_cv;
 PointVector map_add_ds_;        // handoff: points to add WITH downsample
@@ -1500,20 +1501,15 @@ void map_incremental()
     }
   }
 
-  if (map_insert_delay_scans > 0) {
-    // Hold this scan's (world-frame) points; insert the scan that is now
-    // `delay` scans old. The add/no-add decisions above were made against the
-    // map as it was when the scan was matched — good enough for a lag of a few
-    // scans, and identical every run.
-    map_insert_pending.emplace_back(std::move(PointToAdd), std::move(PointNoNeedDownsample));
-    if (map_insert_pending.size() <= static_cast<size_t>(map_insert_delay_scans)) {
-      add_point_size = 0;
-      return;
-    }
-    PointToAdd = std::move(map_insert_pending.front().first);
-    PointNoNeedDownsample = std::move(map_insert_pending.front().second);
-    map_insert_pending.pop_front();
+  // Preserve each scan's paired add decisions and release exactly the batch
+  // that is now delay scans old; the reset path discards its old-world history.
+  auto ready = map_insert_pending.stage(std::move(PointToAdd), std::move(PointNoNeedDownsample), map_insert_delay_scans);
+  if (!ready) {
+    add_point_size = 0;
+    return;
   }
+  PointToAdd = std::move(ready->first);
+  PointNoNeedDownsample = std::move(ready->second);
 
   if (async_map_en) {
     // Off-thread: the worker calls Add_Points during the inter-scan gap; joined before
@@ -1873,8 +1869,6 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   }
   ++ekf_iters;
   ekf_search_iters += searching ? 1 : 0;
-  laserCloudOri->clear();
-  corr_normvect->clear();
   total_residual = 0.0;
 
   // [v11] the gate judges every residual against the prior's [pos, rot] covariance, which IKFoM keeps
@@ -1889,12 +1883,9 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
 /** closest surface search and residual computation **/
   if (static_cast<int>(plane_cache.size()) < feats_down_size) {
     plane_cache.resize(feats_down_size);
-    plane_cache_ok.resize(feats_down_size);
-    body_range_sqrt.resize(feats_down_size);
     gate_var.resize(feats_down_size);
     gate_nn0.resize(feats_down_size);
     gate_w.resize(feats_down_size);
-    corr_weight.resize(feats_down_size);
   }
 
 #ifdef MP_EN
@@ -1927,25 +1918,26 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
 
     auto & points_near = Nearest_Points[i];
 
+    auto & cached_plane = plane_cache[i];
     if (searching) {
-      /** Find the closest surfaces in the map **/
+      // A failed search/fit must not leave the previous neighbourhood usable.
+      cached_plane.invalidate();
       ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
-      point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS        ? false
-                               : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false
-                                                                            : true;
-      if (point_selected_surf[i]) {
-        plane_cache_ok[i] = esti_plane(plane_cache[i], points_near, 0.1f) ? 1 : 0;
-        body_range_sqrt[i] = sqrt(p_body.norm());
+      if (points_near.size() >= NUM_MATCH_POINTS && pointSearchSqDis[NUM_MATCH_POINTS - 1] <= 5) {
+        cached_plane.fit<NUM_MATCH_POINTS>(points_near, 0.1f, sqrt(p_body.norm()));
       }
     }
 
-    if (!point_selected_surf[i])
+    // Per-iteration selection is independent of the cached neighbours. A row
+    // rejected by residual/innovation/ground gates can recover at the new pose.
+    point_selected_surf[i] = false;
+    if (!cached_plane.valid())
       continue;
 
-    const VF(4) & pabcd = plane_cache[i];
-    point_selected_surf[i] = false;
-    if (plane_cache_ok[i]) {
-      float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
+    const VF(4) & pabcd = cached_plane.coefficients();
+    {
+      const auto residual = cached_plane.evaluate(point_world.x, point_world.y, point_world.z);
+      const float pd2 = residual.distance;
       // [v11] the gate's inputs, computed while `s` still names the state; the decision waits for the
       // whole scan's residual scale (below the loop)
       if (gate_on) {
@@ -1959,9 +1951,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
           gate_nn0[i] = (V3D(points_near[0].x, points_near[0].y, points_near[0].z) - p_global).norm();
         }
       }
-      float s = 1 - 0.9 * fabs(pd2) / body_range_sqrt[i];
-
-      if (s > 0.9) {
+      if (residual.accepted) {
         point_selected_surf[i] = true;
         normvec->points[i].x = pabcd(0);
         normvec->points[i].y = pabcd(1);
@@ -2225,11 +2215,11 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     std::fill(std::begin(res_bin_ss), std::end(res_bin_ss), 0.0);
   }
 
-  for (int i = 0; i < feats_down_size; i++) {
-    if (point_selected_surf[i]) {
-      laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
-      corr_normvect->points[effct_feat_num] = normvec->points[i];
-      corr_weight[effct_feat_num] = corr_kernel != 0 ? gate_w[i] : 1.0;
+  // res_last and point_selected_surf have the same extent; the compactor checks
+  // that extent and the point/normal/weight bounds before invoking this observer.
+  effct_feat_num = static_cast<int>(fast_lio::compactSelectedCorrespondences(
+    static_cast<std::size_t>(feats_down_size), *feats_down_body, *normvec, point_selected_surf,
+    gate_w, corr_kernel != 0, *laserCloudOri, *corr_normvect, corr_weight, [&](std::size_t i) {
       total_residual += res_last[i];
       if (degeneracy_debug) {
         const PointType & pb = feats_down_body->points[i];
@@ -2239,9 +2229,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
         ++res_bin_n[b];
         res_bin_ss[b] += double(res_last[i]) * res_last[i];
       }
-      effct_feat_num++;
-    }
-  }
+    }));
 
   // Position-observability metric (degeneracy detector): eigenvalues of the
   // normal information matrix M = sum(n n^T) over effective points. The min
@@ -2423,8 +2411,8 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
         const V3D nrm = es.eigenvectors().col(0);
         const V3D d = pw - c;
         d_in = (d - nrm * nrm.dot(d)).norm();
-        if (plane_cache_ok[i]) {
-          const VF(4) & pl = plane_cache[i];
+        if (plane_cache[i].valid()) {
+          const VF(4) & pl = plane_cache[i].coefficients();
           double ss = 0.0;
           for (const auto & q : near) {
             const double dd = pl(0) * q.x + pl(1) * q.y + pl(2) * q.z + pl(3);
@@ -2453,7 +2441,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
       fout_corr << std::setprecision(15) << lidar_end_time << ',' << iter << ',' << i << ',' << int(eff)
                 << std::setprecision(5) << ',' << p_body.norm() << ',' << point_this(0) << ',' << point_this(1) << ','
                 << point_this(2) << ',' << nx << ',' << ny << ',' << nz << ',' << pd2 << ',' << ax << ',' << ay << ','
-                << az << ',' << nn0 << ',' << nn4 << ',' << n_near << ',' << int(plane_cache_ok[i]) << ',' << plane_rms
+                << az << ',' << nn0 << ',' << nn4 << ',' << n_near << ',' << int(plane_cache[i].valid()) << ',' << plane_rms
                 << ',' << lam0 << ',' << lam1 << ',' << lam2 << ',' << d_in << ',' << cosv << ',' << w << ',' << pw(2)
                 << ',' << pw(0) << ',' << pw(1) << '\n';
     }
@@ -3057,6 +3045,10 @@ public:
       const int ivox_nearby = this->declare_parameter<int>("ivox_nearby_type", 26);
       const int ivox_vcap = this->declare_parameter<int>("ivox_voxel_capacity", 50);
       const int ivox_maxvox = this->declare_parameter<int>("ivox_max_voxels", 5000000);
+      if (ivox_maxvox < 0) {
+        RCLCPP_FATAL(this->get_logger(), "ivox_max_voxels must be nonnegative (0 uses 5000000); got %d", ivox_maxvox);
+        throw std::invalid_argument("ivox_max_voxels must be nonnegative");
+      }
       ikdtree.Init(static_cast<float>(ivox_res), ivox_nearby, ivox_vcap, static_cast<std::size_t>(ivox_maxvox));
       RCLCPP_INFO(this->get_logger(),
                   "[IVOX] map backend = iVox (res=%.2f nearby=%d voxel_cap=%d max_voxels=%d)",
@@ -3497,6 +3489,8 @@ private:
       ekf_iters = 0;
       ekf_search_iters = 0;
       nn_have_last_search = false;
+      for (auto & cached_plane : plane_cache)
+        cached_plane.invalidate();
       nn_max_shift = 0.0;
       nn_skips = 0;
       kdtree_search_time = 0.0;
@@ -3766,6 +3760,13 @@ private:
                 return;
               }
 #ifdef USE_IVOX
+              if (!ikdtree.canAddPinnedPoints(prior_ds->points)) {
+                RCLCPP_FATAL(this->get_logger(),
+                             "Prior map cannot fit coarse capacity (%zu) or has unrepresentable voxel coordinates",
+                             ikdtree.maxVoxels());
+                rclcpp::shutdown();
+                return;
+              }
               if (prior_map_pinned_) {
                 ikdtree.AddPinnedPoints(prior_ds->points);
                 ikdtree.Add_Points(feats_down_world->points, true);
@@ -4499,6 +4500,9 @@ private:
       auto rebuild_local_map = [&](const char * tag) {
         if (async_map_en)
           joinMapAdd();
+        // The worker no longer owns an old batch. Pending world-frame points
+        // belong to the discarded live history and must not reappear later.
+        map_insert_pending.reset();
         feats_down_world->resize(feats_down_size);
         for (int i = 0; i < feats_down_size; i++) {
           pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
@@ -5221,6 +5225,13 @@ private:
     in_frame->width = static_cast<uint32_t>(in_frame->points.size());
     in_frame->height = 1;
 
+    if (!ikdtree.canReplacePinnedPoints(in_frame->points)) {
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "[PRIOR-MAP] replacement exceeds pinned coarse capacity (%zu) or voxel coordinate range; "
+                           "keeping the installed prior and transform",
+                           ikdtree.maxVoxels());
+      return;
+    }
     const std::size_t evicted_before = ikdtree.evictedVoxels();
     const int live_before = ikdtree.size();
     ikdtree.clearPinned();

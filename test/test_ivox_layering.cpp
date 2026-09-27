@@ -1,11 +1,11 @@
 // The prior-map tier: what the live run may and may not take away from it.
 
-#include "ivox/ivox.hpp"
-
-#include <gtest/gtest.h>
 #include <pcl/point_types.h>
 
+#include <gtest/gtest.h>
 #include <vector>
+
+#include "ivox/ivox.hpp"
 
 namespace
 {
@@ -144,7 +144,7 @@ TEST(IvoxLayering, WithoutPinningTheBackendBehavesExactlyAsBefore)
   Cloud live = lattice(0.0f, 20);
   v.Add_Points(live, true);
   EXPECT_EQ(v.pinnedVoxels(), 0u);
-  EXPECT_LE(v.numVoxels(), 9u);  // bounded by capacity (the check runs after each insert)
+  EXPECT_LE(v.numVoxels(), 8u);  // eviction precedes insertion, never exceeding capacity
   EXPECT_GT(v.evictedVoxels(), 0u);
   v.clearLive();
   EXPECT_EQ(v.size(), 0) << "with nothing pinned, clearLive empties the map";
@@ -237,4 +237,100 @@ TEST(IvoxLayering, ReinstallingAPriorMapAtANewAlignmentReplacesItWhole)
   std::vector<float> sqdist;
   v.Nearest_Search(first.front(), 1, near, sqdist);
   EXPECT_TRUE(near.empty() || sqdist[0] > 1.0f) << "nothing left where the old alignment put it";
+}
+
+TEST(IvoxLayering, AllPinnedCapacityRejectsLiveWithoutCountingOrClaimingCells)
+{
+  Ivox v = makeIvox(2);
+  auto prior = lattice(0, 2);
+  ASSERT_EQ(v.AddPinnedPoints(prior), 2);
+  auto live = lattice(10, 1);
+  EXPECT_EQ(v.Add_Points(live, true), 0);
+  EXPECT_EQ(v.Add_Points(live, false), 0);
+  EXPECT_EQ(v.size(), 2);
+  EXPECT_EQ(v.numVoxels(), 2u);
+  EXPECT_EQ(v.evictedVoxels(), 0u);
+  v.clearPinned();
+  EXPECT_EQ(v.Add_Points(live, true), 1);  // rejected point never claimed its fine cell
+  EXPECT_EQ(v.size(), 1);
+}
+
+TEST(IvoxLayering, OversizedPinnedAdditionOrReplacementPreservesTheOldMap)
+{
+  Ivox v = makeIvox(2);
+  auto prior = lattice(0, 1);
+  auto live = lattice(10, 1);
+  v.AddPinnedPoints(prior);
+  v.Add_Points(live, true);
+  auto tooLarge = lattice(20, 3);
+  EXPECT_FALSE(v.canAddPinnedPoints(tooLarge));
+  EXPECT_FALSE(v.canReplacePinnedPoints(tooLarge));
+  EXPECT_THROW(v.AddPinnedPoints(tooLarge), std::length_error);
+  EXPECT_EQ(v.size(), 2);
+  EXPECT_EQ(v.pinnedVoxels(), 1u);
+  EXPECT_EQ(v.evictedVoxels(), 0u);
+  for (const auto & p : {prior.front(), live.front()}) {
+    Cloud nearest;
+    std::vector<float> distances;
+    v.Nearest_Search(p, 1, nearest, distances);
+    ASSERT_EQ(nearest.size(), 1u);
+    EXPECT_FLOAT_EQ(distances[0], 0.0f);
+  }
+  auto replacement = lattice(20, 2);
+  EXPECT_FALSE(v.canAddPinnedPoints(replacement));  // union with the existing pinned voxel
+  EXPECT_TRUE(v.canReplacePinnedPoints(replacement));
+}
+
+TEST(IvoxLayering, MixedCapacityEvictsOnlyTheOldestLiveAndCountsRetainedPoints)
+{
+  Ivox v = makeIvox(2);
+  auto pinned = lattice(0, 1);
+  auto first = lattice(10, 1);
+  auto second = lattice(20, 1);
+  v.AddPinnedPoints(pinned);
+  EXPECT_EQ(v.Add_Points(first, true), 1);
+  EXPECT_EQ(v.Add_Points(second, true), 1);
+  EXPECT_EQ(v.numVoxels(), 2u);
+  EXPECT_EQ(v.size(), 2);
+  EXPECT_EQ(v.evictedVoxels(), 1u);
+  for (const auto & p : {pinned.front(), second.front()}) {
+    Cloud nearest;
+    std::vector<float> distances;
+    v.Nearest_Search(p, 1, nearest, distances);
+    ASSERT_FALSE(nearest.empty());
+    EXPECT_FLOAT_EQ(distances[0], 0.0f);
+  }
+  Cloud nearest;
+  std::vector<float> distances;
+  v.Nearest_Search(first.front(), 1, nearest, distances);
+  EXPECT_TRUE(nearest.empty());
+}
+
+TEST(IvoxLayering, ZeroCapacityKeepsExistingDefaultAndExtremePriorPreflightIsReadOnly)
+{
+  Ivox v = makeIvox(0);
+  EXPECT_EQ(v.maxVoxels(), 5000000u);
+  auto prior = lattice(0, 1);
+  v.AddPinnedPoints(prior);
+  auto huge = lattice(std::numeric_limits<float>::max(), 1);
+  EXPECT_FALSE(v.canAddPinnedPoints(huge));
+  EXPECT_FALSE(v.canReplacePinnedPoints(huge));
+  EXPECT_THROW(v.AddPinnedPoints(huge), std::length_error);
+  EXPECT_EQ(v.Add_Points(huge, false), 0);
+  EXPECT_EQ(v.Add_Points(huge, true), 0);
+  EXPECT_EQ(v.size(), 1);
+}
+
+TEST(IvoxLayering, PinnedPreflightCountsUniqueCoarseBucketsNotPoints)
+{
+  Ivox v = makeIvox(2);
+  auto first = lattice(0, 1);
+  v.AddPinnedPoints(first);
+  Cloud duplicates(100, first.front());
+  auto second = lattice(1, 1);
+  duplicates.push_back(second.front());
+  EXPECT_TRUE(v.canAddPinnedPoints(duplicates));
+  EXPECT_EQ(v.AddPinnedPoints(duplicates), 1);
+  EXPECT_EQ(v.pinnedVoxels(), 2u);
+  EXPECT_EQ(v.size(), 2);
 }

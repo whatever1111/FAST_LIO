@@ -25,6 +25,8 @@
 
 #include "imu_coverage_policy.hpp"
 #include "imu_gap_prior.hpp"
+#include "imu_initialization_validity.hpp"
+#include "population_moments.hpp"
 #include "scan_time_policy.hpp"
 #include "use-ikfom.hpp"
 
@@ -117,7 +119,18 @@ class ImuProcess
   double gravity_norm() const { return mean_acc.norm(); }
 
  private:
-  void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
+  // Discard only the invalid initialization window. In particular, keep the
+  // consumed-scan guard and the initialization attempt clock.
+  void discardInitializationWindow()
+  {
+    b_first_frame_ = true;
+    init_iter_num = 0;
+    mean_acc.setZero();
+    mean_gyr.setZero();
+    cov_acc.setZero();
+    cov_gyr.setZero();
+  }
+  bool IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, std::size_t &N);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
@@ -133,10 +146,12 @@ class ImuProcess
   V3D angvel_last;
   V3D acc_s_last;
   double start_timestamp_;
+  double initialization_attempt_start_ = 0.0;
+  bool has_initialization_attempt_start_ = false;
   double last_lidar_end_time_ = -1.0;
   fast_lio::ScanConsumption scan_consumption_;
   ProcessStatus last_status_ = ProcessStatus::kRejected;
-  int    init_iter_num = 1;
+  std::size_t init_iter_num = 0;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
 };
@@ -144,7 +159,7 @@ class ImuProcess
 ImuProcess::ImuProcess()
     : b_first_frame_(true), imu_need_init_(true), start_timestamp_(-1)
 {
-  init_iter_num = 1;
+  init_iter_num = 0;
   Q = process_noise_cov();
   cov_acc       = V3D(0.1, 0.1, 0.1);
   cov_gyr       = V3D(0.1, 0.1, 0.1);
@@ -153,6 +168,7 @@ ImuProcess::ImuProcess()
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
   angvel_last     = Zero3d;
+  acc_s_last      = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
   last_imu_ = std::make_shared<sensor_msgs::msg::Imu>();
@@ -168,7 +184,9 @@ void ImuProcess::Reset()
   angvel_last       = Zero3d;
   imu_need_init_    = true;
   start_timestamp_  = -1;
-  init_iter_num     = 1;
+  initialization_attempt_start_ = 0.0;
+  has_initialization_attempt_start_ = false;
+  init_iter_num     = 0;
   v_imu_.clear();
   IMUpose.clear();
   last_imu_ = std::make_shared<sensor_msgs::msg::Imu>();
@@ -218,7 +236,7 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
   cov_bias_acc = b_a;
 }
 
-void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
+bool ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, std::size_t &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
    ** 2. normalize the acceleration measurenments to unit gravity **/
@@ -227,13 +245,11 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   
   if (b_first_frame_)
   {
-    Reset();
-    N = 1;
+    // A new statistics window is not a new startup attempt. In particular,
+    // retain the timeout origin and the consumed-scan cursor across retries.
+    discardInitializationWindow();
+    N = 0;
     b_first_frame_ = false;
-    const auto &imu_acc = meas.imu.front()->linear_acceleration;
-    const auto &gyr_acc = meas.imu.front()->angular_velocity;
-    mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
-    mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
     first_lidar_time = meas.lidar_beg_time;
   }
 
@@ -244,16 +260,15 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
 
-    mean_acc      += (cur_acc - mean_acc) / N;
-    mean_gyr      += (cur_gyr - mean_gyr) / N;
-
-    cov_acc = cov_acc * (N - 1.0) / N + (cur_acc - mean_acc).cwiseProduct(cur_acc - mean_acc) * (N - 1.0) / (N * N);
-    cov_gyr = cov_gyr * (N - 1.0) / N + (cur_gyr - mean_gyr).cwiseProduct(cur_gyr - mean_gyr) * (N - 1.0) / (N * N);
-
-    // cout<<"acc norm: "<<cur_acc.norm()<<" "<<mean_acc.norm()<<endl;
-
-    N ++;
+    ++N; // inclusive sample count for both independent vector statistics
+    fast_lio::updatePopulationMoments(cur_acc, N, mean_acc, cov_acc);
+    fast_lio::updatePopulationMoments(cur_gyr, N, mean_gyr, cov_gyr);
   }
+  // Finite components alone do not make a usable gravity direction. Reject
+  // zero/cancelling/tiny means before quaternion construction or normalization.
+  if (!fast_lio::validInitializationMean(mean_acc, mean_gyr) || !cov_acc.allFinite() || !cov_gyr.allFinite() ||
+      !std::isfinite(cov_acc.sum()) || !std::isfinite(cov_gyr.sum()))
+    return false;
   state_ikfom init_state = kf_state.get_x();
 
   // Gravity alignment: rotate world frame so Z-axis aligns with gravity.
@@ -262,14 +277,14 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   Eigen::Quaterniond gravity_align = Eigen::Quaterniond::FromTwoVectors(
       mean_acc, Eigen::Vector3d::UnitZ());
   V3D aligned_acc = gravity_align * mean_acc;
-  V3D aligned_gyr = gravity_align * mean_gyr;
 
   init_state.rot  = SO3(gravity_align);
   init_state.grav = S2(- aligned_acc / aligned_acc.norm() * G_m_s2);
-  init_state.bg   = aligned_gyr;
+  // get_f subtracts bg directly from the incoming IMU/body-frame gyro.
+  // Gravity alignment changes the world orientation, not the gyro input frame.
+  init_state.bg   = mean_gyr;
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
-  kf_state.change_x(init_state);
 
   esekfom::esekf<state_ikfom, 12, input_ikfom>::cov init_P = kf_state.get_P();
   init_P.setIdentity();
@@ -278,9 +293,12 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(15,15) = init_P(16,16) = init_P(17,17) = 0.0001;
   init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;
   init_P(21,21) = init_P(22,22) = 0.00001; 
+  if (!fast_lio::finiteInitializationState(init_state) || !init_P.allFinite())
+    return false;
+  kf_state.change_x(init_state);
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
-
+  return true;
 }
 
 void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
@@ -373,7 +391,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
       break;
     }
   }
-  IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
+  IMUpose.push_back(set_pose6d(prop_time - pcl_beg_time, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -382,7 +400,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     double tail_stamp = rclcpp::Time(tail->header.stamp).seconds();
     double head_stamp = rclcpp::Time(head->header.stamp).seconds();
 
-    if (tail_stamp < last_lidar_end_time_)    continue;
+    if (tail_stamp <= prop_time)    continue;
     
     angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
                 0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
@@ -429,6 +447,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
       kf_state.predict(dt, Q, in);
     }
 
+    prop_time = tail_stamp;
     /* save the poses at each IMU measurements */
     imu_state = kf_state.get_x();
     angvel_last = angvel_avr - imu_state.bg;
@@ -452,7 +471,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   // A short advancing scan can contain only duplicate old IMU samples.
   // They were already integrated up to last_lidar_end_time_; never integrate
   // that old interval a second time while extrapolating to this scan's end.
-  dt = pcl_end_time - std::max(imu_end_time, prop_time);
+  dt = pcl_end_time - prop_time;
   if (fast_lio::isImuGap(dt, gap_params))
   {
     // The IMU stops before the scan ends: hold the velocity to the end as well, carry on only the rotation about
@@ -476,6 +495,14 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   {
     close_gap();
     kf_state.predict(dt, Q, in);
+    if (IMUpose.size() == 1) {
+      // No new IMU knot: the actual tail prediction still defines one deskew segment.
+      const state_ikfom tail_state = kf_state.get_x();
+      angvel_last = in.gyro - tail_state.bg;
+      acc_s_last = tail_state.rot * (in.acc - tail_state.ba) + tail_state.grav.get_vect();
+      IMUpose.push_back(set_pose6d(pcl_end_time - pcl_beg_time, acc_s_last, angvel_last, tail_state.vel,
+                                   tail_state.pos, tail_state.rot.toRotationMatrix()));
+    }
   }
 
   imu_state = kf_state.get_x();
@@ -483,16 +510,9 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
 
-  /*** undistort each lidar point (backward propagation). Restructured from
-   * the original shared tail-cursor walk into per-segment constants + a
-   * parallel point loop: every point evaluates the exact same expression with
-   * the same segment inputs as before and is touched exactly once, so the
-   * output is bit-identical to the serial walk — but the ~50k-point scans of
-   * the allpoint chain no longer serialize the biggest slice of t1-t0.
-   * Ownership mapping preserved from the serial walk: segment with head
-   * offset o_{j-1} owns points with o_{j-1} < t <= o_j, the last segment is
-   * unbounded above (extrapolation past the final IMU sample), and points at
-   * or before the scan-start pose (t <= 0) are left untouched. ***/
+  // Deskew every retained point into the frame-end pose. Internal knots belong
+  // to the preceding segment (head < t <= tail); only the earliest head is
+  // included. The final segment retains unbounded extrapolation past its tail.
   const int n_pts = static_cast<int>(pcl_out.points.size());
   if (n_pts == 0) return;
   const int n_seg = static_cast<int>(IMUpose.size()) - 1;
@@ -511,15 +531,8 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     seg_acc[j] << VEC_FROM_ARRAY(tail.acc);
     seg_gyr[j] << VEC_FROM_ARRAY(tail.gyr);
   }
-  // Ownership must replicate the serial tail-cursor walk EXACTLY — a
-  // lower_bound over head offsets is WRONG here: IMUpose offsets are NOT
-  // monotonic (the 0.0 seed is followed by NEGATIVE offsets for IMU samples
-  // falling in the previous-scan-end .. scan-begin gap, 2-3 per scan at
-  // 200 Hz), and binary search over that sequence misassigns the early-scan
-  // points to wrong segments (measured: sub-cm noise on most bags, but 72
-  // "No Effective Points" collapses and a 607 m FE dive on the 0702 canopy
-  // bag). The two-pointer backward sweep below performs the SAME comparisons
-  // in the SAME order as the serial walk, for any head sequence.
+  // Knots carry their actual propagation times, including negative offsets
+  // before scan begin. The backward sweep preserves internal boundary ownership.
   // Per-segment affine folding. The compensation below is affine in the point and every
   // factor except the intra-segment rotation is constant over a scan, and Rodrigues on a
   // fixed axis is exact as R(dt) = R0 + sin(w dt) R1 + (1-cos(w dt)) R2. Precomputing the
@@ -563,13 +576,14 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     for (int j = n_seg; j >= 1 && p >= 0; j--)
     {
       const double head_t = seg_head_t[j - 1];
-      while (p >= 0 && pcl_out.points[p].curvature / double(1000) > head_t)
+      while (p >= 0 && (pcl_out.points[p].curvature / double(1000) > head_t ||
+                        (j == 1 && pcl_out.points[p].curvature / double(1000) == head_t)))
       {
         seg_of[p] = j - 1;
         --p;
       }
     }
-    for (; p >= 0; --p) seg_of[p] = -1;  // at/before the scan-start pose: untouched
+    for (; p >= 0; --p) seg_of[p] = -1;  // earlier than available history (rejected by Process)
   }
 #ifdef MP_EN
   #pragma omp parallel for
@@ -643,8 +657,11 @@ bool ImuProcess::Process(const MeasureGroup & meas,
 
   if (imu_need_init_)
   {
-    /// The very first lidar frame
-    IMU_init(meas, kf_state, init_iter_num);
+    if (!has_initialization_attempt_start_) {
+      initialization_attempt_start_ = meas.lidar_beg_time;
+      has_initialization_attempt_start_ = true;
+    }
+    const bool valid_init = IMU_init(meas, kf_state, init_iter_num);
 
     imu_need_init_ = true;
     
@@ -652,19 +669,23 @@ bool ImuProcess::Process(const MeasureGroup & meas,
     last_lidar_end_time_ = meas.lidar_end_time;
     scan_consumption_.commit(meas.lidar_end_time);
     last_status_ = ProcessStatus::kInitializing;
+    if (!valid_init) {
+      discardInitializationWindow();
+      return false;  // neither disabled stillness nor its timeout may bypass validity
+    }
 
     state_ikfom imu_state = kf_state.get_x();
-    if (init_iter_num > MAX_INI_COUNT)
+    if (init_iter_num >= MAX_INI_COUNT)
     {
       const double still_ratio = mean_acc.norm() > 1e-6 ? std::sqrt(cov_acc.sum()) / mean_acc.norm() : 1e9;
-      const bool timed_out = (meas.lidar_beg_time - first_lidar_time) > init_still_timeout_s;
+      const bool timed_out = (meas.lidar_beg_time - initialization_attempt_start_) > init_still_timeout_s;
       if (init_require_still && still_ratio > init_still_tol && !timed_out)
       {
         // platform is moving: restart the accumulation window and keep waiting
         std::cerr << "[IMU-INIT] motion detected during init (scatter " << still_ratio
                   << " > " << init_still_tol << ") — restarting init window" << std::endl;
         b_first_frame_ = true;   // next IMU_init call re-seeds mean/cov from fresh samples
-        init_iter_num = 1;
+        init_iter_num = 0;
         return false;
       }
       if (init_require_still && timed_out && still_ratio > init_still_tol)
@@ -684,6 +705,13 @@ bool ImuProcess::Process(const MeasureGroup & meas,
 
     return false;
   }
+
+  // The filter cannot reconstruct points preceding its retained state. Reject
+  // before coverage rebasing or propagation; overlapping scans remain legal when
+  // every retained point lies within the available history.
+  const auto earliest = std::min_element(meas.lidar->points.begin(), meas.lidar->points.end(), time_list);
+  if (earliest->curvature / double(1000) < last_lidar_end_time_ - meas.lidar_beg_time)
+    return false;
 
   std::vector<double> imu_stamps;
   imu_stamps.reserve(meas.imu.size() + 1);

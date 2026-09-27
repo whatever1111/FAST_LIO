@@ -15,8 +15,8 @@
 // search; FAST-LIO's async map worker already guarantees that via its join-before-search.
 #pragma once
 
-#include <pcl/point_types.h>
 #include <Eigen/Core>
+#include <pcl/point_types.h>
 
 #include <algorithm>
 #include <array>
@@ -25,24 +25,29 @@
 #include <limits>
 #include <list>
 #include <robin_hood/robin_hood.h>  // cache-friendly open-addressing map (vs node-based std::unordered_map)
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
-namespace lio_ivox {
+namespace lio_ivox
+{
 
-template <typename PointType>
-class IVox {
- public:
+template<typename PointType>
+class IVox
+{
+public:
   using PointVector = std::vector<PointType, Eigen::aligned_allocator<PointType>>;
 
-  IVox() {
+  IVox()
+  {
     setNearby(26);  // safe defaults; overridden by Init()
     updateReserve();
   }
 
   // resolution: voxel edge (m); nearby_type: 6/18/26 (use >=18); per_voxel_cap: backstop
   // on points per voxel; max_voxels: LRU capacity (replaces ikd-Tree FOV box-deletion).
-  void Init(float resolution, int nearby_type, int per_voxel_cap, std::size_t max_voxels) {
+  void Init(float resolution, int nearby_type, int per_voxel_cap, std::size_t max_voxels)
+  {
     res_ = resolution > 1e-4f ? resolution : 0.5f;
     inv_res_ = 1.0f / res_;
     per_voxel_cap_ = per_voxel_cap > 0 ? per_voxel_cap : 50;
@@ -55,14 +60,20 @@ class IVox {
   // Match ikd-Tree's downsample-on-add: keep <=1 point per filter_size_map box. Without this
   // the map inflates ~3x vs ikd-Tree (map_incremental's need_add gate is not a strict dedup),
   // which slows every kNN. downsample_size_ is the fine (sub-voxel) dedup grid.
-  void set_downsample_param(float leaf) {
-    if (leaf > 1e-4f) { downsample_size_ = leaf; inv_ds_ = 1.0f / leaf; updateReserve(); }
+  void set_downsample_param(float leaf)
+  {
+    if (leaf > 1e-4f) {
+      downsample_size_ = leaf;
+      inv_ds_ = 1.0f / leaf;
+      updateReserve();
+    }
   }
   // Rebuild the map from `points` alone. ikd-Tree's Build deletes the existing tree first,
   // and the caller that matters (the guard's "rebuild the local map here" recovery) depends
   // on that: without the clear, a map the estimate can no longer register against survives
   // the recovery it was supposed to be dropped by, and the log says "rebuilt" either way.
-  void Build(PointVector& points) {
+  void Build(PointVector & points)
+  {
     clear();
     Add_Points(points, true);
   }
@@ -70,13 +81,15 @@ class IVox {
   // Drop everything the live scans put here, keep the pinned tier (a preloaded prior map).
   // This is what the guard's recovery wants once a prior map is loaded: the local map that
   // no longer fits goes away, the map the operator delivered stays.
-  void clearLive() {
-    for (const Key& k : lru_) {
+  void clearLive()
+  {
+    for (const Key & k : lru_) {
       auto it = map_.find(k);
       if (it == map_.end()) {
         continue;
       }
-      for (const auto& q : it->second.pts) occupied_fine_.erase(fineKey(q));
+      for (const auto & q : it->second.pts)
+        eraseOwnedFine(q, it->first);
       num_points_ -= it->second.pts.size();
       map_.erase(it);
     }
@@ -87,20 +100,23 @@ class IVox {
   // clearLive(): a prior map installed at one alignment has to go away whole before one
   // installed at a better alignment takes its place, or the two sit in the map together
   // and every plane fit gets to choose between them.
-  void clearPinned() {
+  void clearPinned()
+  {
     for (auto it = map_.begin(); it != map_.end();) {
       if (!it->second.pinned) {
         ++it;
         continue;
       }
-      for (const auto& q : it->second.pts) occupied_fine_.erase(fineKey(q));
+      for (const auto & q : it->second.pts)
+        eraseOwnedFine(q, it->first);
       num_points_ -= it->second.pts.size();
       it = map_.erase(it);
     }
     pinned_voxels_ = 0;
   }
 
-  void clear() {
+  void clear()
+  {
     map_.clear();
     occupied_fine_.clear();
     lru_.clear();
@@ -110,15 +126,28 @@ class IVox {
 
   // Add points that must survive both eviction and clearLive(): a prior map is not something
   // this run learned, so nothing this run does may drop it.
-  int AddPinnedPoints(PointVector& points) { return addPoints(points, true, true); }
+  // Conservative coarse demand, independent of fine-grid first-point-wins.
+  // Both checks are read-only and stop as soon as capacity is exceeded.
+  bool canAddPinnedPoints(const PointVector & points) const { return pinnedDemandFits(points, false); }
+  bool canReplacePinnedPoints(const PointVector & points) const { return pinnedDemandFits(points, true); }
+  int AddPinnedPoints(PointVector & points)
+  {
+    if (!canAddPinnedPoints(points))
+      throw std::length_error("iVox pinned coarse-voxel demand exceeds capacity");
+    return addPoints(points, true, true);
+  }
 
-  int Add_Points(PointVector& points, bool downsample_on) { return addPoints(points, downsample_on, false); }
+  int Add_Points(PointVector & points, bool downsample_on) { return addPoints(points, downsample_on, false); }
 
- private:
-  int addPoints(PointVector& points, bool downsample_on, bool pinned) {
+private:
+  int addPoints(PointVector & points, bool downsample_on, bool pinned)
+  {
     int added = 0;
-    for (const auto& p : points) {
-      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    for (const auto & p : points) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+        continue;
+      if (!representable(p, inv_res_) || !representable(p, inv_ds_))
+        continue;
       // GLOBAL fine-grid (downsample_size_) dedup: <=1 point per fine box across the WHOLE
       // map (not per-voxel), so fine boxes straddling NN-voxel borders aren't double-kept.
       // This keeps res=0.5 NN voxels (best probe agreement) at ikd-Tree's 542k map size.
@@ -134,12 +163,18 @@ class IVox {
       Key fk{};
       if (downsample_on) {
         fk = fineKey(p);
-        if (occupied_fine_.find(fk) != occupied_fine_.end()) continue;
+        if (occupied_fine_.find(fk) != occupied_fine_.end())
+          continue;
       }
       const Key k = key(p);
       auto it = map_.find(k);
       bool was_added = false;
       if (it == map_.end()) {
+        if (map_.size() >= max_voxels_) {
+          if (lru_.empty())
+            continue;  // no evictable live voxel: do not count or claim this point
+          evictOldest();
+        }
         Voxel v;
         v.pts.reserve(pts_reserve_);
         v.pts.push_back(p);
@@ -152,17 +187,15 @@ class IVox {
         }
         map_.emplace(k, std::move(v));
         was_added = true;
-        // Only live voxels are evictable, so a full map with nothing live left simply stays
-        // full — the prior-map load guard is what keeps that from being reachable.
-        if (map_.size() > max_voxels_ && !lru_.empty()) evictOldest();
       } else {
-        Voxel& v = it->second;
+        Voxel & v = it->second;
         if (pinned && !v.pinned) {  // a live voxel the prior map also covers becomes pinned
           lru_.erase(v.lru);
           v.pinned = true;
           ++pinned_voxels_;
         }
-        if (!v.pinned) lru_.splice(lru_.begin(), lru_, v.lru);  // touch (most-recently-used)
+        if (!v.pinned)
+          lru_.splice(lru_.begin(), lru_, v.lru);  // touch (most-recently-used)
         if (static_cast<int>(v.pts.size()) < per_voxel_cap_) {
           v.pts.push_back(p);
           was_added = true;
@@ -171,36 +204,52 @@ class IVox {
       if (was_added) {
         ++num_points_;
         ++added;
-        if (downsample_on) occupied_fine_.insert(fk);
+        if (downsample_on)
+          occupied_fine_.emplace(fk, k);
       }
     }
     return added;
   }
 
- public:
+public:
   // Fills `nearest` with up to k closest map points (ascending) and `sqdist` with their
   // squared distances — exactly what ikd-Tree::Nearest_Search returns. h_share rejects when
   // nearest.size() < k or sqdist[k-1] > 5, so returning <k on a sparse query is fine.
-  void Nearest_Search(const PointType& point, int k, PointVector& nearest,
-                      std::vector<float>& sqdist,
-                      float max_dist = std::numeric_limits<float>::infinity()) const {
+  void Nearest_Search(const PointType & point,
+                      int k,
+                      PointVector & nearest,
+                      std::vector<float> & sqdist,
+                      float max_dist = std::numeric_limits<float>::infinity()) const
+  {
+    nearest.clear();
+    sqdist.clear();
+    if (k <= 0 || !representable(point, inv_res_))
+      return;
     const Key qk = key(point);
-    const float max_sq =
-        std::isinf(max_dist) ? std::numeric_limits<float>::infinity() : max_dist * max_dist;
-    thread_local std::vector<std::pair<float, const PointType*>> cand;
+    const float max_sq = std::isinf(max_dist) ? std::numeric_limits<float>::infinity() : max_dist * max_dist;
+    thread_local std::vector<std::pair<float, const PointType *>> cand;
     cand.clear();
-    for (const auto& o : nbr_) {
-      auto it = map_.find(Key{qk.x + o[0], qk.y + o[1], qk.z + o[2]});
-      if (it == map_.end()) continue;
-      for (const auto& p : it->second.pts) {
+    for (const auto & o : nbr_) {
+      const std::int64_t x = static_cast<std::int64_t>(qk.x) + o[0];
+      const std::int64_t y = static_cast<std::int64_t>(qk.y) + o[1];
+      const std::int64_t z = static_cast<std::int64_t>(qk.z) + o[2];
+      if (x < std::numeric_limits<int>::min() || x > std::numeric_limits<int>::max() ||
+          y < std::numeric_limits<int>::min() || y > std::numeric_limits<int>::max() ||
+          z < std::numeric_limits<int>::min() || z > std::numeric_limits<int>::max())
+        continue;
+      auto it = map_.find(Key{static_cast<int>(x), static_cast<int>(y), static_cast<int>(z)});
+      if (it == map_.end())
+        continue;
+      for (const auto & p : it->second.pts) {
         const float dx = p.x - point.x, dy = p.y - point.y, dz = p.z - point.z;
         const float d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 <= max_sq) cand.emplace_back(d2, &p);
+        if (d2 <= max_sq)
+          cand.emplace_back(d2, &p);
       }
     }
     const int m = std::min(static_cast<int>(cand.size()), k);
-    std::partial_sort(cand.begin(), cand.begin() + m, cand.end(),
-                      [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::partial_sort(
+      cand.begin(), cand.begin() + m, cand.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
     nearest.resize(m);
     sqdist.resize(m);
     for (int i = 0; i < m; ++i) {
@@ -209,9 +258,12 @@ class IVox {
     }
   }
 
-  template <typename BoxT>
-  int Delete_Point_Boxes(std::vector<BoxT>& /*boxes*/) { return 0; }  // FOV via LRU instead
-  void acquire_removed_points(PointVector& /*out*/) {}                // caller discards it
+  template<typename BoxT>
+  int Delete_Point_Boxes(std::vector<BoxT> & /*boxes*/)
+  {
+    return 0;
+  }                                                      // FOV via LRU instead
+  void acquire_removed_points(PointVector & /*out*/) {}  // caller discards it
 
   int size() const { return static_cast<int>(num_points_); }
   int validnum() const { return static_cast<int>(num_points_); }
@@ -223,35 +275,90 @@ class IVox {
   // but it is silent: the oldest-WRITTEN voxel is dropped with no trace, and "oldest written"
   // is not "furthest away" — Nearest_Search never touches the LRU, so a region the robot is
   // standing in front of is evicted just the same if nothing has been added to it lately.
-  // A prior map loaded past capacity is therefore truncated in PCD file order. Callers
-  // report on these counters instead of finding out through a degraded match.
+  // Pinned additions are preflighted atomically against coarse capacity; live
+  // insertions may evict only older live voxels. Counters describe retained state.
   std::size_t maxVoxels() const { return max_voxels_; }
   std::size_t evictedVoxels() const { return evicted_voxels_; }
   std::size_t pinnedVoxels() const { return pinned_voxels_; }
   bool atCapacity() const { return map_.size() >= max_voxels_; }
 
- private:
-  struct Key {
+private:
+  struct Key
+  {
     int x, y, z;
-    bool operator==(const Key& o) const { return x == o.x && y == o.y && z == o.z; }
+    bool operator==(const Key & o) const { return x == o.x && y == o.y && z == o.z; }
   };
-  struct KeyHash {
-    std::size_t operator()(const Key& k) const {
-      return static_cast<std::size_t>((k.x * 73856093) ^ (k.y * 471943) ^ (k.z * 83492791));
+  struct KeyHash
+  {
+    std::size_t operator()(const Key & k) const
+    {
+      // Convert before multiplying: ordinary voxel coordinates already overflow
+      // a signed int (x = 30 at the deployed 0.3 m resolution is only 9 m).
+      // Unsigned 64-bit arithmetic also defines the wraparound for negative keys.
+      constexpr std::uint64_t kXPrime = 73856093;
+      constexpr std::uint64_t kYPrime = 471943;
+      constexpr std::uint64_t kZPrime = 83492791;
+      return static_cast<std::size_t>((static_cast<std::uint64_t>(k.x) * kXPrime) ^
+                                      (static_cast<std::uint64_t>(k.y) * kYPrime) ^
+                                      (static_cast<std::uint64_t>(k.z) * kZPrime));
     }
   };
-  struct Voxel {
+  struct Voxel
+  {
     PointVector pts;
     typename std::list<Key>::iterator lru;  // dependent type in a class template → typename
     bool pinned = false;                    // prior-map voxel: never evicted, survives clearLive()
   };
 
-  Key key(const PointType& p) const {
+  bool representable(const PointType & point, float inverse) const
+  {
+    // Preserve the existing float grid multiplication. Compare its floored
+    // result in double: converting INT_MAX to float would round it out of range.
+    for (float coordinate : {point.x, point.y, point.z}) {
+      const double cell = std::floor(coordinate * inverse);
+      if (!std::isfinite(cell) || cell < static_cast<double>(std::numeric_limits<int>::min()) ||
+          cell > static_cast<double>(std::numeric_limits<int>::max()))
+        return false;
+    }
+    return true;
+  }
+
+  void eraseOwnedFine(const PointType & point, const Key & owner)
+  {
+    const auto found = occupied_fine_.find(fineKey(point));
+    if (found != occupied_fine_.end() && found->second == owner)
+      occupied_fine_.erase(found);
+  }
+
+  bool pinnedDemandFits(const PointVector & points, bool replacement) const
+  {
+    robin_hood::unordered_flat_set<Key, KeyHash> needed;
+    if (!replacement) {
+      for (const auto & entry : map_) {
+        if (entry.second.pinned)
+          needed.insert(entry.first);
+      }
+    }
+    for (const auto & point : points) {
+      if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
+        continue;
+      if (!representable(point, inv_res_) || !representable(point, inv_ds_))
+        return false;
+      needed.insert(key(point));
+      if (needed.size() > max_voxels_)
+        return false;
+    }
+    return true;
+  }
+
+  Key key(const PointType & p) const
+  {
     return Key{static_cast<int>(std::floor(p.x * inv_res_)),
                static_cast<int>(std::floor(p.y * inv_res_)),
                static_cast<int>(std::floor(p.z * inv_res_))};
   }
-  Key fineKey(const PointType& p) const {  // downsample_size_ grid for global dedup
+  Key fineKey(const PointType & p) const
+  {  // downsample_size_ grid for global dedup
     return Key{static_cast<int>(std::floor(p.x * inv_ds_)),
                static_cast<int>(std::floor(p.y * inv_ds_)),
                static_cast<int>(std::floor(p.z * inv_ds_))};
@@ -264,38 +371,54 @@ class IVox {
   // map's voxel ceiling that dwarfs every other per-voxel cost. Points added with
   // downsample_on = false bypass the dedup, so this is a starting size and never a cap:
   // the vector grows for the few voxels that exceed it, and per_voxel_cap_ is what bounds them.
-  void updateReserve() {
+  void updateReserve()
+  {
     // The epsilon keeps an exact integer ratio (0.3/0.3, 0.5/0.25) from rounding up on float noise.
     const float boxes_per_edge = std::max(1.0f, std::ceil(res_ / downsample_size_ - 1e-4f));
     const double slots = static_cast<double>(boxes_per_edge) * boxes_per_edge * boxes_per_edge;
     pts_reserve_ = static_cast<std::size_t>(std::min(slots, static_cast<double>(per_voxel_cap_)));
   }
 
-  void setNearby(int n) {
+  void setNearby(int n)
+  {
     nbr_.clear();
     nbr_.push_back({0, 0, 0});
     const int f[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-    for (auto& o : f) nbr_.push_back({o[0], o[1], o[2]});
+    for (auto & o : f)
+      nbr_.push_back({o[0], o[1], o[2]});
     if (n >= 18) {
-      const int e[12][3] = {{1, 1, 0},  {1, -1, 0}, {-1, 1, 0}, {-1, -1, 0},
-                            {1, 0, 1},  {1, 0, -1}, {-1, 0, 1}, {-1, 0, -1},
-                            {0, 1, 1},  {0, 1, -1}, {0, -1, 1}, {0, -1, -1}};
-      for (auto& o : e) nbr_.push_back({o[0], o[1], o[2]});
+      const int e[12][3] = {{1, 1, 0},
+                            {1, -1, 0},
+                            {-1, 1, 0},
+                            {-1, -1, 0},
+                            {1, 0, 1},
+                            {1, 0, -1},
+                            {-1, 0, 1},
+                            {-1, 0, -1},
+                            {0, 1, 1},
+                            {0, 1, -1},
+                            {0, -1, 1},
+                            {0, -1, -1}};
+      for (auto & o : e)
+        nbr_.push_back({o[0], o[1], o[2]});
     }
     if (n >= 26) {
-      const int c[8][3] = {{1, 1, 1},   {1, 1, -1},  {1, -1, 1},  {1, -1, -1},
-                           {-1, 1, 1},  {-1, 1, -1}, {-1, -1, 1}, {-1, -1, -1}};
-      for (auto& o : c) nbr_.push_back({o[0], o[1], o[2]});
+      const int c[8][3] = {
+        {1, 1, 1}, {1, 1, -1}, {1, -1, 1}, {1, -1, -1}, {-1, 1, 1}, {-1, 1, -1}, {-1, -1, 1}, {-1, -1, -1}};
+      for (auto & o : c)
+        nbr_.push_back({o[0], o[1], o[2]});
     }
   }
 
-  void evictOldest() {
+  void evictOldest()
+  {
     const Key old = lru_.back();
     lru_.pop_back();
     ++evicted_voxels_;
     auto it = map_.find(old);
     if (it != map_.end()) {
-      for (const auto& q : it->second.pts) occupied_fine_.erase(fineKey(q));  // free its fine boxes
+      for (const auto & q : it->second.pts)
+        eraseOwnedFine(q, it->first);  // free its fine boxes
       num_points_ -= it->second.pts.size();
       map_.erase(it);
     }
@@ -311,7 +434,7 @@ class IVox {
   // bottleneck — 27 lookups/query). Safe here: search candidates point into each voxel's
   // pts HEAP buffer (stable across rehash), and no insertion runs during a search.
   robin_hood::unordered_flat_map<Key, Voxel, KeyHash> map_;
-  robin_hood::unordered_flat_set<Key, KeyHash> occupied_fine_;  // global 1-pt-per-fine-box dedup
+  robin_hood::unordered_flat_map<Key, Key, KeyHash> occupied_fine_;  // global 1-pt-per-fine-box dedup
   std::list<Key> lru_;
   std::size_t num_points_ = 0;
   std::size_t evicted_voxels_ = 0;

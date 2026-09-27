@@ -1,10 +1,18 @@
+#include <cmath>
 #include <cstdint>
 #include <gtest/gtest.h>
+#include <utility>
 #include <vector>
 
+#include "IKFoM_toolkit/esekfom/esekfom.hpp"
 #include "cached_plane.hpp"
-#include "common_lib.h"
-#include "use-ikfom.hpp"
+#include "laser_mapping_test_types.hpp"
+
+// Keep the state opaque: use-ikfom.hpp also defines non-inline process functions.
+// The component owns its default-constructed state; this fixture never initializes
+// a ROS node or mutates that state, and the measurement model reads it only.
+struct state_ikfom;
+extern state_ikfom state_point;
 
 // These are the actual component's scan buffers and model, not a copied model.
 extern bool prepareScanCorrespondenceStorage(std::size_t count);
@@ -18,6 +26,8 @@ extern std::vector<fast_lio::CachedPlane, Eigen::aligned_allocator<fast_lio::Cac
 
 namespace
 {
+constexpr int kPlaneNeighbourCount = 5;  // production NUM_MATCH_POINTS
+
 class HModelScanBounds : public ::testing::TestWithParam<std::size_t>
 {
 protected:
@@ -43,7 +53,7 @@ protected:
       plane.push_back(point);
     }
     fast_lio::CachedPlane fitted;
-    ASSERT_TRUE(fitted.fit<NUM_MATCH_POINTS>(plane, 0.1f, std::sqrt(std::sqrt(101.0f))));
+    ASSERT_TRUE(fitted.fit<kPlaneNeighbourCount>(plane, 0.1f, std::sqrt(std::sqrt(101.0f))));
     for (std::size_t i = 0; i < count; ++i) {
       PointType point{};
       point.x = 10.0f;
@@ -59,11 +69,10 @@ protected:
 
   void evaluate(std::size_t count, bool rows)
   {
-    state_ikfom state;
     esekfom::dyn_share_datastruct<double> measurement;
     measurement.converge = false;  // exercise the production cached-neighbour model
     measurement.valid = true;
-    h_share_model(state, measurement);
+    h_share_model(state_point, measurement);
     EXPECT_EQ(effct_feat_num, rows ? static_cast<int>(count) : 0);
     ASSERT_EQ(laserCloudOri->size(), rows ? count : 0u);
     ASSERT_EQ(corr_normvect->size(), rows ? count : 0u);

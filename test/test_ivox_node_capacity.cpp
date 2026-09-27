@@ -4,8 +4,8 @@
 #include <class_loader/class_loader.hpp>
 #include <gtest/gtest.h>
 
-#include "common_lib.h"
 #include "ivox/ivox.hpp"
+#include "laser_mapping_test_types.hpp"
 
 extern lio_ivox::IVox<PointType> ikdtree;
 

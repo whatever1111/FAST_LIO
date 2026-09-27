@@ -63,6 +63,7 @@
 #include <Python.h>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -541,7 +542,7 @@ int ground_recover_max_rows = 4000;        // per-scan cap on recovered rows
 int canopy_ground_recovered = 0;           // diag: rows recovered last h_share call
 
 std::vector<std::uint8_t> point_selected_surf;
-bool lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
+bool lidar_pushed, flg_first_scan = true, flg_EKF_inited;
 bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool is_first_lidar = true;
 bool diag_first_lidar_cb_logged = false;
@@ -702,14 +703,6 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
-
-void SigHandle(int sig)
-{
-  flg_exit = true;
-  std::cout << "catch sig %d" << sig << std::endl;
-  sig_buffer.notify_all();
-  rclcpp::shutdown();
-}
 
 inline void dump_lio_state_to_log(FILE * fp)
 {
@@ -5407,12 +5400,43 @@ private:
 };
 
 #ifndef FASTLIO_AS_COMPONENT
+namespace
+{
+void relayStandaloneSigterm(int) noexcept
+{
+  const int savedErrno = errno;
+  ::kill(::getpid(), SIGINT);
+  errno = savedErrno;
+}
+}  // namespace
+
 int main(int argc, char ** argv)
 {
-  rclcpp::init(argc, argv);
+  // Preserve the pre-init action, not rclcpp's subsequently uninstalled SIGTERM handler.
+  struct sigaction previousTermAction{};
+  if (::sigaction(SIGTERM, nullptr, &previousTermAction) != 0) {
+    const int signalError = errno;
+    RCLCPP_ERROR(rclcpp::get_logger("fastlio_mapping"), "read pre-init SIGTERM action failed (errno=%d)", signalError);
+    return 1;
+  }
 
-  signal(SIGINT, SigHandle);
-  signal(SIGTERM, SigHandle);
+  // Keep rclcpp's deferred SIGINT shutdown path on Foxy and Humble.
+  rclcpp::init(argc, argv);
+  struct sigaction relayAction{};
+  relayAction.sa_handler = relayStandaloneSigterm;
+  if (::sigemptyset(&relayAction.sa_mask) != 0) {
+    const int signalError = errno;
+    RCLCPP_ERROR(rclcpp::get_logger("fastlio_mapping"), "initialize SIGTERM relay mask failed (errno=%d)", signalError);
+    rclcpp::shutdown();
+    return 1;
+  }
+  if (::sigaction(SIGTERM, &relayAction, nullptr) != 0) {
+    const int signalError = errno;
+    RCLCPP_ERROR(
+      rclcpp::get_logger("fastlio_mapping"), "install standalone SIGTERM relay failed (errno=%d)", signalError);
+    rclcpp::shutdown();
+    return 1;
+  }
 
   rclcpp::spin(std::make_shared<LaserMappingNode>());
 
@@ -5468,6 +5492,20 @@ int main(int argc, char ** argv)
     }
   }
 
+  // Do not overwrite an action installed by another owner or rclcpp shutdown.
+  struct sigaction currentTermAction{};
+  if (::sigaction(SIGTERM, nullptr, &currentTermAction) != 0) {
+    const int signalError = errno;
+    RCLCPP_ERROR(rclcpp::get_logger("fastlio_mapping"), "read exit SIGTERM action failed (errno=%d)", signalError);
+    return 1;
+  }
+  if (!(currentTermAction.sa_flags & SA_SIGINFO) && currentTermAction.sa_handler == relayStandaloneSigterm &&
+      ::sigaction(SIGTERM, &previousTermAction, nullptr) != 0) {
+    const int signalError = errno;
+    RCLCPP_ERROR(
+      rclcpp::get_logger("fastlio_mapping"), "restore pre-init SIGTERM action failed (errno=%d)", signalError);
+    return 1;
+  }
   return 0;
 }
 #endif  // FASTLIO_AS_COMPONENT

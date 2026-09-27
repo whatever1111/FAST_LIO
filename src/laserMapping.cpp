@@ -1392,6 +1392,16 @@ std::thread map_worker_thread;
 std::atomic<uint64_t> g_async_add_us{0};  // last completed worker Add() wall time (us)
 double g_map_join_wait_ms = 0;            // last joinMapAdd() block time (main-only)
 
+#ifdef FASTLIO_TEST_HOOKS
+#include "laser_mapping_test_hooks.hpp"
+namespace fast_lio_test
+{
+std::function<void()> beforeMapAdd;
+std::function<void()> beforeResetJoin;
+std::function<void()> afterPendingReset;
+}  // namespace fast_lio_test
+#endif
+
 void mapWorkerLoop()
 {
   std::unique_lock<std::mutex> lk(map_add_mtx);
@@ -1406,6 +1416,10 @@ void mapWorkerLoop()
     map_add_running_ = true;
     lk.unlock();
 
+#ifdef FASTLIO_TEST_HOOKS
+    if (fast_lio_test::beforeMapAdd)
+      fast_lio_test::beforeMapAdd();
+#endif
     const double st = omp_get_wtime();
     ikdtree.Add_Points(toAdd, true);
     ikdtree.Add_Points(noDS, false);
@@ -1456,6 +1470,47 @@ void joinMapAdd()
   std::unique_lock<std::mutex> lk(map_add_mtx);
   map_add_cv.wait(lk, [] { return !map_add_ready_ && !map_add_running_; });
   g_map_join_wait_ms = (omp_get_wtime() - t0) * 1000.0;
+}
+
+// The recovery callback and the worker-ordering fixture use this exact boundary.
+// Join precedes every map read/write and discarding delayed world-frame batches.
+bool rebuildLocalMapStorage(int & map_before)
+{
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::beforeResetJoin)
+    fast_lio_test::beforeResetJoin();
+#endif
+  if (async_map_en)
+    joinMapAdd();
+  // The worker no longer owns an old batch. Pending world-frame points
+  // belong to the discarded live history and must not reappear later.
+  map_insert_pending.reset();
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::afterPendingReset)
+    fast_lio_test::afterPendingReset();
+#endif
+  feats_down_world->resize(feats_down_size);
+  for (int i = 0; i < feats_down_size; i++) {
+    pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+  }
+  bool kept_prior = false;
+  map_before = ikdtree.size();
+#ifdef USE_IVOX
+  if (ikdtree.pinnedVoxels() > 0) {
+    // A pinned prior map is the one thing here that is still trustworthy: the local map
+    // stopped fitting, the delivered map did not. Recovery drops what this run learned
+    // and re-registers against what it was given.
+    ikdtree.clearLive();
+    ikdtree.Add_Points(feats_down_world->points, true);
+    kept_prior = true;
+  } else
+#endif
+  {
+    ikdtree.Build(feats_down_world->points);
+  }
+  Localmap_Initialized = false;
+  fast_lio::resetReanchorGate(&reanchor_gate);
+  return kept_prior;
 }
 
 void map_incremental()
@@ -4508,32 +4563,8 @@ private:
       // from this scan at the current pose. The jump is real, is logged, and
       // reaches consumers through the health flags.
       auto rebuild_local_map = [&](const char * tag) {
-        if (async_map_en)
-          joinMapAdd();
-        // The worker no longer owns an old batch. Pending world-frame points
-        // belong to the discarded live history and must not reappear later.
-        map_insert_pending.reset();
-        feats_down_world->resize(feats_down_size);
-        for (int i = 0; i < feats_down_size; i++) {
-          pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
-        }
-        bool kept_prior = false;
-        const int map_before = ikdtree.size();
-#ifdef USE_IVOX
-        if (ikdtree.pinnedVoxels() > 0) {
-          // A pinned prior map is the one thing here that is still trustworthy: the local map
-          // stopped fitting, the delivered map did not. Recovery drops what this run learned
-          // and re-registers against what it was given.
-          ikdtree.clearLive();
-          ikdtree.Add_Points(feats_down_world->points, true);
-          kept_prior = true;
-        } else
-#endif
-        {
-          ikdtree.Build(feats_down_world->points);
-        }
-        Localmap_Initialized = false;
-        fast_lio::resetReanchorGate(&reanchor_gate);
+        int map_before = 0;
+        const bool kept_prior = rebuildLocalMapStorage(map_before);
         if (kept_prior) {
           RCLCPP_ERROR(this->get_logger(),
                        "[%s] live map dropped and re-seeded from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: "

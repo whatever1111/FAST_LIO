@@ -187,6 +187,36 @@ if(BUILD_TESTING)
     rosidl_target_interfaces(test_h_model_scan_bounds ${PROJECT_NAME} "rosidl_typesupport_cpp")
   endif()
   if(USE_IVOX)
+    # Non-installed real node TU with test-only worker barriers. Serialize this
+    # third heavy compilation after BOTH normal production targets finish.
+    add_library(fastlio_mapping_test_component SHARED
+      src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
+    target_compile_definitions(fastlio_mapping_test_component PRIVATE
+      FASTLIO_AS_COMPONENT FASTLIO_TEST_HOOKS USE_IVOX)
+    target_include_directories(fastlio_mapping_test_component PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})
+    target_link_libraries(fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen)
+    ament_target_dependencies(fastlio_mapping_test_component ${dependencies})
+    if(PythonLibs_FOUND)
+      target_link_libraries(fastlio_mapping_test_component ${PYTHON_LIBRARIES})
+      target_include_directories(fastlio_mapping_test_component PRIVATE ${PYTHON_INCLUDE_DIRS})
+    endif()
+    if(cpp_typesupport_target)
+      target_link_libraries(fastlio_mapping_test_component ${cpp_typesupport_target})
+    else()
+      rosidl_target_interfaces(fastlio_mapping_test_component ${PROJECT_NAME} "rosidl_typesupport_cpp")
+    endif()
+    add_dependencies(fastlio_mapping_test_component fastlio_mapping fastlio_mapping_component)
+    ament_add_gtest(test_async_map_reset test/test_async_map_reset.cpp TIMEOUT 30)
+    target_include_directories(test_async_map_reset PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})
+    target_link_libraries(test_async_map_reset fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen)
+    ament_target_dependencies(test_async_map_reset ${dependencies})
+    if(cpp_typesupport_target)
+      target_link_libraries(test_async_map_reset ${cpp_typesupport_target})
+    else()
+      rosidl_target_interfaces(test_async_map_reset ${PROJECT_NAME} "rosidl_typesupport_cpp")
+    endif()
     find_package(class_loader REQUIRED)
     # One actual component activation per process: production globals are not reset between nodes.
     foreach(capacity_case negative zero small)

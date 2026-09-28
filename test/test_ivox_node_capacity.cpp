@@ -4,6 +4,7 @@
 #include <class_loader/class_loader.hpp>
 #include <gtest/gtest.h>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "ivox/ivox.hpp"
@@ -32,7 +33,13 @@ protected:
        rclcpp::Parameter("mapping.extrinsic_T", std::vector<double>{0.0, 0.0, 0.0}),
        rclcpp::Parameter("mapping.extrinsic_R", std::vector<double>{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0})});
     if (requested < 0) {
-      EXPECT_THROW(factory->create_node_instance(options), std::invalid_argument);
+      // The refusal has to name the parameter an operator must fix, not just fail.
+      try {
+        factory->create_node_instance(options);
+        ADD_FAILURE() << "a negative ivox_max_voxels was accepted";
+      } catch (const std::invalid_argument & error) {
+        EXPECT_NE(std::string(error.what()).find("ivox_max_voxels"), std::string::npos) << error.what();
+      }
       return;
     }
     auto node = factory->create_node_instance(options);

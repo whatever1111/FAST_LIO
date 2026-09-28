@@ -1,10 +1,12 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <future>
 #include <gtest/gtest.h>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #include "delayed_map_insertion.hpp"
 #include "ivox/ivox.hpp"
@@ -30,7 +32,51 @@ PointVector pointAt(float x)
   return PointVector{point};
 }
 
-TEST(AsyncMapReset, RealWorkerMustFinishBeforeDiscardingDelayedHistory)
+// The map as every case starts it: one original point at x = 1, a one-point scan at
+// x = 50 to rebuild from, and no delayed batch left over from an earlier case.
+void prepareMap(bool asyncMap)
+{
+  async_map_en = asyncMap;
+  map_insert_pending.reset();
+  ikdtree.Init(0.5f, 26, 50, 100);
+  auto original = pointAt(1.0f);
+  ikdtree.Build(original);
+  feats_down_body->points = pointAt(50.0f);
+}
+
+// Stages `delayScans` scans' batches at x = firstX, firstX + 1, ...; each waits for
+// its turn, so none comes out.
+void stageHeldBatches(float firstX, int delayScans)
+{
+  for (int scan = 0; scan < delayScans; ++scan) {
+    EXPECT_FALSE(map_insert_pending.stage(pointAt(firstX + static_cast<float>(scan)), {}, delayScans).has_value())
+      << "scan " << scan;
+  }
+}
+
+// After a reset: only the scan at x = 50 is in the map, nothing is pending, and the
+// first batch staged afterwards is the first to come out (at once when there is no
+// delay), so neither the discarded delayed batches nor an in-flight one resurfaces.
+void expectRebuiltWithoutOldHistory(int delayScans)
+{
+  EXPECT_EQ(ikdtree.size(), 1);
+  EXPECT_EQ(map_insert_pending.pendingSize(), 0u);
+  PointVector nearest;
+  std::vector<float> distances;
+  const auto rebuilt = pointAt(50.0f);
+  ikdtree.Nearest_Search(rebuilt.front(), 1, nearest, distances);
+  ASSERT_EQ(nearest.size(), 1u);
+  EXPECT_EQ(nearest.front().x, 50.0f);
+  stageHeldBatches(60.0f, delayScans);
+  const auto next = map_insert_pending.stage(pointAt(70.0f), {}, delayScans);
+  ASSERT_TRUE(next.has_value());
+  ASSERT_EQ(next->first.size(), 1u);
+  EXPECT_EQ(next->first.front().x, delayScans > 0 ? 60.0f : 70.0f);
+}
+
+// A reset while the real worker is inserting a batch blocks until that batch is in the
+// map, and only then discards the delayed batches and rebuilds.
+void expectResetWaitsForTheWorker(int delayScans)
 {
   using namespace std::chrono_literals;
   std::mutex mutex;
@@ -39,6 +85,11 @@ TEST(AsyncMapReset, RealWorkerMustFinishBeforeDiscardingDelayedHistory)
   bool release = false;
   std::promise<void> resetEntered;
   std::atomic<bool> discarded{false};
+  prepareMap(true);
+  ASSERT_TRUE(prepareScanCorrespondenceStorage(1));
+  stageHeldBatches(20.0f, delayScans);
+  ASSERT_EQ(map_insert_pending.pendingSize(), static_cast<std::size_t>(delayScans));
+
   fast_lio_test::beforeMapAdd = [&] {
     std::unique_lock<std::mutex> lock(mutex);
     entered = true;
@@ -51,14 +102,6 @@ TEST(AsyncMapReset, RealWorkerMustFinishBeforeDiscardingDelayedHistory)
   fast_lio_test::afterPendingReset = [&] {
     discarded.store(true);
   };
-  async_map_en = true;
-  ikdtree.Init(0.5f, 26, 50, 100);
-  auto original = pointAt(1.0f);
-  ikdtree.Build(original);
-  ASSERT_TRUE(prepareScanCorrespondenceStorage(1));
-  feats_down_body->points = pointAt(50.0f);
-  ASSERT_FALSE(map_insert_pending.stage(pointAt(20.0f), {}, 1).has_value());
-
   startMapWorker();
   auto inFlight = pointAt(30.0f);
   PointVector direct;
@@ -95,18 +138,65 @@ TEST(AsyncMapReset, RealWorkerMustFinishBeforeDiscardingDelayedHistory)
   EXPECT_TRUE(discarded.load());
   EXPECT_EQ(result.first, 2);  // original + completed real worker batch, before reset
   EXPECT_FALSE(result.second);
-  EXPECT_EQ(ikdtree.size(), 1);
-  EXPECT_EQ(map_insert_pending.pendingSize(), 0u);
-  PointVector nearest;
-  std::vector<float> distances;
-  const auto rebuilt = pointAt(50.0f);
-  ikdtree.Nearest_Search(rebuilt.front(), 1, nearest, distances);
-  ASSERT_EQ(nearest.size(), 1u);
-  EXPECT_EQ(nearest.front().x, 50.0f);
-  EXPECT_FALSE(map_insert_pending.stage(pointAt(60.0f), {}, 1).has_value());
-  const auto next = map_insert_pending.stage(pointAt(70.0f), {}, 1);
-  ASSERT_TRUE(next.has_value());
-  ASSERT_EQ(next->first.size(), 1u);
-  EXPECT_EQ(next->first.front().x, 60.0f);  // neither the old delayed nor in-flight batch resurfaces
+  expectRebuiltWithoutOldHistory(delayScans);
+}
+
+TEST(AsyncMapReset, RealWorkerMustFinishBeforeDiscardingDelayedHistory)
+{
+  expectResetWaitsForTheWorker(1);
+}
+
+TEST(AsyncMapReset, WithNoDelayTheResetStillWaitsForTheInFlightBatch)
+{
+  expectResetWaitsForTheWorker(0);
+}
+
+TEST(AsyncMapReset, EveryBatchOfAMultiScanDelayIsDiscarded)
+{
+  expectResetWaitsForTheWorker(3);
+}
+
+// FLIO_ASYNC_MAP=0: map_incremental inserts on the scan thread, so there is no worker to
+// wait for; the reset still discards the delayed batches before it rebuilds.
+void expectResetWithoutTheWorker(int delayScans)
+{
+  prepareMap(false);
+  ASSERT_TRUE(prepareScanCorrespondenceStorage(1));
+  stageHeldBatches(20.0f, delayScans);
+  ASSERT_EQ(map_insert_pending.pendingSize(), static_cast<std::size_t>(delayScans));
+
+  bool resetEntered = false;
+  std::size_t pendingAtDiscard = 1;
+  fast_lio_test::beforeResetJoin = [&] {
+    resetEntered = true;
+  };
+  fast_lio_test::afterPendingReset = [&] {
+    pendingAtDiscard = map_insert_pending.pendingSize();
+  };
+  int before = 0;
+  const bool kept = rebuildLocalMapStorage(before);
+  fast_lio_test::beforeResetJoin = {};
+  fast_lio_test::afterPendingReset = {};
+
+  EXPECT_TRUE(resetEntered);
+  EXPECT_EQ(pendingAtDiscard, 0u);
+  EXPECT_EQ(before, 1);  // the original point only: nothing was in flight
+  EXPECT_FALSE(kept);
+  expectRebuiltWithoutOldHistory(delayScans);
+}
+
+TEST(AsyncMapReset, WithoutTheWorkerTheResetDiscardsDelayedHistoryAndRebuilds)
+{
+  expectResetWithoutTheWorker(1);
+}
+
+TEST(AsyncMapReset, WithoutTheWorkerOrADelayTheResetStillRebuilds)
+{
+  expectResetWithoutTheWorker(0);
+}
+
+TEST(AsyncMapReset, WithoutTheWorkerEveryBatchOfAMultiScanDelayIsDiscarded)
+{
+  expectResetWithoutTheWorker(3);
 }
 }  // namespace

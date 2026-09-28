@@ -3933,6 +3933,7 @@ private:
       if (!prepareScanCorrespondenceStorage(downsampled_count)) {
         RCLCPP_ERROR(
           this->get_logger(), "Downsampled scan exceeds int-indexed estimator capacity: %zu points", downsampled_count);
+        frontendDrop();
         return;
       }
 #ifdef FASTLIO_TEST_HOOKS

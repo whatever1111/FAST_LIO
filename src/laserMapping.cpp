@@ -103,6 +103,7 @@
 #include "engulf_release.hpp"
 #include "frontend_observation.hpp"
 #include "gravity_align_kinematics.hpp"
+#include "imu_backlog_policy.hpp"
 #include "imu_gap_prior.hpp"
 #include "parked_hold.hpp"
 #include "preprocess.h"
@@ -111,12 +112,13 @@
 #include "rp_consider.hpp"
 #include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
+#include "timing_log_ring.hpp"
 #include "voxel_downsample.hpp"
 #include "zupt_policy.hpp"
 
 #define INIT_TIME (0.1)
 #define LASER_POINT_COV (0.001)
-#define MAXN (720000)
+#define MAXN (fast_lio::kTimingLogCapacity)
 #define PUBFRAME_PERIOD (20)
 
 struct FileCloser
@@ -133,6 +135,8 @@ using FileHandle = std::unique_ptr<std::FILE, FileCloser>;
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
+// A ring over scan_count and time_log_counter, which outlive these arrays: every store goes through
+// fast_lio::timingLogSlot() and the dump reads back through timingLogRowSlot() (timing_log_ring.hpp).
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN],
   s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
@@ -620,6 +624,11 @@ int max_buffered_scans = 100;
 // age keeps the estimator on the newest scan — the cost of falling behind becomes a
 // lower effective scan rate instead of an ever-growing lag.
 double max_scan_backlog_sec = 0.5;
+// Only a scan drains imu_buffer, so while the LiDAR is absent and the IMU keeps publishing nothing else bounds it, and
+// the first scan afterwards would integrate the whole backlog. trim_imu_buffer() keeps the newest max_imu_backlog_sec
+// of IMU sensor time and every sample from the oldest queued scan's begin on (imu_backlog_policy.hpp).
+double max_imu_backlog_sec = 10.0;
+std::uint64_t dropped_imu_backlog_total = 0;
 // 自适应降采样:单帧计算越过预算就把扫描体素调粗,让精度降级而不是延迟降级。
 // Adaptive downsampling: quality degrades instead of latency when a scan costs too much.
 fast_lio::AdaptiveDownsampleParams adaptive_ds_params;
@@ -912,6 +921,41 @@ static void trim_lidar_buffer()
 rclcpp::Clock input_time_log_clock(RCL_STEADY_TIME);
 fast_lio::InputEpochGuard input_epoch_guard;
 
+// Enforce max_imu_backlog_sec. Called from enqueue_imu_msg with mtx_buffer held, right after the push. The samples from
+// the oldest queued scan's begin on stay whatever their age: that scan still integrates them. Dropped samples count
+// into the observation's dropped counter, as dropped scans do.
+static void trim_imu_buffer()
+{
+  if (!(max_imu_backlog_sec > 0.0) || imu_buffer.empty())
+    return;
+  const double protect_from = lidar_buffer.empty() ? std::numeric_limits<double>::infinity() : time_buffer.front();
+  const std::size_t dropped = fast_lio::imuBacklogExcess(
+    imu_buffer.size(),
+    [](std::size_t i) { return get_time_sec(imu_buffer[i]->header.stamp); },
+    get_time_sec(imu_buffer.back()->header.stamp),
+    max_imu_backlog_sec,
+    protect_from);
+  if (dropped == 0)
+    return;
+  const double oldest_dropped = get_time_sec(imu_buffer.front()->header.stamp);
+  const double newest_dropped = get_time_sec(imu_buffer[dropped - 1]->header.stamp);
+  for (std::size_t i = 0; i < dropped; ++i)
+    imu_buffer.pop_front();
+  dropped_imu_backlog_total += dropped;
+  frontendDrop(dropped);
+  RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                       input_time_log_clock,
+                       5000,
+                       "[IMU-BACKLOG] IMU queue over its %.2fs window: dropped %zu sample(s) stamped %.3f..%.3f "
+                       "(%.3fs) that no queued scan needs, %lu dropped in total",
+                       max_imu_backlog_sec,
+                       dropped,
+                       oldest_dropped,
+                       newest_dropped,
+                       newest_dropped - oldest_dropped,
+                       static_cast<unsigned long>(dropped_imu_backlog_total));
+}
+
 // Caller holds mtx_buffer; all ingestion/sync callbacks share one mutually
 // exclusive group. A full estimator/map reset requires explicit restart, not
 // an automatic gravity reinitialization on a possibly moving platform.
@@ -992,7 +1036,9 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
   lidar_receive_time_buffer.push_back(receive_time);
   trim_lidar_buffer();
   last_timestamp_lidar = cur_time;
-  s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+  if (fast_lio::timingLogAccepts(scan_count)) {
+    s_plot11[fast_lio::timingLogSlot(scan_count)] = omp_get_wtime() - preprocess_start_time;
+  }
   mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
@@ -1042,7 +1088,9 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
   lidar_receive_time_buffer.push_back(receive_time);
   trim_lidar_buffer();
   last_timestamp_lidar = cur_time;
-  s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+  if (fast_lio::timingLogAccepts(scan_count)) {
+    s_plot11[fast_lio::timingLogSlot(scan_count)] = omp_get_wtime() - preprocess_start_time;
+  }
   mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
@@ -1104,7 +1152,9 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
   lidar_receive_time_buffer.push_back(receive_time);
   trim_lidar_buffer();
 
-  s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+  if (fast_lio::timingLogAccepts(scan_count)) {
+    s_plot11[fast_lio::timingLogSlot(scan_count)] = omp_get_wtime() - preprocess_start_time;
+  }
   mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
@@ -1145,6 +1195,7 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
 
   imu_buffer.push_back(msg);
   frontendAdmit(msg->header.stamp);
+  trim_imu_buffer();
   mtx_buffer.unlock();
   sig_buffer.notify_all();
   if (frontend_observation_en)
@@ -2730,6 +2781,10 @@ public:
     this->declare_parameter<int>("max_iteration", 4);
     this->declare_parameter<int>("max_buffered_scans", 100);
     this->declare_parameter<double>("max_scan_backlog_sec", 0.5);
+    // Bound on the IMU sensor time imu_buffer holds, in seconds behind the newest sample; must be finite, <= 0
+    // disables it. 10 s never binds on normal data: the four M20 regression bags hold at most 313 samples (~1.5 s)
+    // before the first scan and well under 1 s in steady state.
+    this->declare_parameter<double>("max_imu_backlog_sec", 10.0);
     this->declare_parameter<bool>("adaptive_downsample_en", false);
     this->declare_parameter<double>("adaptive_downsample_budget_sec", 0.06);
     this->declare_parameter<double>("adaptive_downsample_release_sec", 0.035);
@@ -3019,6 +3074,18 @@ public:
     this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
     this->get_parameter_or<int>("max_buffered_scans", max_buffered_scans, 100);
     this->get_parameter_or<double>("max_scan_backlog_sec", max_scan_backlog_sec, 0.5);
+    this->get_parameter_or<double>("max_imu_backlog_sec", max_imu_backlog_sec, 10.0);
+    if (!std::isfinite(max_imu_backlog_sec)) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "max_imu_backlog_sec must be finite (<= 0 disables the bound), got %f",
+                   max_imu_backlog_sec);
+      throw std::invalid_argument("max_imu_backlog_sec must be finite");
+    }
+    if (!(max_imu_backlog_sec > 0.0)) {
+      RCLCPP_INFO(this->get_logger(),
+                  "[IMU-BACKLOG] max_imu_backlog_sec is %.3f: the IMU queue is not bounded",
+                  max_imu_backlog_sec);
+    }
     this->get_parameter_or<bool>("adaptive_downsample_en", adaptive_ds_params.enabled, false);
     this->get_parameter_or<double>("adaptive_downsample_budget_sec", adaptive_ds_params.budget_sec, 0.06);
     this->get_parameter_or<double>("adaptive_downsample_release_sec", adaptive_ds_params.release_sec, 0.035);
@@ -5394,17 +5461,20 @@ private:
         aver_time_incre = aver_time_incre * (frame_num - 1) / frame_num + (kdtree_incremental_time) / frame_num;
         aver_time_solve = aver_time_solve * (frame_num - 1) / frame_num + (solve_time + solve_H_time) / frame_num;
         aver_time_const_H_time = aver_time_const_H_time * (frame_num - 1) / frame_num + solve_time / frame_num;
-        T1[time_log_counter] = Measures.lidar_beg_time;
-        s_plot[time_log_counter] = t5 - t0;
-        s_plot2[time_log_counter] = feats_undistort->points.size();
-        s_plot3[time_log_counter] = kdtree_incremental_time;
-        s_plot4[time_log_counter] = kdtree_search_time;
-        s_plot5[time_log_counter] = kdtree_delete_counter;
-        s_plot6[time_log_counter] = kdtree_delete_time;
-        s_plot7[time_log_counter] = kdtree_size_st;
-        s_plot8[time_log_counter] = kdtree_size_end;
-        s_plot9[time_log_counter] = aver_time_consu;
-        s_plot10[time_log_counter] = add_point_size;
+        if (fast_lio::timingLogAccepts(time_log_counter)) {
+          const std::size_t slot = fast_lio::timingLogSlot(time_log_counter);
+          T1[slot] = Measures.lidar_beg_time;
+          s_plot[slot] = t5 - t0;
+          s_plot2[slot] = feats_undistort->points.size();
+          s_plot3[slot] = kdtree_incremental_time;
+          s_plot4[slot] = kdtree_search_time;
+          s_plot5[slot] = kdtree_delete_counter;
+          s_plot6[slot] = kdtree_delete_time;
+          s_plot7[slot] = kdtree_size_st;
+          s_plot8[slot] = kdtree_size_end;
+          s_plot9[slot] = aver_time_consu;
+          s_plot10[slot] = add_point_size;
+        }
         time_log_counter++;
         printf(
           "[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  "
@@ -5715,7 +5785,9 @@ int main(int argc, char ** argv)
       fprintf(timingLog.get(),
               "time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree "
               "size st, tree size end, add point size, preprocess time\n");
-      for (int i = 0; i < time_log_counter; i++) {
+      const std::size_t rows = fast_lio::timingLogRows(time_log_counter);
+      for (std::size_t row = 0; row < rows; row++) {
+        const std::size_t i = fast_lio::timingLogRowSlot(time_log_counter, row);
         fprintf(timingLog.get(),
                 "%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",
                 T1[i],

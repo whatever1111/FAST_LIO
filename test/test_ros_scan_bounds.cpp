@@ -22,6 +22,9 @@
 
 namespace
 {
+// The class name RCLCPP_COMPONENTS_REGISTER_NODE(LaserMappingNode) registers.
+constexpr const char * kLaserMappingFactory = "rclcpp_components::NodeFactoryTemplate<LaserMappingNode>";
+
 struct ScanEvidence
 {
   std::size_t count;
@@ -55,9 +58,12 @@ protected:
     rclcpp::init(0, nullptr);
     executor = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
     loader = std::make_unique<class_loader::ClassLoader>(FASTLIO_TEST_COMPONENT_PATH);
+    // Every component library in the process lists its factory here, not only this one
+    // (a link that keeps tf2_ros's static_transform_broadcaster_node adds a second), so
+    // the front end's is taken by the name RCLCPP_COMPONENTS_REGISTER_NODE gives it.
     const auto names = loader->getAvailableClasses<rclcpp_components::NodeFactory>();
-    ASSERT_EQ(names.size(), 1u);
-    factory = loader->createInstance<rclcpp_components::NodeFactory>(names.front());
+    ASSERT_NE(std::find(names.begin(), names.end(), kLaserMappingFactory), names.end());
+    factory = loader->createInstance<rclcpp_components::NodeFactory>(kLaserMappingFactory);
     rclcpp::NodeOptions options;
     options.use_intra_process_comms(true);
     options.parameter_overrides(

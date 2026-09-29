@@ -1,6 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/node_factory.hpp>
 
+#include <algorithm>
 #include <class_loader/class_loader.hpp>
 #include <gtest/gtest.h>
 #include <stdexcept>
@@ -14,6 +15,9 @@ extern lio_ivox::IVox<PointType> ikdtree;
 
 namespace
 {
+// The class name RCLCPP_COMPONENTS_REGISTER_NODE(LaserMappingNode) registers.
+constexpr const char * kLaserMappingFactory = "rclcpp_components::NodeFactoryTemplate<LaserMappingNode>";
+
 // Each case has its own CTest process: the production node owns file-scope state.
 class IVoxNodeCapacity : public ::testing::Test
 {
@@ -24,9 +28,12 @@ protected:
   void constructAndCheck(int requested, std::size_t expected)
   {
     class_loader::ClassLoader loader(FASTLIO_COMPONENT_PATH);
+    // Every component library in the process lists its factory here, not only this one
+    // (a link that keeps tf2_ros's static_transform_broadcaster_node adds a second), so
+    // the front end's is taken by the name RCLCPP_COMPONENTS_REGISTER_NODE gives it.
     const auto names = loader.getAvailableClasses<rclcpp_components::NodeFactory>();
-    ASSERT_EQ(names.size(), 1u);
-    auto factory = loader.createInstance<rclcpp_components::NodeFactory>(names.front());
+    ASSERT_NE(std::find(names.begin(), names.end(), kLaserMappingFactory), names.end());
+    auto factory = loader.createInstance<rclcpp_components::NodeFactory>(kLaserMappingFactory);
     rclcpp::NodeOptions options;
     options.parameter_overrides(
       {rclcpp::Parameter("ivox_max_voxels", requested),

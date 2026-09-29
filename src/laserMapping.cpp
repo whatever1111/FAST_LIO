@@ -103,6 +103,7 @@
 #include "engulf_release.hpp"
 #include "frontend_observation.hpp"
 #include "gravity_align_kinematics.hpp"
+#include "imu_backlog_policy.hpp"
 #include "imu_gap_prior.hpp"
 #include "parked_hold.hpp"
 #include "preprocess.h"
@@ -623,6 +624,11 @@ int max_buffered_scans = 100;
 // age keeps the estimator on the newest scan — the cost of falling behind becomes a
 // lower effective scan rate instead of an ever-growing lag.
 double max_scan_backlog_sec = 0.5;
+// Only a scan drains imu_buffer, so while the LiDAR is absent and the IMU keeps publishing nothing else bounds it, and
+// the first scan afterwards would integrate the whole backlog. trim_imu_buffer() keeps the newest max_imu_backlog_sec
+// of IMU sensor time and every sample from the oldest queued scan's begin on (imu_backlog_policy.hpp).
+double max_imu_backlog_sec = 10.0;
+std::uint64_t dropped_imu_backlog_total = 0;
 // 自适应降采样:单帧计算越过预算就把扫描体素调粗,让精度降级而不是延迟降级。
 // Adaptive downsampling: quality degrades instead of latency when a scan costs too much.
 fast_lio::AdaptiveDownsampleParams adaptive_ds_params;
@@ -915,6 +921,41 @@ static void trim_lidar_buffer()
 rclcpp::Clock input_time_log_clock(RCL_STEADY_TIME);
 fast_lio::InputEpochGuard input_epoch_guard;
 
+// Enforce max_imu_backlog_sec. Called from enqueue_imu_msg with mtx_buffer held, right after the push. The samples from
+// the oldest queued scan's begin on stay whatever their age: that scan still integrates them. Dropped samples count
+// into the observation's dropped counter, as dropped scans do.
+static void trim_imu_buffer()
+{
+  if (!(max_imu_backlog_sec > 0.0) || imu_buffer.empty())
+    return;
+  const double protect_from = lidar_buffer.empty() ? std::numeric_limits<double>::infinity() : time_buffer.front();
+  const std::size_t dropped = fast_lio::imuBacklogExcess(
+    imu_buffer.size(),
+    [](std::size_t i) { return get_time_sec(imu_buffer[i]->header.stamp); },
+    get_time_sec(imu_buffer.back()->header.stamp),
+    max_imu_backlog_sec,
+    protect_from);
+  if (dropped == 0)
+    return;
+  const double oldest_dropped = get_time_sec(imu_buffer.front()->header.stamp);
+  const double newest_dropped = get_time_sec(imu_buffer[dropped - 1]->header.stamp);
+  for (std::size_t i = 0; i < dropped; ++i)
+    imu_buffer.pop_front();
+  dropped_imu_backlog_total += dropped;
+  frontendDrop(dropped);
+  RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                       input_time_log_clock,
+                       5000,
+                       "[IMU-BACKLOG] IMU queue over its %.2fs window: dropped %zu sample(s) stamped %.3f..%.3f "
+                       "(%.3fs) that no queued scan needs, %lu dropped in total",
+                       max_imu_backlog_sec,
+                       dropped,
+                       oldest_dropped,
+                       newest_dropped,
+                       newest_dropped - oldest_dropped,
+                       static_cast<unsigned long>(dropped_imu_backlog_total));
+}
+
 // Caller holds mtx_buffer; all ingestion/sync callbacks share one mutually
 // exclusive group. A full estimator/map reset requires explicit restart, not
 // an automatic gravity reinitialization on a possibly moving platform.
@@ -1154,6 +1195,7 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
 
   imu_buffer.push_back(msg);
   frontendAdmit(msg->header.stamp);
+  trim_imu_buffer();
   mtx_buffer.unlock();
   sig_buffer.notify_all();
   if (frontend_observation_en)
@@ -2739,6 +2781,10 @@ public:
     this->declare_parameter<int>("max_iteration", 4);
     this->declare_parameter<int>("max_buffered_scans", 100);
     this->declare_parameter<double>("max_scan_backlog_sec", 0.5);
+    // Bound on the IMU sensor time imu_buffer holds, in seconds behind the newest sample; must be finite, <= 0
+    // disables it. 10 s never binds on normal data: the four M20 regression bags hold at most 313 samples (~1.5 s)
+    // before the first scan and well under 1 s in steady state.
+    this->declare_parameter<double>("max_imu_backlog_sec", 10.0);
     this->declare_parameter<bool>("adaptive_downsample_en", false);
     this->declare_parameter<double>("adaptive_downsample_budget_sec", 0.06);
     this->declare_parameter<double>("adaptive_downsample_release_sec", 0.035);
@@ -3028,6 +3074,18 @@ public:
     this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
     this->get_parameter_or<int>("max_buffered_scans", max_buffered_scans, 100);
     this->get_parameter_or<double>("max_scan_backlog_sec", max_scan_backlog_sec, 0.5);
+    this->get_parameter_or<double>("max_imu_backlog_sec", max_imu_backlog_sec, 10.0);
+    if (!std::isfinite(max_imu_backlog_sec)) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "max_imu_backlog_sec must be finite (<= 0 disables the bound), got %f",
+                   max_imu_backlog_sec);
+      throw std::invalid_argument("max_imu_backlog_sec must be finite");
+    }
+    if (!(max_imu_backlog_sec > 0.0)) {
+      RCLCPP_INFO(this->get_logger(),
+                  "[IMU-BACKLOG] max_imu_backlog_sec is %.3f: the IMU queue is not bounded",
+                  max_imu_backlog_sec);
+    }
     this->get_parameter_or<bool>("adaptive_downsample_en", adaptive_ds_params.enabled, false);
     this->get_parameter_or<double>("adaptive_downsample_budget_sec", adaptive_ds_params.budget_sec, 0.06);
     this->get_parameter_or<double>("adaptive_downsample_release_sec", adaptive_ds_params.release_sec, 0.035);

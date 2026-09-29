@@ -373,6 +373,12 @@ if(BUILD_TESTING)
   if(TARGET test_timing_log_ring)
     target_include_directories(test_timing_log_ring PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
+  # Pure header, no dependencies: how much of the IMU queue a LiDAR outage may leave behind,
+  # trimmed by laserMapping.cpp's IMU callback after every push.
+  ament_add_gtest(test_imu_backlog_policy test/test_imu_backlog_policy.cpp)
+  if(TARGET test_imu_backlog_policy)
+    target_include_directories(test_imu_backlog_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
   # Pure header, Eigen only: the window-mean linear acceleration the levelling prior
   # subtracts from the specific-force mean, and when it must be withheld
   # (docs/PGO_LOOP_TUNING.md section 7.3).

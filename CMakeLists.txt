@@ -367,6 +367,12 @@ if(BUILD_TESTING)
   if(TARGET test_parked_hold)
     target_include_directories(test_parked_hold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
+  # Pure header, no dependencies: the ring the timing log's ever-growing counters index,
+  # written by laserMapping.cpp's callbacks and read back by its shutdown dump.
+  ament_add_gtest(test_timing_log_ring test/test_timing_log_ring.cpp)
+  if(TARGET test_timing_log_ring)
+    target_include_directories(test_timing_log_ring PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
   # Pure header, Eigen only: the window-mean linear acceleration the levelling prior
   # subtracts from the specific-force mean, and when it must be withheld
   # (docs/PGO_LOOP_TUNING.md section 7.3).

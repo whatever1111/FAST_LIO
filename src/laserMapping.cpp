@@ -111,12 +111,13 @@
 #include "rp_consider.hpp"
 #include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
+#include "timing_log_ring.hpp"
 #include "voxel_downsample.hpp"
 #include "zupt_policy.hpp"
 
 #define INIT_TIME (0.1)
 #define LASER_POINT_COV (0.001)
-#define MAXN (720000)
+#define MAXN (fast_lio::kTimingLogCapacity)
 #define PUBFRAME_PERIOD (20)
 
 struct FileCloser
@@ -133,6 +134,8 @@ using FileHandle = std::unique_ptr<std::FILE, FileCloser>;
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
+// A ring over scan_count and time_log_counter, which outlive these arrays: every store goes through
+// fast_lio::timingLogSlot() and the dump reads back through timingLogRowSlot() (timing_log_ring.hpp).
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN],
   s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
@@ -992,7 +995,9 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
   lidar_receive_time_buffer.push_back(receive_time);
   trim_lidar_buffer();
   last_timestamp_lidar = cur_time;
-  s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+  if (fast_lio::timingLogAccepts(scan_count)) {
+    s_plot11[fast_lio::timingLogSlot(scan_count)] = omp_get_wtime() - preprocess_start_time;
+  }
   mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
@@ -1042,7 +1047,9 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
   lidar_receive_time_buffer.push_back(receive_time);
   trim_lidar_buffer();
   last_timestamp_lidar = cur_time;
-  s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+  if (fast_lio::timingLogAccepts(scan_count)) {
+    s_plot11[fast_lio::timingLogSlot(scan_count)] = omp_get_wtime() - preprocess_start_time;
+  }
   mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
@@ -1104,7 +1111,9 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
   lidar_receive_time_buffer.push_back(receive_time);
   trim_lidar_buffer();
 
-  s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+  if (fast_lio::timingLogAccepts(scan_count)) {
+    s_plot11[fast_lio::timingLogSlot(scan_count)] = omp_get_wtime() - preprocess_start_time;
+  }
   mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
@@ -5393,17 +5402,20 @@ private:
         aver_time_incre = aver_time_incre * (frame_num - 1) / frame_num + (kdtree_incremental_time) / frame_num;
         aver_time_solve = aver_time_solve * (frame_num - 1) / frame_num + (solve_time + solve_H_time) / frame_num;
         aver_time_const_H_time = aver_time_const_H_time * (frame_num - 1) / frame_num + solve_time / frame_num;
-        T1[time_log_counter] = Measures.lidar_beg_time;
-        s_plot[time_log_counter] = t5 - t0;
-        s_plot2[time_log_counter] = feats_undistort->points.size();
-        s_plot3[time_log_counter] = kdtree_incremental_time;
-        s_plot4[time_log_counter] = kdtree_search_time;
-        s_plot5[time_log_counter] = kdtree_delete_counter;
-        s_plot6[time_log_counter] = kdtree_delete_time;
-        s_plot7[time_log_counter] = kdtree_size_st;
-        s_plot8[time_log_counter] = kdtree_size_end;
-        s_plot9[time_log_counter] = aver_time_consu;
-        s_plot10[time_log_counter] = add_point_size;
+        if (fast_lio::timingLogAccepts(time_log_counter)) {
+          const std::size_t slot = fast_lio::timingLogSlot(time_log_counter);
+          T1[slot] = Measures.lidar_beg_time;
+          s_plot[slot] = t5 - t0;
+          s_plot2[slot] = feats_undistort->points.size();
+          s_plot3[slot] = kdtree_incremental_time;
+          s_plot4[slot] = kdtree_search_time;
+          s_plot5[slot] = kdtree_delete_counter;
+          s_plot6[slot] = kdtree_delete_time;
+          s_plot7[slot] = kdtree_size_st;
+          s_plot8[slot] = kdtree_size_end;
+          s_plot9[slot] = aver_time_consu;
+          s_plot10[slot] = add_point_size;
+        }
         time_log_counter++;
         printf(
           "[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  "
@@ -5714,7 +5726,9 @@ int main(int argc, char ** argv)
       fprintf(timingLog.get(),
               "time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree "
               "size st, tree size end, add point size, preprocess time\n");
-      for (int i = 0; i < time_log_counter; i++) {
+      const std::size_t rows = fast_lio::timingLogRows(time_log_counter);
+      for (std::size_t row = 0; row < rows; row++) {
+        const std::size_t i = fast_lio::timingLogRowSlot(time_log_counter, row);
         fprintf(timingLog.get(),
                 "%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",
                 T1[i],

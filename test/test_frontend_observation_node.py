@@ -16,6 +16,7 @@ from pathlib import Path
 import rclpy
 from ament_index_python.packages import get_package_prefix
 from fast_lio_interfaces.msg import FrontendObservation
+from rcl_interfaces.msg import Log
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu
@@ -37,6 +38,20 @@ def test_frontend_idle_and_restart(tmp_path):
         durability=DurabilityPolicy.VOLATILE,
     )
     subscription = observer.create_subscription(FrontendObservation, observation_topic, samples.append, qos)
+    # The subject's envelope writer is best effort, volatile and keeps one sample, so an
+    # envelope it publishes before it has matched the reader above reaches no one; the
+    # graph shows only this side of that match. The subject learns this node's readers from
+    # its subscription announcements, which it receives reliably and in order, and this
+    # /rosout reader is announced after the envelope reader: a /rosout message from the
+    # subject shows it has matched the envelope reader too.
+    rosout_senders = set()
+    rosout_qos = QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1000,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+    rosout = observer.create_subscription(Log, "/rosout", lambda log: rosout_senders.add(log.name), rosout_qos)
     imu_qos = QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
         depth=10,
@@ -60,7 +75,8 @@ def test_frontend_idle_and_restart(tmp_path):
     def activation(index, enabled):
         samples.clear()
         log_path = tmp_path / f"activation_{index}.log"
-        args = [str(binary), "--ros-args", "-r", f"__node:=frontend_subject_{index}"]
+        subject = f"frontend_subject_{index}"
+        args = [str(binary), "--ros-args", "-r", f"__node:={subject}"]
         parameters = {
             "common.imu_topic": imu_topic,
             "common.lid_topic": prefix + "/lidar",
@@ -81,9 +97,15 @@ def test_frontend_idle_and_restart(tmp_path):
             try:
                 spin_until(lambda: publisher.get_subscription_count() == 1)
                 if enabled:
-                    spin_until(lambda: observer.count_publishers(observation_topic) == 1)
+                    spin_until(
+                        lambda: (
+                            [info.node_name for info in observer.get_publishers_info_by_topic(observation_topic)]
+                            == [subject]
+                        )
+                    )
                     if hasattr(subscription, "get_publisher_count"):
                         spin_until(lambda: subscription.get_publisher_count() == 1)
+                    spin_until(lambda: subject in rosout_senders)
                 for stamp_ns in (100_000_000_000, 100_100_000_000, 100_500_000_000):
                     msg = Imu()
                     msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(stamp_ns, 1_000_000_000)
@@ -152,6 +174,7 @@ def test_frontend_idle_and_restart(tmp_path):
         second = activation(2, True)
         assert first != second
     finally:
+        observer.destroy_subscription(rosout)
         observer.destroy_subscription(subscription)
         observer.destroy_node()
         executor.shutdown()

@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>shm_msgs</name>
+  <version>0.1.0</version>
+  <!-- Interfaces-only subset of ZhenshengLee/shm_msgs: only the messages needed
+       to decode /pre/all_point (shm_msgs/PointCloud8mAndPose) on the giant
+       260612-allpoint dataset. The upstream package's shared-memory transport
+       demos (iceoryx/cuda/opencv/pcl) are intentionally dropped. -->
+  <description>Interfaces-only shm_msgs (PointCloud8mAndPose + deps) for the LIO-SLAM giant allpoint pipeline.</description>
+  <maintainer email="lzs_1993@qq.com">ZhenshengLee</maintainer>
+  <license>Apache License 2.0</license>
+  <author email="lzs_1993@qq.com">ZhenshengLee</author>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <build_depend>builtin_interfaces</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+
+  <exec_depend>builtin_interfaces</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

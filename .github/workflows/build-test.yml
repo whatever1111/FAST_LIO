@@ -1,0 +1,100 @@
+# Compile fast_lio and run its own test suite on every push to this fork, so a
+# front-end branch has a build/test signal before LIO-SLAM bumps its gitlink.
+#
+# Runs on a GitHub-hosted runner (LIO-SLAM's self-hosted runners stay with the
+# superproject). The message packages fast_lio compiles against are staged as
+# interface-only builds by .github/ci/stage_interface_deps.sh. The superproject's
+# "FAST_LIO Build & Test" job, which builds against the real driver packages, is
+# still the gate for the gitlink bump; this job is the earlier, cheaper signal.
+#
+# workflow_dispatch takes an optional ref, to test a branch that predates this file.
+name: Build & Test
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to build; empty builds the dispatched ref'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & Test (Humble)
+    runs-on: ubuntu-24.04
+    container: ros:humble-ros-base
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      WS: /ws
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -yq --no-install-recommends git ca-certificates curl
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          path: FAST_LIO
+
+      - name: Stage workspace
+        run: |
+          mkdir -p "$WS/src"
+          cp -r "$GITHUB_WORKSPACE/FAST_LIO" "$WS/src/FAST_LIO"
+          # Nested package; colcon does not descend into the fast_lio package.
+          ln -s "$WS/src/FAST_LIO/fast_lio_interfaces" "$WS/src/fast_lio_interfaces"
+          "$GITHUB_WORKSPACE/FAST_LIO/.github/ci/stage_interface_deps.sh" "$WS/src"
+          echo "FAST_LIO at $(git -C "$GITHUB_WORKSPACE/FAST_LIO" rev-parse HEAD)"
+
+      - name: Install dependencies
+        run: |
+          # CMakeLists.txt finds these, but package.xml does not declare them.
+          apt-get install -yq --no-install-recommends \
+            ros-humble-tf2-ros ros-humble-rclcpp-components ros-humble-std-srvs \
+            ros-humble-visualization-msgs python3-pytest
+          rosdep update --rosdistro humble
+          rosdep install --from-paths "$WS/src" --ignore-src -y --rosdistro humble
+
+      # Debug/-O0, -j4, BUILD_TESTING=ON: the same build as the superproject's job.
+      - name: Build
+        working-directory: /ws
+        run: |
+          source /opt/ros/humble/setup.bash
+          export MAKEFLAGS=-j4
+          colcon build --event-handlers console_cohesion+ \
+            --cmake-args \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -DCMAKE_CXX_FLAGS_DEBUG='-g1 -O0' \
+              -DCMAKE_C_FLAGS_DEBUG='-g1 -O0' \
+              -DBUILD_TESTING=ON
+
+      - name: Test
+        working-directory: /ws
+        run: |
+          source install/setup.bash
+          colcon test --packages-select fast_lio --return-code-on-test-failure \
+            --event-handlers console_direct+
+          # An empty suite is the failure this job exists to catch, so it fails too.
+          colcon test-result --all --verbose | tee fastlio_test_results.txt
+          grep -qE 'Summary: [1-9][0-9]* test' fastlio_test_results.txt \
+            || { echo '::error::fast_lio ran zero tests'; exit 1; }
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast_lio-test-logs
+          path: |
+            /ws/log
+            /ws/build/fast_lio/test_results
+          if-no-files-found: ignore

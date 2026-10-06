@@ -62,6 +62,10 @@
 
 #include <Python.h>
 #include <algorithm>
+#include <array>
+#ifdef FASTLIO_TEST_HOOKS
+#include "laser_mapping_test_hooks.hpp"
+#endif
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -606,7 +610,44 @@ struct LatencyStats
 deque<double> time_buffer;
 deque<PointCloudXYZI::Ptr> lidar_buffer;
 deque<SteadyTimePoint> lidar_receive_time_buffer;
-deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
+struct QueuedImu
+{
+  sensor_msgs::msg::Imu::ConstSharedPtr message;
+  std::uint64_t identity = 0;
+  bool retained = false;
+  const sensor_msgs::msg::Imu * operator->() const { return message.get(); }
+  bool operator==(const QueuedImu & other) const { return identity == other.identity && message == other.message; }
+};
+deque<QueuedImu> imu_buffer;
+// Callback group serializes the transaction lifetime. mtx_buffer protects only
+// FIFO selection/confirmation and ingestion; no filter propagation holds it.
+fast_lio::ImuFifoTransaction<QueuedImu> imu_fifo_transaction;
+fast_lio::ImuFifoTransaction<QueuedImu>::Token pending_imu_token;
+std::uint64_t imu_sample_sequence = 0;
+struct ImuConsumptionCounters
+{
+  std::array<std::uint64_t, static_cast<std::size_t>(fast_lio::ImuProcessReason::kCount)> events{};
+  std::array<std::uint64_t, static_cast<std::size_t>(fast_lio::ImuProcessReason::kCount)> lostValid{};
+  std::uint64_t retainedBatches = 0;
+  std::uint64_t retainedUniqueSamples = 0;
+  std::uint64_t committedSamples = 0;
+  std::uint64_t validLostOnReject = 0;
+  std::uint64_t backlogValidLost = 0;
+  std::uint64_t retainedBacklogLost = 0;
+  std::uint64_t epochValidLost = 0;
+  std::uint64_t exceptionValidLost = 0;
+  double maxPendingAge = 0.0;
+};
+ImuConsumptionCounters imu_consumption_counters;
+bool imu_backlog_reanchor_required = false;
+
+void observePendingImuAgeLocked()
+{
+  if (!imu_buffer.empty() && imu_buffer.front().retained)
+    imu_consumption_counters.maxPendingAge =
+      std::max(imu_consumption_counters.maxPendingAge,
+               get_time_sec(imu_buffer.back()->header.stamp) - get_time_sec(imu_buffer.front()->header.stamp));
+}
 
 // The scan queue is the front end's only backpressure valve. Unbounded, any
 // sustained shortfall — a starved core, an IMU stream stamped seconds behind
@@ -939,8 +980,25 @@ static void trim_imu_buffer()
     return;
   const double oldest_dropped = get_time_sec(imu_buffer.front()->header.stamp);
   const double newest_dropped = get_time_sec(imu_buffer[dropped - 1]->header.stamp);
-  for (std::size_t i = 0; i < dropped; ++i)
+  for (std::size_t i = 0; i < dropped; ++i) {
+    if (validImuForConsumption(imu_buffer.front().message)) {
+      ++imu_consumption_counters.backlogValidLost;
+      if (imu_buffer.front().retained) {
+        ++imu_consumption_counters.retainedBacklogLost;
+        imu_backlog_reanchor_required = true;
+      }
+    }
     imu_buffer.pop_front();
+  }
+  imu_fifo_transaction.invalidate();
+  RCLCPP_WARN(
+    rclcpp::get_logger("laser_mapping"),
+    "[IMU-CONSUMPTION-LOSS] reason=backlog samples=%zu oldest=%.9f newest=%.9f valid_total=%lu retained_total=%lu",
+    dropped,
+    oldest_dropped,
+    newest_dropped,
+    static_cast<unsigned long>(imu_consumption_counters.backlogValidLost),
+    static_cast<unsigned long>(imu_consumption_counters.retainedBacklogLost));
   dropped_imu_backlog_total += dropped;
   frontendDrop(dropped);
   RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
@@ -966,6 +1024,11 @@ bool acceptInputEpoch(double previous, double current, const char * source)
   if (input_epoch_guard.observe(previous, current, kInputEpochRollbackSec))
     return true;
   frontendDrop(lidar_buffer.size() + imu_buffer.size() + 1);
+  for (const auto & sample : imu_buffer)
+    if (validImuForConsumption(sample.message))
+      ++imu_consumption_counters.epochValidLost;
+  imu_fifo_transaction.invalidate();
+  pending_imu_token = {};
   lidar_buffer.clear();
   time_buffer.clear();
   lidar_receive_time_buffer.clear();
@@ -1193,9 +1256,10 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
 
   last_timestamp_imu = timestamp;
 
-  imu_buffer.push_back(msg);
+  imu_buffer.push_back({msg, ++imu_sample_sequence, false});
   frontendAdmit(msg->header.stamp);
   trim_imu_buffer();
+  observePendingImuAgeLocked();
   mtx_buffer.unlock();
   sig_buffer.notify_all();
   if (frontend_observation_en)
@@ -1363,9 +1427,77 @@ void markImuGapBridged(double end)
   fast_lio::updateReanchorGate(&reanchor_gate, true, 0, 0.0, end, reanchor_params);
 }
 
+bool finishImuBatch(const fast_lio::ImuProcessOutcome & outcome)
+{
+  std::lock_guard<std::mutex> lock(mtx_buffer);
+  const auto confirmation = imu_fifo_transaction.settle(imu_buffer, pending_imu_token, outcome.disposition);
+  const auto reason = static_cast<std::size_t>(outcome.reason);
+  ++imu_consumption_counters.events.at(reason);
+  if (confirmation == fast_lio::ImuConfirmation::kRetained) {
+    if (!pending_imu_token.prefix.empty())
+      ++imu_consumption_counters.retainedBatches;
+    for (std::size_t i = 0; i < pending_imu_token.prefix.size(); ++i) {
+      if (!imu_buffer[i].retained) {
+        ++imu_consumption_counters.retainedUniqueSamples;
+        imu_buffer[i].retained = true;
+      }
+    }
+    observePendingImuAgeLocked();
+  } else if (confirmation == fast_lio::ImuConfirmation::kReleased) {
+    imu_consumption_counters.committedSamples += pending_imu_token.prefix.size();
+  } else if (confirmation == fast_lio::ImuConfirmation::kInvalidDropped ||
+             confirmation == fast_lio::ImuConfirmation::kFatal) {
+    for (const auto & sample : pending_imu_token.prefix) {
+      if (validImuForConsumption(sample.message)) {
+        ++imu_consumption_counters.lostValid.at(reason);
+        if (confirmation == fast_lio::ImuConfirmation::kFatal)
+          ++imu_consumption_counters.exceptionValidLost;
+        else
+          ++imu_consumption_counters.validLostOnReject;
+      }
+    }
+  }
+  const bool settled = confirmation == fast_lio::ImuConfirmation::kRetained ||
+                       confirmation == fast_lio::ImuConfirmation::kReleased ||
+                       confirmation == fast_lio::ImuConfirmation::kInvalidDropped;
+  if (!settled) {
+    imu_fifo_transaction.failClosed();
+    flio_map_frozen = true;
+    flio_degraded_odom = true;
+  }
+  if (outcome.reason != fast_lio::ImuProcessReason::kProcessed || !settled)
+    RCLCPP_INFO(
+      rclcpp::get_logger("laser_mapping"),
+      "[IMU-CONSUMPTION-EVENT] token=%lu epoch=%lu begin=%.9f end=%.9f disposition=%d reason=%s "
+      "confirmation=%d samples=%zu first_id=%lu last_id=%lu pending=%zu",
+      static_cast<unsigned long>(pending_imu_token.sequence),
+      static_cast<unsigned long>(pending_imu_token.epoch),
+      Measures.lidar_beg_time,
+      Measures.lidar_end_time,
+      static_cast<int>(outcome.disposition),
+      fast_lio::imuProcessReasonName(outcome.reason),
+      static_cast<int>(confirmation),
+      pending_imu_token.prefix.size(),
+      static_cast<unsigned long>(pending_imu_token.prefix.empty() ? 0 : pending_imu_token.prefix.front().identity),
+      static_cast<unsigned long>(pending_imu_token.prefix.empty() ? 0 : pending_imu_token.prefix.back().identity),
+      imu_buffer.size());
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::afterImuConsumption)
+    fast_lio_test::afterImuConsumption(pending_imu_token.sequence,
+                                       static_cast<int>(outcome.disposition),
+                                       static_cast<int>(outcome.reason),
+                                       pending_imu_token.prefix.size(),
+                                       imu_buffer.size(),
+                                       pending_imu_token.prefix.empty() ? 0
+                                                                        : pending_imu_token.prefix.front().identity);
+#endif
+  return settled;
+}
+
 bool sync_packages(MeasureGroup & meas)
 {
-  if (input_epoch_guard.faulted())
+  std::unique_lock<std::mutex> lock(mtx_buffer);
+  if (input_epoch_guard.faulted() || imu_fifo_transaction.faulted())
     return false;
   if (lidar_buffer.empty() || imu_buffer.empty()) {
     return false;
@@ -1390,6 +1522,9 @@ bool sync_packages(MeasureGroup & meas)
       meas.lidar_beg_time, meas.lidar->points, [](const auto & point) { return point.curvature; }, max_scan_duration_s);
     if (!timing.valid()) {
       ++invalid_scan_time_count;
+      RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                  "[IMU-CONSUMPTION-SYNC] reason=invalid_scan_time begin=%.9f",
+                  meas.lidar_beg_time);
       frontendDrop();
       RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
                            input_time_log_clock,
@@ -1404,6 +1539,10 @@ bool sync_packages(MeasureGroup & meas)
     lidar_end_time = timing.end;
     if (lidar_end_time <= p_imu->lastProcessedEnd()) {
       ++nonadvancing_scan_count;
+      RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                  "[IMU-CONSUMPTION-SYNC] reason=nonadvancing begin=%.9f end=%.9f",
+                  meas.lidar_beg_time,
+                  lidar_end_time);
       frontendDrop();
       RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
                            input_time_log_clock,
@@ -1424,12 +1563,13 @@ bool sync_packages(MeasureGroup & meas)
     return false;
   }
 
-  /*** push imu data, and pop from imu buffer ***/
+  // Borrow the exact front prefix; only an explicit consumption outcome releases it.
   meas.imu.clear();
-  while (!imu_buffer.empty() && get_time_sec(imu_buffer.front()->header.stamp) <= lidar_end_time) {
-    meas.imu.push_back(imu_buffer.front());
-    imu_buffer.pop_front();
-  }
+  const std::size_t count = fast_lio::imuPrefixThrough(
+    imu_buffer, lidar_end_time, [](const auto & sample) { return get_time_sec(sample->header.stamp); });
+  pending_imu_token = imu_fifo_transaction.borrow(imu_buffer, count);
+  for (const auto & sample : pending_imu_token.prefix)
+    meas.imu.push_back(sample.message);
   popLidarScan();
   if (meas.imu.empty() && p_imu->bridgesEmptyScan(meas.lidar_end_time)) {
     // No IMU sample in this scan, but the lidar kept recording through the IMU dropout: the IMU-gap prior carries
@@ -1437,9 +1577,16 @@ bool sync_packages(MeasureGroup & meas)
     return true;
   }
   if (meas.imu.empty()) {
+    imu_fifo_transaction.settle(imu_buffer, pending_imu_token, fast_lio::ImuDisposition::kUncommitted);
     ++empty_scan_imu_count;
     frontendDrop();
     markImuCoverageGap(meas.lidar_end_time);
+    lock.unlock();
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[IMU-CONSUMPTION-SYNC] reason=empty begin=%.9f end=%.9f token=%lu",
+                meas.lidar_beg_time,
+                meas.lidar_end_time,
+                static_cast<unsigned long>(pending_imu_token.sequence));
     if (frontend_observation_en)
       publishFrontendObservation(false, true, meas.lidar_end_time);
     RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
@@ -1501,6 +1648,8 @@ std::function<void()> beforeResetJoin;
 std::function<void()> afterPendingReset;
 std::function<void(std::size_t, double)> afterScanPrepared;
 std::function<void(std::size_t, double, int)> afterHModelRows;
+std::function<void(std::uint64_t, int, int, std::size_t, std::size_t, std::uint64_t)> afterImuConsumption;
+std::function<void()> beforeImuProcess;
 }  // namespace fast_lio_test
 #endif
 
@@ -3754,6 +3903,50 @@ public:
 
   ~LaserMappingNode()
   {
+    {
+      std::lock_guard<std::mutex> lock(mtx_buffer);
+      std::uint64_t pendingValid = 0;
+      std::uint64_t pendingRetained = 0;
+      for (const auto & sample : imu_buffer) {
+        pendingValid += validImuForConsumption(sample.message) ? 1 : 0;
+        pendingRetained += sample.retained ? 1 : 0;
+      }
+      const auto & counts = imu_consumption_counters;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[IMU-CONSUMPTION-SUMMARY] retained_batches=%lu retained_unique_samples=%lu committed_samples=%lu "
+        "valid_lost_lidar_reject=%lu backlog_valid_lost=%lu retained_backlog_lost=%lu epoch_valid_lost=%lu "
+        "exception_valid_lost=%lu duplicate_confirm=%lu duplicate_integration=%lu watermark_regressions=%lu "
+        "stale_output_reuse=%lu history_rejected=%lu bridged_scans=%lu empty=%lu nonadvancing=%lu "
+        "max_pending_age=%.9f pending_valid=%lu pending_retained=%lu max_imu_backlog_sec=%.9f faulted=%d",
+        static_cast<unsigned long>(counts.retainedBatches),
+        static_cast<unsigned long>(counts.retainedUniqueSamples),
+        static_cast<unsigned long>(counts.committedSamples),
+        static_cast<unsigned long>(counts.validLostOnReject),
+        static_cast<unsigned long>(counts.backlogValidLost),
+        static_cast<unsigned long>(counts.retainedBacklogLost),
+        static_cast<unsigned long>(counts.epochValidLost),
+        static_cast<unsigned long>(counts.exceptionValidLost),
+        static_cast<unsigned long>(imu_fifo_transaction.duplicateConfirmations()),
+        static_cast<unsigned long>(p_imu->integrationLedger().duplicateIntegrations()),
+        static_cast<unsigned long>(p_imu->integrationLedger().watermarkRegressions()),
+        static_cast<unsigned long>(p_imu->staleOutputReuseCount()),
+        static_cast<unsigned long>(counts.events[static_cast<std::size_t>(fast_lio::ImuProcessReason::kHistory)]),
+        static_cast<unsigned long>(imu_gap_bridged_count),
+        static_cast<unsigned long>(empty_scan_imu_count),
+        static_cast<unsigned long>(nonadvancing_scan_count),
+        counts.maxPendingAge,
+        static_cast<unsigned long>(pendingValid),
+        static_cast<unsigned long>(pendingRetained),
+        max_imu_backlog_sec,
+        imu_fifo_transaction.faulted());
+      for (std::size_t i = 0; i < counts.events.size(); ++i)
+        RCLCPP_INFO(this->get_logger(),
+                    "[IMU-CONSUMPTION-REASON] reason=%s events=%lu valid_lost=%lu",
+                    fast_lio::imuProcessReasonName(static_cast<fast_lio::ImuProcessReason>(i)),
+                    static_cast<unsigned long>(counts.events[i]),
+                    static_cast<unsigned long>(counts.lostValid[i]));
+    }
     // The off-thread map worker is a global std::thread; when the node is used as a
     // component (offline replay, composed pipelines) nobody else joins it before the
     // library unloads → std::terminate. Idempotent with the standalone main's call.
@@ -3835,10 +4028,15 @@ private:
   {
     if (sync_packages(Measures)) {
       frontend_runaway = false;
+      if (imu_backlog_reanchor_required) {
+        markImuCoverageGap(Measures.lidar_end_time);
+        imu_backlog_reanchor_required = false;
+      }
       if (flg_first_scan) {
         first_lidar_time = Measures.lidar_beg_time;
         p_imu->first_lidar_time = first_lidar_time;
         flg_first_scan = false;
+        finishImuBatch({fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kBootstrap});
         return;
       }
 
@@ -3863,7 +4061,27 @@ private:
       svd_time = 0;
       t0 = omp_get_wtime();
 
-      if (!p_imu->Process(Measures, kf, feats_undistort)) {
+      bool processed = false;
+      try {
+#ifdef FASTLIO_TEST_HOOKS
+        if (fast_lio_test::beforeImuProcess)
+          fast_lio_test::beforeImuProcess();
+#endif
+        processed = p_imu->Process(Measures, kf, feats_undistort);
+      } catch (const std::exception & error) {
+        feats_undistort->clear();
+        finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation});
+        RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: %s", error.what());
+        return;
+      } catch (...) {
+        feats_undistort->clear();
+        finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation});
+        RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: unknown exception");
+        return;
+      }
+      if (!finishImuBatch(p_imu->lastOutcome()))
+        return;
+      if (!processed) {
         if (p_imu->lastStatus() == ImuProcess::ProcessStatus::kCoverageGap) {
           markImuCoverageGap(Measures.lidar_end_time);
           frontendDrop();
@@ -3886,6 +4104,16 @@ private:
       if (p_imu->gap_summary.gaps > 0) {
         const fast_lio::ImuGapSummary & gaps = p_imu->gap_summary;
         ++imu_gap_bridged_count;
+        RCLCPP_INFO(this->get_logger(),
+                    "[IMU-CONSUMPTION-GAP] token=%lu begin=%.9f end=%.9f gaps=%d longest_interval=%.9f total=%.9f "
+                    "scans_total=%lu",
+                    static_cast<unsigned long>(pending_imu_token.sequence),
+                    Measures.lidar_beg_time,
+                    Measures.lidar_end_time,
+                    gaps.gaps,
+                    gaps.longest_interval_s,
+                    gaps.total_s,
+                    static_cast<unsigned long>(imu_gap_bridged_count));
         // The IMU interval, not the stretch this scan bridged: a dropout carried through several empty scans is
         // bridged 0.1 s at a time.
         const bool verify = gaps.longest_interval_s > imu_gap_verify_s;

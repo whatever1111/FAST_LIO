@@ -23,6 +23,7 @@
 #include <so3_math.h>
 #include <thread>
 
+#include "imu_consumption_policy.hpp"
 #include "imu_coverage_policy.hpp"
 #include "imu_gap_prior.hpp"
 #include "imu_initialization_validity.hpp"
@@ -36,6 +37,14 @@
 #define MAX_INI_COUNT (10)
 
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
+
+inline bool validImuForConsumption(const sensor_msgs::msg::Imu::ConstSharedPtr & imu)
+{
+  return imu && imu->header.stamp.sec >= 0 && imu->header.stamp.nanosec < 1000000000u &&
+         std::isfinite(imu->linear_acceleration.x) && std::isfinite(imu->linear_acceleration.y) &&
+         std::isfinite(imu->linear_acceleration.z) && std::isfinite(imu->angular_velocity.x) &&
+         std::isfinite(imu->angular_velocity.y) && std::isfinite(imu->angular_velocity.z);
+}
 
 /// *************IMU Process and undistortion
 class ImuProcess
@@ -70,6 +79,10 @@ class ImuProcess
   };
   ProcessStatus lastStatus() const { return last_status_; }
   const fast_lio::ImuProcessOutcome & lastOutcome() const { return last_outcome_; }
+  const fast_lio::ImuIntegrationLedger & integrationLedger() const { return integration_ledger_; }
+  std::uint64_t staleOutputReuseCount() const { return stale_output_reuse_count_; }
+  const V3D & lastDeskewAcceleration() const { return acc_s_last; }
+  const V3D & lastDeskewAngularVelocity() const { return angvel_last; }
   fast_lio::ImuCoverageParams coverage_params;
   fast_lio::ImuCoverageResult coverage_result;
   // IMU-gap prior (imu_gap_prior.hpp): intervals longer than gap_params.min_gap_s inside the coverage limit are
@@ -155,6 +168,8 @@ class ImuProcess
   fast_lio::ScanConsumption scan_consumption_;
   ProcessStatus last_status_ = ProcessStatus::kRejected;
   fast_lio::ImuProcessOutcome last_outcome_;
+  fast_lio::ImuIntegrationLedger integration_ledger_;
+  std::uint64_t stale_output_reuse_count_ = 0;
   std::size_t init_iter_num = 0;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -199,6 +214,8 @@ void ImuProcess::Reset()
   scan_consumption_.reset();
   last_status_ = ProcessStatus::kRejected;
   last_outcome_ = {};
+  integration_ledger_ = {};
+  stale_output_reuse_count_ = 0;
   b_first_frame_ = true;
   acc_s_last = Zero3d;
 }
@@ -387,6 +404,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
         Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
         in = gap_input(gyro_avr);
         double dt_start = pcl_beg_time - prop_time;
+        integration_ledger_.observe(prop_time, pcl_beg_time);
         kf_state.predict(dt_start, Q, in);
         gap_run += dt_start;
         gap_interval = std::max(gap_interval, first_stamp - before_stamp);
@@ -442,6 +460,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     {
       // Gyro average as upstream; the bracketing accelerometer mean is NOT integrated over the gap.
       in = gap_input(angvel_avr);
+      integration_ledger_.observe(std::max(prop_time, head_stamp), tail_stamp);
       kf_state.predict(dt, Q, in);
       gap_run += std::max(dt, 0.0);
       gap_interval = std::max(gap_interval, tail_stamp - head_stamp);
@@ -451,6 +470,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
       close_gap();
       in.acc = acc_avr;
       in.gyro = angvel_avr;
+      integration_ledger_.observe(std::max(prop_time, head_stamp), tail_stamp);
       kf_state.predict(dt, Q, in);
     }
 
@@ -488,6 +508,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     const V3D gyro_last = fast_lio::rotationAboutGravityInput(
       V3D(in.gyro), s_end.bg, s_end.rot.toRotationMatrix(), s_end.grav.get_vect());
     in = gap_input(gyro_last);
+    integration_ledger_.observe(prop_time, pcl_end_time);
     kf_state.predict(dt, Q, in);
     gap_run += dt;
     gap_interval = std::max(gap_interval, pcl_end_time - imu_end_time);
@@ -501,6 +522,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   else
   {
     close_gap();
+    integration_ledger_.observe(prop_time, pcl_end_time);
     kf_state.predict(dt, Q, in);
     if (IMUpose.size() == 1) {
       // No new IMU knot: the actual tail prediction still defines one deskew segment.
@@ -642,11 +664,21 @@ bool ImuProcess::Process(const MeasureGroup & meas,
 
   last_status_ = ProcessStatus::kRejected;
   last_outcome_ = {};
-  const auto finish =
-    [this](fast_lio::ImuDisposition disposition, fast_lio::ImuProcessReason reason, bool output = false) {
-      last_outcome_ = {disposition, reason, output};
-      return output;
-    };
+  const auto finish = [this, &meas, &cur_pcl_un_](
+                        fast_lio::ImuDisposition disposition, fast_lio::ImuProcessReason reason, bool output = false) {
+    if (disposition == fast_lio::ImuDisposition::kUncommitted &&
+        !fast_lio::canRetainImuBatch(
+          meas.imu,
+          [](const auto & imu) { return rclcpp::Time(imu->header.stamp).seconds(); },
+          validImuForConsumption)) {
+      disposition = fast_lio::ImuDisposition::kInvalid;
+      reason = fast_lio::ImuProcessReason::kInvalidImu;
+    }
+    if (!output && cur_pcl_un_ && !cur_pcl_un_->empty())
+      ++stale_output_reuse_count_;
+    last_outcome_ = {disposition, reason, output};
+    return output;
+  };
   gap_summary = fast_lio::ImuGapSummary{};
   // Always invalidate the caller's previous cloud before any early return.
   if (!cur_pcl_un_)
@@ -665,9 +697,7 @@ bool ImuProcess::Process(const MeasureGroup & meas,
     return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kInvalidScanTime);
 
   for (const auto & imu : meas.imu) {
-    if (!imu || !std::isfinite(imu->linear_acceleration.x) || !std::isfinite(imu->linear_acceleration.y) ||
-        !std::isfinite(imu->linear_acceleration.z) || !std::isfinite(imu->angular_velocity.x) ||
-        !std::isfinite(imu->angular_velocity.y) || !std::isfinite(imu->angular_velocity.z))
+    if (!validImuForConsumption(imu))
       return finish(fast_lio::ImuDisposition::kInvalid, fast_lio::ImuProcessReason::kInvalidImu);
   }
 
@@ -685,6 +715,7 @@ bool ImuProcess::Process(const MeasureGroup & meas,
     last_imu_   = meas.imu.back();
     last_lidar_end_time_ = meas.lidar_end_time;
     scan_consumption_.commit(meas.lidar_end_time);
+    integration_ledger_.anchor(meas.lidar_end_time);
     last_status_ = ProcessStatus::kInitializing;
     if (!valid_init) {
       discardInitializationWindow();
@@ -755,6 +786,7 @@ bool ImuProcess::Process(const MeasureGroup & meas,
         last_imu_ = meas.imu.back();
       last_lidar_end_time_ = meas.lidar_end_time;
       scan_consumption_.commit(meas.lidar_end_time);
+      integration_ledger_.anchor(meas.lidar_end_time);
       IMUpose.clear();
     }
     last_status_ = ProcessStatus::kCoverageGap;
@@ -762,8 +794,10 @@ bool ImuProcess::Process(const MeasureGroup & meas,
     return finish(outcome.disposition, outcome.reason);
   }
 
+  last_outcome_ = {fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation};
   UndistortPcl(meas, kf_state, *cur_pcl_un_);
   scan_consumption_.commit(meas.lidar_end_time);
+  integration_ledger_.anchor(meas.lidar_end_time);
 
   t2 = omp_get_wtime();
   t3 = omp_get_wtime();

@@ -99,6 +99,8 @@ TEST(ImuProcessValidity, EmptyInputClearsPreviouslyPopulatedOutputWithoutChangin
   output->push_back(PointType{});
   const auto before = filter.get_x().pos;
   EXPECT_FALSE(process.Process(scan(10.0), filter, output));
+  EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kUncommitted);
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kNoImu);
   EXPECT_TRUE(output->empty());
   EXPECT_EQ(filter.get_x().pos, before);
 }
@@ -115,9 +117,12 @@ TEST(ImuProcessValidity, InitializationCommitsTimeAndEqualEndNeverReusesOutput)
   auto output = std::make_shared<PointCloudXYZI>();
   EXPECT_FALSE(process.Process(input, filter, output));
   EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), input.lidar_end_time);
+  EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationComplete);
   output->push_back(PointType{});
   EXPECT_FALSE(process.Process(input, filter, output));
   EXPECT_TRUE(output->empty());
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kNonadvancing);
   process.Reset();
   EXPECT_LT(process.lastProcessedEnd(), 0.0);
 }
@@ -141,6 +146,9 @@ TEST(ImuProcessValidity, SuccessfulScanThenDuplicateAndGapCannotReuseOrPropagate
   for (int i = 0; i < 20; ++i)
     addImu(good, 10.1 + i * 0.005);
   ASSERT_TRUE(process.Process(good, filter, output));
+  EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kProcessed);
+  EXPECT_TRUE(process.lastOutcome().producedOutput);
   ASSERT_FALSE(output->empty());
   const auto state_before = filter.get_x();
   good.imu.clear();
@@ -153,6 +161,8 @@ TEST(ImuProcessValidity, SuccessfulScanThenDuplicateAndGapCannotReuseOrPropagate
     addImu(gap, 14.1 + i * 0.005);
   EXPECT_FALSE(process.Process(gap, filter, output));
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kCoverageGap);
+  EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kCoverageGap);
   EXPECT_TRUE(output->empty());
   EXPECT_EQ(filter.get_x().pos, state_before.pos);
   EXPECT_EQ(filter.get_x().vel, state_before.vel);
@@ -423,6 +433,8 @@ TEST(ImuProcessValidity, InvalidGravityWindowCannotCommitOrCompleteRegardlessOfS
           addImu(bad, 10.0 + i * 0.005, V3D(0, 0, acceleration), V3D::Zero());
         EXPECT_FALSE(process.Process(bad, filter, output));
         EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
+        EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+        EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationInvalidMean);
         EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), bad.lidar_end_time);
         EXPECT_TRUE(output->empty());
         expectUnchangedInitialization(filter, before, covariance);
@@ -516,6 +528,8 @@ TEST(ImuProcessValidity, NonFiniteConstructedCandidateDoesNotPartiallyCommit)
   auto output = std::make_shared<PointCloudXYZI>();
   EXPECT_FALSE(process.Process(input, filter, output));
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
+  EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationInvalidState);
   expectUnchangedInitialization(filter, before, covariance);
 }
 
@@ -765,6 +779,8 @@ TEST(ImuProcessValidity, DeskewRejectsUnavailableOverlapWithoutAdvancingHistory)
   const double watermark = fixture.process.lastProcessedEnd();
   EXPECT_FALSE(fixture.process.Process(rejected, fixture.filter, fixture.output));
   EXPECT_EQ(fixture.process.lastStatus(), ImuProcess::ProcessStatus::kRejected);
+  EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kUncommitted);
+  EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kHistory);
   EXPECT_TRUE(fixture.output->empty());
   expectUnchangedInitialization(fixture.filter, state, covariance);
   EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), watermark);

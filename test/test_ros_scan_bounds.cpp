@@ -14,9 +14,11 @@
 #include <gtest/gtest.h>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
+#include "imu_consumption_policy.hpp"
 #include "imu_process_outcome.hpp"
 #include "laser_mapping_test_hooks.hpp"
 #include "preprocess.h"
@@ -89,6 +91,9 @@ protected:
        rclcpp::Parameter("filter_size_surf", 0.001),
        rclcpp::Parameter("filter_size_map", 0.05),
        rclcpp::Parameter("imu_init_require_still", false),
+#ifdef FASTLIO_INPUT_FAULT_TEST
+       rclcpp::Parameter("max_imu_backlog_sec", 1.0),
+#endif
        rclcpp::Parameter("publish.scan_publish_en", false),
        rclcpp::Parameter("publish.path_en", false),
        rclcpp::Parameter("runtime_pos_log_enable", false)});
@@ -193,6 +198,16 @@ protected:
               << ",\"reason\":\"" << fast_lio::imuProcessReasonName(batch.reason) << "\",\"samples\":" << batch.samples
               << ",\"pending\":" << batch.pending << ",\"first_id\":" << batch.firstIdentity << '}';
     }
+    receipt << "],\"fault_snapshots\":[";
+    for (std::size_t i = 0; i < faultSnapshots.size(); ++i) {
+      if (i)
+        receipt << ',';
+      const auto & state = faultSnapshots[i];
+      receipt << "{\"lidar_queued\":" << state.lidarQueued << ",\"imu_queued\":" << state.imuQueued
+              << ",\"rejected_lidar\":" << state.rejectedLidar << ",\"rejected_imu\":" << state.rejectedImu
+              << ",\"discarded_lidar\":" << state.discardedLidar << ",\"discarded_imu\":" << state.discardedImu
+              << ",\"faulted\":" << (state.faulted ? "true" : "false") << ",\"filter_end\":" << state.filterEnd << '}';
+    }
     receipt << "]}\n";
   }
 
@@ -219,7 +234,13 @@ protected:
   void sendScan(std::size_t count, double start)
   {
     // Continuous finite IMU coverage; no writes to the estimator or initialization state.
-    const auto through = static_cast<std::int64_t>(std::llround((start + 0.06) * 1e9));
+    sendImuThrough(start + 0.06);
+    sendLidar(count, start);
+  }
+
+  void sendImuThrough(double end)
+  {
+    const auto through = static_cast<std::int64_t>(std::llround(end * 1e9));
     for (; nextImu <= through; nextImu += 5000000) {
       sensor_msgs::msg::Imu message;
       message.header.stamp = rclcpp::Time(nextImu);
@@ -227,6 +248,10 @@ protected:
       imu->publish(message);
       executor->spin_some();
     }
+  }
+
+  void sendLidar(std::size_t count, double start)
+  {
     pcl::PointCloud<ouster_ros::Point> cloud;
     cloud.resize(count);
     for (std::size_t i = 0; i < count; ++i) {
@@ -265,11 +290,13 @@ protected:
   std::vector<double> odomStamps;
   std::size_t omittedOdomStamps = 0;
   std::vector<TargetEvidence> targets;
+  std::vector<fast_lio_test::ImuInputSnapshot> faultSnapshots;
   std::int64_t nextImu = 990000000;
   double lastOdom = -1.0;
   bool lastPoseFinite = false;
 };
 
+#ifndef FASTLIO_INPUT_FAULT_TEST
 TEST_F(RosScanBounds, RealSubscriptionsDownsampleAndModelAllThreeBounds)
 {
   double start = 1.0;
@@ -335,4 +362,74 @@ TEST_F(RosScanBounds, RealSubscriptionsDownsampleAndModelAllThreeBounds)
   }
   EXPECT_GT(imuBatches.back().pending, 0u);  // EOF keeps the future, unselected tail explicit.
 }
+#else
+TEST_F(RosScanBounds, FatalTransactionRejectsRealInputsAndBoundsBothQueues)
+{
+  double start = 1.0;
+  double warmupEnd = -1.0;
+  for (int i = 0; i < 6 && modeled.empty(); ++i, start += 0.1) {
+    sendScan(2000, start);
+    warmupEnd = start + 0.05;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    spinUntil([&] { return std::chrono::steady_clock::now() >= until; }, 1.0);
+  }
+  ASSERT_TRUE(spinUntil([&] {
+    return saw(modeled, 2000, warmupEnd) && lastPoseFinite && std::isfinite(lastOdom) &&
+           std::abs(lastOdom - warmupEnd) < 1e-6;
+  }));
+  const auto before = fast_lio_test::inspectImuInput();
+  const auto published = odomStamps.size();
+  const auto modeledCount = modeled.size();
+  const auto batches = imuBatches.size();
+  int processCalls = 0;
+  fast_lio_test::beforeImuProcess = [&] {
+    ++processCalls;
+    throw std::runtime_error("injected IMU processing fault");
+  };
+  sendScan(2000, start);
+  ASSERT_TRUE(spinUntil([&] { return imuBatches.size() > batches; }));
+  ASSERT_EQ(imuBatches.back().disposition, fast_lio::ImuDisposition::kFatal);
+  const auto latched = fast_lio_test::inspectImuInput();
+  faultSnapshots.push_back(latched);
+  EXPECT_TRUE(latched.faulted);
+  EXPECT_TRUE(latched.mapFrozen);
+  EXPECT_TRUE(latched.degradedOdom);
+  EXPECT_EQ(latched.lidarQueued, 0u);
+  EXPECT_EQ(latched.imuQueued, 0u);
+  EXPECT_GT(latched.discardedImu, 0u);  // the unselected future tail is accounted
+  EXPECT_DOUBLE_EQ(latched.filterEnd, before.filterEnd);
+
+  // A leaves this scan protected forever. Subsequent IMU-only traffic is thirty
+  // times the configured backlog window, followed by more real LiDAR inputs.
+  sendLidar(2000, start + 0.1);
+  executor->spin_some();
+  sendImuThrough(start + 30.0);
+  const auto afterImu = fast_lio_test::inspectImuInput();
+  faultSnapshots.push_back(afterImu);
+  EXPECT_EQ(afterImu.lidarQueued, 0u);
+  EXPECT_LE(afterImu.imuQueued, 1u);
+  EXPECT_GT(afterImu.rejectedImu, latched.rejectedImu + 1000);
+  for (int i = 1; i <= 8; ++i) {
+    sendLidar(2000, start + 30.0 + i * 0.1);
+    executor->spin_some();
+  }
+  const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+  spinUntil([&] { return std::chrono::steady_clock::now() >= until; }, 1.0);
+  const auto final = fast_lio_test::inspectImuInput();
+  faultSnapshots.push_back(final);
+  EXPECT_EQ(final.lidarQueued, 0u);
+  EXPECT_LE(final.imuQueued, 1u);
+  EXPECT_GE(final.rejectedLidar, latched.rejectedLidar + 9);
+  EXPECT_DOUBLE_EQ(final.filterEnd, before.filterEnd);
+  EXPECT_EQ(processCalls, 1);
+  EXPECT_EQ(imuBatches.size(), batches + 1);
+  EXPECT_EQ(modeled.size(), modeledCount);
+  EXPECT_EQ(odomStamps.size(), published);
+  const auto confirmation = static_cast<fast_lio::ImuConfirmation>(fast_lio_test::reconfirmLastImuBatch());
+  EXPECT_EQ(confirmation, fast_lio::ImuConfirmation::kStaleEpoch);
+  EXPECT_NE(confirmation, fast_lio::ImuConfirmation::kReleased);
+  EXPECT_NE(confirmation, fast_lio::ImuConfirmation::kRetained);
+  EXPECT_EQ(fast_lio_test::inspectImuInput().imuQueued, final.imuQueued);
+}
+#endif
 }  // namespace

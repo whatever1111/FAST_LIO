@@ -130,6 +130,23 @@ TEST(ImuConsumptionPolicy, FatalPartialPropagationReleasesOwnedPrefixAndStopsFur
   EXPECT_THROW(transaction.borrow(queue, 1), std::logic_error);
 }
 
+TEST(ImuConsumptionPolicy, AdmissionLatchesBothEpochAndTransactionFaultsAcrossInvalidation)
+{
+  Queue queue{{1, 1.0}, {2, 1.1}};
+  Transaction transaction;
+  EXPECT_TRUE(transaction.acceptsInput(false));
+  EXPECT_FALSE(transaction.acceptsInput(true));
+  const auto token = transaction.borrow(queue, 1);
+  EXPECT_EQ(transaction.settle(queue, token, ImuDisposition::kFatal), ImuConfirmation::kFatal);
+  EXPECT_FALSE(transaction.acceptsInput(false));
+  transaction.invalidate();
+  queue.clear();
+  EXPECT_FALSE(transaction.acceptsInput(false));
+  EXPECT_FALSE(transaction.acceptsInput(true));
+  EXPECT_EQ(transaction.settle(queue, token, ImuDisposition::kCommitted), ImuConfirmation::kStaleEpoch);
+  EXPECT_TRUE(queue.empty());
+}
+
 TEST(ImuConsumptionPolicy, AnEmptyPriorBatchLeavesFutureSamplesInPlace)
 {
   Queue queue{{1, 2.0}};

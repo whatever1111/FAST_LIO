@@ -1084,7 +1084,7 @@ TEST(ImuProcessValidity, PartiallyPropagatedExceptionIsFatalInsteadOfAnUncommitt
   EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kPartialPropagation);
 }
 
-TEST(ImuProcessValidity, AStillRejects161UnavailableHistoryScansWithoutMovingItsWatermark)
+TEST(ImuProcessValidity, RepeatedUnavailableHistoryRejectionsDoNotConsumeOrMoveTheWatermark)
 {
   GapFixture fixture(false);
   auto rejected = scan(10.1 - 0.000511169433594);

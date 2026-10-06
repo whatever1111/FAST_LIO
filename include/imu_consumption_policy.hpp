@@ -110,6 +110,7 @@ public:
   }
   void failClosed() { faulted_ = true; }
   bool faulted() const { return faulted_; }
+  bool acceptsInput(bool epochFaulted) const { return !epochFaulted && !faulted_; }
   std::uint64_t duplicateConfirmations() const { return duplicateConfirmations_; }
 
 private:

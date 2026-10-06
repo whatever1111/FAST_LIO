@@ -225,6 +225,9 @@ if(BUILD_TESTING)
     foreach(scan_test test_ros_scan_bounds test_ros_imu_fault)
       string(REGEX REPLACE "^test_" "" scan_receipt "${scan_test}")
       ament_add_gtest(${scan_test} test/test_ros_scan_bounds.cpp TIMEOUT 240)
+      # Both fixtures use the broker's ROS domain and the real /Odometry endpoint.
+      # Serialize their processes rather than allocating an unleased test domain.
+      set_tests_properties(${scan_test} PROPERTIES RUN_SERIAL TRUE)
       target_include_directories(${scan_test} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})

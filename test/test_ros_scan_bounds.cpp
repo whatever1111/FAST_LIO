@@ -273,16 +273,25 @@ protected:
 TEST_F(RosScanBounds, RealSubscriptionsDownsampleAndModelAllThreeBounds)
 {
   double start = 1.0;
+  double warmupEnd = -1.0;
   // First scan, real IMU initialization, map seeding, then a real lidar update.
   for (int i = 0; i < 6 && modeled.empty(); ++i, start += 0.1) {
     sendScan(2000, start);
+    warmupEnd = start + 0.05;
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
     spinUntil([&] { return std::chrono::steady_clock::now() >= until; }, 1.0);
   }
   ASSERT_FALSE(modeled.empty()) << "real IMU/map initialization did not reach h_model";
-  // h_model precedes observer dispatch; use the published boundary for the rejected scan.
-  ASSERT_TRUE(spinUntil([&] { return lastOdom > 0.0 && lastPoseFinite; }))
-    << "real IMU/map initialization did not publish finite odometry";
+  // h_model precedes observer dispatch. Bind the boundary to the last successful
+  // warmup scan, rather than accepting a finite odometry from an earlier scan.
+  ASSERT_TRUE(spinUntil([&] {
+    return saw(modeled, 2000, warmupEnd) && std::isfinite(lastOdom) && lastOdom >= 0.0 && lastPoseFinite &&
+           std::abs(lastOdom - warmupEnd) < 1e-6;
+  }))
+    << "last successful warmup scan did not publish its finite odometry";
+  ASSERT_TRUE(std::isfinite(lastOdom));
+  ASSERT_GE(lastOdom, 0.0);
+  ASSERT_NEAR(lastOdom, warmupEnd, 1e-6);
   ASSERT_FALSE(imuBatches.empty());
   EXPECT_EQ(imuBatches.front().reason, fast_lio::ImuProcessReason::kBootstrap);
   EXPECT_EQ(imuBatches.front().disposition, fast_lio::ImuDisposition::kCommitted);

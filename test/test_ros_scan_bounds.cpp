@@ -280,6 +280,9 @@ TEST_F(RosScanBounds, RealSubscriptionsDownsampleAndModelAllThreeBounds)
     spinUntil([&] { return std::chrono::steady_clock::now() >= until; }, 1.0);
   }
   ASSERT_FALSE(modeled.empty()) << "real IMU/map initialization did not reach h_model";
+  // h_model precedes observer dispatch; use the published boundary for the rejected scan.
+  ASSERT_TRUE(spinUntil([&] { return lastOdom > 0.0 && lastPoseFinite; }))
+    << "real IMU/map initialization did not publish finite odometry";
   ASSERT_FALSE(imuBatches.empty());
   EXPECT_EQ(imuBatches.front().reason, fast_lio::ImuProcessReason::kBootstrap);
   EXPECT_EQ(imuBatches.front().disposition, fast_lio::ImuDisposition::kCommitted);

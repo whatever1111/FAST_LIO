@@ -14,9 +14,12 @@
 #include <gtest/gtest.h>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
+#include "imu_consumption_policy.hpp"
+#include "imu_process_outcome.hpp"
 #include "laser_mapping_test_hooks.hpp"
 #include "preprocess.h"
 
@@ -30,6 +33,16 @@ struct ScanEvidence
   std::size_t count;
   double stamp;
   int effective;
+};
+
+struct ImuBatchEvidence
+{
+  std::uint64_t token;
+  fast_lio::ImuDisposition disposition;
+  fast_lio::ImuProcessReason reason;
+  std::size_t samples;
+  std::size_t pending;
+  std::uint64_t firstIdentity;
 };
 
 constexpr std::size_t kPreparedEvidenceCapacity = 64;
@@ -78,6 +91,9 @@ protected:
        rclcpp::Parameter("filter_size_surf", 0.001),
        rclcpp::Parameter("filter_size_map", 0.05),
        rclcpp::Parameter("imu_init_require_still", false),
+#ifdef FASTLIO_INPUT_FAULT_TEST
+       rclcpp::Parameter("max_imu_backlog_sec", 1.0),
+#endif
        rclcpp::Parameter("publish.scan_publish_en", false),
        rclcpp::Parameter("publish.path_en", false),
        rclcpp::Parameter("runtime_pos_log_enable", false)});
@@ -107,6 +123,20 @@ protected:
       if (modeled.size() < kModelEvidenceCapacity)
         modeled.push_back({count, stamp, effective});
     };
+    fast_lio_test::afterImuConsumption = [this](std::uint64_t token,
+                                                int disposition,
+                                                int reason,
+                                                std::size_t count,
+                                                std::size_t pending,
+                                                std::uint64_t firstIdentity) {
+      if (imuBatches.size() < kModelEvidenceCapacity)
+        imuBatches.push_back({token,
+                              static_cast<fast_lio::ImuDisposition>(disposition),
+                              static_cast<fast_lio::ImuProcessReason>(reason),
+                              count,
+                              pending,
+                              firstIdentity});
+    };
     executor->add_node(subject->get_node_base_interface());
     executor->add_node(observer);
     ASSERT_TRUE(spinUntil([&] { return imu->get_subscription_count() == 1 && lidar->get_subscription_count() == 1; }));
@@ -122,6 +152,8 @@ protected:
     subject.reset();  // production destructor drains and joins the real map worker
     fast_lio_test::afterScanPrepared = {};
     fast_lio_test::afterHModelRows = {};
+    fast_lio_test::afterImuConsumption = {};
+    fast_lio_test::beforeImuProcess = {};
     odom.reset();
     imu.reset();
     lidar.reset();
@@ -157,6 +189,25 @@ protected:
               << ",\"odom\":" << (target.odom ? "true" : "false") << ",\"last_odom\":" << target.lastOdom
               << ",\"last_pose_finite\":" << (target.lastPoseFinite ? "true" : "false") << '}';
     }
+    receipt << "],\"imu_batches\":[";
+    for (std::size_t i = 0; i < imuBatches.size(); ++i) {
+      if (i)
+        receipt << ',';
+      const auto & batch = imuBatches[i];
+      receipt << "{\"token\":" << batch.token << ",\"disposition\":" << static_cast<int>(batch.disposition)
+              << ",\"reason\":\"" << fast_lio::imuProcessReasonName(batch.reason) << "\",\"samples\":" << batch.samples
+              << ",\"pending\":" << batch.pending << ",\"first_id\":" << batch.firstIdentity << '}';
+    }
+    receipt << "],\"fault_snapshots\":[";
+    for (std::size_t i = 0; i < faultSnapshots.size(); ++i) {
+      if (i)
+        receipt << ',';
+      const auto & state = faultSnapshots[i];
+      receipt << "{\"lidar_queued\":" << state.lidarQueued << ",\"imu_queued\":" << state.imuQueued
+              << ",\"rejected_lidar\":" << state.rejectedLidar << ",\"rejected_imu\":" << state.rejectedImu
+              << ",\"discarded_lidar\":" << state.discardedLidar << ",\"discarded_imu\":" << state.discardedImu
+              << ",\"faulted\":" << (state.faulted ? "true" : "false") << ",\"filter_end\":" << state.filterEnd << '}';
+    }
     receipt << "]}\n";
   }
 
@@ -183,7 +234,13 @@ protected:
   void sendScan(std::size_t count, double start)
   {
     // Continuous finite IMU coverage; no writes to the estimator or initialization state.
-    const auto through = static_cast<std::int64_t>(std::llround((start + 0.06) * 1e9));
+    sendImuThrough(start + 0.06);
+    sendLidar(count, start);
+  }
+
+  void sendImuThrough(double end)
+  {
+    const auto through = static_cast<std::int64_t>(std::llround(end * 1e9));
     for (; nextImu <= through; nextImu += 5000000) {
       sensor_msgs::msg::Imu message;
       message.header.stamp = rclcpp::Time(nextImu);
@@ -191,6 +248,10 @@ protected:
       imu->publish(message);
       executor->spin_some();
     }
+  }
+
+  void sendLidar(std::size_t count, double start)
+  {
     pcl::PointCloud<ouster_ros::Point> cloud;
     cloud.resize(count);
     for (std::size_t i = 0; i < count; ++i) {
@@ -225,24 +286,57 @@ protected:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr lidar;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom;
   std::vector<ScanEvidence> prepared, modeled;
+  std::vector<ImuBatchEvidence> imuBatches;
   std::vector<double> odomStamps;
   std::size_t omittedOdomStamps = 0;
   std::vector<TargetEvidence> targets;
+  std::vector<fast_lio_test::ImuInputSnapshot> faultSnapshots;
   std::int64_t nextImu = 990000000;
   double lastOdom = -1.0;
   bool lastPoseFinite = false;
 };
 
+#ifndef FASTLIO_INPUT_FAULT_TEST
 TEST_F(RosScanBounds, RealSubscriptionsDownsampleAndModelAllThreeBounds)
 {
   double start = 1.0;
+  double warmupEnd = -1.0;
   // First scan, real IMU initialization, map seeding, then a real lidar update.
   for (int i = 0; i < 6 && modeled.empty(); ++i, start += 0.1) {
     sendScan(2000, start);
+    warmupEnd = start + 0.05;
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
     spinUntil([&] { return std::chrono::steady_clock::now() >= until; }, 1.0);
   }
   ASSERT_FALSE(modeled.empty()) << "real IMU/map initialization did not reach h_model";
+  // h_model precedes observer dispatch. Bind the boundary to the last successful
+  // warmup scan, rather than accepting a finite odometry from an earlier scan.
+  ASSERT_TRUE(spinUntil([&] {
+    return saw(modeled, 2000, warmupEnd) && std::isfinite(lastOdom) && lastOdom >= 0.0 && lastPoseFinite &&
+           std::abs(lastOdom - warmupEnd) < 1e-6;
+  }))
+    << "last successful warmup scan did not publish its finite odometry";
+  ASSERT_TRUE(std::isfinite(lastOdom));
+  ASSERT_GE(lastOdom, 0.0);
+  ASSERT_NEAR(lastOdom, warmupEnd, 1e-6);
+  ASSERT_FALSE(imuBatches.empty());
+  EXPECT_EQ(imuBatches.front().reason, fast_lio::ImuProcessReason::kBootstrap);
+  EXPECT_EQ(imuBatches.front().disposition, fast_lio::ImuDisposition::kCommitted);
+  const std::size_t beforeReject = imuBatches.size();
+  sendScan(2000, lastOdom - 0.000511169433594);
+  ASSERT_TRUE(spinUntil([&] { return imuBatches.size() > beforeReject; }));
+  const auto retained = imuBatches.back();
+  ASSERT_EQ(retained.reason, fast_lio::ImuProcessReason::kHistory);
+  EXPECT_EQ(retained.disposition, fast_lio::ImuDisposition::kUncommitted);
+  EXPECT_GT(retained.samples, 0u);
+  EXPECT_GE(retained.pending, retained.samples);
+  sendScan(2000, start);
+  ASSERT_TRUE(spinUntil([&] { return imuBatches.back().token > retained.token; }));
+  const auto consumed = imuBatches.back();
+  EXPECT_EQ(consumed.disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(consumed.firstIdentity, retained.firstIdentity);
+  EXPECT_GE(consumed.samples, retained.samples);
+  start += 0.1;
   for (const std::size_t count : {99999u, 100000u, 100001u}) {
     sendScan(count, start);
     const double end = start + 0.05;
@@ -266,5 +360,76 @@ TEST_F(RosScanBounds, RealSubscriptionsDownsampleAndModelAllThreeBounds)
     EXPECT_TRUE(lastPoseFinite);
     start += 0.1;
   }
+  EXPECT_GT(imuBatches.back().pending, 0u);  // EOF keeps the future, unselected tail explicit.
 }
+#else
+TEST_F(RosScanBounds, FatalTransactionRejectsRealInputsAndBoundsBothQueues)
+{
+  double start = 1.0;
+  double warmupEnd = -1.0;
+  for (int i = 0; i < 6 && modeled.empty(); ++i, start += 0.1) {
+    sendScan(2000, start);
+    warmupEnd = start + 0.05;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    spinUntil([&] { return std::chrono::steady_clock::now() >= until; }, 1.0);
+  }
+  ASSERT_TRUE(spinUntil([&] {
+    return saw(modeled, 2000, warmupEnd) && lastPoseFinite && std::isfinite(lastOdom) &&
+           std::abs(lastOdom - warmupEnd) < 1e-6;
+  }));
+  const auto before = fast_lio_test::inspectImuInput();
+  const auto published = odomStamps.size();
+  const auto modeledCount = modeled.size();
+  const auto batches = imuBatches.size();
+  int processCalls = 0;
+  fast_lio_test::beforeImuProcess = [&] {
+    ++processCalls;
+    throw std::runtime_error("injected IMU processing fault");
+  };
+  sendScan(2000, start);
+  ASSERT_TRUE(spinUntil([&] { return imuBatches.size() > batches; }));
+  ASSERT_EQ(imuBatches.back().disposition, fast_lio::ImuDisposition::kFatal);
+  const auto latched = fast_lio_test::inspectImuInput();
+  faultSnapshots.push_back(latched);
+  EXPECT_TRUE(latched.faulted);
+  EXPECT_TRUE(latched.mapFrozen);
+  EXPECT_TRUE(latched.degradedOdom);
+  EXPECT_EQ(latched.lidarQueued, 0u);
+  EXPECT_EQ(latched.imuQueued, 0u);
+  EXPECT_GT(latched.discardedImu, 0u);  // the unselected future tail is accounted
+  EXPECT_DOUBLE_EQ(latched.filterEnd, before.filterEnd);
+
+  // A leaves this scan protected forever. Subsequent IMU-only traffic is thirty
+  // times the configured backlog window, followed by more real LiDAR inputs.
+  sendLidar(2000, start + 0.1);
+  executor->spin_some();
+  sendImuThrough(start + 30.0);
+  const auto afterImu = fast_lio_test::inspectImuInput();
+  faultSnapshots.push_back(afterImu);
+  EXPECT_EQ(afterImu.lidarQueued, 0u);
+  EXPECT_LE(afterImu.imuQueued, 1u);
+  EXPECT_GT(afterImu.rejectedImu, latched.rejectedImu + 1000);
+  for (int i = 1; i <= 8; ++i) {
+    sendLidar(2000, start + 30.0 + i * 0.1);
+    executor->spin_some();
+  }
+  const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+  spinUntil([&] { return std::chrono::steady_clock::now() >= until; }, 1.0);
+  const auto final = fast_lio_test::inspectImuInput();
+  faultSnapshots.push_back(final);
+  EXPECT_EQ(final.lidarQueued, 0u);
+  EXPECT_LE(final.imuQueued, 1u);
+  EXPECT_GE(final.rejectedLidar, latched.rejectedLidar + 9);
+  EXPECT_DOUBLE_EQ(final.filterEnd, before.filterEnd);
+  EXPECT_EQ(processCalls, 1);
+  EXPECT_EQ(imuBatches.size(), batches + 1);
+  EXPECT_EQ(modeled.size(), modeledCount);
+  EXPECT_EQ(odomStamps.size(), published);
+  const auto confirmation = static_cast<fast_lio::ImuConfirmation>(fast_lio_test::reconfirmLastImuBatch());
+  EXPECT_EQ(confirmation, fast_lio::ImuConfirmation::kStaleEpoch);
+  EXPECT_NE(confirmation, fast_lio::ImuConfirmation::kReleased);
+  EXPECT_NE(confirmation, fast_lio::ImuConfirmation::kRetained);
+  EXPECT_EQ(fast_lio_test::inspectImuInput().imuQueued, final.imuQueued);
+}
+#endif
 }  // namespace

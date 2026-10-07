@@ -23,9 +23,11 @@
 #include <so3_math.h>
 #include <thread>
 
+#include "imu_consumption_policy.hpp"
 #include "imu_coverage_policy.hpp"
 #include "imu_gap_prior.hpp"
 #include "imu_initialization_validity.hpp"
+#include "imu_process_outcome.hpp"
 #include "population_moments.hpp"
 #include "scan_time_policy.hpp"
 #include "use-ikfom.hpp"
@@ -35,6 +37,14 @@
 #define MAX_INI_COUNT (10)
 
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
+
+inline bool validImuForConsumption(const sensor_msgs::msg::Imu::ConstSharedPtr & imu)
+{
+  return imu && imu->header.stamp.sec >= 0 && imu->header.stamp.nanosec < 1000000000u &&
+         std::isfinite(imu->linear_acceleration.x) && std::isfinite(imu->linear_acceleration.y) &&
+         std::isfinite(imu->linear_acceleration.z) && std::isfinite(imu->angular_velocity.x) &&
+         std::isfinite(imu->angular_velocity.y) && std::isfinite(imu->angular_velocity.z);
+}
 
 /// *************IMU Process and undistortion
 class ImuProcess
@@ -68,6 +78,11 @@ class ImuProcess
     kCoverageGap
   };
   ProcessStatus lastStatus() const { return last_status_; }
+  const fast_lio::ImuProcessOutcome & lastOutcome() const { return last_outcome_; }
+  const fast_lio::ImuIntegrationLedger & integrationLedger() const { return integration_ledger_; }
+  std::uint64_t staleOutputReuseCount() const { return stale_output_reuse_count_; }
+  const V3D & lastDeskewAcceleration() const { return acc_s_last; }
+  const V3D & lastDeskewAngularVelocity() const { return angvel_last; }
   fast_lio::ImuCoverageParams coverage_params;
   fast_lio::ImuCoverageResult coverage_result;
   // IMU-gap prior (imu_gap_prior.hpp): intervals longer than gap_params.min_gap_s inside the coverage limit are
@@ -130,7 +145,8 @@ class ImuProcess
     cov_acc.setZero();
     cov_gyr.setZero();
   }
-  bool IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, std::size_t &N);
+  fast_lio::ImuProcessOutcome
+  IMU_init(const MeasureGroup & meas, esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state, std::size_t & N);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
@@ -151,6 +167,9 @@ class ImuProcess
   double last_lidar_end_time_ = -1.0;
   fast_lio::ScanConsumption scan_consumption_;
   ProcessStatus last_status_ = ProcessStatus::kRejected;
+  fast_lio::ImuProcessOutcome last_outcome_;
+  fast_lio::ImuIntegrationLedger integration_ledger_;
+  std::uint64_t stale_output_reuse_count_ = 0;
   std::size_t init_iter_num = 0;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -194,6 +213,9 @@ void ImuProcess::Reset()
   last_lidar_end_time_ = -1.0;
   scan_consumption_.reset();
   last_status_ = ProcessStatus::kRejected;
+  last_outcome_ = {};
+  integration_ledger_ = {};
+  stale_output_reuse_count_ = 0;
   b_first_frame_ = true;
   acc_s_last = Zero3d;
 }
@@ -236,7 +258,9 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
   cov_bias_acc = b_a;
 }
 
-bool ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, std::size_t &N)
+fast_lio::ImuProcessOutcome ImuProcess::IMU_init(const MeasureGroup & meas,
+                                                 esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state,
+                                                 std::size_t & N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
    ** 2. normalize the acceleration measurenments to unit gravity **/
@@ -268,7 +292,7 @@ bool ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   // zero/cancelling/tiny means before quaternion construction or normalization.
   if (!fast_lio::validInitializationMean(mean_acc, mean_gyr) || !cov_acc.allFinite() || !cov_gyr.allFinite() ||
       !std::isfinite(cov_acc.sum()) || !std::isfinite(cov_gyr.sum()))
-    return false;
+    return {fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationInvalidMean};
   state_ikfom init_state = kf_state.get_x();
 
   // Gravity alignment: rotate world frame so Z-axis aligns with gravity.
@@ -294,11 +318,11 @@ bool ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;
   init_P(21,21) = init_P(22,22) = 0.00001; 
   if (!fast_lio::finiteInitializationState(init_state) || !init_P.allFinite())
-    return false;
+    return {fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationInvalidState};
   kf_state.change_x(init_state);
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
-  return true;
+  return {fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationAccumulated};
 }
 
 void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
@@ -380,6 +404,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
         Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
         in = gap_input(gyro_avr);
         double dt_start = pcl_beg_time - prop_time;
+        integration_ledger_.observe(prop_time, pcl_beg_time);
         kf_state.predict(dt_start, Q, in);
         gap_run += dt_start;
         gap_interval = std::max(gap_interval, first_stamp - before_stamp);
@@ -435,6 +460,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     {
       // Gyro average as upstream; the bracketing accelerometer mean is NOT integrated over the gap.
       in = gap_input(angvel_avr);
+      integration_ledger_.observe(std::max(prop_time, head_stamp), tail_stamp);
       kf_state.predict(dt, Q, in);
       gap_run += std::max(dt, 0.0);
       gap_interval = std::max(gap_interval, tail_stamp - head_stamp);
@@ -444,6 +470,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
       close_gap();
       in.acc = acc_avr;
       in.gyro = angvel_avr;
+      integration_ledger_.observe(std::max(prop_time, head_stamp), tail_stamp);
       kf_state.predict(dt, Q, in);
     }
 
@@ -481,6 +508,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     const V3D gyro_last = fast_lio::rotationAboutGravityInput(
       V3D(in.gyro), s_end.bg, s_end.rot.toRotationMatrix(), s_end.grav.get_vect());
     in = gap_input(gyro_last);
+    integration_ledger_.observe(prop_time, pcl_end_time);
     kf_state.predict(dt, Q, in);
     gap_run += dt;
     gap_interval = std::max(gap_interval, pcl_end_time - imu_end_time);
@@ -494,6 +522,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   else
   {
     close_gap();
+    integration_ledger_.observe(prop_time, pcl_end_time);
     kf_state.predict(dt, Q, in);
     if (IMUpose.size() == 1) {
       // No new IMU knot: the actual tail prediction still defines one deskew segment.
@@ -634,25 +663,42 @@ bool ImuProcess::Process(const MeasureGroup & meas,
   t1 = omp_get_wtime();
 
   last_status_ = ProcessStatus::kRejected;
+  last_outcome_ = {};
+  const auto finish = [this, &meas, &cur_pcl_un_](
+                        fast_lio::ImuDisposition disposition, fast_lio::ImuProcessReason reason, bool output = false) {
+    if (disposition == fast_lio::ImuDisposition::kUncommitted &&
+        !fast_lio::canRetainImuBatch(
+          meas.imu,
+          [](const auto & imu) { return rclcpp::Time(imu->header.stamp).seconds(); },
+          validImuForConsumption)) {
+      disposition = fast_lio::ImuDisposition::kInvalid;
+      reason = fast_lio::ImuProcessReason::kInvalidImu;
+    }
+    if (!output && cur_pcl_un_ && !cur_pcl_un_->empty())
+      ++stale_output_reuse_count_;
+    last_outcome_ = {disposition, reason, output};
+    return output;
+  };
   gap_summary = fast_lio::ImuGapSummary{};
   // Always invalidate the caller's previous cloud before any early return.
   if (!cur_pcl_un_)
-    return false;
+    return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kNoOutput);
   cur_pcl_un_->clear();
   const bool bridged_empty = meas.imu.empty() && bridgesEmptyScan(meas.lidar_end_time);
-  if (!meas.lidar || meas.lidar->empty() || (meas.imu.empty() && !bridged_empty) ||
-      !scan_consumption_.canProcess(meas.lidar_end_time))
-    return false;
+  if (!meas.lidar || meas.lidar->empty())
+    return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kNoLidar);
+  if (meas.imu.empty() && !bridged_empty)
+    return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kNoImu);
+  if (!scan_consumption_.canProcess(meas.lidar_end_time))
+    return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kNonadvancing);
   const auto timing =
     fast_lio::scanTime(meas.lidar_beg_time, meas.lidar->points, [](const auto & point) { return point.curvature; });
   if (!timing.valid() || timing.end > meas.lidar_end_time)
-    return false;
+    return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kInvalidScanTime);
 
   for (const auto & imu : meas.imu) {
-    if (!imu || !std::isfinite(imu->linear_acceleration.x) || !std::isfinite(imu->linear_acceleration.y) ||
-        !std::isfinite(imu->linear_acceleration.z) || !std::isfinite(imu->angular_velocity.x) ||
-        !std::isfinite(imu->angular_velocity.y) || !std::isfinite(imu->angular_velocity.z))
-      return false;
+    if (!validImuForConsumption(imu))
+      return finish(fast_lio::ImuDisposition::kInvalid, fast_lio::ImuProcessReason::kInvalidImu);
   }
 
   if (imu_need_init_)
@@ -661,17 +707,19 @@ bool ImuProcess::Process(const MeasureGroup & meas,
       initialization_attempt_start_ = meas.lidar_beg_time;
       has_initialization_attempt_start_ = true;
     }
-    const bool valid_init = IMU_init(meas, kf_state, init_iter_num);
+    const auto initialization = IMU_init(meas, kf_state, init_iter_num);
+    const bool valid_init = initialization.reason == fast_lio::ImuProcessReason::kInitializationAccumulated;
 
     imu_need_init_ = true;
     
     last_imu_   = meas.imu.back();
     last_lidar_end_time_ = meas.lidar_end_time;
     scan_consumption_.commit(meas.lidar_end_time);
+    integration_ledger_.anchor(meas.lidar_end_time);
     last_status_ = ProcessStatus::kInitializing;
     if (!valid_init) {
       discardInitializationWindow();
-      return false;  // neither disabled stillness nor its timeout may bypass validity
+      return finish(initialization.disposition, initialization.reason);
     }
 
     state_ikfom imu_state = kf_state.get_x();
@@ -686,7 +734,7 @@ bool ImuProcess::Process(const MeasureGroup & meas,
                   << " > " << init_still_tol << ") — restarting init window" << std::endl;
         b_first_frame_ = true;   // next IMU_init call re-seeds mean/cov from fresh samples
         init_iter_num = 0;
-        return false;
+        return finish(fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationMotion);
       }
       if (init_require_still && timed_out && still_ratio > init_still_tol)
         std::cerr << "[IMU-INIT] WARN still-gate timeout after " << init_still_timeout_s
@@ -703,7 +751,9 @@ bool ImuProcess::Process(const MeasureGroup & meas,
       if (runtime_log_en) fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
     }
 
-    return false;
+    return finish(fast_lio::ImuDisposition::kCommitted,
+                  imu_need_init_ ? fast_lio::ImuProcessReason::kInitializationAccumulated
+                                 : fast_lio::ImuProcessReason::kInitializationComplete);
   }
 
   // The filter cannot reconstruct points preceding its retained state. Reject
@@ -711,7 +761,7 @@ bool ImuProcess::Process(const MeasureGroup & meas,
   // every retained point lies within the available history.
   const auto earliest = std::min_element(meas.lidar->points.begin(), meas.lidar->points.end(), time_list);
   if (earliest->curvature / double(1000) < last_lidar_end_time_ - meas.lidar_beg_time)
-    return false;
+    return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kHistory);
 
   std::vector<double> imu_stamps;
   imu_stamps.reserve(meas.imu.size() + 1);
@@ -736,19 +786,26 @@ bool ImuProcess::Process(const MeasureGroup & meas,
         last_imu_ = meas.imu.back();
       last_lidar_end_time_ = meas.lidar_end_time;
       scan_consumption_.commit(meas.lidar_end_time);
+      integration_ledger_.anchor(meas.lidar_end_time);
       IMUpose.clear();
     }
     last_status_ = ProcessStatus::kCoverageGap;
-    return false;
+    const auto outcome = fast_lio::imuCoverageOutcome(coverage_result.status);
+    return finish(outcome.disposition, outcome.reason);
   }
 
+  last_outcome_ = {fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation};
   UndistortPcl(meas, kf_state, *cur_pcl_un_);
   scan_consumption_.commit(meas.lidar_end_time);
+  integration_ledger_.anchor(meas.lidar_end_time);
 
   t2 = omp_get_wtime();
   t3 = omp_get_wtime();
   
   // cout<<"[ IMU Process ]: Time: "<<t3 - t1<<endl;
   last_status_ = ProcessStatus::kProcessed;
-  return !cur_pcl_un_->empty();
+  const bool output = !cur_pcl_un_->empty();
+  return finish(fast_lio::ImuDisposition::kCommitted,
+                output ? fast_lio::ImuProcessReason::kProcessed : fast_lio::ImuProcessReason::kProcessedNoCloud,
+                output);
 }

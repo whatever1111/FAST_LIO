@@ -221,21 +221,29 @@ if(BUILD_TESTING)
       rosidl_target_interfaces(test_async_map_reset ${PROJECT_NAME} "rosidl_typesupport_cpp")
     endif()
     find_package(class_loader REQUIRED)
-    ament_add_gtest(test_ros_scan_bounds test/test_ros_scan_bounds.cpp TIMEOUT 240)
-    target_include_directories(test_ros_scan_bounds PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
-      ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})
-    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test_results/${PROJECT_NAME})
-    target_compile_definitions(test_ros_scan_bounds PRIVATE
-      FASTLIO_TEST_COMPONENT_PATH="$<TARGET_FILE:fastlio_mapping_test_component>"
-      FASTLIO_SCAN_RECEIPT_PATH="${CMAKE_CURRENT_BINARY_DIR}/test_results/${PROJECT_NAME}/ros_scan_bounds_receipt.json")
-    target_link_libraries(test_ros_scan_bounds fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen)
-    ament_target_dependencies(test_ros_scan_bounds ${dependencies} class_loader)
-    if(cpp_typesupport_target)
-      target_link_libraries(test_ros_scan_bounds ${cpp_typesupport_target})
-    else()
-      rosidl_target_interfaces(test_ros_scan_bounds ${PROJECT_NAME} "rosidl_typesupport_cpp")
-    endif()
+    # Each executable creates one component; production globals outlive a node.
+    foreach(scan_test test_ros_scan_bounds test_ros_imu_fault)
+      string(REGEX REPLACE "^test_" "" scan_receipt "${scan_test}")
+      ament_add_gtest(${scan_test} test/test_ros_scan_bounds.cpp TIMEOUT 240)
+      # Both fixtures use the broker's ROS domain and the real /Odometry endpoint.
+      # Serialize their processes rather than allocating an unleased test domain.
+      set_tests_properties(${scan_test} PROPERTIES RUN_SERIAL TRUE)
+      target_include_directories(${scan_test} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})
+      file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test_results/${PROJECT_NAME})
+      target_compile_definitions(${scan_test} PRIVATE
+        FASTLIO_TEST_COMPONENT_PATH="$<TARGET_FILE:fastlio_mapping_test_component>"
+        FASTLIO_SCAN_RECEIPT_PATH="${CMAKE_CURRENT_BINARY_DIR}/test_results/${PROJECT_NAME}/${scan_receipt}_receipt.json")
+      target_link_libraries(${scan_test} fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen)
+      ament_target_dependencies(${scan_test} ${dependencies} class_loader)
+      if(cpp_typesupport_target)
+        target_link_libraries(${scan_test} ${cpp_typesupport_target})
+      else()
+        rosidl_target_interfaces(${scan_test} ${PROJECT_NAME} "rosidl_typesupport_cpp")
+      endif()
+    endforeach()
+    target_compile_definitions(test_ros_imu_fault PRIVATE FASTLIO_INPUT_FAULT_TEST)
     # One actual component activation per process: production globals are not reset between nodes.
     foreach(capacity_case negative zero small)
       # Direct linking and ClassLoader must resolve the same physical build DSO.
@@ -273,6 +281,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_frontend_observation OpenSSL::Crypto)
   ament_add_gtest(test_imu_coverage_policy test/test_imu_coverage_policy.cpp)
   target_include_directories(test_imu_coverage_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  ament_add_gtest(test_imu_process_outcome test/test_imu_process_outcome.cpp)
+  target_include_directories(test_imu_process_outcome PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  ament_add_gtest(test_imu_consumption_policy test/test_imu_consumption_policy.cpp)
+  target_include_directories(test_imu_consumption_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   ament_add_gtest(test_scan_time_policy test/test_scan_time_policy.cpp)
   target_include_directories(test_scan_time_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   ament_add_gtest(test_population_moments test/test_population_moments.cpp)
@@ -280,10 +292,13 @@ if(BUILD_TESTING)
   ament_add_gtest(test_plane_fit test/test_plane_fit.cpp)
   ament_add_gtest(test_simple_update_tangent test/test_simple_update_tangent.cpp)
   ament_add_gtest(test_imu_process_validity test/test_imu_process_validity.cpp)
+  ament_add_gtest(test_imu_0906_timing test/test_imu_0906_timing.cpp TIMEOUT 240)
+  target_compile_definitions(test_imu_0906_timing PRIVATE
+    FASTLIO_0906_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/m20_0906_scan_timing.txt")
   ament_add_gtest(test_preprocess_timing test/test_preprocess_timing.cpp src/preprocess.cpp)
   # the consider update on the real estimator (use-ikfom.hpp pulls in the same dependencies)
   ament_add_gtest(test_rp_consider_filter test/test_rp_consider_filter.cpp)
-  foreach(timing_test test_plane_fit test_simple_update_tangent test_imu_process_validity test_preprocess_timing test_rp_consider_filter)
+  foreach(timing_test test_plane_fit test_simple_update_tangent test_imu_process_validity test_imu_0906_timing test_preprocess_timing test_rp_consider_filter)
     target_include_directories(${timing_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                ${CMAKE_CURRENT_SOURCE_DIR}/src ${PCL_INCLUDE_DIRS})
     target_link_libraries(${timing_test} ${PCL_LIBRARIES} Eigen3::Eigen)

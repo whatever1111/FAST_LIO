@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
-#include <omp.h>
-
 #include <limits>
+#include <omp.h>
+#include <stdexcept>
 
 #include "IMU_Processing.hpp"
 #include "imu_initialization_validity.hpp"
@@ -99,6 +99,8 @@ TEST(ImuProcessValidity, EmptyInputClearsPreviouslyPopulatedOutputWithoutChangin
   output->push_back(PointType{});
   const auto before = filter.get_x().pos;
   EXPECT_FALSE(process.Process(scan(10.0), filter, output));
+  EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kUncommitted);
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kNoImu);
   EXPECT_TRUE(output->empty());
   EXPECT_EQ(filter.get_x().pos, before);
 }
@@ -115,9 +117,12 @@ TEST(ImuProcessValidity, InitializationCommitsTimeAndEqualEndNeverReusesOutput)
   auto output = std::make_shared<PointCloudXYZI>();
   EXPECT_FALSE(process.Process(input, filter, output));
   EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), input.lidar_end_time);
+  EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationComplete);
   output->push_back(PointType{});
   EXPECT_FALSE(process.Process(input, filter, output));
   EXPECT_TRUE(output->empty());
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kNonadvancing);
   process.Reset();
   EXPECT_LT(process.lastProcessedEnd(), 0.0);
 }
@@ -141,6 +146,9 @@ TEST(ImuProcessValidity, SuccessfulScanThenDuplicateAndGapCannotReuseOrPropagate
   for (int i = 0; i < 20; ++i)
     addImu(good, 10.1 + i * 0.005);
   ASSERT_TRUE(process.Process(good, filter, output));
+  EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kProcessed);
+  EXPECT_TRUE(process.lastOutcome().producedOutput);
   ASSERT_FALSE(output->empty());
   const auto state_before = filter.get_x();
   good.imu.clear();
@@ -153,6 +161,8 @@ TEST(ImuProcessValidity, SuccessfulScanThenDuplicateAndGapCannotReuseOrPropagate
     addImu(gap, 14.1 + i * 0.005);
   EXPECT_FALSE(process.Process(gap, filter, output));
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kCoverageGap);
+  EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kCoverageGap);
   EXPECT_TRUE(output->empty());
   EXPECT_EQ(filter.get_x().pos, state_before.pos);
   EXPECT_EQ(filter.get_x().vel, state_before.vel);
@@ -423,6 +433,8 @@ TEST(ImuProcessValidity, InvalidGravityWindowCannotCommitOrCompleteRegardlessOfS
           addImu(bad, 10.0 + i * 0.005, V3D(0, 0, acceleration), V3D::Zero());
         EXPECT_FALSE(process.Process(bad, filter, output));
         EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
+        EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+        EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationInvalidMean);
         EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), bad.lidar_end_time);
         EXPECT_TRUE(output->empty());
         expectUnchangedInitialization(filter, before, covariance);
@@ -516,6 +528,8 @@ TEST(ImuProcessValidity, NonFiniteConstructedCandidateDoesNotPartiallyCommit)
   auto output = std::make_shared<PointCloudXYZI>();
   EXPECT_FALSE(process.Process(input, filter, output));
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
+  EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationInvalidState);
   expectUnchangedInitialization(filter, before, covariance);
 }
 
@@ -765,6 +779,8 @@ TEST(ImuProcessValidity, DeskewRejectsUnavailableOverlapWithoutAdvancingHistory)
   const double watermark = fixture.process.lastProcessedEnd();
   EXPECT_FALSE(fixture.process.Process(rejected, fixture.filter, fixture.output));
   EXPECT_EQ(fixture.process.lastStatus(), ImuProcess::ProcessStatus::kRejected);
+  EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kUncommitted);
+  EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kHistory);
   EXPECT_TRUE(fixture.output->empty());
   expectUnchangedInitialization(fixture.filter, state, covariance);
   EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), watermark);
@@ -924,4 +940,179 @@ TEST(ImuProcessValidity, DeskewInternalKnotBelongsToPrecedingMotionSegment)
     EXPECT_NEAR(point.x, expected.x(), 2e-6);
     EXPECT_NEAR(point.y, expected.y(), 2e-6);
   }
+}
+
+TEST(ImuProcessValidity, RetainedRejectionsThenSuccessMatchOneCombinedBatchIncludingAuxiliaryState)
+{
+  GapFixture retained(false), combined(false);
+  std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> queue;
+  fast_lio::ImuFifoTransaction<sensor_msgs::msg::Imu::ConstSharedPtr> transaction;
+  auto final = scan(10.2);
+  for (int i = 0; i < 40; ++i)
+    addImu(final, 10.1 + i * 0.005, V3D(0.3, 0.2, 9.81), V3D(0, 0, 0.2));
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const auto count = static_cast<std::size_t>(10 + attempt * 5);
+    while (queue.size() < count)
+      queue.push_back(final.imu[queue.size()]);
+    const auto token = transaction.borrow(queue, count);
+    auto rejected = scan(10.1 - 0.000511169433594);
+    deskewPoints(rejected, {0.0f, 100.0f});
+    rejected.imu.assign(token.prefix.begin(), token.prefix.end());
+    EXPECT_FALSE(retained.process.Process(rejected, retained.filter, retained.output));
+    EXPECT_EQ(retained.process.lastOutcome().reason, fast_lio::ImuProcessReason::kHistory);
+    EXPECT_EQ(transaction.settle(queue, token, retained.process.lastOutcome().disposition),
+              fast_lio::ImuConfirmation::kRetained);
+    EXPECT_EQ(queue.size(), count);
+  }
+  queue.assign(final.imu.begin(), final.imu.end());
+  const auto token = transaction.borrow(queue, queue.size());
+  ASSERT_TRUE(retained.process.Process(final, retained.filter, retained.output));
+  ASSERT_TRUE(combined.process.Process(final, combined.filter, combined.output));
+  EXPECT_EQ(transaction.settle(queue, token, retained.process.lastOutcome().disposition),
+            fast_lio::ImuConfirmation::kReleased);
+  EXPECT_TRUE(queue.empty());
+  EXPECT_TRUE(retained.filter.get_x().pos.isApprox(combined.filter.get_x().pos, 0.0));
+  EXPECT_TRUE(retained.filter.get_x().vel.isApprox(combined.filter.get_x().vel, 0.0));
+  EXPECT_TRUE(
+    retained.filter.get_x().rot.toRotationMatrix().isApprox(combined.filter.get_x().rot.toRotationMatrix(), 0.0));
+  EXPECT_TRUE(retained.filter.get_P().isApprox(combined.filter.get_P(), 0.0));
+  EXPECT_TRUE(retained.process.lastDeskewAcceleration().isApprox(combined.process.lastDeskewAcceleration(), 0.0));
+  EXPECT_TRUE(retained.process.lastDeskewAngularVelocity().isApprox(combined.process.lastDeskewAngularVelocity(), 0.0));
+  EXPECT_DOUBLE_EQ(retained.process.lastProcessedEnd(), combined.process.lastProcessedEnd());
+  EXPECT_EQ(retained.process.integrationLedger().duplicateIntegrations(), 0u);
+  EXPECT_EQ(retained.process.integrationLedger().watermarkRegressions(), 0u);
+}
+
+TEST(ImuProcessValidity, PrevalidationRejectionsRetainOnlyFiniteOrderedSamples)
+{
+  GapFixture fixture(false);
+  auto input = scan(10.1);
+  addImu(input, 10.1);
+  EXPECT_FALSE(fixture.process.Process(input, fixture.filter, nullptr));
+  EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kUncommitted);
+  EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kNoOutput);
+  input.lidar.reset();
+  EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output));
+  EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kUncommitted);
+  input.imu.push_back(nullptr);
+  EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output));
+  EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kInvalid);
+  EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInvalidImu);
+  EXPECT_TRUE(fixture.output->empty());
+}
+
+TEST(ImuProcessValidity, InvalidMessageStampsAndNonFiniteComponentsAreExplicitlyInvalid)
+{
+  for (int malformed = 0; malformed < 5; ++malformed) {
+    GapFixture fixture(false);
+    auto input = scan(10.1);
+    auto imu = std::make_shared<sensor_msgs::msg::Imu>();
+    imu->header.stamp = rclcpp::Time(static_cast<std::int64_t>(10100000000LL));
+    imu->linear_acceleration.z = 9.81;
+    switch (malformed) {
+      case 0:
+        imu->header.stamp.sec = -1;
+        break;
+      case 1:
+        imu->header.stamp.nanosec = 1000000000u;
+        break;
+      case 2:
+        imu->linear_acceleration.x = std::numeric_limits<double>::quiet_NaN();
+        break;
+      case 3:
+        imu->angular_velocity.z = std::numeric_limits<double>::infinity();
+        break;
+      case 4:
+        imu.reset();
+        break;
+    }
+    input.imu.push_back(imu);
+    EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output));
+    EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kInvalid);
+    EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInvalidImu);
+    EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), 10.1);
+  }
+}
+
+TEST(ImuProcessValidity, EndCoverageReanchorsButUnorderedOrInvalidCoverageDoesNot)
+{
+  for (int path = 0; path < 3; ++path) {
+    GapFixture fixture(false);
+    auto input = scan(10.1);
+    addImu(input, 10.1);
+    addImu(input, 10.11);
+    if (path == 0)
+      fixture.process.coverage_params.max_extrapolation_s = 0.01;
+    else if (path == 1)
+      addImu(input, 10.105);
+    else
+      fixture.process.coverage_params.max_gap_s = -1.0;
+    EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output));
+    EXPECT_EQ(fixture.process.lastOutcome().disposition,
+              path == 0 ? fast_lio::ImuDisposition::kCommitted : fast_lio::ImuDisposition::kInvalid);
+    EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), path == 0 ? input.lidar_end_time : 10.1);
+    EXPECT_TRUE(fixture.output->empty());
+  }
+}
+
+TEST(ImuProcessValidity, PartiallyPropagatedExceptionIsFatalInsteadOfAnUncommittedRetry)
+{
+  GapFixture fixture(false);
+  static int calls;
+  calls = 0;
+  double epsilon[23];
+  std::fill(std::begin(epsilon), std::end(epsilon), 0.001);
+  fixture.filter.init_dyn_share(
+    [](state_ikfom & state, const input_ikfom & input) -> Eigen::Matrix<double, 24, 1> {
+      if (++calls == 2)
+        throw std::runtime_error("injected partial propagation");
+      return get_f(state, input);
+    },
+    df_dx,
+    df_dw,
+    [](state_ikfom &, esekfom::dyn_share_datastruct<double> &) {},
+    5,
+    epsilon);
+  auto input = scan(10.1);
+  for (int i = 0; i < 20; ++i)
+    addImu(input, 10.1 + i * 0.005);
+  const auto before = fixture.filter.get_x().pos;
+  EXPECT_THROW(fixture.process.Process(input, fixture.filter, fixture.output), std::runtime_error);
+  EXPECT_EQ(calls, 2);
+  EXPECT_FALSE(fixture.filter.get_x().pos.isApprox(before, 0.0));
+  EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kFatal);
+  EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kPartialPropagation);
+}
+
+TEST(ImuProcessValidity, RepeatedUnavailableHistoryRejectionsDoNotConsumeOrMoveTheWatermark)
+{
+  GapFixture fixture(false);
+  auto rejected = scan(10.1 - 0.000511169433594);
+  deskewPoints(rejected, {0.0f, 100.0f});
+  for (int i = 0; i < 20; ++i)
+    addImu(rejected, 10.1 + i * 0.005);
+  auto queue = rejected.imu;
+  fast_lio::ImuFifoTransaction<sensor_msgs::msg::Imu::ConstSharedPtr> transaction;
+  int rejectedScans = 0;
+  for (int i = 0; i < 161; ++i) {
+    const auto token = transaction.borrow(queue, queue.size());
+    EXPECT_FALSE(fixture.process.Process(rejected, fixture.filter, fixture.output));
+    ASSERT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kHistory);
+    EXPECT_EQ(transaction.settle(queue, token, fixture.process.lastOutcome().disposition),
+              fast_lio::ImuConfirmation::kRetained);
+    EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), 10.1);
+    EXPECT_TRUE(fixture.output->empty());
+    ++rejectedScans;
+  }
+  EXPECT_EQ(rejectedScans, 161);
+  auto successor = scan(10.1);
+  deskewPoints(successor, {0.0f, 100.0f});
+  successor.imu = queue;
+  const auto token = transaction.borrow(queue, queue.size());
+  ASSERT_TRUE(fixture.process.Process(successor, fixture.filter, fixture.output));
+  EXPECT_EQ(transaction.settle(queue, token, fixture.process.lastOutcome().disposition),
+            fast_lio::ImuConfirmation::kReleased);
+  EXPECT_TRUE(queue.empty());
+  EXPECT_EQ(fixture.process.integrationLedger().duplicateIntegrations(), 0u);
+  EXPECT_EQ(fixture.process.staleOutputReuseCount(), 0u);
 }

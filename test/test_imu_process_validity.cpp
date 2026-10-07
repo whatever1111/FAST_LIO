@@ -768,15 +768,66 @@ TEST(ImuProcessValidity, DeskewIncludesEarliestPointAndInternalBoundaryNeighbors
     EXPECT_NEAR(p.x, 7.9 + p.curvature / 1000.0, 2e-6);
 }
 
-TEST(ImuProcessValidity, DeskewRejectsUnavailableOverlapWithoutAdvancingHistory)
+TEST(ImuProcessValidity, DeskewRetainsLegalOverlapPointsAndExcludesPointsWithoutHistory)
+{
+  GapFixture fixture(false), reference(false);
+  const double begin = fixture.process.lastProcessedEnd() - 0.0625;
+  auto input = scan(begin);
+  deskewPoints(input, {0.0f, 62.5f, 51.0f, 100.0f, 75.0f});
+  input.lidar->header.stamp = 123456;
+  for (std::size_t i = 0; i < input.lidar->size(); ++i)
+    input.lidar->points[i].intensity = static_cast<float>(i + 1);
+  for (int i = 0; i < 9; ++i)
+    addImu(input, 10.095 + i * 0.005);
+  const auto original = *input.lidar;
+  auto selected = input;
+  selected.lidar = std::make_shared<PointCloudXYZI>(original);
+  selected.lidar->erase(selected.lidar->begin());
+  selected.lidar->erase(selected.lidar->begin() + 1);
+  ASSERT_TRUE(fixture.process.Process(input, fixture.filter, fixture.output));
+  ASSERT_TRUE(reference.process.Process(selected, reference.filter, reference.output));
+  EXPECT_EQ(fixture.process.lastStatus(), ImuProcess::ProcessStatus::kProcessed);
+  EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), input.lidar_end_time);
+  ASSERT_EQ(fixture.output->size(), 3u);
+  EXPECT_EQ(fixture.output->width, 3u);
+  EXPECT_EQ(fixture.output->height, 1u);
+  EXPECT_EQ(fixture.output->header.stamp, original.header.stamp);
+  for (std::size_t i = 0; i < fixture.output->size(); ++i) {
+    const auto & point = fixture.output->points[i];
+    EXPECT_GE(double(point.curvature) / 1000.0, 0.0625);
+    EXPECT_NEAR(point.x, 8.0 - (input.lidar_end_time - begin - double(point.curvature) / 1000.0), 2e-6);
+    EXPECT_EQ(point.x, reference.output->points[i].x);
+    EXPECT_EQ(point.curvature, reference.output->points[i].curvature);
+    EXPECT_EQ(point.intensity, reference.output->points[i].intensity);
+  }
+  EXPECT_FLOAT_EQ(fixture.output->front().curvature, 62.5f);
+  EXPECT_TRUE(fixture.filter.get_x().pos.isApprox(reference.filter.get_x().pos, 0.0));
+  EXPECT_TRUE(fixture.filter.get_x().vel.isApprox(reference.filter.get_x().vel, 0.0));
+  EXPECT_EQ(fixture.filter.get_P(), reference.filter.get_P());
+  ASSERT_EQ(input.lidar->size(), original.size());
+  for (std::size_t i = 0; i < original.size(); ++i) {
+    EXPECT_FLOAT_EQ(input.lidar->points[i].x, original.points[i].x);
+    EXPECT_FLOAT_EQ(input.lidar->points[i].curvature, original.points[i].curvature);
+    EXPECT_FLOAT_EQ(input.lidar->points[i].intensity, original.points[i].intensity);
+  }
+  EXPECT_DOUBLE_EQ(input.lidar_beg_time, begin);
+  EXPECT_DOUBLE_EQ(input.lidar_end_time, begin + 0.1);
+  EXPECT_EQ(fixture.process.integrationLedger().duplicateIntegrations(), 0u);
+  EXPECT_EQ(fixture.process.integrationLedger().watermarkRegressions(), 0u);
+}
+
+TEST(ImuProcessValidity, AllOldHistoryPointsStillRejectWithoutAdvancingOrReusingOutput)
 {
   GapFixture fixture(false);
   auto rejected = scan(10.05);
-  deskewPoints(rejected, {0.0f, 100.0f});
-  for (int i = 0; i <= 20; ++i) addImu(rejected, 10.05 + i * 0.005);
+  deskewPoints(rejected, {0.0f, 49.0f});
+  for (int i = 0; i < 11; ++i)
+    addImu(rejected, 10.095 + i * 0.005);
   const auto state = fixture.filter.get_x();
   const auto covariance = fixture.filter.get_P();
   const double watermark = fixture.process.lastProcessedEnd();
+  fixture.output->push_back(rejected.lidar->front());
   EXPECT_FALSE(fixture.process.Process(rejected, fixture.filter, fixture.output));
   EXPECT_EQ(fixture.process.lastStatus(), ImuProcess::ProcessStatus::kRejected);
   EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kUncommitted);
@@ -784,6 +835,9 @@ TEST(ImuProcessValidity, DeskewRejectsUnavailableOverlapWithoutAdvancingHistory)
   EXPECT_TRUE(fixture.output->empty());
   expectUnchangedInitialization(fixture.filter, state, covariance);
   EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), watermark);
+  EXPECT_EQ(fixture.process.integrationLedger().duplicateIntegrations(), 0u);
+  EXPECT_EQ(fixture.process.integrationLedger().watermarkRegressions(), 0u);
+  EXPECT_EQ(fixture.process.staleOutputReuseCount(), 0u);
   auto accepted = scan(10.05);
   deskewPoints(accepted, {51.0f, 100.0f});
   // Retained IMU is 10.095; a valid successor must not prepend older samples.
@@ -791,6 +845,120 @@ TEST(ImuProcessValidity, DeskewRejectsUnavailableOverlapWithoutAdvancingHistory)
   ASSERT_TRUE(fixture.process.Process(accepted, fixture.filter, fixture.output));
   EXPECT_NEAR(fixture.filter.get_x().pos.x(), 0.05, 1e-10);
   EXPECT_NEAR(fixture.output->front().x, 8.0 - 0.049, 2e-6);
+}
+
+TEST(ImuProcessValidity, NanosecondAndObservedOverlapsDeskewOnlyLegalPoints)
+{
+  for (double overlap : {1e-9, 0.000511, 0.000511169433594}) {
+    SCOPED_TRACE(overlap);
+    GapFixture fixture(false);
+    const double history = fixture.process.lastProcessedEnd();
+    auto input = scan(history - overlap);
+    deskewPoints(input, {0.0f, 0.510f, 0.512f, 100.0f});
+    for (int i = 0; i < 20; ++i)
+      addImu(input, 10.095 + i * 0.005);
+    const double begin = input.lidar_beg_time;
+    const double end = input.lidar_end_time;
+    ASSERT_TRUE(fixture.process.Process(input, fixture.filter, fixture.output));
+    EXPECT_EQ(fixture.output->size(), overlap == 1e-9 ? 3u : 2u);
+    for (const auto & point : *fixture.output) {
+      EXPECT_GE(double(point.curvature) / 1000.0, history - begin);
+      EXPECT_NEAR(point.x, 8.0 - (end - begin - double(point.curvature) / 1000.0), 2e-6);
+    }
+    EXPECT_DOUBLE_EQ(input.lidar_beg_time, begin);
+    EXPECT_DOUBLE_EQ(input.lidar_end_time, end);
+    EXPECT_EQ(input.lidar->size(), 4u);
+    EXPECT_TRUE(fixture.filter.get_x().pos.allFinite());
+    EXPECT_TRUE(fixture.filter.get_P().allFinite());
+    EXPECT_EQ(fixture.process.integrationLedger().duplicateIntegrations(), 0u);
+    EXPECT_EQ(fixture.process.integrationLedger().watermarkRegressions(), 0u);
+  }
+}
+
+TEST(ImuProcessValidity, HistoryCompactionCannotHideInvalidOriginalScanTimes)
+{
+  GapFixture fixture(false);
+  for (float invalid :
+       {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -1.0f, 101.0f}) {
+    auto input = scan(10.1 - 0.000511169433594);
+    deskewPoints(input, {invalid, 100.0f});
+    addImu(input, 10.095);
+    const auto state = fixture.filter.get_x();
+    const auto covariance = fixture.filter.get_P();
+    const double watermark = fixture.process.lastProcessedEnd();
+    fixture.output->push_back(input.lidar->back());
+    EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output));
+    EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInvalidScanTime);
+    EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kUncommitted);
+    EXPECT_TRUE(fixture.output->empty());
+    EXPECT_EQ(input.lidar->size(), 2u);
+    expectUnchangedInitialization(fixture.filter, state, covariance);
+    EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), watermark);
+  }
+}
+
+TEST(ImuProcessValidity, RetainedHistoryPointsMatchAnalyticUniformTranslationAndRotation)
+{
+  GapFixture fixture(false);
+  const double history = fixture.process.lastProcessedEnd();
+  auto input = scan(history - 0.0625);
+  deskewPoints(input, {0.0f, 62.5f, 70.0f, 90.0f, 100.0f});
+  constexpr double rate = 0.2;
+  for (int i = 0; i < 9; ++i)
+    addImu(input, 10.095 + i * 0.005, V3D(0, 0, 9.81), V3D(0, 0, rate));
+  ASSERT_TRUE(fixture.process.Process(input, fixture.filter, fixture.output));
+  ASSERT_EQ(fixture.output->size(), 4u);
+  const M3D endRotation = Eigen::AngleAxisd(rate * (input.lidar_end_time - history), V3D::UnitZ()).toRotationMatrix();
+  for (const auto & point : *fixture.output) {
+    const double offset = double(point.curvature) / 1000.0;
+    const double sinceHistory = input.lidar_beg_time - history + offset;
+    ASSERT_GE(sinceHistory, 0.0);
+    const M3D pointRotation = Eigen::AngleAxisd(rate * sinceHistory, V3D::UnitZ()).toRotationMatrix();
+    const V3D expected = endRotation.transpose() * (pointRotation * V3D(8, 0, 0) -
+                                                    V3D(input.lidar_end_time - input.lidar_beg_time - offset, 0, 0));
+    EXPECT_NEAR(point.x, expected.x(), 2e-6);
+    EXPECT_NEAR(point.y, expected.y(), 2e-6);
+    EXPECT_NEAR(point.z, expected.z(), 2e-6);
+  }
+  EXPECT_TRUE(fixture.filter.get_x().rot.toRotationMatrix().isApprox(endRotation, 1e-10));
+  EXPECT_TRUE(fixture.filter.get_P().allFinite());
+  EXPECT_EQ(fixture.process.integrationLedger().duplicateIntegrations(), 0u);
+  EXPECT_EQ(fixture.process.integrationLedger().watermarkRegressions(), 0u);
+}
+
+TEST(ImuProcessValidity, RecoveredScanCommitMakesSuccessorUseItsNewHistoryBoundary)
+{
+  GapFixture fixture(false);
+  const double initialHistory = fixture.process.lastProcessedEnd();
+  auto first = scan(initialHistory - 0.000511169433594);
+  deskewPoints(first, {0.0f, 0.512f, 100.0f});
+  for (int i = 0; i < 20; ++i)
+    addImu(first, 10.095 + i * 0.005);
+  ASSERT_TRUE(fixture.process.Process(first, fixture.filter, fixture.output));
+  ASSERT_EQ(fixture.output->size(), 2u);
+  EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), first.lidar_end_time);
+
+  auto successor = scan(10.15);  // Its earliest point was legal against the pre-B watermark.
+  deskewPoints(successor, {0.0f, 25.0f, 50.0f, 100.0f});
+  ASSERT_GT(successor.lidar_beg_time, initialHistory);
+  ASSERT_LT(successor.lidar_beg_time, first.lidar_end_time);
+  for (int i = 0; i < 11; ++i)
+    addImu(successor, 10.19 + i * 0.005);
+  ASSERT_TRUE(fixture.process.Process(successor, fixture.filter, fixture.output));
+  ASSERT_EQ(fixture.output->size(), 2u);
+  EXPECT_FLOAT_EQ(fixture.output->front().curvature, 50.0f);
+  EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), successor.lidar_end_time);
+
+  auto ordinary = scan(successor.lidar_end_time);
+  deskewPoints(ordinary, {0.0f, 100.0f});
+  for (int i = 0; i < 22; ++i)
+    addImu(ordinary, 10.24 + i * 0.005);
+  ASSERT_TRUE(fixture.process.Process(ordinary, fixture.filter, fixture.output));
+  ASSERT_EQ(fixture.output->size(), 2u);
+  EXPECT_FLOAT_EQ(fixture.output->front().curvature, 0.0f);
+  EXPECT_EQ(fixture.process.integrationLedger().duplicateIntegrations(), 0u);
+  EXPECT_EQ(fixture.process.integrationLedger().watermarkRegressions(), 0u);
+  EXPECT_EQ(fixture.process.staleOutputReuseCount(), 0u);
 }
 
 TEST(ImuProcessValidity, DeskewUsesNegativeSeedOffsetAcrossScanGap)
@@ -956,7 +1124,7 @@ TEST(ImuProcessValidity, RetainedRejectionsThenSuccessMatchOneCombinedBatchInclu
       queue.push_back(final.imu[queue.size()]);
     const auto token = transaction.borrow(queue, count);
     auto rejected = scan(10.1 - 0.000511169433594);
-    deskewPoints(rejected, {0.0f, 100.0f});
+    deskewPoints(rejected, {0.0f, 0.5f});  // All points lack history; retain A's negative control.
     rejected.imu.assign(token.prefix.begin(), token.prefix.end());
     EXPECT_FALSE(retained.process.Process(rejected, retained.filter, retained.output));
     EXPECT_EQ(retained.process.lastOutcome().reason, fast_lio::ImuProcessReason::kHistory);
@@ -1088,7 +1256,7 @@ TEST(ImuProcessValidity, RepeatedUnavailableHistoryRejectionsDoNotConsumeOrMoveT
 {
   GapFixture fixture(false);
   auto rejected = scan(10.1 - 0.000511169433594);
-  deskewPoints(rejected, {0.0f, 100.0f});
+  deskewPoints(rejected, {0.0f, 0.5f});  // Repeated all-old rejection must still retain IMU.
   for (int i = 0; i < 20; ++i)
     addImu(rejected, 10.1 + i * 0.005);
   auto queue = rejected.imu;

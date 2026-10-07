@@ -23,7 +23,7 @@ float floatBits(const std::string & hex)
 }
 }  // namespace
 
-TEST(Imu0906Timing, SequentialProcessMatchesIndependentGoldenHistoryRejections)
+TEST(Imu0906Timing, SequentialProcessRetainsHistoryBoundedPointsWithUnchangedTimingFixture)
 {
   std::ifstream fixture(FASTLIO_0906_FIXTURE_PATH);
   ASSERT_TRUE(fixture.is_open());
@@ -46,9 +46,8 @@ TEST(Imu0906Timing, SequentialProcessMatchesIndependentGoldenHistoryRejections)
   Imu latestImu;
   fast_lio::ImuFifoTransaction<Imu> transaction;
   std::int64_t nextImuNs = beginNs - 10000000;
-  std::vector<std::int64_t> expectedRejected, actualRejected;
-  std::size_t frames = 0, successful = 0, nonadvancing = 0, successfulAfterRejection = 0;
-  bool retainedSinceSuccess = false;
+  std::vector<std::int64_t> baselineRejected, actualRejected;
+  std::size_t frames = 0, successful = 0, nonadvancing = 0, recovered = 0, trimmed = 0;
   while (std::getline(fixture, line)) {
     std::int64_t rawId, headerDelta, beginDelta;
     std::string firstBits, lastBits;
@@ -113,34 +112,44 @@ TEST(Imu0906Timing, SequentialProcessMatchesIndependentGoldenHistoryRejections)
     }
     ASSERT_FALSE(input.imu.empty());
     const double previousEnd = process.lastProcessedEnd();
+    const double historyOffset = previousEnd - input.lidar_beg_time;
+    // Independently count legal points using original float32 offsets. Apply
+    // the new watermark to EVERY successor, not a whitelist of baseline H rows.
+    const std::size_t expectedPoints =
+      (double(firstMs) / 1000.0 >= historyOffset ? 1u : 0u) + (double(lastMs) / 1000.0 >= historyOffset ? 1u : 0u);
     const bool processed = process.Process(input, filter, output);
     const auto outcome = process.lastOutcome();
     if (outcome.reason == fast_lio::ImuProcessReason::kHistory)
       actualRejected.push_back(rawId);
-    if (label == 'H') {
-      expectedRejected.push_back(rawId);
-      EXPECT_FALSE(processed);
-      EXPECT_EQ(outcome.reason, fast_lio::ImuProcessReason::kHistory);
-      EXPECT_EQ(outcome.disposition, fast_lio::ImuDisposition::kUncommitted);
-      EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), previousEnd);
-      EXPECT_TRUE(output->empty());
-      retainedSinceSuccess = true;
-    } else if (label == 'I') {
+    if (label == 'I') {
       EXPECT_FALSE(processed);
       EXPECT_EQ(outcome.reason, fast_lio::ImuProcessReason::kInitializationComplete);
       EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), input.lidar_end_time);
     } else {
-      ASSERT_TRUE(label == 'M' || label == 'O');
-      EXPECT_TRUE(processed);
+      ASSERT_TRUE(label == 'H' || label == 'M' || label == 'O');
+      ASSERT_GT(expectedPoints, 0u);
+      ASSERT_TRUE(processed);
       EXPECT_EQ(outcome.reason, fast_lio::ImuProcessReason::kProcessed);
+      EXPECT_EQ(outcome.disposition, fast_lio::ImuDisposition::kCommitted);
       EXPECT_GT(process.lastProcessedEnd(), previousEnd);
       EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), input.lidar_end_time);
-      if (retainedSinceSuccess)
-        ++successfulAfterRejection;
-      retainedSinceSuccess = false;
-      if (label == 'O')
+      ASSERT_EQ(output->size(), expectedPoints);
+      for (const auto & point : *output)
+        EXPECT_GE(double(point.curvature) / 1000.0, historyOffset);
+      if (expectedPoints < input.lidar->size())
+        ++trimmed;
+      if (label == 'H') {
+        baselineRejected.push_back(rawId);
+        ++recovered;
+      }
+      if (label != 'M')
         ++successful;
+      EXPECT_TRUE(filter.get_x().pos.allFinite());
+      EXPECT_TRUE(filter.get_P().allFinite());
     }
+    ASSERT_EQ(input.lidar->size(), 2u);
+    EXPECT_FLOAT_EQ(input.lidar->front().curvature, firstMs);
+    EXPECT_FLOAT_EQ(input.lidar->back().curvature, lastMs);
     const auto confirmation = transaction.settle(queue, token, outcome.disposition);
     EXPECT_EQ(confirmation,
               outcome.disposition == fast_lio::ImuDisposition::kCommitted ? fast_lio::ImuConfirmation::kReleased
@@ -149,11 +158,15 @@ TEST(Imu0906Timing, SequentialProcessMatchesIndependentGoldenHistoryRejections)
   }
   EXPECT_TRUE(fixture.eof());
   EXPECT_EQ(frames, 8968u);
-  ASSERT_EQ(expectedRejected.size(), 161u);
-  EXPECT_EQ(actualRejected, expectedRejected);
-  EXPECT_EQ(successful, 8799u);
+  ASSERT_EQ(baselineRejected.size(), 161u);  // Frozen labels remain baseline evidence.
+  EXPECT_TRUE(actualRejected.empty());
+  EXPECT_EQ(recovered, baselineRejected.size());
+  EXPECT_EQ(trimmed, 186u);
+  EXPECT_EQ(successful, 8960u);
   EXPECT_EQ(nonadvancing, 5u);
-  EXPECT_EQ(successfulAfterRejection, 161u);
+  RecordProperty("history_trimmed_scans", static_cast<int>(trimmed));
+  RecordProperty("recovered_baseline_history_scans", static_cast<int>(recovered));
+  RecordProperty("eligible_output_scans", static_cast<int>(successful));
   EXPECT_EQ(process.integrationLedger().duplicateIntegrations(), 0u);
   EXPECT_EQ(process.integrationLedger().watermarkRegressions(), 0u);
   EXPECT_EQ(process.staleOutputReuseCount(), 0u);

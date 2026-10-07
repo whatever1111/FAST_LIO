@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <cstring>
 #include <gtest/gtest.h>
 #include <limits>
 #include <omp.h>
+#include <sstream>
 #include <stdexcept>
 
 #include "IMU_Processing.hpp"
@@ -112,16 +114,13 @@ struct StaticInitFixture
 
   MeasureGroup input(int frame, bool moving = false, double origin = 10.0)
   {
-    // Match the IMU stamp's integer-nanosecond conversion. begin + 0.1 can
-    // otherwise put the scan end one ULP before its final IMU (frame 12).
-    constexpr int64_t kFrameNs = 100000000;
-    const int64_t beginNs = static_cast<int64_t>(std::llround(origin * 1e9)) + frame * kFrameNs;
-    auto result = scan(rclcpp::Time(beginNs).seconds());
-    result.lidar_end_time = rclcpp::Time(beginNs + kFrameNs).seconds();
+    auto result = scan(origin + frame * 0.1);
     for (int i = frame == 0 ? 0 : 1; i <= 20; ++i) {
       const double x = moving ? (i % 2 == 0 ? 1.0 : -1.0) : 0.0;
       addImu(result, origin + (frame * 20 + i) * 0.005, V3D(x, 0.0, 9.81), V3D(0.0, 0.0, moving ? 0.2 : 0.0));
     }
+    // Include both the point-derived end and the actual nanosecond-quantized IMU tail.
+    result.lidar_end_time = std::max(result.lidar_end_time, rclcpp::Time(result.imu.back()->header.stamp).seconds());
     return result;
   }
 };
@@ -153,23 +152,37 @@ TEST(ImuProcessValidity, T13SustainedStillInitializesAtFirstOneSecondFrameEnd)
 TEST(ImuProcessValidity, T14MovingTimeoutCompletesAndDegradationSurvivesReset)
 {
   StaticInitFixture f;
+  std::ostringstream frameReasons;
+  const auto recordReason = [&f, &frameReasons](const char * phase, int frame) {
+    const auto reason = f.process.lastOutcome().reason;
+    frameReasons << phase << " frame=" << frame << " reason=" << static_cast<int>(reason) << " ("
+                 << fast_lio::imuProcessReasonName(reason) << ")\n";
+  };
   for (int frame = 0; frame <= 6; ++frame) {
-    EXPECT_FALSE(f.process.Process(f.input(frame, true), f.filter, f.output));
+    const bool processed = f.process.Process(f.input(frame, true), f.filter, f.output);
+    recordReason("moving", frame);
+    SCOPED_TRACE(frameReasons.str());
+    EXPECT_FALSE(processed);
     EXPECT_EQ(f.process.lastOutcome().reason,
               frame <= 5 ? fast_lio::ImuProcessReason::kInitializationMotion
                          : fast_lio::ImuProcessReason::kInitializationComplete);
     EXPECT_EQ(f.process.initializationDegraded(), frame == 6);
   }
   // Timeout retains the current batch's legacy mean/bias and covariance calculation.
-  EXPECT_DOUBLE_EQ(f.filter.get_x().bg.z(), 0.2);
+  EXPECT_DOUBLE_EQ(f.filter.get_x().bg.z(), 0.2) << frameReasons.str();
   const S2 expectedGravity(V3D(0.0, 0.0, -G_m_s2));
-  EXPECT_DOUBLE_EQ(f.filter.get_x().grav.get_vect().z(), expectedGravity.get_vect().z());
-  EXPECT_EQ(f.process.cov_acc, V3D::Constant(0.1));
+  EXPECT_DOUBLE_EQ(f.filter.get_x().grav.get_vect().z(), expectedGravity.get_vect().z()) << frameReasons.str();
+  EXPECT_EQ(f.process.cov_acc, V3D::Constant(0.1)) << frameReasons.str();
   f.process.Reset();
-  EXPECT_TRUE(f.process.initializationDegraded());
+  EXPECT_TRUE(f.process.initializationDegraded()) << frameReasons.str();
   f.process.init_still_timeout_s = 90.0;
-  for (int frame = 0; frame < 10; ++frame)
-    EXPECT_FALSE(f.process.Process(f.input(frame, false, 20.0), f.filter, f.output));
+  for (int frame = 0; frame < 10; ++frame) {
+    const bool processed = f.process.Process(f.input(frame, false, 20.0), f.filter, f.output);
+    recordReason("after_reset", frame);
+    SCOPED_TRACE(frameReasons.str());
+    EXPECT_FALSE(processed);
+  }
+  SCOPED_TRACE(frameReasons.str());
   EXPECT_EQ(f.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationComplete);
   EXPECT_TRUE(f.process.initializationDegraded());
 }

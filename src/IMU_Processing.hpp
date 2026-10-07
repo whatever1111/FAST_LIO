@@ -29,6 +29,7 @@
 #include "imu_initialization_validity.hpp"
 #include "imu_process_outcome.hpp"
 #include "population_moments.hpp"
+#include "scan_history_policy.hpp"
 #include "scan_time_policy.hpp"
 #include "use-ikfom.hpp"
 
@@ -147,7 +148,10 @@ class ImuProcess
   }
   fast_lio::ImuProcessOutcome
   IMU_init(const MeasureGroup & meas, esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state, std::size_t & N);
-  void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
+  void UndistortPcl(const MeasureGroup & meas,
+                    esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state,
+                    PointCloudXYZI & pcl_in_out,
+                    const PointCloudXYZI & working_cloud);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
   // sensor_msgs::ImuConstPtr last_imu_;
@@ -325,7 +329,10 @@ fast_lio::ImuProcessOutcome ImuProcess::IMU_init(const MeasureGroup & meas,
   return {fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationAccumulated};
 }
 
-void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
+void ImuProcess::UndistortPcl(const MeasureGroup & meas,
+                              esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state,
+                              PointCloudXYZI & pcl_out,
+                              const PointCloudXYZI & working_cloud)
 {
   /*** add the imu of the last frame-tail to the of current frame-head ***/
   auto v_imu = meas.imu;
@@ -336,7 +343,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   const double &pcl_end_time = meas.lidar_end_time;
   
   /*** sort point clouds by offset time ***/
-  pcl_out = *(meas.lidar);
+  pcl_out = working_cloud;
   sort(pcl_out.points.begin(), pcl_out.points.end(), time_list);
   // cout<<"[ IMU Process ]: Process lidar from "<<pcl_beg_time<<" to "<<pcl_end_time<<", " \
   //          <<meas.imu.size()<<" imu msgs from "<<imu_beg_time<<" to "<<imu_end_time<<endl;
@@ -756,12 +763,23 @@ bool ImuProcess::Process(const MeasureGroup & meas,
                                  : fast_lio::ImuProcessReason::kInitializationComplete);
   }
 
-  // The filter cannot reconstruct points preceding its retained state. Reject
-  // before coverage rebasing or propagation; overlapping scans remain legal when
-  // every retained point lies within the available history.
-  const auto earliest = std::min_element(meas.lidar->points.begin(), meas.lidar->points.end(), time_list);
-  if (earliest->curvature / double(1000) < last_lidar_end_time_ - meas.lidar_beg_time)
+  // Original scanTime validation above must precede any removal. Only the
+  // overlapping branch copies points; all timestamps and the IMU window stay
+  // unchanged. Points without history never enter deskew or the caller's map.
+  const double history_offset = last_lidar_end_time_ - meas.lidar_beg_time;
+  const auto point_offset = [](const auto & point) {
+    return point.curvature;
+  };
+  const auto history = fast_lio::scanHistoryAction(meas.lidar->points, history_offset, point_offset);
+  if (history == fast_lio::ScanHistoryAction::kReject)
     return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kHistory);
+  PointCloudXYZI::Ptr history_cloud;
+  if (history == fast_lio::ScanHistoryAction::kDiscardEarly) {
+    history_cloud = std::make_shared<PointCloudXYZI>(*meas.lidar);
+    fast_lio::discardPointsBeforeHistory(history_cloud->points, history_offset, point_offset);
+    history_cloud->width = static_cast<std::uint32_t>(history_cloud->size());
+    history_cloud->height = 1;
+  }
 
   std::vector<double> imu_stamps;
   imu_stamps.reserve(meas.imu.size() + 1);
@@ -795,7 +813,7 @@ bool ImuProcess::Process(const MeasureGroup & meas,
   }
 
   last_outcome_ = {fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation};
-  UndistortPcl(meas, kf_state, *cur_pcl_un_);
+  UndistortPcl(meas, kf_state, *cur_pcl_un_, history_cloud ? *history_cloud : *meas.lidar);
   scan_consumption_.commit(meas.lidar_end_time);
   integration_ledger_.anchor(meas.lidar_end_time);
 

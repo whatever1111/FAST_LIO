@@ -337,6 +337,8 @@ double gravity_align_grav_cap_deg = 3.0;   // [v4] leak cap: grav tangent std ce
 bool imu_init_require_still_ = false;      // quasi-static IMU-init gate (see IMU_Processing.hpp)
 double imu_init_still_tol_ = 0.03;
 double imu_init_still_timeout_s_ = 20.0;
+fast_lio::ImuStaticInitParams imu_init_static_params_;
+bool imu_init_degraded_warned_ = false;
 struct GravWinAgg {
   double t;
   Eigen::Vector3d sum;
@@ -2174,6 +2176,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   // consumer. Layout contract:
   // LIO-SLAM core pgo_factor_kernels.hpp kFeHealth*Cell.
   if (health_pub_en) {
+    odomAftMapped.twist.covariance[5] =
+      fast_lio::imuInitDegradedCell(health_pub_en, p_imu->sustainedInitActive(), p_imu->initializationDegraded());
     odomAftMapped.twist.covariance[0] = 1.0;  // sentinel/version
     // Flags say what the front end did about this scan, which is what a
     // consumer must act on: a degraded pose is fresh and self-consistent, so
@@ -3114,6 +3118,13 @@ public:
     this->declare_parameter<bool>("imu_init_require_still", false);
     this->declare_parameter<double>("imu_init_still_tol", 0.03);
     this->declare_parameter<double>("imu_init_still_timeout_s", 20.0);
+    this->declare_parameter<bool>("imu_init_still_sustained_en", false);
+    this->declare_parameter<double>("imu_init_still_min_duration_s", 1.0);
+    this->declare_parameter<int>("imu_init_still_min_samples", 100);
+    this->declare_parameter<double>("imu_init_still_gyro_rms_max", 0.1);
+    this->declare_parameter<double>("imu_init_still_gravity_ref", 9.81);
+    this->declare_parameter<double>("imu_init_still_gravity_tol", 0.05);
+    this->declare_parameter<double>("imu_init_still_max_gap_s", 0.1);
     this->declare_parameter<bool>("divergence_guard_en", true);
     this->declare_parameter<int>("divergence_guard_min_eff", 50);
     this->declare_parameter<bool>("guard_engulf_en", true);
@@ -3453,6 +3464,21 @@ public:
     this->get_parameter_or<bool>("imu_init_require_still", imu_init_require_still_, false);
     this->get_parameter_or<double>("imu_init_still_tol", imu_init_still_tol_, 0.03);
     this->get_parameter_or<double>("imu_init_still_timeout_s", imu_init_still_timeout_s_, 20.0);
+    this->get_parameter_or<bool>("imu_init_still_sustained_en", imu_init_static_params_.enabled, false);
+    this->get_parameter_or<double>("imu_init_still_min_duration_s", imu_init_static_params_.minDurationS, 1.0);
+    this->get_parameter_or<int>("imu_init_still_min_samples", imu_init_static_params_.minSamples, 100);
+    this->get_parameter_or<double>("imu_init_still_gyro_rms_max", imu_init_static_params_.gyroRmsMax, 0.1);
+    this->get_parameter_or<double>("imu_init_still_gravity_ref", imu_init_static_params_.gravityRef, 9.81);
+    this->get_parameter_or<double>("imu_init_still_gravity_tol", imu_init_static_params_.gravityTol, 0.05);
+    this->get_parameter_or<double>("imu_init_still_max_gap_s", imu_init_static_params_.maxGapS, 0.1);
+    if (!fast_lio::validImuStaticInitParams(imu_init_static_params_))
+      throw std::invalid_argument("imu_init_still sustained-window limits must be finite and positive");
+    if (fast_lio::imuStaticInitActive(imu_init_require_still_, imu_init_static_params_) &&
+        (!std::isfinite(imu_init_still_tol_) || imu_init_still_tol_ <= 0.0 ||
+         !std::isfinite(imu_init_still_timeout_s_) || imu_init_still_timeout_s_ <= 0.0))
+      throw std::invalid_argument("imu_init_still_tol and imu_init_still_timeout_s must be finite and positive");
+    if (imu_init_static_params_.enabled && !imu_init_require_still_)
+      RCLCPP_WARN(this->get_logger(), "imu_init_still_sustained_en requires imu_init_require_still; gate is inactive");
     this->get_parameter_or<bool>("divergence_guard_en", divergence_guard_en, true);
     this->get_parameter_or<int>("divergence_guard_min_eff", divergence_guard_min_eff, 50);
     this->get_parameter_or<bool>("guard_engulf_en", guard_engulf_en, true);
@@ -3768,6 +3794,7 @@ public:
     p_imu->init_require_still = imu_init_require_still_;
     p_imu->init_still_tol = imu_init_still_tol_;
     p_imu->init_still_timeout_s = imu_init_still_timeout_s_;
+    p_imu->init_static_params = imu_init_static_params_;
     p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
     p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
     p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
@@ -4189,6 +4216,12 @@ private:
         finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation});
         RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: unknown exception");
         return;
+      }
+      if (p_imu->initializationDegraded() && !imu_init_degraded_warned_) {
+        imu_init_degraded_warned_ = true;
+        RCLCPP_WARN(this->get_logger(),
+                    "[IMU-INIT] sustained still-gate timeout: initialized from a MOVING IMU window; "
+                    "map roll/pitch may be biased (initialization degraded)");
       }
       if (!finishImuBatch(p_imu->lastOutcome()))
         return;

@@ -171,3 +171,12 @@ TEST(ImuStaticInitGate, T12InvalidParametersAreRejected)
   valid.minSamples = -1;
   EXPECT_FALSE(fast_lio::validImuStaticInitParams(valid));
 }
+
+TEST(ImuStaticInitGate, T16DiagnosticCellRequiresHealthActiveGateAndDegradedLatch)
+{
+  for (bool health : {false, true})
+    for (bool active : {false, true})
+      for (bool degraded : {false, true})
+        EXPECT_DOUBLE_EQ(fast_lio::imuInitDegradedCell(health, active, degraded),
+                         health && active && degraded ? 1.0 : 0.0);
+}

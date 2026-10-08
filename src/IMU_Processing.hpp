@@ -775,7 +775,7 @@ bool ImuProcess::Process(const MeasureGroup & meas,
     return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kHistory);
   PointCloudXYZI::Ptr history_cloud;
   if (history == fast_lio::ScanHistoryAction::kDiscardEarly) {
-    history_cloud = std::make_shared<PointCloudXYZI>(*meas.lidar);
+    history_cloud.reset(new PointCloudXYZI(*meas.lidar));
     fast_lio::discardPointsBeforeHistory(history_cloud->points, history_offset, point_offset);
     history_cloud->width = static_cast<std::uint32_t>(history_cloud->size());
     history_cloud->height = 1;

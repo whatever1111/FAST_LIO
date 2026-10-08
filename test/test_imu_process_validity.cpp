@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #include "IMU_Processing.hpp"
+#include "imu_backlog_policy.hpp"
 #include "imu_initialization_validity.hpp"
 #include "reanchor_gate.hpp"
 
@@ -54,6 +55,7 @@ struct GapFixture
   ImuProcess process;
   Filter filter;
   PointCloudXYZI::Ptr output = std::make_shared<PointCloudXYZI>();
+  double lastImu = 0.0;  // the last initialisation sample, kept by Process as the next scan's previous IMU
 
   explicit GapFixture(bool prior, double initializationBegin = 10.0)
   {
@@ -69,6 +71,7 @@ struct GapFixture
     auto init = scan(initializationBegin);
     for (int i = 0; i < 20; ++i)
       addImu(init, initializationBegin + i * 0.005);
+    lastImu = rclcpp::Time(init.imu.back()->header.stamp).seconds();
     EXPECT_FALSE(process.Process(init, filter, output));
     auto state = filter.get_x();
     state.vel = V3D(1.0, 0.0, 0.0);
@@ -131,21 +134,42 @@ constexpr double kLongHoleTurnRadians = 174.0 * M_PI / 180.0;
 
 // The varying rate integrates analytically to 174 degrees over the first 16 s, then stays zero.
 // Endpoint rates are zero, so the retained pre-hole IMU sample adds no turn before the committed history.
-MeasureGroup longHoleScan(double history)
+// The hole runs from history to the scan end; the default is the 26.1 s outage.
+MeasureGroup longHoleScan(double history, double hole = 26.1)
 {
   constexpr int64_t kSampleNs = 5'000'000;  // 200 Hz
-  constexpr int kSamples = 5220;            // 26.1 s
+  const int samples = static_cast<int>(std::llround(hole * 1e9 / kSampleNs));
   const int64_t history_ns = static_cast<int64_t>(std::llround(history * 1e9));
-  const double end = rclcpp::Time(history_ns + kSamples * kSampleNs).seconds();
+  const double end = rclcpp::Time(history_ns + samples * kSampleNs).seconds();
   auto input = scan(end - 0.1);
   input.lidar_end_time = end;  // Use the same nanosecond clock as the final sample.
-  for (int i = 0; i <= kSamples; ++i) {
+  for (int i = 0; i <= samples; ++i) {
     const double elapsed = i * 0.005;
     const double rate =
       elapsed <= 16.0 ? kLongHoleTurnRadians / 16.0 * (1.0 - std::cos(2.0 * M_PI * elapsed / 16.0)) : 0.0;
     const double stamp = rclcpp::Time(history_ns + i * kSampleNs).seconds();
     addImu(input, stamp, V3D(0.0, 0.0, 9.81), V3D(0.0, 0.0, rate));
   }
+  return input;
+}
+
+constexpr double kLongBacklogWindow = 60.0;  // s; m20 max_imu_backlog_sec
+
+// The same hole after the node bounds the IMU queue (trim_imu_buffer). It trims after every push, but the window only
+// moves forward, so one trim at the newest sample drops the same prefix. No scan is queued during the hole.
+MeasureGroup clippedLongHoleScan(const GapFixture & fixture, double hole)
+{
+  auto input = longHoleScan(fixture.process.lastProcessedEnd(), hole);
+  const auto stampAt = [&input](std::size_t i) {
+    return rclcpp::Time(input.imu[i]->header.stamp).seconds();
+  };
+  const std::size_t dropped = fast_lio::imuBacklogExcess(input.imu.size(),
+                                                         stampAt,
+                                                         stampAt(input.imu.size() - 1),
+                                                         kLongBacklogWindow,
+                                                         std::numeric_limits<double>::infinity());
+  for (std::size_t i = 0; i < dropped; ++i)
+    input.imu.pop_front();
   return input;
 }
 }  // namespace
@@ -339,6 +363,52 @@ TEST(ImuProcessValidity, TenSecondClippingOfSameLongHoleSkipsCoverageWithoutProp
   EXPECT_EQ(fixture.process.lastStatus(), ImuProcess::ProcessStatus::kCoverageGap);
   EXPECT_EQ(fixture.process.coverage_result.status, fast_lio::ImuCoverageStatus::kGap);
   EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kCoverageGap);
+  EXPECT_TRUE(fixture.output->empty());
+  EXPECT_TRUE(fixture.filter.get_x().rot.toRotationMatrix().isApprox(before.rot.toRotationMatrix(), 0.0));
+  EXPECT_TRUE(fixture.filter.get_x().pos.isApprox(before.pos, 0.0));
+  EXPECT_TRUE(fixture.filter.get_P().isApprox(covariance_before, 0.0));
+}
+
+// Coverage compares adjacent IMU stamps only, so a hole longer than the window still propagates while the clipped
+// prefix leaves at most imu_coverage.max_gap_s (2 s, as on m20) after the previous frame's last IMU: the skip
+// boundary is the window plus max_gap_s. 61.5 s leaves about 1.5 s, which the IMU-gap prior bridges.
+TEST(ImuProcessValidity, T09HoleClippedWithinTheCoverageGapStillPropagates)
+{
+  constexpr double kHole = 61.5;
+  GapFixture fixture(true);
+  auto input = clippedLongHoleScan(fixture, kHole);
+  ASSERT_EQ(input.imu.size(), 12001u);  // the newest 60 s at 200 Hz, both ends included
+  const double gap = rclcpp::Time(input.imu.front()->header.stamp).seconds() - fixture.lastImu;
+  EXPECT_NEAR(gap, kHole - kLongBacklogWindow, 0.01);
+  ASSERT_LE(gap, fixture.process.coverage_params.max_gap_s);
+  ASSERT_TRUE(fixture.process.Process(input, fixture.filter, fixture.output));
+  EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kProcessed);
+  EXPECT_EQ(fixture.process.coverage_result.status, fast_lio::ImuCoverageStatus::kCovered);
+  EXPECT_DOUBLE_EQ(fixture.process.coverage_result.max_gap_s, gap);
+  // One bridged IMU interval: the node compares it with imu_gap_verify_s.
+  EXPECT_EQ(fixture.process.gap_summary.gaps, 1);
+  EXPECT_DOUBLE_EQ(fixture.process.gap_summary.longest_interval_s, gap);
+  EXPECT_TRUE(fixture.filter.get_P().allFinite());
+}
+
+// 62.5 s leaves about 2.5 s, past max_gap_s: the frame is skipped without propagation, as with the 10 s window.
+TEST(ImuProcessValidity, T09HoleClippedBeyondTheCoverageGapIsSkippedWithoutPropagation)
+{
+  constexpr double kHole = 62.5;
+  GapFixture fixture(true);
+  auto input = clippedLongHoleScan(fixture, kHole);
+  ASSERT_EQ(input.imu.size(), 12001u);
+  const double gap = rclcpp::Time(input.imu.front()->header.stamp).seconds() - fixture.lastImu;
+  EXPECT_NEAR(gap, kHole - kLongBacklogWindow, 0.01);
+  ASSERT_GT(gap, fixture.process.coverage_params.max_gap_s);
+  const auto before = fixture.filter.get_x();
+  const auto covariance_before = fixture.filter.get_P();
+  EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output));
+  EXPECT_EQ(fixture.process.lastStatus(), ImuProcess::ProcessStatus::kCoverageGap);
+  EXPECT_EQ(fixture.process.coverage_result.status, fast_lio::ImuCoverageStatus::kGap);
+  EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kCoverageGap);
+  EXPECT_DOUBLE_EQ(fixture.process.coverage_result.max_gap_s, gap);
   EXPECT_TRUE(fixture.output->empty());
   EXPECT_TRUE(fixture.filter.get_x().rot.toRotationMatrix().isApprox(before.rot.toRotationMatrix(), 0.0));
   EXPECT_TRUE(fixture.filter.get_x().pos.isApprox(before.pos, 0.0));

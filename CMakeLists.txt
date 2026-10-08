@@ -398,6 +398,10 @@ if(BUILD_TESTING)
   if(TARGET test_imu_backlog_policy)
     target_include_directories(test_imu_backlog_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
+  ament_add_gtest(test_scan_hole_policy test/test_scan_hole_policy.cpp)
+  if(TARGET test_scan_hole_policy)
+    target_include_directories(test_scan_hole_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
   # Pure header, Eigen only: the window-mean linear acceleration the levelling prior
   # subtracts from the specific-force mean, and when it must be withheld
   # (docs/PGO_LOOP_TUNING.md section 7.3).

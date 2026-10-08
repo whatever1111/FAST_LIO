@@ -116,6 +116,7 @@
 #include "reanchor_gate.hpp"
 #include "rp_consider.hpp"
 #include "runaway_watchdog.hpp"
+#include "scan_hole_policy.hpp"
 #include "static_evidence.hpp"
 #include "timing_log_ring.hpp"
 #include "voxel_downsample.hpp"
@@ -461,6 +462,8 @@ bool guard_hole_en = false;
 double guard_hole_min_sec = 0.3;    // s; scan gap that counts as a hole (nominal 0.1)
 double guard_hole_max_accel = 1.0;  // m/s^2; |vel - vel_pre_hole| is capped at this * gap
 bool guard_hole_reanchor_pos = true;  // also reset pos to pos_pre + vel_pre * gap
+double guard_hole_verify_sec = 0.0;   // s; zero disables frozen-map verification after a scan hole
+std::uint64_t scan_hole_verify_count = 0;
 double hole_last_scan_end = -1.0;
 V3D hole_vel_pre = V3D::Zero();
 V3D hole_pos_pre = V3D::Zero();
@@ -3155,6 +3158,7 @@ public:
     this->declare_parameter<double>("guard_hole_min_sec", 0.3);
     this->declare_parameter<double>("guard_hole_max_accel", 1.0);
     this->declare_parameter<bool>("guard_hole_reanchor_pos", true);
+    this->declare_parameter<double>("guard_hole_verify_sec", 0.0);
     this->declare_parameter<int>("divergence_guard_streak", 5);
     this->declare_parameter<double>("divergence_guard_max_speed", 30.0);
     this->declare_parameter<bool>("zupt_en", true);
@@ -3528,6 +3532,11 @@ public:
     this->get_parameter_or<double>("guard_hole_min_sec", guard_hole_min_sec, 0.3);
     this->get_parameter_or<double>("guard_hole_max_accel", guard_hole_max_accel, 1.0);
     this->get_parameter_or<bool>("guard_hole_reanchor_pos", guard_hole_reanchor_pos, true);
+    this->get_parameter_or<double>("guard_hole_verify_sec", guard_hole_verify_sec, 0.0);
+    if (guard_hole_en && !fast_lio::validScanHoleVerifySec(guard_hole_verify_sec)) {
+      RCLCPP_FATAL(this->get_logger(), "guard_hole_verify_sec must be finite and nonnegative");
+      throw std::invalid_argument("guard_hole_verify_sec parameter");
+    }
     this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
     this->get_parameter_or<bool>("zupt_en", zupt_en, true);
     this->get_parameter_or<double>("zupt_gyro_thresh", zupt_gyro_thresh, 0.05);
@@ -4298,6 +4307,12 @@ private:
             gravity_align_vel_overwritten = true;
             resetVelocityCovariance(guard_vel_reset_sigma);
           }
+          const bool verify = fast_lio::scanHoleRequiresVerification(
+            gap, guard_hole_verify_sec, reanchor_gate.state == fast_lio::ReanchorState::kBlind);
+          if (verify) {
+            markImuGapBridged(Measures.lidar_end_time);
+            ++scan_hole_verify_count;
+          }
           const V3D pos_imu = st.pos;
           if (guard_hole_reanchor_pos) {
             st.pos = hole_pos_pre + hole_vel_pre * gap;
@@ -4308,13 +4323,14 @@ private:
           // velocity, so |dv| here is what the samples that do exist integrated and the clamp rarely engages.
           RCLCPP_WARN(this->get_logger(),
                       "[HOLE-GUARD] scan hole %.2fs: imu-only vel %.2f m/s (pre-hole %.2f) -> held %.2f; pos "
-                      "re-anchored by %.2fm%s",
+                      "re-anchored by %.2fm%s%s",
                       gap,
                       spd_imu,
                       hole_vel_pre.norm(),
                       state_point.vel.norm(),
                       guard_hole_reanchor_pos ? (pos_imu - state_point.pos).norm() : 0.0,
-                      p_imu->gap_summary.gaps > 0 ? " (IMU gap bridged, velocity held across it)" : "");
+                      p_imu->gap_summary.gaps > 0 ? " (IMU gap bridged, velocity held across it)" : "",
+                      verify ? "; map frozen until re-anchored" : "");
         }
       }
       pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;

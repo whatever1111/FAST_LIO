@@ -70,6 +70,24 @@ TEST(ImuBacklogPolicy, SamplesInsideTheWindowStay)
   EXPECT_EQ(excess(imuStream(2001), kWindow), 0u);
 }
 
+TEST(ImuBacklogPolicy, SixtySecondWindowRetainsTwentySixSecondHole)
+{
+  EXPECT_EQ(excess(imuStream(26 * 200 + 40 + 1), 60.0), 0u);  // 26.2 s, including both endpoints
+}
+
+TEST(ImuBacklogPolicy, SixtySecondWindowTrimsOnlyOlderSamplesAndProtectsQueuedScan)
+{
+  const auto stamps = imuStream(60 * 200 + 40 + 1);  // 60.2 s
+  const auto dropped = excess(stamps, 60.0);
+  ASSERT_EQ(dropped, 40u);
+  EXPECT_DOUBLE_EQ(stamps[dropped], stamps.back() - 60.0);
+  EXPECT_LT(stamps[dropped - 1], stamps.back() - 60.0);
+  const double queued_begin = imuStamp(20);
+  EXPECT_EQ(excess(stamps, 60.0, queued_begin), 20u);
+  EXPECT_EQ(excess(stamps, 60.0, stamps.front()), 0u);
+  EXPECT_EQ(excess(stamps, 60.0, stamps.back() - 5.0), dropped);
+}
+
 TEST(ImuBacklogPolicy, ThirtyMinuteOutageKeepsExactlyTheLastTenSeconds)
 {
   const std::vector<double> stamps = imuStream(kOutageSamples);

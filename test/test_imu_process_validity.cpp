@@ -1,3 +1,5 @@
+#include <Eigen/Eigenvalues>
+
 #include <algorithm>
 #include <cstring>
 #include <gtest/gtest.h>
@@ -124,6 +126,28 @@ struct StaticInitFixture
     return result;
   }
 };
+
+constexpr double kLongHoleTurnRadians = 174.0 * M_PI / 180.0;
+
+// The varying rate integrates analytically to 174 degrees over the first 16 s, then stays zero.
+// Endpoint rates are zero, so the retained pre-hole IMU sample adds no turn before the committed history.
+MeasureGroup longHoleScan(double history)
+{
+  constexpr int64_t kSampleNs = 5'000'000;  // 200 Hz
+  constexpr int kSamples = 5220;            // 26.1 s
+  const int64_t history_ns = static_cast<int64_t>(std::llround(history * 1e9));
+  const double end = rclcpp::Time(history_ns + kSamples * kSampleNs).seconds();
+  auto input = scan(end - 0.1);
+  input.lidar_end_time = end;  // Use the same nanosecond clock as the final sample.
+  for (int i = 0; i <= kSamples; ++i) {
+    const double elapsed = i * 0.005;
+    const double rate =
+      elapsed <= 16.0 ? kLongHoleTurnRadians / 16.0 * (1.0 - std::cos(2.0 * M_PI * elapsed / 16.0)) : 0.0;
+    const double stamp = rclcpp::Time(history_ns + i * kSampleNs).seconds();
+    addImu(input, stamp, V3D(0.0, 0.0, 9.81), V3D(0.0, 0.0, rate));
+  }
+  return input;
+}
 }  // namespace
 
 TEST(ImuProcessValidity, T13SustainedStillInitializesAtFirstOneSecondFrameEnd)
@@ -280,6 +304,45 @@ TEST(ImuProcessValidity, SustainedInvalidBatchDiscardsTheSameGravityWindow)
   }
   EXPECT_FALSE(f.process.Process(f.input(12), f.filter, f.output));
   EXPECT_EQ(f.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationComplete);
+}
+
+TEST(ImuProcessValidity, LongLidarHoleCommitsVaryingRateTurnWithFiniteSymmetricPsdCovariance)
+{
+  GapFixture fixture(true);
+  const double yaw_before = yawOf(fixture.filter.get_x());
+  const auto input = longHoleScan(fixture.process.lastProcessedEnd());
+  ASSERT_EQ(input.imu.size(), 5221u);
+  ASSERT_TRUE(fixture.process.Process(input, fixture.filter, fixture.output));
+  EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+  EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kProcessed);
+  EXPECT_EQ(fixture.process.coverage_result.status, fast_lio::ImuCoverageStatus::kCovered);
+  const double error = yawOf(fixture.filter.get_x()) - yaw_before - kLongHoleTurnRadians;
+  EXPECT_LE(std::abs(std::atan2(std::sin(error), std::cos(error))), 0.5 * M_PI / 180.0);
+  const auto P = fixture.filter.get_P();
+  ASSERT_TRUE(P.allFinite());
+  EXPECT_TRUE(P.isApprox(P.transpose(), 1e-10));
+  Eigen::SelfAdjointEigenSolver<GapFixture::Filter::cov> eigenvalues(P);
+  ASSERT_EQ(eigenvalues.info(), Eigen::Success);
+  EXPECT_GE(eigenvalues.eigenvalues().minCoeff(), -1e-10);
+}
+
+TEST(ImuProcessValidity, TenSecondClippingOfSameLongHoleSkipsCoverageWithoutPropagation)
+{
+  GapFixture fixture(true);
+  auto input = longHoleScan(fixture.process.lastProcessedEnd());
+  for (int i = 0; i < 3220; ++i)
+    input.imu.pop_front();  // Remove exactly the first 16.1 s.
+  ASSERT_EQ(input.imu.size(), 2001u);
+  const auto before = fixture.filter.get_x();
+  const auto covariance_before = fixture.filter.get_P();
+  EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output));
+  EXPECT_EQ(fixture.process.lastStatus(), ImuProcess::ProcessStatus::kCoverageGap);
+  EXPECT_EQ(fixture.process.coverage_result.status, fast_lio::ImuCoverageStatus::kGap);
+  EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kCoverageGap);
+  EXPECT_TRUE(fixture.output->empty());
+  EXPECT_TRUE(fixture.filter.get_x().rot.toRotationMatrix().isApprox(before.rot.toRotationMatrix(), 0.0));
+  EXPECT_TRUE(fixture.filter.get_x().pos.isApprox(before.pos, 0.0));
+  EXPECT_TRUE(fixture.filter.get_P().isApprox(covariance_before, 0.0));
 }
 
 TEST(ImuProcessValidity, EmptyInputClearsPreviouslyPopulatedOutputWithoutChangingState)

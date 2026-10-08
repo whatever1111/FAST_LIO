@@ -226,6 +226,43 @@ TEST(ImuProcessValidity, T15DisabledGateRetainsLegacyMovingStreamStateBitwise)
   }
 }
 
+TEST(ImuProcessValidity, T20FirstLateStillFrameDegradesOnlyBeforeWindowIsReady)
+{
+  for (const bool degraded : {false, true}) {
+    StaticInitFixture f;
+    f.process.init_still_timeout_s = degraded ? 0.75 : 0.85;
+    const int completeFrame = degraded ? 8 : 9;
+    const auto first = f.input(0);
+    const double firstStamp = rclcpp::Time(first.imu.front()->header.stamp).seconds();
+    for (int frame = 0; frame < 15; ++frame) {
+      SCOPED_TRACE(::testing::Message() << "timeout=" << f.process.init_still_timeout_s << " frame=" << frame);
+      const auto input = f.input(frame);
+      const double elapsed = input.lidar_beg_time - first.lidar_beg_time;
+      const double duration = rclcpp::Time(input.imu.back()->header.stamp).seconds() - firstStamp;
+      const bool processed = f.process.Process(input, f.filter, f.output);
+      if (frame < completeFrame) {
+        EXPECT_LE(elapsed, f.process.init_still_timeout_s);
+        EXPECT_LT(duration, 1.0);
+        EXPECT_FALSE(processed);
+        EXPECT_EQ(f.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationAccumulated);
+        EXPECT_FALSE(f.process.initializationDegraded());
+      } else if (frame == completeFrame) {
+        EXPECT_GT(elapsed, f.process.init_still_timeout_s);
+        if (degraded)
+          EXPECT_LT(duration, 1.0);
+        else
+          EXPECT_GE(duration, 1.0);
+        EXPECT_FALSE(processed);
+        EXPECT_EQ(f.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationComplete);
+        EXPECT_EQ(f.process.initializationDegraded(), degraded);
+      } else {
+        EXPECT_TRUE(processed) << fast_lio::imuProcessReasonName(f.process.lastOutcome().reason);
+        EXPECT_EQ(f.process.initializationDegraded(), degraded);
+      }
+    }
+  }
+}
+
 TEST(ImuProcessValidity, SustainedInvalidBatchDiscardsTheSameGravityWindow)
 {
   StaticInitFixture f;

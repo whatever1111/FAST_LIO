@@ -135,11 +135,23 @@ TEST(ImuStaticInitGate, T09TimeoutUsesStrictlyGreaterAndDegradesFirstLateBatch)
 TEST(ImuStaticInitGate, T10DisabledGateDoesNotReadSamplesOrParticipate)
 {
   GateFixture f;
+  const auto batch = stillBatch(0.0, 1.0, 201);
+  std::size_t sampleCalls = 0;
+  const auto sampleOf = [&sampleCalls](const Sample & sample) {
+    ++sampleCalls;
+    return sample;
+  };
   f.params.enabled = false;
-  EXPECT_EQ(f.observe({}, 100.0), Decision::kDisabled);
-  f.params.enabled = true;
-  EXPECT_EQ(f.observe({}, 100.0, false), Decision::kDisabled);
+  EXPECT_EQ(f.gate.observe(batch, sampleOf, true, f.params, 0.03, 100.0, 20.0), Decision::kDisabled);
+  EXPECT_EQ(sampleCalls, 0u);
   EXPECT_EQ(f.gate.samples(), 0u);
+  f.params.enabled = true;
+  EXPECT_EQ(f.gate.observe(batch, sampleOf, false, f.params, 0.03, 100.0, 20.0), Decision::kDisabled);
+  EXPECT_EQ(sampleCalls, 0u);
+  EXPECT_EQ(f.gate.samples(), 0u);
+  EXPECT_EQ(f.gate.observe(batch, sampleOf, true, f.params, 0.03, 1.0, 20.0), Decision::kReady);
+  EXPECT_EQ(sampleCalls, batch.size());
+  EXPECT_EQ(f.gate.samples(), batch.size());
 }
 
 TEST(ImuStaticInitGate, T11MovingThenStillBeforeTimeoutIsNormal)
@@ -179,4 +191,24 @@ TEST(ImuStaticInitGate, T16DiagnosticCellRequiresHealthActiveGateAndDegradedLatc
       for (bool degraded : {false, true})
         EXPECT_DOUBLE_EQ(fast_lio::imuInitDegradedCell(health, active, degraded),
                          health && active && degraded ? 1.0 : 0.0);
+}
+
+TEST(ImuStaticInitGate, T19LateReadyWindowTakesPriorityOverStrictTimeout)
+{
+  GateFixture ready;
+  EXPECT_EQ(ready.observe(stillBatch(0.0, 0.9, 181), 19.9), Decision::kAccumulating);
+  EXPECT_EQ(ready.observe(stillBatch(0.905, 0.095, 20), 20.01), Decision::kReady);
+  EXPECT_EQ(ready.gate.samples(), 201u);
+
+  // The same late arrival degrades when its still window is not yet one second.
+  GateFixture incomplete;
+  EXPECT_EQ(incomplete.observe(stillBatch(0.0, 0.8, 161), 19.9), Decision::kAccumulating);
+  EXPECT_EQ(incomplete.observe(stillBatch(0.805, 0.095, 20), 20.01), Decision::kDegraded);
+  EXPECT_EQ(incomplete.gate.samples(), 181u);
+
+  // At equality, the incomplete still window continues accumulating.
+  GateFixture atTimeout;
+  EXPECT_EQ(atTimeout.observe(stillBatch(0.0, 0.8, 161), 19.9), Decision::kAccumulating);
+  EXPECT_EQ(atTimeout.observe(stillBatch(0.805, 0.095, 20), 20.0), Decision::kAccumulating);
+  EXPECT_EQ(atTimeout.gate.samples(), 181u);
 }

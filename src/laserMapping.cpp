@@ -118,6 +118,7 @@
 #include "rp_consider.hpp"
 #include "runaway_watchdog.hpp"
 #include "static_evidence.hpp"
+#include "stationary_anchor_policy.hpp"
 #include "timing_log_ring.hpp"
 #include "voxel_downsample.hpp"
 #include "zupt_policy.hpp"
@@ -479,11 +480,25 @@ double zupt_acc_span_ratio = 0.02;      // (max-min)|a| / mean|a| — free of th
 double zupt_wheel_speed_thresh = 0.05;  // m/s; wheel speed below this reads as parked
 double zupt_wheel_max_age = 0.5;        // s; older wheel samples are not evidence
 bool zupt_require_wheel = false;        // true = hold only when a fresh wheel sample agrees
-V3D zupt_anchor_pos = V3D::Zero();      // last pose a healthy scan confirmed
+V3D zupt_anchor_pos = V3D::Zero();      // pose of the current candidate or anchor (stationary_anchor.state says which)
 SO3 zupt_anchor_rot;
-bool zupt_anchor_valid = false;
 bool zupt_active = false;
 int zupt_hold_scans = 0;
+// Anchor lifecycle (stationary_anchor_policy.hpp): an anchor is the reference of one continuous stationary
+// episode, and whatever ends the episode drops it together with both holds. A later anchor is a new one.
+fast_lio::StationaryAnchor stationary_anchor;
+fast_lio::StationaryAnchorParams stationary_anchor_params;
+bool anchor_usable = false;        // this scan's anchor step found a usable anchor; cleared at scan start and on drops
+bool anchor_ever_created = false;  // an anchor has been created in this process
+// Recovery trust, the platform policy (on when reanchor_total_timeout_sec > 0): how long the front end may run
+// without support before its position is not trusted again in this process.
+fast_lio::RecoveryParams recovery_params;
+fast_lio::RecoveryState recovery_state;
+std::uint64_t lifecycle_scan_seq = 0;  // one per scan the scan path starts on: a matching run is consecutive in it
+bool anchor_scan_evaluated = false;    // the scan being processed reached the anchor step
+bool reanchor_lost_this_scan = false;  // the gate declared the scan being processed lost, whatever re-armed it since
+bool anchor_idle_path = false;         // inside the check the IMU samples run while no scan is queued
+bool input_epoch_handled = false;
 // Parked hold (parked_hold.hpp): the same evidence, applied while the scan is
 // HEALTHY.
 fast_lio::ParkedHoldParams parked_hold_params;
@@ -495,17 +510,11 @@ bool zupt_anchor_trace_en = false;
 fast_lio::AnchorTraceCounters anchor_trace_counters;
 fast_lio::MonotonicSequence anchor_event_seq;
 fast_lio::MonotonicSequence anchor_scan_seq;
-fast_lio::MonotonicSequence anchor_id_seq;
-std::uint64_t zupt_anchor_id = 0;               // anchor_id of zupt_anchor_pos/rot; 0 = none
-std::int64_t zupt_anchor_created_ns = -1;       // end of the scan whose pose became the anchor
-std::int64_t anchor_last_evidence_ns = -1;      // end of the last scan the anchor step evaluated
-std::int64_t anchor_trace_hole_ns = 300000000;  // a longer gap is a scan hole: 3 scan periods
 fast_lio::AnchorScanRecord anchor_scan_record;  // the scan being processed
 bool anchor_scan_record_open = false;
 bool anchor_trace_body_was_static = false;  // the previous evaluated verdict, for motion edges
 bool anchor_trace_gap_run = false;          // inside a run of scans with IMU coverage gaps
 bool anchor_trace_bridge_run = false;       // inside a run of scans with bridged IMU gaps
-bool anchor_trace_epoch_reported = false;
 double input_epoch_fault_stamp = std::numeric_limits<double>::quiet_NaN();  // under mtx_buffer
 double last_twist_stamp = -1.0;  // newest wheel-speed sample time (s); -1 = none yet
 double last_twist_speed = 0.0;   // |v| of the newest wheel sample (m/s)
@@ -1294,6 +1303,8 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
   sig_buffer.notify_all();
 }
 
+void checkAnchorEvidenceIdle(double imu_stamp);
+
 void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stamp)
 {
   publish_count++;
@@ -1332,9 +1343,12 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
   frontendAdmit(msg->header.stamp);
   const auto backlogLoss = trim_imu_buffer();
   observePendingImuAgeLocked();
+  const bool scan_waiting = !lidar_buffer.empty() || lidar_pushed;
   mtx_buffer.unlock();
   logImuBacklogLoss(backlogLoss);
   sig_buffer.notify_all();
+  if (!scan_waiting)
+    checkAnchorEvidenceIdle(timestamp);
   if (frontend_observation_en)
     publishFrontendObservation(false);
 }
@@ -1429,10 +1443,11 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
 }
 
 // Independent, front-end-agnostic evidence that the platform is parked. The
-// verdict itself lives in static_evidence.hpp (pure, unit-tested); this only
+// verdict itself lives in static_evidence.hpp and stationary_anchor_policy.hpp (pure, unit-tested); this only
 // summarises the scan's IMU window and reads the newest wheel sample. `trace`, when given, receives the verdict and
 // its inputs for the anchor trace.
-bool body_is_static(const MeasureGroup & meas, double now, fast_lio::AnchorScanRecord * trace = nullptr)
+fast_lio::StaticEvidenceVerdict
+static_evidence_of(const MeasureGroup & meas, double now, fast_lio::AnchorScanRecord * trace = nullptr)
 {
   fast_lio::ImuWindowStats imu;
   imu.acc_min = std::numeric_limits<double>::max();
@@ -1465,17 +1480,30 @@ bool body_is_static(const MeasureGroup & meas, double now, fast_lio::AnchorScanR
   params.wheel_speed_thresh = zupt_wheel_speed_thresh;
   params.wheel_max_age = zupt_wheel_max_age;
   params.require_wheel = zupt_require_wheel;
-  const bool verdict = fast_lio::bodyIsStatic(imu, wheel_age, wheel_speed, params);
+  fast_lio::WheelEvidence wheel;
+  wheel.valid = wheel_stamp > 0.0;
+  wheel.age = wheel_age;
+  wheel.speed = wheel_speed;
+  const fast_lio::StaticEvidenceVerdict verdict = fast_lio::classifyStaticEvidence(imu, wheel, params);
   if (trace != nullptr) {
-    trace->body = verdict ? fast_lio::AnchorTraceBody::kStatic : fast_lio::AnchorTraceBody::kMoving;
+    trace->body = verdict.stationary() ? fast_lio::AnchorTraceBody::kStatic : fast_lio::AnchorTraceBody::kMoving;
     trace->imu_n = imu.samples;
     trace->gyr_max = imu.samples > 0 ? imu.gyr_max : std::numeric_limits<double>::quiet_NaN();
     trace->acc_span = imu.samples > 0 && imu.acc_mean > 0.0 ? (imu.acc_max - imu.acc_min) / imu.acc_mean
                                                             : std::numeric_limits<double>::quiet_NaN();
     trace->wheel_age = wheel_age;
     trace->wheel_speed = wheel_stamp > 0.0 ? wheel_speed : std::numeric_limits<double>::quiet_NaN();
+    trace->evidence = verdict.evidence;
+    trace->evidence_reason = verdict.reason;
+    trace->imu_only = verdict.imu_only;
+    trace->wheel_valid = fast_lio::wheelEvidenceUsable(wheel, params);
   }
   return verdict;
+}
+
+bool body_is_static(const MeasureGroup & meas, double now)
+{
+  return static_evidence_of(meas, now).stationary();
 }
 
 double max_scan_duration_s = 0.0;  // 0 disables the device-specific upper bound.
@@ -1494,8 +1522,23 @@ void popLidarScan()
   lidar_pushed = false;
 }
 
-// Stationary-anchor trace (anchor_trace.hpp). Everything from here to markImuCoverageGap only reads the
-// estimator and writes the trace's own state.
+// What every encoding of the current scan reports (stationary_anchor_policy.hpp): the legacy flags, the published
+// covariance inflation and the typed observation all read this one verdict. Pending and Unanchored are degraded
+// whatever the local registration says; a static hold is claimed only for a hold on a usable anchor; and the scan
+// the gate declared lost reports the loss even when its own map reset has re-armed the gate since.
+fast_lio::AnchorHealth currentAnchorHealth()
+{
+  fast_lio::AnchorHealthInputs in;
+  in.degraded = flio_degraded_odom;
+  in.hold_active = zupt_active || parked_hold_state.active;
+  in.anchor_usable = anchor_usable;
+  in.lost = reanchor_gate.state == fast_lio::ReanchorState::kLost || reanchor_lost_this_scan;
+  in.trust = recovery_state.trust;
+  return fast_lio::anchorHealth(in);
+}
+
+// Stationary-anchor trace (anchor_trace.hpp). Everything from here to the anchor lifecycle helpers only reads the
+// estimator and the lifecycle, and writes the trace's own state.
 fast_lio::AnchorTraceGate anchorTraceGate(fast_lio::ReanchorState state)
 {
   switch (state) {
@@ -1529,12 +1572,44 @@ void anchorTransition(fast_lio::AnchorTraceEvent event, fast_lio::AnchorTraceRea
   transition.event_seq = anchor_event_seq.next();
   transition.scan_seq = anchor_scan_seq.last();
   transition.stamp_ns = fast_lio::traceNs(stamp);
-  transition.anchor_id = zupt_anchor_id;
-  transition.anchor_valid = zupt_anchor_valid;
-  transition.created_ns = zupt_anchor_created_ns;
-  transition.last_evidence_ns = anchor_last_evidence_ns;
+  transition.anchor_id = stationary_anchor.id;
+  transition.anchor_valid = stationary_anchor.state == fast_lio::AnchorState::kValid;
+  transition.created_ns = stationary_anchor.created_ns;
+  transition.last_evidence_ns = stationary_anchor.last_evidence_end_ns;
+  transition.anchor_state = stationary_anchor.state;
+  transition.episode = stationary_anchor.episode;
+  transition.ref_gen = stationary_anchor.reference_generation;
+  transition.streak = static_cast<std::uint64_t>(std::max(parked_hold_state.parked_scans, 0));
   fast_lio::saturatingIncrement(&anchor_trace_counters.events);
   emitAnchorTraceLine(fast_lio::formatAnchorTransition(transition));
+}
+
+// One recovery record, from the same event sequence. Never throttled.
+void recoveryTransition(fast_lio::RecoveryTraceEvent event, fast_lio::RecoveryCause reason, std::int64_t stamp_ns)
+{
+  fast_lio::RecoveryTransition transition;
+  transition.event = event;
+  transition.reason = reason;
+  transition.event_seq = anchor_event_seq.next();
+  transition.scan_seq = anchor_scan_seq.last();
+  transition.stamp_ns = stamp_ns;
+  transition.episode = recovery_state.episode;
+  transition.start_ns = recovery_state.start_ns;
+  transition.deadline_ns = recovery_state.deadline_ns;
+  transition.elapsed_ns =
+    stamp_ns >= 0 && recovery_state.start_ns >= 0 ? stamp_ns - recovery_state.start_ns : std::int64_t{-1};
+  transition.reset_count = recovery_state.map_resets;
+  transition.path = anchor_idle_path ? fast_lio::RecoveryTracePath::kIdle : fast_lio::RecoveryTracePath::kScan;
+  fast_lio::saturatingIncrement(&anchor_trace_counters.events);
+  emitAnchorTraceLine(fast_lio::formatRecoveryTransition(transition));
+}
+
+// The parked streak counts the scans of one candidate or anchor, so whatever ends that, or breaks the evidence
+// behind it, ends the streak. The count goes first and the records of the event already carry it; an engaged
+// prior is released, and that recorded, where the anchor ends or by the scan's anchor step.
+void endParkedStreak()
+{
+  parked_hold_state.parked_scans = 0;
 }
 
 // An input event that breaks the static evidence behind an anchor: counted every time, marked on the open scan
@@ -1543,6 +1618,7 @@ void anchorEvidence(
   fast_lio::AnchorTraceReason reason, std::uint32_t bit, std::uint64_t * counter, double stamp, bool report)
 {
   fast_lio::saturatingIncrement(counter);
+  endParkedStreak();
   if (anchor_scan_record_open)
     anchor_scan_record.events |= bit;
   if (report)
@@ -1556,9 +1632,10 @@ void beginAnchorScanRecord(double beg, double end)
   fast_lio::saturatingIncrement(&anchor_trace_counters.scans);
   anchor_scan_record.beg_ns = fast_lio::traceNs(beg);
   anchor_scan_record.end_ns = fast_lio::traceNs(end);
-  if (anchor_last_evidence_ns >= 0 && anchor_scan_record.beg_ns >= 0)
-    anchor_scan_record.gap_ns = anchor_scan_record.beg_ns - anchor_last_evidence_ns;
+  if (stationary_anchor.last_evidence_end_ns >= 0 && anchor_scan_record.beg_ns >= 0)
+    anchor_scan_record.gap_ns = anchor_scan_record.beg_ns - stationary_anchor.last_evidence_end_ns;
   anchor_scan_record.gate_pre = anchorTraceGate(reanchor_gate.state);
+  anchor_scan_record.trust_pre = recovery_state.trust;
   anchor_scan_record_open = true;
 }
 
@@ -1579,17 +1656,67 @@ void copyPoseCovarianceBlock(const Matrix & P, double out[36])
       out[r * 6 + c] = P(r, c);
 }
 
-void copyTraceState(const state_ikfom & x, double p[3], double q[4], double v[3])
+void copyTracePose(const V3D & pos, const SO3 & rot, double p[3], double q[4])
 {
-  const auto & coeffs = x.rot.coeffs();  // x, y, z, w
+  const auto & coeffs = rot.coeffs();  // x, y, z, w
   q[0] = coeffs[3];
   q[1] = coeffs[0];
   q[2] = coeffs[1];
   q[3] = coeffs[2];
-  for (int i = 0; i < 3; ++i) {
-    p[i] = x.pos[i];
+  for (int i = 0; i < 3; ++i)
+    p[i] = pos[i];
+}
+
+void copyTraceState(const state_ikfom & x, double p[3], double q[4], double v[3])
+{
+  copyTracePose(x.pos, x.rot, p, q);
+  for (int i = 0; i < 3; ++i)
     v[i] = x.vel[i];
-  }
+}
+
+// The fields of the scan record that only the per-scan trace prints are observed only with it on: each of the
+// helpers below reads the estimator or the lifecycle and writes the record, and decides nothing.
+bool anchorScanDetail()
+{
+  return anchor_scan_record_open && zupt_anchor_trace_en;
+}
+
+// The state right after a writer of the anchor step returned. The last writer of the scan wins.
+void anchorTraceWriterReturned()
+{
+  if (!anchorScanDetail())
+    return;
+  auto & r = anchor_scan_record;
+  r.have_act = true;
+  copyTraceState(kf.get_x(), r.act_p, r.act_q, r.act_v);
+  copyPoseCovarianceBlock(kf.get_P(), r.p_pose_act);
+}
+
+// The pose the pin set, or the parked prior pulled toward: the anchor's, as the writer read it.
+void anchorTraceTarget()
+{
+  if (!anchorScanDetail())
+    return;
+  anchor_scan_record.have_target = true;
+  copyTracePose(zupt_anchor_pos, zupt_anchor_rot, anchor_scan_record.target_p, anchor_scan_record.target_q);
+}
+
+// The scan's points were handed to the local map: the first build, the rebuild of a reset, the incremental update.
+void anchorTraceMapUpdated()
+{
+  if (anchorScanDetail())
+    anchor_scan_record.map_updated = true;
+}
+
+// What the scan's lidar measurement update moved: distance and rotation angle between the state before and after.
+void anchorTraceMeasurementUpdate(const state_ikfom & before, const state_ikfom & after)
+{
+  if (!anchorScanDetail())
+    return;
+  auto & r = anchor_scan_record;
+  r.have_update = true;
+  r.upd_dp = (after.pos - before.pos).norm();
+  r.upd_dq = Eigen::AngleAxisd(before.rot.toRotationMatrix().transpose() * after.rot.toRotationMatrix()).angle();
 }
 
 // The state the anchor step starts from.
@@ -1618,16 +1745,8 @@ void anchorTraceAction(fast_lio::AnchorTraceAction action, std::uint64_t used)
   anchor_scan_record.have_cov = true;
 }
 
-void anchorTraceRefreshed(double end)
+void anchorTraceAfterStep()
 {
-  zupt_anchor_id = anchor_id_seq.next();
-  zupt_anchor_created_ns = fast_lio::traceNs(end);
-  fast_lio::saturatingIncrement(&anchor_trace_counters.anchor_refreshed);
-}
-
-void anchorTraceAfterStep(double end)
-{
-  anchor_last_evidence_ns = fast_lio::traceNs(end);
   if (!anchor_scan_record_open)
     return;
   auto & r = anchor_scan_record;
@@ -1669,10 +1788,26 @@ void finishAnchorScanRecord()
     return;
   anchor_scan_record_open = false;
   auto & r = anchor_scan_record;
-  r.anchor_id = zupt_anchor_id;
-  r.anchor_valid = zupt_anchor_valid;
-  r.anchor_created_ns = zupt_anchor_created_ns;
+  r.anchor_id = stationary_anchor.id;
+  r.anchor_valid = stationary_anchor.state == fast_lio::AnchorState::kValid;
+  r.anchor_created_ns = stationary_anchor.created_ns;
+  r.anchor_state = stationary_anchor.state;
+  r.episode = stationary_anchor.episode;
+  r.ref_gen = stationary_anchor.reference_generation;
+  r.trust_post = recovery_state.trust;
+  r.recovery_episode = recovery_state.episode;
+  r.recovery_start_ns = recovery_state.start_ns;
+  r.recovery_deadline_ns = recovery_state.deadline_ns;
+  const fast_lio::AnchorHealth health = currentAnchorHealth();
+  r.eff_degraded = health.effective_degraded;
+  r.static_hold = health.reported_static_hold;
   r.gate_post = anchorTraceGate(reanchor_gate.state);
+  if (zupt_anchor_trace_en) {
+    r.streak = static_cast<std::uint64_t>(std::max(parked_hold_state.parked_scans, 0));
+    r.have_anchor_pose = stationary_anchor.state != fast_lio::AnchorState::kEmpty;
+    if (r.have_anchor_pose)
+      copyTracePose(zupt_anchor_pos, zupt_anchor_rot, r.anchor_p, r.anchor_q);
+  }
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterAnchorScanRecord)
     fast_lio_test::afterAnchorScanRecord(r);
@@ -1684,26 +1819,308 @@ void finishAnchorScanRecord()
 // The counter summary (anchor_trace.hpp section 3), once at shutdown.
 void emitAnchorTraceCounters()
 {
-  const bool exhausted = anchor_event_seq.exhausted() || anchor_scan_seq.exhausted() || anchor_id_seq.exhausted();
+  const bool exhausted = anchor_event_seq.exhausted() || anchor_scan_seq.exhausted() || stationary_anchor.ids_exhausted;
   emitAnchorTraceLine(fast_lio::formatAnchorCounters(anchor_trace_counters, anchor_event_seq.next(), exhausted));
 }
 
+// Anchor lifecycle (stationary_anchor_policy.hpp). Every event of a scan that breaks the static evidence comes
+// through here before the scan's anchor step, so the step never sees an anchor the scan has already ended.
+
+// The holds end with their anchor, as state and in what the outputs claim: neither the static hold nor the parked
+// prior or its streak carries into the next stationary episode.
+void releaseAnchorHolds(fast_lio::AnchorTraceReason reason, double stamp)
+{
+  anchor_usable = false;
+  if (zupt_active) {
+    RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                "[ZUPT] static hold released after %d scans: its anchor ended (%s)",
+                zupt_hold_scans,
+                fast_lio::anchorTraceReasonName(reason));
+    zupt_active = false;
+    zupt_hold_scans = 0;
+    anchorTransition(fast_lio::AnchorTraceEvent::kPinReleased, reason, stamp);
+  }
+  if (fast_lio::dropParkedHold(&parked_hold_state)) {
+    RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                "[ZUPT] parked hold released: its anchor ended (%s)",
+                fast_lio::anchorTraceReasonName(reason));
+    anchorTransition(fast_lio::AnchorTraceEvent::kParkedPriorReleased, reason, stamp);
+  }
+}
+
+// Records the end of whatever the lifecycle just dropped (`before` is its state before the drop) and releases the
+// holds.
+void noteAnchorEnded(fast_lio::AnchorState before, fast_lio::AnchorDrop drop, double stamp)
+{
+  const fast_lio::AnchorTraceReason reason = fast_lio::anchorTraceReasonOf(drop);
+  endParkedStreak();
+  if (before == fast_lio::AnchorState::kValid) {
+    fast_lio::saturatingIncrement(&anchor_trace_counters.invalidated);
+    fast_lio::saturatingIncrement(&anchor_trace_counters.invalidated_by[static_cast<std::size_t>(drop)]);
+    RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                "[ZUPT-ANCHOR] anchor %llu invalidated (%s): no hold or prior takes a pose from it again",
+                static_cast<unsigned long long>(stationary_anchor.id),
+                fast_lio::anchorTraceReasonName(reason));
+    anchorTransition(fast_lio::AnchorTraceEvent::kInvalidated, reason, stamp);
+  } else if (before == fast_lio::AnchorState::kQualifying) {
+    fast_lio::saturatingIncrement(&anchor_trace_counters.candidates_dropped);
+    anchorTransition(fast_lio::AnchorTraceEvent::kCandidateDropped, reason, stamp);
+  }
+  releaseAnchorHolds(reason, stamp);
+}
+
+// Ends the current candidate or anchor, if any, and marks the scan so that it neither uses nor starts one.
+void dropStationaryAnchor(fast_lio::AnchorDrop drop, double stamp)
+{
+  const fast_lio::AnchorState before = stationary_anchor.state;
+  fast_lio::dropAnchor(&stationary_anchor, drop);
+  noteAnchorEnded(before, drop, stamp);
+}
+
+// The reference the anchors live in was replaced (local map reset, new prior map): the next anchor belongs to the
+// new generation.
+void changeStationaryReference(fast_lio::AnchorDrop drop, double stamp)
+{
+  const fast_lio::AnchorState before = stationary_anchor.state;
+  fast_lio::changeAnchorReference(&stationary_anchor, drop);
+  noteAnchorEnded(before, drop, stamp);
+}
+
+void noteRecoveryEvent(const fast_lio::RecoveryEvent & event, std::int64_t stamp_ns)
+{
+  const double total_s = static_cast<double>(recovery_params.total_ns) * 1e-9;
+  const double stable_s = static_cast<double>(recovery_params.stable_ns) * 1e-9;
+  if (event.pending) {
+    RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                "[FE-RECOVERY] unsupported recovery #%llu (%s): %.1fs from the last supported scan to show %.1fs of "
+                "unbroken matching on this reference, or the position stops being trusted",
+                static_cast<unsigned long long>(recovery_state.episode),
+                fast_lio::recoveryCauseName(event.cause),
+                total_s,
+                stable_s);
+    recoveryTransition(fast_lio::RecoveryTraceEvent::kPending, event.cause, stamp_ns);
+  }
+  if (event.qualified) {
+    fast_lio::saturatingIncrement(&anchor_trace_counters.recovery_qualified);
+    RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                "[FE-RECOVERY] recovery #%llu qualified: %.1fs of unbroken matching on the same reference",
+                static_cast<unsigned long long>(recovery_state.episode),
+                stable_s);
+    recoveryTransition(fast_lio::RecoveryTraceEvent::kQualified, event.cause, stamp_ns);
+  }
+  if (event.unanchored) {
+    fast_lio::saturatingIncrement(event.cause == fast_lio::RecoveryCause::kMapReset
+                                    ? &anchor_trace_counters.map_reset_unanchored
+                                    : &anchor_trace_counters.recovery_expired);
+    RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                 "[FE-RECOVERY] UNANCHORED (%s): the position is not trusted again in this process and odometry "
+                 "stays flagged degraded; only a restart restores normal operation",
+                 fast_lio::recoveryCauseName(event.cause));
+    recoveryTransition(fast_lio::RecoveryTraceEvent::kUnanchored, event.cause, stamp_ns);
+  }
+}
+
+void startAnchorRecovery(fast_lio::RecoveryCause cause, std::int64_t now_ns)
+{
+  const fast_lio::RecoveryEvent event = fast_lio::startRecovery(&recovery_state, cause, now_ns, recovery_params);
+  if (event.pending || event.unanchored)
+    fast_lio::saturatingIncrement(&anchor_trace_counters.recovery_started);
+  noteRecoveryEvent(event, now_ns);
+}
+
+void expireAnchorRecovery(std::int64_t now_ns)
+{
+  noteRecoveryEvent(fast_lio::expireRecovery(&recovery_state, now_ns), now_ns);
+}
+
+// The anchor write of the scan being processed. The pin and the parked prior each note the filter state they are
+// about to change; the pin runs on degraded scans and the prior on healthy ones, so a scan has at most one. When a
+// later event of the same scan ends the anchor (the runaway watchdog resetting the map, or declaring the front end
+// lost), takeBackAnchorWrite() restores that state: the map is rebuilt around, and the scan publishes, what it
+// would have had with no usable anchor at the anchor step.
+struct AnchorWrite
+{
+  enum class Writer : std::uint8_t
+  {
+    kNone,
+    kPin,
+    kParkedPrior,
+  };
+  Writer writer = Writer::kNone;
+  state_ikfom x;
+  esekfom::esekf<state_ikfom, 12, input_ikfom>::cov P;
+};
+AnchorWrite anchor_write;
+
+void noteAnchorWrite(AnchorWrite::Writer writer)
+{
+  anchor_write.writer = writer;
+  anchor_write.x = kf.get_x();
+  anchor_write.P = kf.get_P();
+}
+
+// Zero-only: parked on a degraded scan with no anchor of this episode to hold to. The velocity is all the static
+// evidence speaks for; position and attitude stay where the scan has them.
+void noteZeroOnlyScan()
+{
+  if (anchor_scan_record_open)
+    anchor_scan_record.zero_only = true;
+  fast_lio::saturatingIncrement(&anchor_trace_counters.zero_only_unanchored);
+  if (anchor_ever_created)
+    fast_lio::saturatingIncrement(&anchor_trace_counters.blocked_stale_use);
+}
+
+// Called before the event that ends the anchor is applied. A pin is only ever written on a degraded, parked scan
+// with ZUPT on, and without a usable anchor that scan zeroes its velocity and nothing else, so that is what takes
+// the pin's place. A healthy scan without a usable anchor applies no prior and keeps whatever else it did. The
+// record and the counters follow the state: they describe what the scan publishes.
+void takeBackAnchorWrite()
+{
+  const AnchorWrite::Writer writer = anchor_write.writer;
+  if (writer == AnchorWrite::Writer::kNone)
+    return;
+  anchor_write.writer = AnchorWrite::Writer::kNone;
+  kf.change_x(anchor_write.x);
+  kf.change_P(anchor_write.P);
+  if (anchor_scan_record_open) {
+    anchor_scan_record.anchor_used = 0;
+    anchor_scan_record.have_target = false;
+    anchor_scan_record.have_act = false;
+  }
+  if (writer == AnchorWrite::Writer::kPin) {
+    anchorTraceAction(fast_lio::AnchorTraceAction::kZeroVelocity, 0);
+    noteZeroOnlyScan();
+    state_ikfom st = kf.get_x();
+    st.vel.setZero();
+    gravity_align_vel_overwritten = true;
+    kf.change_x(st);
+    resetVelocityCovariance(zupt_vel_reset_sigma);
+  } else if (anchor_scan_record_open) {
+    anchor_scan_record.parked_applied = false;
+  }
+  state_point = kf.get_x();
+  if (anchor_scan_record_open && anchor_scan_record.action != fast_lio::AnchorTraceAction::kNone)
+    anchorTraceWriterReturned();
+}
+
+// The anchor writes that stand are counted once nothing later in the scan can take them back.
+void countAnchorWrite()
+{
+  if (anchor_write.writer == AnchorWrite::Writer::kPin)
+    fast_lio::saturatingIncrement(&anchor_trace_counters.pin_applied);
+  else if (anchor_write.writer == AnchorWrite::Writer::kParkedPrior)
+    fast_lio::saturatingIncrement(&anchor_trace_counters.parked_prior_applied);
+}
+
+// The start of every scan taken off the queue, before any of its processing: the scan-hole check, then the
+// deadline. Nothing later in the scan can use an anchor, or a trust, that has already run out.
+void beginAnchorLifecycleScan(double beg, double end)
+{
+  if (lifecycle_scan_seq != std::numeric_limits<std::uint64_t>::max())
+    ++lifecycle_scan_seq;
+  anchor_usable = false;
+  anchor_scan_evaluated = false;
+  reanchor_lost_this_scan = false;
+  anchor_write.writer = AnchorWrite::Writer::kNone;
+  const std::int64_t end_ns = fast_lio::traceNs(end);
+  const fast_lio::AnchorState before = stationary_anchor.state;
+  const fast_lio::AnchorScanStart start =
+    fast_lio::beginAnchorScan(&stationary_anchor, fast_lio::traceNs(beg), stationary_anchor_params);
+  if (start.hole) {
+    anchorEvidence(fast_lio::AnchorTraceReason::kScanHole,
+                   fast_lio::kAnchorEventScanHole,
+                   &anchor_trace_counters.scan_hole,
+                   end,
+                   true);
+    noteAnchorEnded(before, fast_lio::AnchorDrop::kScanHole, end);
+    fast_lio::breakRecoveryRun(&recovery_state);
+    startAnchorRecovery(fast_lio::RecoveryCause::kScanHole, end_ns);
+  }
+  expireAnchorRecovery(end_ns);
+}
+
+// A scan that was taken and ended without its static evidence being evaluated is a missing scan to a candidate,
+// whose confirming scans must be consecutive (stationary_anchor_policy.hpp). An anchor is left to the scan-gap bound.
+void dropUnevaluatedAnchorCandidate(double end)
+{
+  const fast_lio::AnchorState before = stationary_anchor.state;
+  if (fast_lio::dropUnevaluatedCandidate(&stationary_anchor, fast_lio::traceNs(end)))
+    noteAnchorEnded(before, fast_lio::AnchorDrop::kScanNotEvaluated, end);
+}
+
+// The scan path's bracket around one scan: its record and the start-of-scan checks on the way in; on every way
+// out, early returns included, the candidate a scan that never reached the anchor step leaves behind, then the
+// record. The loss the gate declared belongs to this scan's outputs only and ends with it.
+struct AnchorScanScope
+{
+  AnchorScanScope(double beg, double end) : end_(end)
+  {
+    beginAnchorScanRecord(beg, end);
+    beginAnchorLifecycleScan(beg, end);
+  }
+  ~AnchorScanScope()
+  {
+    if (!anchor_scan_evaluated)
+      dropUnevaluatedAnchorCandidate(end_);
+    finishAnchorScanRecord();
+    reanchor_lost_this_scan = false;
+    anchor_write.writer = AnchorWrite::Writer::kNone;
+  }
+  AnchorScanScope(const AnchorScanScope &) = delete;
+  AnchorScanScope & operator=(const AnchorScanScope &) = delete;
+
+private:
+  double end_;
+};
+
 // A scan dropped before processing still gets its record, so the trace accounts for every scan taken.
-void recordDroppedAnchorScan(fast_lio::AnchorScanOutcome outcome, double beg, double end)
+// `unevaluated` says the scan is a new one that ended without its static evidence being evaluated; a repeated or
+// old scan is not, and a scan whose drop ends candidate and anchor alike needs no second word.
+void recordDroppedAnchorScan(fast_lio::AnchorScanOutcome outcome, double beg, double end, bool unevaluated)
 {
   beginAnchorScanRecord(beg, end);
   anchor_scan_record.outcome = outcome;
+  if (unevaluated)
+    dropUnevaluatedAnchorCandidate(end);
   finishAnchorScanRecord();
 }
 
-// Closes the scan's record on every way out of the scan path, early returns included.
-struct AnchorScanTraceScope
+// A scan still in transit gets this long to arrive before the IMU-driven check below calls its stretch a hole.
+constexpr std::int64_t kAnchorIdleSettleMinNs = 500000000;
+
+// While no scan is queued the IMU samples are the input that advances, and the deadline is measured by them: the
+// first sample at or past it latches, at that sample's time. A scan hole is not known that soon, because the scan
+// that would close it may still be in transit, so the hole is called only once the stretch has outlasted the gap
+// bound by the settle allowance. The Pending it opens is timed from the last supported scan like any other, and
+// has run out at once when that was long enough ago. The first scan back re-checks both before anything uses an
+// anchor. No pose is made up: /Odometry changes at the next published scan.
+void checkAnchorEvidenceIdle(double imu_stamp)
 {
-  AnchorScanTraceScope(double beg, double end) { beginAnchorScanRecord(beg, end); }
-  ~AnchorScanTraceScope() { finishAnchorScanRecord(); }
-  AnchorScanTraceScope(const AnchorScanTraceScope &) = delete;
-  AnchorScanTraceScope & operator=(const AnchorScanTraceScope &) = delete;
-};
+  const std::int64_t now_ns = fast_lio::traceNs(imu_stamp);
+  if (now_ns < 0)
+    return;
+  anchor_idle_path = true;
+  expireAnchorRecovery(now_ns);
+  const std::int64_t settle_ns = std::max(stationary_anchor_params.max_scan_gap_ns, kAnchorIdleSettleMinNs);
+  const std::int64_t last_ns = stationary_anchor.last_evidence_end_ns;
+  if (last_ns >= 0 && now_ns >= settle_ns && now_ns - settle_ns - last_ns > stationary_anchor_params.max_scan_gap_ns) {
+    if (stationary_anchor.state != fast_lio::AnchorState::kEmpty)
+      dropStationaryAnchor(fast_lio::AnchorDrop::kScanHole, imu_stamp);
+    fast_lio::breakRecoveryRun(&recovery_state);
+    startAnchorRecovery(fast_lio::RecoveryCause::kScanHole, now_ns);
+    expireAnchorRecovery(now_ns);
+  }
+  anchor_idle_path = false;
+}
+
+// The scan being processed carried a stretch the IMU did not observe. Its pose crossed that stretch on the motion
+// model alone: with the platform policy on, an unsupported recovery starts at the last supported scan, and this
+// scan is not one of the matching scans that could end it.
+void startUnobservedImuRecovery(fast_lio::RecoveryCause cause, double end)
+{
+  fast_lio::excludeRecoveryScan(&recovery_state, lifecycle_scan_seq);
+  startAnchorRecovery(cause, fast_lio::traceNs(end));
+}
 
 void markImuCoverageGap(double end)
 {
@@ -1714,9 +2131,21 @@ void markImuCoverageGap(double end)
                  end,
                  !anchor_trace_gap_run);
   anchor_trace_gap_run = true;
+  // The stretch was not observed: the evidence behind the anchor is broken whether or not the platform moved.
+  dropStationaryAnchor(fast_lio::AnchorDrop::kImuCoverageGap, end);
+  startUnobservedImuRecovery(fast_lio::RecoveryCause::kImuCoverageGap, end);
   fast_lio::updateReanchorGate(&reanchor_gate, true, 0, 0.0, end, reanchor_params);
   flio_map_frozen = true;
   flio_degraded_odom = true;
+}
+
+// An IMU batch whose samples were lost (dropped as invalid, or the input failing closed) leaves the scan's stretch
+// unobserved, as a coverage gap does. A batch kept for the next scan is not lost: that scan's evidence covers it.
+// The re-anchor gate is left as it is: the scan ends here, and the gate judges the scans that register.
+void dropAnchorForLostImu(double end)
+{
+  dropStationaryAnchor(fast_lio::AnchorDrop::kImuCoverageGap, end);
+  startUnobservedImuRecovery(fast_lio::RecoveryCause::kImuCoverageGap, end);
 }
 // IMU-gap prior (imu_gap_prior.hpp, p_imu->gap_params): the scan is propagated across the gap instead of
 // skipped, and an IMU interval longer than imu_gap_verify_s still sends the re-anchor gate to blind, so the map
@@ -1832,13 +2261,16 @@ bool finishImuBatch(const fast_lio::ImuProcessOutcome & outcome)
 bool sync_packages(MeasureGroup & meas)
 {
   std::unique_lock<std::mutex> lock(mtx_buffer);
-  if (input_epoch_guard.faulted() && !anchor_trace_epoch_reported) {
-    anchor_trace_epoch_reported = true;
+  if (input_epoch_guard.faulted() && !input_epoch_handled) {
+    input_epoch_handled = true;
     anchorEvidence(fast_lio::AnchorTraceReason::kTimeEpoch,
                    fast_lio::kAnchorEventTimeEpoch,
                    &anchor_trace_counters.time_epoch,
                    input_epoch_fault_stamp,
                    true);
+    // A changed clock epoch ends every proof timed in the old one; input stays stopped until a restart.
+    dropStationaryAnchor(fast_lio::AnchorDrop::kTimeEpoch, input_epoch_fault_stamp);
+    fast_lio::breakRecoveryRun(&recovery_state);
   }
   if (!imu_fifo_transaction.acceptsInput(input_epoch_guard.faulted()))
     return false;
@@ -1875,9 +2307,14 @@ bool sync_packages(MeasureGroup & meas)
                            "[INPUT-TIME] invalid scan timing reason=%d count=%lu",
                            static_cast<int>(timing.status),
                            static_cast<unsigned long>(invalid_scan_time_count));
+      // Without usable timing the scan cannot be shown to be a repeat of an evaluated one: it is a new scan that
+      // nothing evaluated.
       recordDroppedAnchorScan(fast_lio::AnchorScanOutcome::kDroppedInvalidTime,
                               meas.lidar_beg_time,
-                              std::numeric_limits<double>::quiet_NaN());
+                              std::numeric_limits<double>::quiet_NaN(),
+                              true);
+      // A rejected scan is no match: a recovery has to show its stable time again without it.
+      fast_lio::breakRecoveryRun(&recovery_state);
       meas.imu.clear();
       popLidarScan();
       return false;
@@ -1895,7 +2332,10 @@ bool sync_packages(MeasureGroup & meas)
                            5000,
                            "[INPUT-TIME] nonadvancing scan count=%lu",
                            static_cast<unsigned long>(nonadvancing_scan_count));
-      recordDroppedAnchorScan(fast_lio::AnchorScanOutcome::kDroppedNonadvancing, meas.lidar_beg_time, lidar_end_time);
+      // A scan that does not advance past the processed input is a repeated or old sample, not a missing scan.
+      recordDroppedAnchorScan(
+        fast_lio::AnchorScanOutcome::kDroppedNonadvancing, meas.lidar_beg_time, lidar_end_time, false);
+      fast_lio::breakRecoveryRun(&recovery_state);
       meas.imu.clear();
       popLidarScan();
       return false;
@@ -2493,8 +2933,10 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   odomAftMapped.child_frame_id = body_frame_id;
   odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
   set_posestamp(odomAftMapped.pose);
+  // One verdict for every encoding of this scan: the covariance inflation, the flags and the typed observation.
+  const fast_lio::AnchorHealth anchor_health = currentAnchorHealth();
   auto P = kf.get_P();
-  odomAftMapped.pose.covariance = fast_lio::makeOdomCovariance(P.block<6, 6>(0, 0), flio_degraded_odom);
+  odomAftMapped.pose.covariance = fast_lio::makeOdomCovariance(P.block<6, 6>(0, 0), anchor_health.effective_degraded);
   // Front-end health side-channel (Plan C) — written BEFORE the publish so it is
   // same-scan. The twist covariance was always zero here and has no other
   // consumer. Layout contract:
@@ -2507,12 +2949,12 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     // consumer must act on: a degraded pose is fresh and self-consistent, so
     // staleness gates downstream pass it through unchanged (dog 2, 2026-09-04).
     unsigned health_flags = 0u;
-    if (flio_degraded_odom)
+    if (anchor_health.effective_degraded)
       health_flags |= 1u << 0;  // kFeHealthFlagDegraded
-    if (zupt_active || parked_hold_state.active)
-      health_flags |= 1u << 1;  // kFeHealthFlagStaticHold
-    if (reanchor_gate.state == fast_lio::ReanchorState::kLost)
-      health_flags |= 1u << 2;  // kFeHealthFlagLost
+    if (anchor_health.reported_static_hold)
+      health_flags |= 1u << 1;  // kFeHealthFlagStaticHold: only a hold on a usable anchor
+    if (anchor_health.lost)
+      health_flags |= 1u << 2;  // kFeHealthFlagLost: the scan that declared the loss included
     if (gravity_align_degraded_active)
       health_flags |= 1u << 3;  // kFeHealthFlagLevelling: roll/pitch pulled onto the accel window mean
     odomAftMapped.twist.covariance[1] = static_cast<double>(health_flags);
@@ -2581,11 +3023,12 @@ void buildAndPublishFrontendObservation(bool completed, bool scanEvent, double e
   fast_lio::FrontendFacts facts;
   facts.completed = completed;
   facts.initialized = flg_EKF_inited;
-  facts.lost = reanchor_gate.state == fast_lio::ReanchorState::kLost;
+  const fast_lio::AnchorHealth anchor_health = currentAnchorHealth();
+  facts.lost = anchor_health.lost;
   facts.blind = reanchor_gate.state == fast_lio::ReanchorState::kBlind;
   facts.verifying = reanchor_gate.state == fast_lio::ReanchorState::kVerifying;
-  facts.degraded = flio_degraded_odom;
-  facts.staticHold = zupt_active || parked_hold_state.active;
+  facts.degraded = anchor_health.effective_degraded;
+  facts.staticHold = anchor_health.reported_static_hold;
   facts.runaway = frontend_runaway;
   facts.levelling = gravity_align_degraded_active;
   facts.blocked = input_epoch_guard.faulted();
@@ -3496,6 +3939,8 @@ public:
     this->declare_parameter<double>("zupt_hold_rot_noise", 0.02);
     this->declare_parameter<double>("zupt_hold_vel_noise", 0.05);
     this->declare_parameter<double>("zupt_hold_deadband_sigma", 3.0);
+    this->declare_parameter<int>("zupt_anchor_confirm_scans", 3);
+    this->declare_parameter<double>("zupt_anchor_max_scan_gap_s", 0.0);
     this->declare_parameter<bool>("reanchor_en", true);
     this->declare_parameter<int>("reanchor_min_eff", 200);
     this->declare_parameter<double>("reanchor_max_res", 0.10);
@@ -3506,6 +3951,8 @@ public:
     this->declare_parameter<double>("reanchor_res_floor", 0.04);
     this->declare_parameter<double>("reanchor_min_eff_ratio", 0.0);
     this->declare_parameter<int>("reanchor_healthy_window", 100);
+    this->declare_parameter<double>("reanchor_total_timeout_sec", 0.0);
+    this->declare_parameter<double>("reanchor_recovery_stable_sec", 1.0);
     frontend_observation_en = this->declare_parameter<bool>("publish.frontend_observation", false);
     frontend_clock_domain = this->declare_parameter<std::string>("publish.frontend_clock_domain", "");
     const double frontendIdlePeriod = this->declare_parameter<double>("publish.frontend_idle_period_sec", 0.5);
@@ -3869,6 +4316,9 @@ public:
     this->get_parameter_or<double>("zupt_hold_rot_noise", parked_hold_params.rot_noise, 0.02);
     this->get_parameter_or<double>("zupt_hold_vel_noise", parked_hold_params.vel_noise, 0.05);
     this->get_parameter_or<double>("zupt_hold_deadband_sigma", parked_hold_params.deadband_sigma, 3.0);
+    this->get_parameter_or<int>("zupt_anchor_confirm_scans", stationary_anchor_params.confirm_scans, 3);
+    double zupt_anchor_max_scan_gap_s = 0.0;
+    this->get_parameter_or<double>("zupt_anchor_max_scan_gap_s", zupt_anchor_max_scan_gap_s, 0.0);
     this->get_parameter_or<bool>("reanchor_en", reanchor_params.enabled, true);
     this->get_parameter_or<int>("reanchor_min_eff", reanchor_params.min_eff, 200);
     this->get_parameter_or<double>("reanchor_max_res", reanchor_params.max_res, 0.10);
@@ -3888,6 +4338,16 @@ public:
                    "reanchor_max_res_ratio / reanchor_res_floor / reanchor_min_eff_ratio must be finite and "
                    "nonnegative and reanchor_healthy_window at least 1");
       throw std::invalid_argument("reanchor relative verification parameters");
+    }
+    double reanchor_total_timeout_sec = 0.0;
+    double reanchor_recovery_stable_sec = 1.0;
+    this->get_parameter_or<double>("reanchor_total_timeout_sec", reanchor_total_timeout_sec, 0.0);
+    this->get_parameter_or<double>("reanchor_recovery_stable_sec", reanchor_recovery_stable_sec, 1.0);
+    if (!fast_lio::resolveRecoveryParams(reanchor_total_timeout_sec, reanchor_recovery_stable_sec, &recovery_params)) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "reanchor_total_timeout_sec must be finite and nonnegative (0 = off) and "
+                   "reanchor_recovery_stable_sec finite, positive and, with the total on, shorter than it");
+      throw std::invalid_argument("reanchor recovery budget parameters");
     }
     reanchor_healthy_res =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
@@ -3942,8 +4402,24 @@ public:
     this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
     this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
     this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
-    // The anchor trace calls a gap of more than three scan periods a scan hole.
-    anchor_trace_hole_ns = p_pre->SCAN_RATE > 0 ? std::llround(3e9 / p_pre->SCAN_RATE) : 300000000;
+    // The stationary anchor ends at any gap in the scan evidence longer than this bound (0 = three scan periods).
+    if (!fast_lio::anchorConfirmScansValid(stationary_anchor_params.confirm_scans) ||
+        !fast_lio::resolveAnchorScanGapNs(zupt_anchor_max_scan_gap_s,
+                                          static_cast<double>(p_pre->SCAN_RATE),
+                                          &stationary_anchor_params.max_scan_gap_ns)) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "zupt_anchor_confirm_scans must be at least 1 and zupt_anchor_max_scan_gap_s finite and positive, "
+                   "or 0 with a finite positive preprocess.scan_rate");
+      throw std::invalid_argument("stationary anchor parameters");
+    }
+    RCLCPP_INFO(this->get_logger(),
+                "stationary anchor: confirm_scans=%d max_scan_gap_ns=%lld; recovery budget: total_ns=%lld "
+                "stable_ns=%lld (%s)",
+                stationary_anchor_params.confirm_scans,
+                static_cast<long long>(stationary_anchor_params.max_scan_gap_ns),
+                static_cast<long long>(recovery_params.total_ns),
+                static_cast<long long>(recovery_params.stable_ns),
+                recovery_params.enabled() ? "platform policy on" : "platform policy off");
     this->get_parameter_or<double>("preprocess.max_scan_duration_s", max_scan_duration_s, 0.0);
     this->get_parameter_or<double>("imu_coverage.max_gap_s", p_imu->coverage_params.max_gap_s, 0.0);
     this->get_parameter_or<double>("imu_coverage.max_extrapolation_s", p_imu->coverage_params.max_extrapolation_s, 0.0);
@@ -4496,14 +4972,7 @@ private:
   void timer_callback()
   {
     if (sync_packages(Measures)) {
-      const AnchorScanTraceScope anchor_trace_scope(Measures.lidar_beg_time, Measures.lidar_end_time);
-      if (anchor_scan_record.gap_ns > anchor_trace_hole_ns) {
-        anchorEvidence(fast_lio::AnchorTraceReason::kScanHole,
-                       fast_lio::kAnchorEventScanHole,
-                       &anchor_trace_counters.scan_hole,
-                       Measures.lidar_end_time,
-                       true);
-      }
+      const AnchorScanScope anchor_scan_scope(Measures.lidar_beg_time, Measures.lidar_end_time);
       frontend_runaway = false;
       if (imu_backlog_reanchor_required) {
         markImuCoverageGap(Measures.lidar_end_time);
@@ -4551,12 +5020,14 @@ private:
         finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation});
         RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: %s", error.what());
         anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
+        dropAnchorForLostImu(Measures.lidar_end_time);
         return;
       } catch (...) {
         feats_undistort->clear();
         finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation});
         RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: unknown exception");
         anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
+        dropAnchorForLostImu(Measures.lidar_end_time);
         return;
       }
       if (p_imu->initializationDegraded() && !imu_init_degraded_warned_) {
@@ -4567,10 +5038,13 @@ private:
       }
       if (!finishImuBatch(p_imu->lastOutcome())) {
         anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
+        dropAnchorForLostImu(Measures.lidar_end_time);
         return;
       }
       if (!processed) {
         anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuNotProcessed;
+        if (p_imu->lastOutcome().disposition == fast_lio::ImuDisposition::kInvalid)
+          dropAnchorForLostImu(Measures.lidar_end_time);
         if (p_imu->lastStatus() == ImuProcess::ProcessStatus::kCoverageGap) {
           anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuCoverageGap;
           markImuCoverageGap(Measures.lidar_end_time);
@@ -4600,6 +5074,11 @@ private:
                        Measures.lidar_end_time,
                        !anchor_trace_bridge_run);
         anchor_trace_bridge_run = true;
+        // The motion model crossed a stretch no sample observed, however short: the static evidence behind the
+        // anchor is broken, and the pose on the far side is not supported by anything that saw the crossing. Only
+        // a long interval also sends the gate to blind (below).
+        dropStationaryAnchor(fast_lio::AnchorDrop::kImuBridge, Measures.lidar_end_time);
+        startUnobservedImuRecovery(fast_lio::RecoveryCause::kImuBridge, Measures.lidar_end_time);
         RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping.imu_transactions"),
                      "[IMU-CONSUMPTION-GAP] token=%lu begin=%.9f end=%.9f gaps=%d longest_interval=%.9f total=%.9f "
                      "scans_total=%lu",
@@ -4853,6 +5332,7 @@ private:
               if (prior_map_align_ == fast_lio::PriorMapAlign::kRelocalization) {
                 prior_map_ds_ = prior_ds;
                 ikdtree.Build(feats_down_world->points);
+                anchorTraceMapUpdated();
                 RCLCPP_INFO(this->get_logger(),
                             "map built from the current scan (%d points); the prior map (%zu points) is held "
                             "until /relocalization/result says where it is",
@@ -4894,6 +5374,7 @@ private:
                             feats_down_size,
                             map_points);
               }
+              anchorTraceMapUpdated();
               Localmap_Initialized = false;
               prior_map_installed_ = true;
 #ifdef USE_IVOX
@@ -4930,6 +5411,7 @@ private:
                 pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
               }
               ikdtree.Build(feats_down_world->points);
+              anchorTraceMapUpdated();
             }
             prior_map_pcd_.clear();  // Prevent re-execution
           } else {
@@ -4940,6 +5422,7 @@ private:
               pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
             }
             ikdtree.Build(feats_down_world->points);
+            anchorTraceMapUpdated();
           }
         }
         return;
@@ -5098,6 +5581,7 @@ private:
       kf.clearConsiderRotation();  // never leaks into the gravity / planar / wheel / parked updates (update_simple)
 
       state_point = kf.get_x();
+      anchorTraceMeasurementUpdate(state_before_update, state_point);
       if (!lidar_attitude_hold_active && !lidar_attitude_hold_info_active) { lidar_attitude_hold_since = -1.0; }
       if (lidar_attitude_hold_info_active && !lidar_attitude_hold_active) {
         if (lidar_attitude_hold_since < 0.0) { lidar_attitude_hold_since = lidar_end_time; }
@@ -5607,8 +6091,17 @@ private:
                        &anchor_trace_counters.map_reset,
                        lidar_end_time,
                        true);
+        // The rebuilt map is seeded from the very pose in question. The anchors of the old map end with it, and
+        // the reference counts as rebuilt, not recovered: the gate going healthy below says the local map works
+        // again, not where the platform is.
+        changeStationaryReference(fast_lio::AnchorDrop::kMapReset, lidar_end_time);
+        fast_lio::breakRecoveryRun(&recovery_state);
+        noteRecoveryEvent(
+          fast_lio::resetRecoveryReference(&recovery_state, fast_lio::traceNs(lidar_end_time), recovery_params),
+          fast_lio::traceNs(lidar_end_time));
         int map_before = 0;
         const bool kept_prior = rebuildLocalMapStorage(map_before);
+        anchorTraceMapUpdated();
         if (kept_prior) {
           RCLCPP_ERROR(this->get_logger(),
                        "[%s] live map dropped and re-seeded from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: "
@@ -5636,10 +6129,12 @@ private:
       };
 
       // The relative tests need what healthy scans look like; only a gate that is verifying asks (the medians
-      // are also logged at the release). The tests themselves stay off unless their ratios are set.
+      // are also logged at the release), and an unsupported recovery that runs the same match test. The tests
+      // themselves stay off unless their ratios are set.
       fast_lio::ReanchorReference reanchor_reference;
       if (reanchor_gate.state == fast_lio::ReanchorState::kBlind ||
-          reanchor_gate.state == fast_lio::ReanchorState::kVerifying) {
+          reanchor_gate.state == fast_lio::ReanchorState::kVerifying ||
+          recovery_state.trust == fast_lio::RecoveryTrust::kPending) {
         reanchor_reference.res_median = reanchor_healthy_res.median();
         reanchor_reference.eff_median = reanchor_healthy_eff.median();
       }
@@ -5666,11 +6161,16 @@ private:
           anchor_scan_record.events |= fast_lio::kAnchorEventReanchored;
       }
       if (reanchor.just_lost) {
+        // The loss is this scan's verdict and its outputs carry it, whatever the reset below does to the gate.
+        reanchor_lost_this_scan = true;
         anchorEvidence(fast_lio::AnchorTraceReason::kLost,
                        fast_lio::kAnchorEventLost,
                        &anchor_trace_counters.lost,
                        lidar_end_time,
                        true);
+        // Recorded as a loss before a map reset of the same scan can end the anchor under another reason.
+        dropStationaryAnchor(fast_lio::AnchorDrop::kLost, lidar_end_time);
+        fast_lio::breakRecoveryRun(&recovery_state);
         RCLCPP_ERROR(this->get_logger(),
                      "[REANCHOR] LOST: no re-registration within %.1fs (effct=%d res=%.3fm) — the pose no longer fits "
                      "the map; policy=%s",
@@ -5704,50 +6204,95 @@ private:
       };
       applyAnchorFixtureForTest();
       anchorTraceBeforeStep(flio_in_degraded, reanchor.degraded);
-      // One verdict per scan: the static hold, the parked ZUPT on the healthy
-      // branch and the runaway watchdog must all answer "is it parked?" the same
-      // way, and the summary costs an IMU-window pass. What that verdict is
-      // allowed to do to the state is the decision table in zupt_policy.hpp.
-      const bool body_static =
-        body_is_static(Measures, lidar_end_time, anchor_scan_record_open ? &anchor_scan_record : nullptr);
-      if (!body_static && anchor_trace_body_was_static) {
+      // One verdict per scan: the anchor lifecycle, the static hold, the parked
+      // ZUPT on the healthy branch and the runaway watchdog must all answer "is
+      // it parked?" the same way, and the summary costs an IMU-window pass. What
+      // that verdict is allowed to do to the state is the decision table in
+      // zupt_policy.hpp.
+      const fast_lio::StaticEvidenceVerdict static_evidence =
+        static_evidence_of(Measures, lidar_end_time, anchor_scan_record_open ? &anchor_scan_record : nullptr);
+      const bool body_static = static_evidence.stationary();
+      if (static_evidence.evidence == fast_lio::StaticEvidence::kMoving && anchor_trace_body_was_static) {
         anchorEvidence(fast_lio::AnchorTraceReason::kMotion,
                        fast_lio::kAnchorEventMotion,
                        &anchor_trace_counters.motion,
                        lidar_end_time,
                        true);
       }
+      if (static_evidence.evidence == fast_lio::StaticEvidence::kUnknown) {
+        anchorEvidence(fast_lio::AnchorTraceReason::kEvidenceUnknown,
+                       fast_lio::kAnchorEventEvidenceUnknown,
+                       &anchor_trace_counters.evidence_unknown,
+                       lidar_end_time,
+                       anchor_trace_body_was_static);
+      }
       anchor_trace_body_was_static = body_static;
+      // The anchor step (stationary_anchor_policy.hpp). Every event of this scan
+      // that broke the evidence has already ended the anchor, so whatever the
+      // step finds usable belongs to the current stationary episode.
+      fast_lio::AnchorStepInput anchor_in;
+      anchor_in.end_ns = fast_lio::traceNs(lidar_end_time);
+      anchor_in.evidence = static_evidence.evidence;
+      anchor_in.degraded = reanchor.degraded;
+      anchor_in.reference_trusted = fast_lio::recoveryTrusted(recovery_state);
+      anchor_in.lost = reanchor_gate.state == fast_lio::ReanchorState::kLost;
+      const fast_lio::AnchorState anchor_before = stationary_anchor.state;
+      const fast_lio::AnchorStep anchor_step =
+        fast_lio::stepAnchor(&stationary_anchor, anchor_in, stationary_anchor_params);
+      anchor_scan_evaluated = true;
+      if (anchor_step.dropped) {
+        noteAnchorEnded(anchor_before, anchor_step.drop, lidar_end_time);
+      }
+      // The parked hold counts the scans of the current episode only: its
+      // streak and its engagement end with the anchor (releaseAnchorHolds), and
+      // the prior below needs the anchor usable on this very scan. Counted
+      // before the records of this step are written, so they include the scan.
+      const auto parked =
+        fast_lio::updateParkedHold(&parked_hold_state, anchor_step.parked_evidence, parked_hold_params);
+      if (anchor_step.started) {
+        // A candidate carries the pose of its first scan: the platform has not
+        // moved since, so a later scan adds no information, only the chance of a
+        // slow registration bias.
+        zupt_anchor_pos = state_point.pos;
+        zupt_anchor_rot = state_point.rot;
+        fast_lio::saturatingIncrement(&anchor_trace_counters.candidates);
+        anchorTransition(
+          fast_lio::AnchorTraceEvent::kCandidateStarted, fast_lio::AnchorTraceReason::kNone, lidar_end_time);
+      }
+      if (anchor_step.committed) {
+        anchor_ever_created = true;
+        fast_lio::saturatingIncrement(&anchor_trace_counters.created);
+        anchorTransition(fast_lio::AnchorTraceEvent::kCreated, fast_lio::AnchorTraceReason::kNone, lidar_end_time);
+      }
+      anchor_usable = anchor_step.usable;
+      if (anchor_scan_record_open)
+        anchor_scan_record.usable = anchor_step.usable;
       fast_lio::ZuptPolicyInputs zupt_in;
       zupt_in.scan_degraded = reanchor.degraded;
       zupt_in.zupt_enabled = zupt_en;
-      zupt_in.anchor_valid = zupt_anchor_valid;
+      zupt_in.anchor_valid = anchor_step.usable;
       zupt_in.body_static = body_static;
       zupt_in.speed = kf.get_x().vel.norm();
       zupt_in.max_speed = divergence_guard_max_speed;
       const fast_lio::ZuptDecision zupt_verdict = fast_lio::decideZupt(zupt_in);
-      // The parked hold runs off the same verdict. Without an anchor there is
-      // nothing to hold to, so folding that into the input keeps the health flag
-      // honest rather than reporting a hold that has no reference.
-      const auto parked = fast_lio::updateParkedHold(
-        &parked_hold_state, body_static && zupt_anchor_valid, parked_hold_params);
       if (parked.just_engaged) {
         anchorTransition(
           fast_lio::AnchorTraceEvent::kParkedPriorEngaged, fast_lio::AnchorTraceReason::kNone, lidar_end_time);
       }
       if (parked.just_released) {
-        RCLCPP_WARN(this->get_logger(), "[ZUPT] parked hold released: the platform is moving again");
+        RCLCPP_WARN(this->get_logger(), "[ZUPT] parked hold released: the scan is no parked evidence");
         anchorTransition(
-          fast_lio::AnchorTraceEvent::kParkedPriorReleased, fast_lio::AnchorTraceReason::kMotion, lidar_end_time);
+          fast_lio::AnchorTraceEvent::kParkedPriorReleased, fast_lio::AnchorTraceReason::kNone, lidar_end_time);
       }
       if (reanchor.degraded) {
         state_ikfom st = kf.get_x();
         // Static hold takes precedence over the speed reset: with independent
-        // proof that the platform is parked, the blind stretch has nothing to
-        // integrate, and zeroing only the velocity still leaves the position and
-        // attitude wherever propagation put them (dog 2, 2026-09-04: −3.9 m of Z
-        // in 9 s, unrecoverable once the map unfroze around the wrong pose).
+        // proof that the platform is parked, and an anchor taken in this same
+        // stationary episode, the blind stretch has nothing to integrate, while
+        // zeroing only the velocity would leave the position and attitude
+        // wherever propagation put them.
         if (zupt_verdict.hold) {
+          noteAnchorWrite(AnchorWrite::Writer::kPin);
           st.pos = zupt_anchor_pos;
           st.rot = zupt_anchor_rot;
           st.vel.setZero();
@@ -5756,8 +6301,9 @@ private:
           resetVelocityCovariance(zupt_vel_reset_sigma);
           state_point = kf.get_x();
           ++zupt_hold_scans;
-          anchorTraceAction(fast_lio::AnchorTraceAction::kPin, zupt_anchor_id);
-          fast_lio::saturatingIncrement(&anchor_trace_counters.pin_applied);
+          anchorTraceAction(fast_lio::AnchorTraceAction::kPin, stationary_anchor.id);
+          anchorTraceTarget();
+          anchorTraceWriterReturned();
           if (!zupt_active) {
             zupt_active = true;
             RCLCPP_WARN(this->get_logger(),
@@ -5771,11 +6317,13 @@ private:
               fast_lio::AnchorTraceEvent::kPinEngaged, fast_lio::AnchorTraceReason::kNone, lidar_end_time);
           }
         } else {
-          // Not parked, and the scan still cannot confirm the pose: this is the
-          // stretch the hold must NOT survive into.
-          release_static_hold("moving again while degraded", fast_lio::AnchorTraceReason::kMotion);
+          // No hold on an anchor of this episode, and the scan still cannot
+          // confirm the pose: this is the stretch no hold may survive into.
+          release_static_hold("no hold on a degraded scan", fast_lio::AnchorTraceReason::kNone);
           if (zupt_verdict.action == fast_lio::ZuptAction::kZeroVelocity) {
             anchorTraceAction(fast_lio::AnchorTraceAction::kZeroVelocity, 0);
+            if (zupt_in.zupt_enabled && zupt_in.body_static)
+              noteZeroOnlyScan();
             // A body speed above the platform's physical maximum is a
             // GUARANTEED-WRONG state, not a bound to enforce. Clamping it to
             // max_speed (the old behaviour) turned the clamp into an
@@ -5792,6 +6340,7 @@ private:
             kf.change_x(st);
             resetVelocityCovariance(zupt_vel_reset_sigma);
             state_point = kf.get_x();
+            anchorTraceWriterReturned();
           }
         }
         flio_map_frozen = true;
@@ -5820,19 +6369,6 @@ private:
                              state_point.pos[2],
                              state_point.vel.norm());
       } else {
-        // Healthy scan: the map just confirmed this pose, so it becomes the
-        // anchor the next blind stretch holds on to — unless independent evidence
-        // says the platform is parked, in which case a pose that moved was not moved
-        // by the robot and must not be adopted. Refreshing unconditionally is how the
-        // anchor followed a pedestrian who dragged the registration 5.4 m in 6 s
-        // (dog 2, 2026-09-04) instead of pinning against them. A platform that boots
-        // parked still seeds it once.
-        if (!body_static || !zupt_anchor_valid) {
-          zupt_anchor_pos = state_point.pos;
-          zupt_anchor_rot = state_point.rot;
-          zupt_anchor_valid = true;
-          anchorTraceRefreshed(lidar_end_time);
-        }
         release_static_hold("scan healthy", fast_lio::AnchorTraceReason::kScanHealthy);
         // A parked platform has zero velocity, and a healthy-looking scan does not
         // enforce that: with far_frac 0.84 the correspondences pin rotation and
@@ -5851,6 +6387,7 @@ private:
           kf.change_x(st);
           resetVelocityCovariance(zupt_vel_reset_sigma);
           state_point = kf.get_x();
+          anchorTraceWriterReturned();
           if (zupt_verdict.report) {
             RCLCPP_WARN_THROTTLE(this->get_logger(),
                                  *this->get_clock(),
@@ -5876,8 +6413,10 @@ private:
          *   the prior is worth. A hard pin here would be wrong — the scan is
          *   healthy, so the lidar still deserves a vote, and a robot that is
          *   pushed or slides has to be able to out-vote the prior. That is
-         *   also why the hold is slow to engage and instant to release. ***/
-        if (parked.engaged) {
+         *   also why the hold is slow to engage and instant to release. The
+         *   anchor it pulls toward must be usable on this scan, the same test
+         *   the blind-stretch pin uses. ***/
+        if (fast_lio::parkedHoldPriorApplies(parked, anchor_step.usable)) {
           const state_ikfom stp = kf.get_x();
           const M3D est_rot = stp.rot.toRotationMatrix();
           const M3D anchor_rot = zupt_anchor_rot.toRotationMatrix();
@@ -5886,11 +6425,13 @@ private:
               zupt_anchor_pos, anchor_rot, stp.pos, est_rot, stp.vel, parked_hold_params);
             if (anchor_scan_record_open) {
               anchor_scan_record.parked_applied = true;
-              anchorTraceAction(anchor_scan_record.action, zupt_anchor_id);
+              anchorTraceAction(anchor_scan_record.action, stationary_anchor.id);
             }
-            fast_lio::saturatingIncrement(&anchor_trace_counters.parked_prior_applied);
+            noteAnchorWrite(AnchorWrite::Writer::kParkedPrior);
             kf.update_simple(hold.H, hold.residual, hold.R_diag);
             state_point = kf.get_x();
+            anchorTraceTarget();
+            anchorTraceWriterReturned();
             RCLCPP_WARN_THROTTLE(this->get_logger(),
                                  *this->get_clock(),
                                  5000,
@@ -5937,6 +6478,11 @@ private:
                        res_mean_last,
                        runaway_state.trips,
                        runaway_on_trip.c_str());
+          // A reset and a hold both end the anchor below, within the scan whose anchor step may just have pinned
+          // to it or pulled toward it. That write goes first: what is cleared, rebuilt around and published is
+          // the state the scan has without the anchor. The verdict stands as it was reached.
+          if (runaway_on_trip != "fault_exit")
+            takeBackAnchorWrite();
           // Clear what tripped it. A kParked trip says the velocity is phantom,
           // and rebuilding the map around a state that still carries it re-arms
           // the identical contradiction: dog 2 (2026-09-05) tripped 91 times, 54
@@ -5965,10 +6511,47 @@ private:
                            &anchor_trace_counters.lost,
                            lidar_end_time,
                            true);
+            dropStationaryAnchor(fast_lio::AnchorDrop::kLost, lidar_end_time);
+            fast_lio::breakRecoveryRun(&recovery_state);
           }
         }
       }
-      anchorTraceAfterStep(lidar_end_time);
+      countAnchorWrite();
+
+      /*** Recovery trust (stationary_anchor_policy.hpp, on with
+       *   reanchor_total_timeout_sec > 0). A degraded scan held on a usable
+       *   anchor is supported: the hold is the reference. Any other degraded or
+       *   lost scan starts an unsupported-recovery episode, timed from the last
+       *   supported scan, and so did a stretch of this scan the IMU did not
+       *   observe. While it runs, the only way back is the re-anchor
+       *   gate's own match test, passed by consecutive scans of one reference
+       *   for the stable time, and the map stays frozen meanwhile so the scans
+       *   cannot vouch for themselves with points they added. ***/
+      const bool scan_held = anchor_write.writer == AnchorWrite::Writer::kPin;  // a pin that was not taken back
+      const bool scan_supported = (!reanchor.degraded || scan_held) &&
+                                  reanchor_gate.state != fast_lio::ReanchorState::kLost &&
+                                  !fast_lio::recoveryScanExcluded(recovery_state, lifecycle_scan_seq);
+      if (anchor_scan_record_open)
+        anchor_scan_record.supported = scan_supported;
+      if (scan_supported) {
+        fast_lio::noteSupportedScan(&recovery_state, anchor_in.end_ns);
+      } else {
+        startAnchorRecovery(fast_lio::RecoveryCause::kDegraded, anchor_in.end_ns);
+      }
+      const bool recovery_match =
+        !flio_in_degraded && reanchor_gate.state != fast_lio::ReanchorState::kLost &&
+        fast_lio::reanchorMatchOk(effct_feat_num, res_mean_last, reanchor_params, reanchor_reference);
+      noteRecoveryEvent(fast_lio::observeRecoveryScan(&recovery_state,
+                                                      lifecycle_scan_seq,
+                                                      fast_lio::traceNs(Measures.lidar_beg_time),
+                                                      anchor_in.end_ns,
+                                                      recovery_match,
+                                                      stationary_anchor.reference_generation,
+                                                      recovery_params),
+                        anchor_in.end_ns);
+      if (recovery_state.trust == fast_lio::RecoveryTrust::kPending)
+        flio_map_frozen = true;
+      anchorTraceAfterStep();
 
       /*** Optional degeneracy diagnostics ***/
       if (degeneracy_debug) {
@@ -6140,6 +6723,7 @@ private:
       const bool frozen_by_prior = prior_map_freeze_ && prior_map_installed_;
       if (mapping_enabled.load(std::memory_order_relaxed) && !flio_map_frozen && !frozen_by_prior) {
         map_incremental();
+        anchorTraceMapUpdated();
       }
       t5 = omp_get_wtime();
 
@@ -6384,6 +6968,8 @@ private:
                    &anchor_trace_counters.reference_changed,
                    lidar_end_time,
                    true);
+    // An anchor is a pose in the reference it was taken against; the replaced one takes its anchors with it.
+    changeStationaryReference(fast_lio::AnchorDrop::kReferenceChanged, lidar_end_time);
 
     const Eigen::Vector3d t = T_map_lidar_odom.translation();
     const Eigen::Matrix3d & r = T_map_lidar_odom.linear();

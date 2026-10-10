@@ -246,13 +246,44 @@ if(BUILD_TESTING)
     target_compile_definitions(test_ros_imu_fault PRIVATE FASTLIO_INPUT_FAULT_TEST)
     # The stationary anchor on the production call chain. Each scenario activates the component in its own
     # forked child; like the scan fixtures it uses the broker's ROS domain and the real /Odometry endpoint.
-    ament_add_gtest(test_anchor_lifecycle_node test/test_anchor_lifecycle_node.cpp TIMEOUT 600)
-    set_tests_properties(test_anchor_lifecycle_node PROPERTIES RUN_SERIAL TRUE)
+    # One executable, one CTest entry per gtest suite ("suite:entry suffix:timeout in seconds"), so each entry
+    # has a timeout of its own. AnchorNodeEntries runs in every entry and fails when a suite has none. The
+    # trace-switch entry leaves the trace of each of its runs among the test results, as samples of the format.
+    set(anchor_node_entries
+      "AnchorLifecycleNode:core:480"
+      "AnchorLifecycleTraceSwitch:trace_switch:600"
+      "AnchorLifecycleIdle:idle:180"
+      "AnchorLifecycleEvidence:evidence:300"
+      "AnchorLifecycleInputs:inputs:240"
+      "AnchorLifecycleGate:gate:480")
+    ament_add_gtest_executable(test_anchor_lifecycle_node test/test_anchor_lifecycle_node.cpp)
+    set(anchor_node_suites "")
+    foreach(anchor_node_entry ${anchor_node_entries})
+      string(REPLACE ":" ";" anchor_node_entry "${anchor_node_entry}")
+      list(GET anchor_node_entry 0 anchor_node_suite)
+      list(GET anchor_node_entry 1 anchor_node_suffix)
+      list(GET anchor_node_entry 2 anchor_node_timeout)
+      list(APPEND anchor_node_suites "${anchor_node_suite}")
+      set(anchor_node_test "test_anchor_lifecycle_node_${anchor_node_suffix}")
+      set(anchor_node_result "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/${anchor_node_test}.gtest.xml")
+      ament_add_test(${anchor_node_test}
+        COMMAND "$<TARGET_FILE:test_anchor_lifecycle_node>"
+          "--gtest_filter=${anchor_node_suite}.*:AnchorNodeEntries.*" "--gtest_output=xml:${anchor_node_result}"
+        OUTPUT_FILE "${CMAKE_BINARY_DIR}/ament_cmake_gtest/${anchor_node_test}.txt"
+        RESULT_FILE "${anchor_node_result}"
+        TIMEOUT ${anchor_node_timeout})
+      set_tests_properties(${anchor_node_test} PROPERTIES
+        REQUIRED_FILES "$<TARGET_FILE:test_anchor_lifecycle_node>" LABELS "gtest" RUN_SERIAL TRUE)
+    endforeach()
+    string(REPLACE ";" ":" anchor_node_suites "${anchor_node_suites}")
     target_include_directories(test_anchor_lifecycle_node PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
       ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})
     target_compile_definitions(test_anchor_lifecycle_node PRIVATE
-      FASTLIO_TEST_COMPONENT_PATH="$<TARGET_FILE:fastlio_mapping_test_component>")
+      FASTLIO_TEST_COMPONENT_PATH="$<TARGET_FILE:fastlio_mapping_test_component>"
+      FASTLIO_ANCHOR_NODE_SUITES="${anchor_node_suites}"
+      FASTLIO_ANCHOR_NODE_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}"
+      FASTLIO_ANCHOR_NODE_RESULTS="${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}")
     target_link_libraries(test_anchor_lifecycle_node fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen)
     ament_target_dependencies(test_anchor_lifecycle_node ${dependencies} class_loader)
     if(cpp_typesupport_target)
@@ -337,6 +368,12 @@ if(BUILD_TESTING)
   ament_add_gtest(test_static_evidence test/test_static_evidence.cpp)
   if(TARGET test_static_evidence)
     target_include_directories(test_static_evidence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
+  # Pure header, no ROS: which anchor a parked platform may be held to, and when
+  # the front end may call its reference trusted again.
+  ament_add_gtest(test_stationary_anchor_policy test/test_stationary_anchor_policy.cpp)
+  if(TARGET test_stationary_anchor_policy)
+    target_include_directories(test_stationary_anchor_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
   # Pure header, no ROS: the gate that decides when the frozen map may be
   # trusted (and grown) again after a blind stretch.

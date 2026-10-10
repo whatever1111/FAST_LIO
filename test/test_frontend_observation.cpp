@@ -5,6 +5,7 @@
 #include <string>
 
 #include "frontend_observation.hpp"
+#include "stationary_anchor_policy.hpp"
 
 namespace
 {
@@ -219,5 +220,79 @@ TEST(FrontendObservation, ExactStampAndHashGoldenVector)
   EXPECT_FALSE(fast_lio::frontendObservationId(instance, true, 7, 0, false, "sensor", digest));
   EXPECT_FALSE(fast_lio::frontendObservationId(instance, true, 7, 0, true, "", digest));
   EXPECT_FALSE(fast_lio::frontendObservationId(instance, true, 7, 0, true, std::string(49, 'x'), digest));
+}
+
+// The node fills `degraded` and `staticHold` from anchorHealth() (stationary_anchor_policy.hpp), the same verdict
+// the legacy flags carry. A pose the front end no longer vouches for is degraded with unknown validity and no
+// axes, whatever the local registration says; a static hold is claimed only on a usable anchor; Lost still wins.
+fast_lio::FrontendFacts factsFor(const fast_lio::AnchorHealthInputs & in)
+{
+  auto facts = healthy();
+  const auto health = fast_lio::anchorHealth(in);
+  facts.degraded = health.effective_degraded;
+  facts.staticHold = health.reported_static_hold;
+  facts.lost = in.lost;
+  return facts;
+}
+
+TEST(FrontendObservation, UntrustedRecoveryIsDegradedWithUnknownValidity)
+{
+  for (const auto trust : {fast_lio::RecoveryTrust::kPending, fast_lio::RecoveryTrust::kUnanchored}) {
+    for (const bool held : {false, true}) {
+      fast_lio::AnchorHealthInputs in;
+      in.degraded = false;  // the local registration looks healthy
+      in.hold_active = held;
+      in.anchor_usable = held;
+      in.trust = trust;
+      const auto verdict = fast_lio::frontendVerdict(factsFor(in));
+      EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kDegraded));
+      EXPECT_EQ(verdict.validity, fast_lio::frontendWire(fast_lio::FrontendValidity::kUnknown));
+      EXPECT_EQ(verdict.axes, 0);
+      EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthDegraded, fast_lio::kFrontendHealthDegraded);
+      EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthStaticHold, 0u);
+      EXPECT_NE(verdict.substate, fast_lio::frontendWire(fast_lio::FrontendSubstate::kStaticHold));
+    }
+  }
+}
+
+TEST(FrontendObservation, ZeroOnlyIsDegradedAndNeverAStaticHold)
+{
+  fast_lio::AnchorHealthInputs in;
+  in.degraded = true;
+  in.hold_active = false;  // velocity zeroed, nothing pinned
+  in.anchor_usable = false;
+  for (const auto trust : {fast_lio::RecoveryTrust::kLocalQualified, fast_lio::RecoveryTrust::kPending}) {
+    in.trust = trust;
+    const auto verdict = fast_lio::frontendVerdict(factsFor(in));
+    EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kDegraded));
+    EXPECT_EQ(verdict.validity, fast_lio::frontendWire(fast_lio::FrontendValidity::kUnknown));
+    EXPECT_EQ(verdict.axes, 0);
+    EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthStaticHold, 0u);
+  }
+  // A hold that is still engaged but whose anchor is gone does not count either.
+  in.hold_active = true;
+  EXPECT_EQ(fast_lio::frontendVerdict(factsFor(in)).health & fast_lio::kFrontendHealthStaticHold, 0u);
+}
+
+TEST(FrontendObservation, AHoldOnAUsableAnchorIsReportedAndLostStillWins)
+{
+  fast_lio::AnchorHealthInputs in;
+  in.degraded = true;
+  in.hold_active = true;
+  in.anchor_usable = true;
+  auto verdict = fast_lio::frontendVerdict(factsFor(in));
+  EXPECT_EQ(verdict.substate, fast_lio::frontendWire(fast_lio::FrontendSubstate::kStaticHold));
+  EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthStaticHold, fast_lio::kFrontendHealthStaticHold);
+  EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kDegraded));
+  for (const auto trust : {fast_lio::RecoveryTrust::kLocalQualified,
+                           fast_lio::RecoveryTrust::kPending,
+                           fast_lio::RecoveryTrust::kUnanchored}) {
+    in.trust = trust;
+    in.lost = true;
+    verdict = fast_lio::frontendVerdict(factsFor(in));
+    EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kLost));
+    EXPECT_EQ(verdict.validity, fast_lio::frontendWire(fast_lio::FrontendValidity::kInvalid));
+    EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthStaticHold, 0u);
+  }
 }
 }  // namespace

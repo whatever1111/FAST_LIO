@@ -134,8 +134,9 @@ TEST(ZuptPolicy, BlindAndParkedPinsEvenAtZeroSpeed)
   EXPECT_EQ(decideZupt(in).action, ZuptAction::kPinToAnchor);
 }
 
-// No anchor yet (no healthy scan since startup) — there is nothing to pin to, so
-// the hold must not engage.
+// No usable anchor (none yet, or the stationary episode it belonged to has
+// ended) — there is nothing to pin to, so the hold must not engage. The platform
+// is still parked, so the velocity is zeroed even under the guard ceiling.
 TEST(ZuptPolicy, BlindAndParkedWithoutAnAnchorDoesNotHold)
 {
   ZuptPolicyInputs in = deployed();
@@ -146,7 +147,55 @@ TEST(ZuptPolicy, BlindAndParkedWithoutAnAnchorDoesNotHold)
 
   const ZuptDecision d = decideZupt(in);
   EXPECT_FALSE(d.hold);
-  EXPECT_EQ(d.action, ZuptAction::kNone);  // 1.4 m/s is under the guard ceiling
+  EXPECT_EQ(d.action, ZuptAction::kZeroVelocity);  // 1.4 m/s is under the guard ceiling, and still zeroed
+}
+
+// Zero-only does not depend on the speed either: a small phantom velocity, an
+// already-zero one, one past the ceiling and a non-finite one are all zeroed, and
+// none of them pins the pose.
+TEST(ZuptPolicy, BlindAndParkedWithoutAnAnchorZeroesWhateverTheSpeed)
+{
+  ZuptPolicyInputs in = deployed();
+  in.anchor_valid = false;
+  in.scan_degraded = true;
+  in.body_static = true;
+  for (const double speed : {0.0,
+                             0.02,
+                             0.4,
+                             2.9,
+                             30.0,
+                             45.0,
+                             std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::infinity()}) {
+    in.speed = speed;
+    const ZuptDecision d = decideZupt(in);
+    EXPECT_EQ(d.action, ZuptAction::kZeroVelocity) << "speed " << speed;
+    EXPECT_FALSE(d.hold) << "speed " << speed;
+    EXPECT_EQ(d.report, speed > kZuptPhantomReportSpeed) << "speed " << speed;
+  }
+}
+
+// Zero-only answers "parked, no anchor"; without ZUPT or without the static
+// verdict the blind branch is what it was: only impossible speeds are zeroed.
+TEST(ZuptPolicy, ZeroOnlyNeedsZuptAndTheStaticVerdict)
+{
+  for (const bool zupt : {false, true}) {
+    for (const bool parked : {false, true}) {
+      if (zupt && parked) {
+        continue;
+      }
+      ZuptPolicyInputs in = deployed();
+      in.anchor_valid = false;
+      in.scan_degraded = true;
+      in.zupt_enabled = zupt;
+      in.body_static = parked;
+      in.speed = 1.4;
+      EXPECT_EQ(decideZupt(in).action, ZuptAction::kNone) << "zupt " << zupt << " parked " << parked;
+      in.speed = in.max_speed + 1.0;
+      EXPECT_EQ(decideZupt(in).action, ZuptAction::kZeroVelocity) << "zupt " << zupt << " parked " << parked;
+      EXPECT_FALSE(decideZupt(in).hold);
+    }
+  }
 }
 
 // Moving while blind: the hold must not survive into this, and a speed above the

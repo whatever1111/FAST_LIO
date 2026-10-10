@@ -67,6 +67,44 @@ TEST(ParkedHold, DisabledNeverEngages)
   EXPECT_FALSE(s.active);
 }
 
+// ----------------------------------------------------------- anchor lifecycle
+
+// When the anchor ends, the hold and its streak end with it: an engaged hold
+// must not carry into the next stationary episode, and the next one earns its
+// streak from nothing.
+TEST(ParkedHold, DroppingTheAnchorDropsTheHoldAndItsStreak)
+{
+  ParkedHoldState s;
+  const ParkedHoldParams p = enabledParams();
+  for (int i = 0; i < 5; ++i) {
+    updateParkedHold(&s, true, p);
+  }
+  ASSERT_TRUE(s.active);
+  EXPECT_TRUE(fast_lio::dropParkedHold(&s));
+  EXPECT_FALSE(s.active);
+  EXPECT_EQ(s.parked_scans, 0);
+  EXPECT_FALSE(fast_lio::dropParkedHold(&s)) << "nothing left to drop";
+  const auto first = updateParkedHold(&s, true, p);
+  EXPECT_FALSE(first.engaged);
+  EXPECT_FALSE(first.just_released) << "the drop already released it";
+  EXPECT_FALSE(updateParkedHold(&s, true, p).engaged);
+  EXPECT_TRUE(updateParkedHold(&s, true, p).just_engaged);
+}
+
+// The prior and the degraded pin share one test for "is there an anchor to
+// pull toward": an engaged hold without a usable anchor builds no rows at all.
+TEST(ParkedHold, ThePriorNeedsAnEngagedHoldAndAUsableAnchor)
+{
+  fast_lio::ParkedHoldVerdict verdict;
+  for (const bool engaged : {false, true}) {
+    for (const bool usable : {false, true}) {
+      verdict.engaged = engaged;
+      EXPECT_EQ(fast_lio::parkedHoldPriorApplies(verdict, usable), engaged && usable)
+        << "engaged " << engaged << " usable " << usable;
+    }
+  }
+}
+
 // --------------------------------------------------------------- measurement
 
 TEST(ParkedHold, MatchingStateProducesNoInnovation)

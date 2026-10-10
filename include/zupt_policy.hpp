@@ -20,6 +20,10 @@
 //     the velocity leaves position and attitude wherever propagation put them
 //     (dog 2, 2026-09-04: -3.9 m of Z in 9 s, unrecoverable once the map
 //     unfroze around the wrong pose).
+//   - blind + parked without a usable anchor → zero the velocity only. The
+//     anchor belongs to one stationary episode (stationary_anchor_policy.hpp);
+//     once that ended there is no pose the platform is known to be at, so none
+//     is made up, but a parked platform still has no velocity to integrate.
 //   - healthy + parked → zero the velocity only. The scan owns the pose here,
 //     so a false "parked" costs one scan of re-convergence rather than a pin at
 //     the wrong place.
@@ -47,7 +51,7 @@ struct ZuptPolicyInputs
 {
   bool scan_degraded = false;  ///< the divergence guard says this scan cannot confirm the pose
   bool zupt_enabled = false;   ///< zupt_en
-  bool anchor_valid = false;   ///< a healthy scan has left an anchor to pin to
+  bool anchor_valid = false;   ///< the current stationary episode's anchor is usable on this scan
   bool body_static = false;    ///< bodyIsStatic() for this scan (static_evidence.hpp)
   double speed = 0.0;          ///< |v| of the current state (m/s)
   double max_speed = 0.0;      ///< divergence_guard_max_speed (m/s)
@@ -62,16 +66,25 @@ struct ZuptDecision
 
 /// One scan's verdict. Non-finite speeds compare false everywhere, so they fall
 /// through to kNone rather than triggering a correction on a number nobody trusts
-/// — except on the pin branch, which does not look at the speed at all: with
-/// independent proof of "parked" a blind stretch has nothing to integrate,
-/// whatever the velocity claims.
+/// — except on the blind + parked branches, which do not look at the speed at
+/// all: with independent proof of "parked" a blind stretch has nothing to
+/// integrate, whatever the velocity claims.
 inline ZuptDecision decideZupt(const ZuptPolicyInputs & in)
 {
   ZuptDecision decision;
   if (in.scan_degraded) {
-    if (in.zupt_enabled && in.anchor_valid && in.body_static) {
-      decision.action = ZuptAction::kPinToAnchor;
-      decision.hold = true;
+    if (in.zupt_enabled && in.body_static) {
+      if (in.anchor_valid) {
+        decision.action = ZuptAction::kPinToAnchor;
+        decision.hold = true;
+        return decision;
+      }
+      // No anchor of this episode to hold to. Below the ceiling a phantom
+      // velocity would otherwise keep walking the pose for the whole blind
+      // stretch, so zero it on every such scan, already-zero included; the pose
+      // and attitude stay where they are and nothing reports a hold.
+      decision.action = ZuptAction::kZeroVelocity;
+      decision.report = in.speed > kZuptPhantomReportSpeed;
       return decision;
     }
     // Not parked, and the scan still cannot confirm the pose: this is the

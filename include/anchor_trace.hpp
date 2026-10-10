@@ -65,12 +65,13 @@
 // episode opened by that scan-hole check can therefore expire in the same
 // scan. The IMU check also checks the deadline again after opening a
 // scan-hole episode, so the same accepted sample can write both pending and
-// unanchored with path=idle. If an episode opens after the last deadline
-// check for its input, earlier accepted IMU samples are not replayed against
-// it. A later deadline check writes the record only while it remains pending
-// and that check's input time is at or past deadline_ns, using that input's
-// stamp and path. Only the scan hole the idle check finds still means that no
-// scan was queued.
+// unanchored with path=idle. An episode can also open where its input runs no
+// further deadline check: after a processed scan's entry checks, or in a
+// dropped_empty_imu scan, which runs none. Earlier accepted IMU samples are
+// not replayed against it. A later deadline check writes the record only while
+// it remains pending and that check's input time is at or past deadline_ns,
+// using that input's stamp and path. Only the scan hole the idle check finds
+// still means that no scan was queued.
 //
 // Sequence rules
 //   event_seq   1, 2, 3, ... over the process lifetime, one per transition record

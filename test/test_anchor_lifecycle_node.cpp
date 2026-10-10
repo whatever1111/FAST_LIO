@@ -2318,6 +2318,47 @@ bool writeTraceSample(const ChildResult & r, const std::string & scenario)
   return out.good();
 }
 
+// ---- A map reset whose rebuild takes no point ------------------------------------------------------------------
+
+// A finite position whose map points the map backend cannot represent: at filter_size_map 0.05 their voxel indices
+// pass the int range beyond about 1.07e8 m, so the backend adds none of them.
+constexpr std::array<double, 3> kBeyondTheMap = {2.0e8, 0.0, 0.0};
+constexpr int kRebuildBefore = 6;  // healthy parked scans: a valid anchor by the last one
+constexpr int kRebuildAfter = 8;
+
+// Parked on healthy scans with a valid anchor when the runaway watchdog's map reset runs on a scan that
+// registration put beyond what the map backend can represent: the rebuild around that pose takes no point. With a
+// prior map the prior is kept, and the first scan after the reset is registered back onto it (the fixture's
+// stand-in for that registration); without one nothing is left to register against. `policy` switches the platform
+// policy (a 10 s budget) on.
+Scenario resetRebuildsNoMap(bool prior, bool policy)
+{
+  Scenario s = traced(inputScenario(std::string(prior ? "rebuild_kept_prior" : "rebuild_no_prior") +
+                                    (policy ? "_policy_on" : "_policy_off")),
+                      true);
+  setParam(s, rclcpp::Parameter("runaway_watchdog_en", true));
+  setParam(s, rclcpp::Parameter("runaway_on_trip", "reset_map"));
+  setPolicy(s, policy ? 10.0 : 0.0, 1.0);
+  append(s, kRebuildBefore, slot(Phase::kBefore));
+  if (prior) {
+    s.prior_map = true;
+    s.relocalizations = {{{0.0, 0.0, 0.0}}};
+    setParam(s, rclcpp::Parameter("prior_map_pcd", priorMapPath()));
+    setParam(s, rclcpp::Parameter("prior_map_align", "relocalization"));
+    s.steps.front().relocalization = 0;  // the prior map is installed on the first scan
+  }
+  Step reset = slot(Phase::kEvent);
+  reset.inject = true;
+  reset.pos = kBeyondTheMap;
+  reset.trip = true;
+  s.steps.push_back(reset);
+  Step back = slot(Phase::kAfter);
+  back.inject = true;  // at the origin, where the prior map is
+  s.steps.push_back(back);
+  append(s, kRebuildAfter - 1, slot(Phase::kAfter));
+  return s;
+}
+
 }  // namespace
 
 // Parked again after a moving degraded stretch: the motion ended the anchor taken before it, so nothing pins to
@@ -3649,4 +3690,122 @@ TEST(AnchorLifecycleGate, OnlyAReplacedReferenceMovesTheGenerationOn)
   EXPECT_EQ(counterValue(r, "invalidated_reference_changed"), "2");
   EXPECT_EQ(counterValue(r, "map_reset"), "1");
   EXPECT_EQ(counterValue(r, "invalidated_map_reset"), "1");
+}
+
+// ---------------------------------------------------------------------------
+// A map reset whose rebuild takes no point
+// ---------------------------------------------------------------------------
+
+// The runaway watchdog's map reset on a healthy parked scan with a valid anchor, at a pose whose map points the
+// backend cannot represent: the rebuild takes none of them. The reset is the one change of reference: the anchor
+// ends there, for that reason, and the scan seeds no candidate, uses no anchor and claims no StaticHold. With the
+// platform policy on the reset latches Unanchored and nothing after it clears the latch. What follows is the
+// backend's. Without a prior map nothing is left to register against: every scan after the reset finds the map
+// empty, builds it again at the same pose, and leaves before the anchor step unpublished, so no scan after the
+// reset is evaluated at all. With the prior kept, the scans after it register against the prior and are published.
+TEST(AnchorLifecycleRebuild, AResetWhoseRebuildTakesNoPointEndsTheAnchorOnce)
+{
+  ASSERT_TRUE(writePriorMap(priorMapPath()));
+  for (const bool prior : {false, true}) {
+    for (const bool policy : {false, true}) {
+      const Scenario scenario = resetRebuildsNoMap(prior, policy);
+      const ChildResult r = runScenario(scenario);
+      SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+      ASSERT_TRUE(r.ok());
+      const std::uint64_t old_id = validAnchorAfter(r, Phase::kBefore);
+      ASSERT_NE(old_id, 0u) << "no valid anchor before the reset";
+      const auto before = r.phase(Phase::kBefore);
+      const auto reset = r.phase(Phase::kEvent);
+      const auto after = r.phase(Phase::kAfter);
+      ASSERT_EQ(reset.size(), 1u);
+      ASSERT_EQ(after.size(), static_cast<std::size_t>(kRebuildAfter));
+      const Observation & rs = *reset.front();
+      const auto & rr = rs.record;
+
+      // The reset ran after the anchor step, at the pose the backend cannot represent.
+      const std::uint32_t reset_events = fast_lio::kAnchorEventRunawayTrip | fast_lio::kAnchorEventMapReset;
+      EXPECT_EQ(rr.events & reset_events, reset_events);
+      EXPECT_TRUE(rr.anchor_step && rr.usable) << "the anchor step ran on the valid anchor before the reset";
+      EXPECT_TRUE(rr.map_updated) << "the rebuild was handed the scan's points";
+      EXPECT_TRUE(samePosition(rr.post_p, kBeyondTheMap)) << formatPosition(rr.post_p);
+      ASSERT_TRUE(rs.odom_seen);
+      EXPECT_TRUE(samePosition(rs.odom_p, kBeyondTheMap)) << formatPosition(rs.odom_p);
+
+      // The reference moved on once, at the reset.
+      EXPECT_EQ(rr.ref_gen, before.back()->record.ref_gen + 1);
+      for (const auto * o : after)
+        EXPECT_EQ(o->record.ref_gen, rr.ref_gen) << "step " << o->step;
+      EXPECT_EQ(counterValue(r, "map_reset"), "1");
+      EXPECT_EQ(counterValue(r, "invalidated_map_reset"), "1");
+
+      // The anchor ended there, for that reason, and the scan seeded, used and held on nothing.
+      expectInvalidatedOnce(r, old_id, "map_reset", scenario.name);
+      EXPECT_EQ(rr.anchor_state, fast_lio::AnchorState::kEmpty);
+      EXPECT_FALSE(rr.anchor_valid);
+      EXPECT_EQ(rr.anchor_id, old_id) << "the reset scan started a candidate";
+      for (const auto & line : linesWhere(r, "[ZUPT-ANCHOR]", "event", "candidate_started"))
+        EXPECT_NE(valueOf(line, "scan_seq"), std::to_string(rr.scan_seq)) << line;
+      EXPECT_EQ(rr.anchor_used, 0u);
+      EXPECT_NE(rr.action, fast_lio::AnchorTraceAction::kPin);
+      EXPECT_FALSE(rr.parked_applied);
+      EXPECT_FALSE(rr.static_hold);
+      EXPECT_EQ(odomFlags(rs) & kFlagStaticHold, 0u);
+
+      const auto recovery = linesTagged(r, "[FE-RECOVERY]");
+      if (policy) {
+        ASSERT_EQ(recovery.size(), 1u);
+        EXPECT_EQ(valueOf(recovery.front(), "event"), "unanchored") << recovery.front();
+        EXPECT_EQ(valueOf(recovery.front(), "reason"), "map_reset") << recovery.front();
+        EXPECT_EQ(valueOf(recovery.front(), "scan_seq"), std::to_string(rr.scan_seq)) << recovery.front();
+        EXPECT_EQ(rr.trust_post, fast_lio::RecoveryTrust::kUnanchored);
+        EXPECT_EQ(odomFlags(rs), kFlagDegraded);
+        for (const auto * o : after) {
+          EXPECT_EQ(o->record.trust_pre, fast_lio::RecoveryTrust::kUnanchored) << "step " << o->step;
+          EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kUnanchored) << "step " << o->step;
+        }
+        EXPECT_EQ(counterValue(r, "map_reset_unanchored"), "1");
+        EXPECT_EQ(counterValue(r, "recovery_qualified"), "0");
+      } else {
+        EXPECT_TRUE(recovery.empty());
+        EXPECT_EQ(rr.trust_post, fast_lio::RecoveryTrust::kLocalQualified);
+        EXPECT_EQ(odomFlags(rs), 0u);
+        for (const auto * o : after)
+          EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kLocalQualified) << "step " << o->step;
+        EXPECT_EQ(counterValue(r, "map_reset_unanchored"), "0");
+      }
+
+      if (!prior) {
+        // Nothing to register against, ever again.
+        for (const auto * o : after) {
+          const auto & x = o->record;
+          EXPECT_EQ(x.outcome, fast_lio::AnchorScanOutcome::kBeforeAnchorStep) << "step " << o->step;
+          EXPECT_FALSE(x.anchor_step) << "step " << o->step;
+          EXPECT_TRUE(x.map_updated) << "step " << o->step << ": the empty map was not built again";
+          EXPECT_FALSE(x.have_update) << "step " << o->step;
+          EXPECT_FALSE(x.published) << "step " << o->step;
+          EXPECT_EQ(x.anchor_state, fast_lio::AnchorState::kEmpty) << "step " << o->step;
+          EXPECT_EQ(x.anchor_id, old_id) << "step " << o->step;
+        }
+      } else {
+        // The prior was kept: the scans after the reset register against it again and are published.
+        const std::array<double, 3> origin = {0.0, 0.0, 0.0};
+        for (std::size_t i = 0; i < after.size(); ++i) {
+          const Observation & o = *after[i];
+          EXPECT_TRUE(o.record.anchor_step && o.record.published && o.odom_seen) << "step " << o.step;
+          if (i > 0) {
+            EXPECT_TRUE(o.record.have_update) << "step " << o.step;
+            EXPECT_LT(distance(o.odom_p, origin), 1.0) << "step " << o.step << " " << formatPosition(o.odom_p);
+          }
+          if (policy) {
+            EXPECT_TRUE(o.record.eff_degraded) << "step " << o.step;
+            EXPECT_EQ(o.record.anchor_state, fast_lio::AnchorState::kEmpty) << "step " << o.step;
+            EXPECT_EQ(o.record.anchor_id, old_id) << "step " << o.step << ": an anchor was taken under the latch";
+            EXPECT_EQ(odomFlags(o), kFlagDegraded) << "step " << o.step;
+          }
+        }
+      }
+      expectOdometryOnlyForPublishedScans(r);
+      expectTraceAccountsForEveryScan(r, true, scenario.name);
+    }
+  }
 }

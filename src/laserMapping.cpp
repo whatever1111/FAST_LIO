@@ -497,7 +497,7 @@ fast_lio::RecoveryState recovery_state;
 std::uint64_t lifecycle_scan_seq = 0;  // one per scan the scan path starts on: a matching run is consecutive in it
 bool anchor_scan_evaluated = false;    // the scan being processed reached the anchor step
 bool reanchor_lost_this_scan = false;  // the gate declared the scan being processed lost, whatever re-armed it since
-bool anchor_idle_path = false;         // inside the check the IMU samples run while no scan is queued
+bool anchor_idle_path = false;         // inside the check every IMU sample the front end takes runs
 bool input_epoch_handled = false;
 // Parked hold (parked_hold.hpp): the same evidence, applied while the scan is
 // HEALTHY.
@@ -1303,7 +1303,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
   sig_buffer.notify_all();
 }
 
-void checkAnchorEvidenceIdle(double imu_stamp);
+void checkAnchorEvidenceOnImu(double imu_stamp, bool scan_waiting);
 
 void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stamp)
 {
@@ -1347,8 +1347,7 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
   mtx_buffer.unlock();
   logImuBacklogLoss(backlogLoss);
   sig_buffer.notify_all();
-  if (!scan_waiting)
-    checkAnchorEvidenceIdle(timestamp);
+  checkAnchorEvidenceOnImu(timestamp, scan_waiting);
   if (frontend_observation_en)
     publishFrontendObservation(false);
 }
@@ -2088,22 +2087,26 @@ void recordDroppedAnchorScan(fast_lio::AnchorScanOutcome outcome, double beg, do
 // A scan still in transit gets this long to arrive before the IMU-driven check below calls its stretch a hole.
 constexpr std::int64_t kAnchorIdleSettleMinNs = 500000000;
 
-// While no scan is queued the IMU samples are the input that advances, and the deadline is measured by them: the
-// first sample at or past it latches, at that sample's time. A scan hole is not known that soon, because the scan
-// that would close it may still be in transit, so the hole is called only once the stretch has outlasted the gap
-// bound by the settle allowance. The Pending it opens is timed from the last supported scan like any other, and
-// has run out at once when that was long enough ago. The first scan back re-checks both before anything uses an
-// anchor. No pose is made up: /Odometry changes at the next published scan.
-void checkAnchorEvidenceIdle(double imu_stamp)
+// Every IMU sample the front end takes is input that advances, and the deadline is measured by it whether or not a
+// scan is queued: the first sample at or past it latches, at that sample's time, and a scan still waiting for its
+// IMU is processed under the latch. A queued scan gets no grace: the deadline holds in processing order. A scan
+// hole is not known that soon, because the scan that would close it may still be in transit, so the hole is called
+// only while no scan is queued, once the stretch has outlasted the gap bound by the settle allowance. The Pending it
+// opens is timed from the last supported scan like any other, and has run out at once when that was long enough
+// ago. The next scan re-checks both before anything uses an anchor. No pose is made up: /Odometry changes at the
+// next published scan. Without a Pending episode the check writes nothing.
+void checkAnchorEvidenceOnImu(double imu_stamp, bool scan_waiting)
 {
   const std::int64_t now_ns = fast_lio::traceNs(imu_stamp);
   if (now_ns < 0)
     return;
   anchor_idle_path = true;
+  // Serial with timer_callback only while both callbacks stay in the node's default mutually exclusive group.
   expireAnchorRecovery(now_ns);
   const std::int64_t settle_ns = std::max(stationary_anchor_params.max_scan_gap_ns, kAnchorIdleSettleMinNs);
   const std::int64_t last_ns = stationary_anchor.last_evidence_end_ns;
-  if (last_ns >= 0 && now_ns >= settle_ns && now_ns - settle_ns - last_ns > stationary_anchor_params.max_scan_gap_ns) {
+  if (!scan_waiting && last_ns >= 0 && now_ns >= settle_ns &&
+      now_ns - settle_ns - last_ns > stationary_anchor_params.max_scan_gap_ns) {
     if (stationary_anchor.state != fast_lio::AnchorState::kEmpty)
       dropStationaryAnchor(fast_lio::AnchorDrop::kScanHole, imu_stamp);
     fast_lio::breakRecoveryRun(&recovery_state);

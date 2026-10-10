@@ -178,6 +178,11 @@ struct Step
   double wheel_speed = 0.0;  // m/s; NaN is the bridge saying it cannot measure
   double wheel_age = 0.0;    // s between the wheel sample's stamp and the scan end
   int relocalization = -1;   // index into Scenario::relocalizations, published before the scan
+  // Input-driven slots: the cloud is queued before any IMU sample of the slot; the slot sends no IMU sample (a
+  // later slot sends them, in stamp order); one more IMU sample is stamped exactly at the slot's scan end.
+  bool cloud_first = false;
+  bool hold_imu = false;
+  bool imu_at_end = false;
 };
 
 struct Relocalization
@@ -221,6 +226,7 @@ static_assert(std::is_trivially_copyable<Observation>::value, "observations cros
 struct IdleSample
 {
   std::int64_t input_ns = -1;  // newest IMU stamp the fixture had sent when it arrived
+  std::int64_t stamp_ns = -1;  // the stamp the front end gave its newest input; -1 when it reports none
   unsigned state = 0;
   unsigned health = 0;
   unsigned substate = 0;
@@ -235,6 +241,7 @@ struct ChildResult
   std::vector<std::string> lines;
   std::vector<std::int64_t> line_input_ns;  // per trace line: the newest IMU stamp sent when it was logged
   std::vector<IdleSample> idle;
+  std::vector<std::int64_t> odom_ns;  // the stamp of every /Odometry message received, in order
 
   bool ok() const { return WIFEXITED(status) && WEXITSTATUS(status) == 0 && error.empty(); }
   std::string describe() const
@@ -467,8 +474,9 @@ constexpr double kShortRecoveryBudget = 1.0;  // s, reanchor_total_timeout_sec o
 constexpr std::int64_t kShortRecoveryBudgetNs = 1000000000;
 
 // The platform policy on with a short budget: a degraded moving stretch outlasts it, and the platform then parks
-// on healthy scans. `scan_first` queues every cloud before the IMU sample that passes its end, so the scan whose
-// end is the deadline is what the front end processes at the deadline; without it that IMU sample comes first.
+// on healthy scans. `scan_first` queues every cloud before the IMU sample that passes its end, so the first sample
+// past the deadline arrives while the scan whose end is the deadline waits; without it that sample arrives before
+// the scan.
 Scenario recoveryRunsOut(bool trace = false, bool scan_first = true)
 {
   const FieldCase & c = kFieldCases[1];
@@ -539,6 +547,7 @@ public:
     odom_ = observer_->create_subscription<nav_msgs::msg::Odometry>(
       "/Odometry", rclcpp::QoS(rclcpp::KeepLast(50)).reliable(), [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
         odom_by_ms_[msKey(rclcpp::Time(msg->header.stamp).seconds())] = *msg;
+        odom_ns_.push_back(rclcpp::Time(msg->header.stamp).nanoseconds());
       });
     wheel_ = observer_->create_publisher<geometry_msgs::msg::TwistStamped>(
       kWheelTopic, rclcpp::QoS(rclcpp::KeepLast(100)).reliable());
@@ -590,6 +599,10 @@ public:
     writeAll(fd, &idle, sizeof(idle));
     if (idle > 0)
       writeAll(fd, idle_.data(), sizeof(IdleSample) * idle_.size());
+    const auto odom = static_cast<std::uint32_t>(odom_ns_.size());
+    writeAll(fd, &odom, sizeof(odom));
+    if (odom > 0)
+      writeAll(fd, odom_ns_.data(), sizeof(std::int64_t) * odom_ns_.size());
   }
 
 private:
@@ -669,6 +682,7 @@ private:
     }
     IdleSample sample;
     sample.input_ns = newest_imu_ns_;
+    sample.stamp_ns = message.has_input_stamp ? message.input_stamp_ns : -1;
     sample.state = message.estimator_state;
     sample.health = message.health_flags;
     sample.substate = message.fe_substate;
@@ -729,22 +743,41 @@ private:
     executor_->spin_some();
   }
 
+  // Every IMU sample stamped up to `end` that has not gone out yet: the fixture's grid, and the extra samples
+  // slots asked for, in stamp order.
   void sendImuThrough(double end)
   {
     const auto through = static_cast<std::int64_t>(std::llround(end * 1e9));
-    for (; next_imu_ns_ <= through; next_imu_ns_ += kImuPeriodNs) {
-      const double t = static_cast<double>(next_imu_ns_) * 1e-9;
-      const int scan = scanOfImuTime(t);
-      const Imu pattern = imuForScan(scan);
-      if (pattern == Imu::kGap && t > scanEnd(scan - 1) + kGapMargin && t < scanEnd(scan) - kGapMargin)
+    for (;;) {
+      const bool grid = next_imu_ns_ <= through;
+      const bool extra =
+        !extra_imu_ns_.empty() && *extra_imu_ns_.begin() <= through && (!grid || *extra_imu_ns_.begin() < next_imu_ns_);
+      if (extra) {
+        const std::int64_t stamp = *extra_imu_ns_.begin();
+        extra_imu_ns_.erase(extra_imu_ns_.begin());
+        sendImuSample(stamp);
         continue;
-      if (inImuHole(t))
-        continue;
-      double yaw_rate = pattern == Imu::kMoving ? kMovingYawRate : 0.0;
-      if (bad_imu_scan_ == scan && t > scanEnd(scan) - 0.004 && t <= scanEnd(scan))
-        yaw_rate = std::numeric_limits<double>::quiet_NaN();
-      publishImu(next_imu_ns_, yaw_rate);
+      }
+      if (!grid)
+        break;
+      sendImuSample(next_imu_ns_);
+      next_imu_ns_ += kImuPeriodNs;
     }
+  }
+
+  void sendImuSample(std::int64_t stamp_ns)
+  {
+    const double t = static_cast<double>(stamp_ns) * 1e-9;
+    const int scan = scanOfImuTime(t);
+    const Imu pattern = imuForScan(scan);
+    if (pattern == Imu::kGap && t > scanEnd(scan - 1) + kGapMargin && t < scanEnd(scan) - kGapMargin)
+      return;
+    if (inImuHole(t))
+      return;
+    double yaw_rate = pattern == Imu::kMoving ? kMovingYawRate : 0.0;
+    if (bad_imu_scan_ == scan && t > scanEnd(scan) - 0.004 && t <= scanEnd(scan))
+      yaw_rate = std::numeric_limits<double>::quiet_NaN();
+    publishImu(stamp_ns, yaw_rate);
   }
 
   void sendLidar(double start, Cloud kind = Cloud::kDense)
@@ -961,6 +994,8 @@ private:
       imu_holes_.emplace_back(scanEnd(scan) + s.hole_from, scanEnd(scan) + s.hole_to);
     if (s.bad_imu)
       bad_imu_scan_ = scan;
+    if (s.imu_at_end)
+      extra_imu_ns_.insert(static_cast<std::int64_t>(std::llround(scanEnd(scan) * 1e9)));
     if (s.relocalization >= 0) {
       const auto & target = scenario_.relocalizations[static_cast<std::size_t>(s.relocalization)];
       geometry_msgs::msg::TransformStamped message;
@@ -982,16 +1017,20 @@ private:
     if (s.clock_back)
       publishImu(std::max<std::int64_t>(1, newest_imu_ns_ - 1500000000LL), 0.0);
     const bool send = s.cloud != Cloud::kNone;
-    if (send && scenario_.lidar_first) {
-      sendImuThrough(scanEnd(scan) - 0.001);
+    const bool cloud_first = send && s.cloud_first;
+    const bool lidar_first = send && !cloud_first && scenario_.lidar_first;
+    if (cloud_first || lidar_first) {
+      if (lidar_first)
+        sendImuThrough(scanEnd(scan) - 0.001);
       sendLidar(scanStart(scan), s.cloud);
       if (!waitUntilQueued())
         return "the front end never queued the scan";
     }
-    sendImuThrough(scanEnd(scan) + 0.006);
+    if (!s.hold_imu)
+      sendImuThrough(scanEnd(scan) + 0.006);
     if (s.late_imu)
       publishImu(newest_imu_ns_ - 50000000LL, 0.0);
-    if (send && !scenario_.lidar_first)
+    if (send && !cloud_first && !lidar_first)
       sendLidar(scanStart(scan), s.cloud);
     if (send && s.expect_scan)
       pending_.push_back({scan, index, s.cloud != Cloud::kEmpty});
@@ -1041,6 +1080,8 @@ private:
   std::vector<std::pair<double, double>> imu_holes_;
   std::vector<PendingScan> pending_;
   std::vector<std::int64_t> line_input_ns_;
+  std::vector<std::int64_t> odom_ns_;
+  std::set<std::int64_t> extra_imu_ns_;  // IMU samples off the grid, sent with the grid in stamp order
   std::int64_t newest_imu_ns_ = -1;
   int bad_imu_scan_ = -1;
   std::map<std::int64_t, int> step_by_end_ms_;
@@ -1176,6 +1217,16 @@ ChildResult runScenario(const Scenario & scenario)
   result.idle.resize(idle);
   if (idle > 0 && !reader.take(result.idle.data(), sizeof(IdleSample) * idle)) {
     result.error = "child idle samples truncated";
+    return result;
+  }
+  std::uint32_t odom = 0;
+  if (!reader.take(&odom, sizeof(odom))) {
+    result.error = "child odometry stamps truncated";
+    return result;
+  }
+  result.odom_ns.resize(odom);
+  if (odom > 0 && !reader.take(result.odom_ns.data(), sizeof(std::int64_t) * odom)) {
+    result.error = "child odometry stamps truncated";
     return result;
   }
   return result;
@@ -1696,6 +1747,67 @@ std::uint64_t validAnchorAfter(const ChildResult & r, Phase phase)
   return scans.back()->record.anchor_id;
 }
 
+// The first sample of the fixture's IMU grid stamped at or after `t_ns`.
+std::int64_t firstGridImuAtOrAfter(std::int64_t t_ns)
+{
+  if (t_ns <= kImuFirstNs)
+    return kImuFirstNs;
+  return kImuFirstNs + (t_ns - kImuFirstNs + kImuPeriodNs - 1) / kImuPeriodNs * kImuPeriodNs;
+}
+
+// Among the inputs the front end reported between scans, each at the stamp the front end gave it, the stamp nearest
+// to `t_ns`; -1 when it reported none.
+std::int64_t nearestReportedInputNs(const ChildResult & r, std::int64_t t_ns)
+{
+  std::int64_t nearest = -1;
+  std::int64_t nearest_off = 0;
+  for (const auto & idle : r.idle) {
+    if (idle.stamp_ns < 0)
+      continue;
+    const std::int64_t off = idle.stamp_ns > t_ns ? idle.stamp_ns - t_ns : t_ns - idle.stamp_ns;
+    if (nearest < 0 || off < nearest_off) {
+      nearest = idle.stamp_ns;
+      nearest_off = off;
+    }
+  }
+  return nearest;
+}
+
+// One /Odometry message per published scan, each carrying that scan's end time: nothing went out between scans,
+// such as a pose made up for an IMU sample.
+void expectOdometryOnlyForPublishedScans(const ChildResult & r)
+{
+  std::multiset<std::int64_t> published;
+  for (const auto & o : r.observations)
+    if (o.record.published)
+      published.insert(msKey(static_cast<double>(o.record.end_ns) * 1e-9));
+  std::multiset<std::int64_t> received;
+  for (const std::int64_t ns : r.odom_ns)
+    received.insert(msKey(static_cast<double>(ns) * 1e-9));
+  EXPECT_EQ(received, published) << r.odom_ns.size() << " /Odometry messages for " << published.size()
+                                 << " published scans";
+}
+
+// Every scan of `scans` was processed under the latch: it took no pose from an anchor, held on none, claimed no
+// StaticHold, left no candidate or anchor, and reported Degraded. No scan of the run confirmed a recovery.
+void expectLatchedFrom(const ChildResult & r, const std::vector<const Observation *> & scans)
+{
+  for (const auto * o : scans) {
+    const auto & x = o->record;
+    EXPECT_EQ(x.trust_pre, fast_lio::RecoveryTrust::kUnanchored) << "step " << o->step;
+    EXPECT_EQ(x.trust_post, fast_lio::RecoveryTrust::kUnanchored) << "step " << o->step;
+    EXPECT_EQ(x.anchor_state, fast_lio::AnchorState::kEmpty) << "step " << o->step;
+    EXPECT_EQ(x.anchor_used, 0u) << "step " << o->step;
+    EXPECT_NE(x.action, fast_lio::AnchorTraceAction::kPin) << "step " << o->step;
+    EXPECT_FALSE(x.parked_applied) << "step " << o->step;
+    EXPECT_FALSE(x.static_hold) << "step " << o->step;
+    EXPECT_TRUE(x.eff_degraded) << "step " << o->step;
+    EXPECT_EQ(odomFlags(*o), kFlagDegraded) << "step " << o->step;
+  }
+  EXPECT_TRUE(recoveryLines(r, "qualified").empty());
+  EXPECT_EQ(counterValue(r, "recovery_qualified"), "0");
+}
+
 // No scan of `scans` took a pose from anchor `id`, held on it or claimed a static hold.
 void expectNeverUsed(const std::vector<const Observation *> & scans, std::uint64_t id, const std::string & name)
 {
@@ -1785,7 +1897,7 @@ Scenario idleWithImu()
 
 // The matching run that would end Pending completes on the very scan whose end is the deadline. `total` just above
 // the scenario's budget is the control: the same run then ends Pending. Every cloud is queued before the IMU sample
-// that passes its end, so that scan is the processing event at the deadline.
+// that passes its end, so that scan waits while the first sample past the deadline arrives.
 Scenario confirmationAtTheDeadline(double total)
 {
   Scenario s =
@@ -1808,6 +1920,101 @@ Scenario allInputStops()
   first.hole_to = (kIdleBudget + kResumeAfterDeadline) - 0.3;
   s.steps.push_back(first);
   append(s, 14, slot(Phase::kAfter, Imu::kStatic, Guard::kHealthy, Cloud::kNone));
+  return s;
+}
+
+// ---- The deadline while a scan waits for its IMU --------------------------------------------------------------
+
+constexpr double kQueuedStable = 0.5;            // s, reanchor_recovery_stable_sec where no run is to complete
+constexpr double kConfirmStable = 1.0;           // s, the recovery's stable time where a run is to complete
+constexpr int kConfirmRun = 11;                  // scans of a run that spans it: 10 x 0.1 s + 0.05 s
+constexpr double kConfirmLate = 1.201;           // s: the deadline 1 ms after the end of the run's last scan
+constexpr double kConfirmInTime = 1.2055;        // s: 5.5 ms after it, past the IMU sample 2.5 ms after that end
+constexpr double kLidarBackAfterDeadline = 0.2;  // s: the IMU is back this long after the deadline
+constexpr double kOnSampleBudget = 1.2;          // s: puts the deadline on 2.75 s, a stamp an IMU sample keeps
+constexpr int kOnSampleDegraded = 11;            // degraded scans up to 0.1 s before that deadline
+constexpr double kEverySampleReported = 1e-6;    // s, publish.frontend_idle_period_sec below the IMU period
+constexpr std::int64_t kConfirmStableNs = 1000000000;
+constexpr std::int64_t kOnSampleBudgetNs = 1200000000;
+
+// One healthy moving scan, the last supported one, then `degraded` degraded parked scans: Pending, timed from that
+// scan.
+Scenario pendingFromOneScan(const std::string & name, double total, double stable, int degraded)
+{
+  Scenario s = inputScenario(name);
+  setPolicy(s, total, stable);
+  append(s, 1, slot(Phase::kBefore, Imu::kMoving));
+  append(s, degraded, slot(Phase::kEvent, Imu::kStatic, Guard::kDegraded));
+  return s;
+}
+
+// A slot that sends nothing: no cloud, and its IMU samples go out with a later slot.
+Step heldSlot(Phase phase)
+{
+  Step s = slot(phase, Imu::kStatic, Guard::kHealthy, Cloud::kNone);
+  s.hold_imu = true;
+  return s;
+}
+
+// The scan S whose end is 0.2 s past the deadline D is queued first. The scans at D and D + 0.1 s never arrive,
+// and the IMU samples from 0.1 s before D on go out only after S is queued, one by one: D - 2.5 ms, a sample on D
+// itself, D + 2.5 ms, and so on up to S. Parked healthy scans follow. The front end takes an IMU stamp through
+// seconds as a double and back, and drops what is left of a nanosecond: only a stamp whose fraction of a second is
+// exact in binary reaches the deadline check as it was sent. The budget puts D on one, 2.75 s, so that the sample
+// sent on D is the first one at or past it. The typed observation is on, with an idle period below the IMU period:
+// between scans the front end then reports every IMU sample it takes, at the stamp it gave the sample.
+Scenario scanQueuedPastTheDeadline()
+{
+  Scenario s = pendingFromOneScan("scan_queued_past_deadline", kOnSampleBudget, kQueuedStable, kOnSampleDegraded);
+  s.typed = true;
+  setParam(s, rclcpp::Parameter("publish.frontend_observation", true));
+  setParam(s, rclcpp::Parameter("publish.frontend_clock_domain", "fixture"));
+  setParam(s, rclcpp::Parameter("publish.frontend_idle_period_sec", kEverySampleReported));
+  Step at_deadline = heldSlot(Phase::kEvent);
+  at_deadline.imu_at_end = true;
+  s.steps.push_back(at_deadline);
+  s.steps.push_back(heldSlot(Phase::kEvent));
+  Step queued = slot(Phase::kAfter);
+  queued.cloud_first = true;
+  s.steps.push_back(queued);
+  append(s, 6, slot(Phase::kLater));
+  return s;
+}
+
+// After one degraded scan, matching scans whose run reaches the 1 s stable time on its 11th scan. That scan is
+// queued before its IMU samples: the one 2.5 ms past its end makes it processable. `total` puts the deadline just
+// before that sample (kConfirmLate) or just after it (kConfirmInTime). Parked healthy scans follow.
+Scenario confirmationQueuedAtTheDeadline(double total)
+{
+  Scenario s =
+    pendingFromOneScan(total < kConfirmInTime ? "confirmation_queued_at_deadline" : "confirmation_queued_in_time",
+                       total,
+                       kConfirmStable,
+                       1);
+  append(s, kConfirmRun - 1, slot(Phase::kAfter));
+  Step last = slot(Phase::kAfter);
+  last.cloud_first = true;
+  s.steps.push_back(last);
+  append(s, 6, slot(Phase::kLater));
+  return s;
+}
+
+// Every input stops after two degraded scans. The LiDAR is back first: the first scan after the hole, whose end is
+// 0.3 s past the deadline, is queued before any IMU sample, and the IMU is back 0.2 s past the deadline. Parked
+// healthy scans follow.
+Scenario lidarBackBeforeTheImu()
+{
+  Scenario s = pendingFromOneScan("lidar_back_before_imu", kIdleBudget, kQueuedStable, 2);
+  // The degraded scans end 0.1 s and 0.2 s after the last supported one; nothing is sent for the next ten slots.
+  Step first = heldSlot(Phase::kEvent);
+  first.hole_from = -0.094;  // everything after the samples already sent with the last scan
+  first.hole_to = (kIdleBudget + kLidarBackAfterDeadline) - 0.3;
+  s.steps.push_back(first);
+  append(s, 9, heldSlot(Phase::kEvent));
+  Step back = slot(Phase::kAfter);
+  back.cloud_first = true;
+  s.steps.push_back(back);
+  append(s, 6, slot(Phase::kLater));
   return s;
 }
 
@@ -2359,9 +2566,10 @@ TEST(AnchorLifecycleNode, ResetOnAParkedScanLatchesOnlyWithThePlatformPolicy)
 }
 
 // The platform policy on with a 1 s budget. A degraded moving stretch without a hold starts the unsupported
-// recovery, timed from the last supported scan; every scan before the deadline is Pending and the first one at or
-// past it latches Unanchored (expiry is checked before anything else of the scan). The healthy parked scans after
-// it do not clear the latch: they report Degraded, take no anchor and never claim StaticHold.
+// recovery, timed from the last supported scan; every scan before the deadline is Pending. The first IMU sample at
+// or past the deadline latches Unanchored, before the scan whose end is the deadline is processed, and every scan
+// from that one on is processed under the latch. The healthy parked scans after it do not clear the latch: they
+// report Degraded, take no anchor and never claim StaticHold.
 TEST(AnchorLifecycleNode, ARecoveryThatRunsOutStaysUnanchored)
 {
   const ChildResult r = runScenario(recoveryRunsOut());
@@ -2375,7 +2583,7 @@ TEST(AnchorLifecycleNode, ARecoveryThatRunsOutStaysUnanchored)
   EXPECT_EQ(valueOf(unanchored, "event"), "unanchored") << unanchored;
   EXPECT_EQ(valueOf(unanchored, "reason"), "deadline") << unanchored;
   EXPECT_EQ(valueOf(pending, "path"), "scan") << pending;
-  EXPECT_EQ(valueOf(unanchored, "path"), "scan") << unanchored;
+  EXPECT_EQ(valueOf(unanchored, "path"), "idle") << unanchored;
   const auto anchored = r.phase(Phase::kAnchorStatic);
   ASSERT_FALSE(anchored.empty());
   const std::int64_t start = anchored.back()->record.end_ns;
@@ -2388,7 +2596,8 @@ TEST(AnchorLifecycleNode, ARecoveryThatRunsOutStaysUnanchored)
   const auto more = r.phase(Phase::kMoveDegraded);
   blind.insert(blind.end(), more.begin(), more.end());
   ASSERT_EQ(blind.size(), 13u);
-  std::uint64_t latched_at = 0;
+  const Observation * last_pending = nullptr;
+  const Observation * first_past = nullptr;
   int pending_scans = 0;
   for (const auto * o : blind) {
     const bool past = o->record.end_ns >= deadline;
@@ -2397,20 +2606,26 @@ TEST(AnchorLifecycleNode, ARecoveryThatRunsOutStaysUnanchored)
     EXPECT_FALSE(o->record.supported) << "step " << o->step;
     EXPECT_EQ(odomFlags(*o) & (kFlagDegraded | kFlagStaticHold), kFlagDegraded) << "step " << o->step;
     pending_scans += past ? 0 : 1;
-    if (past && latched_at == 0) {
-      latched_at = o->record.scan_seq;
-      EXPECT_EQ(valueOf(unanchored, "stamp_ns"), std::to_string(o->record.end_ns)) << unanchored;
-      EXPECT_EQ(valueOf(unanchored, "scan_seq"), std::to_string(o->record.scan_seq)) << unanchored;
-    }
+    if (!past)
+      last_pending = o;
+    else if (first_past == nullptr)
+      first_past = o;
   }
   EXPECT_GT(pending_scans, 0);
-  ASSERT_NE(latched_at, 0u) << "the stretch never reached the deadline";
-  // Every cloud of this scenario is queued before the IMU sample that passes its end. The sample past the deadline
-  // therefore arrived while the scan whose end is the deadline was waiting, and latched nothing: the one latch is
-  // that scan's, stamped with its end (above). AnImuSamplePastTheDeadlineLatchesBeforeTheScanInTransit has the
-  // other order.
+  ASSERT_NE(last_pending, nullptr);
+  ASSERT_NE(first_past, nullptr) << "the stretch never reached the deadline";
+  const std::uint64_t latched_at = first_past->record.scan_seq;
+  // Every cloud of this scenario is queued before the IMU sample that passes its end. The first sample at or past
+  // the deadline therefore arrives while the scan whose end is the deadline waits: it latches at its own time,
+  // naming the scan taken before, and the waiting scan is processed under the latch.
+  // AnImuSamplePastTheDeadlineLatchesBeforeTheScanInTransit has the other order, and the same latch.
+  const std::int64_t first_sample = firstGridImuAtOrAfter(deadline);
+  ASSERT_EQ(first_sample, deadline + 2500000);
+  EXPECT_EQ(valueOf(unanchored, "stamp_ns"), std::to_string(first_sample)) << unanchored;
+  EXPECT_EQ(inputNsOf(r, unanchored), first_sample) << unanchored;
+  EXPECT_EQ(valueOf(unanchored, "scan_seq"), std::to_string(last_pending->record.scan_seq)) << unanchored;
+  EXPECT_EQ(first_past->record.trust_pre, fast_lio::RecoveryTrust::kUnanchored) << "step " << first_past->step;
   EXPECT_EQ(recoveryLines(r, "unanchored").size(), 1u);
-  EXPECT_GT(inputNsOf(r, unanchored), deadline) << unanchored;
 
   const auto parked = r.phase(Phase::kParkedAfterLatch);
   ASSERT_EQ(parked.size(), 6u);
@@ -2565,8 +2780,9 @@ TEST(AnchorLifecycleIdle, TheDeadlinePassesOnTheImuClockWhileNoScanArrives)
   EXPECT_EQ(counterValue(r, "recovery_expired"), "1");
 }
 
-// The scan that would complete the stable time ends exactly at the deadline: expiry is checked first, so the
-// recovery is too late and latches. With a budget 0.1 s longer the same scan ends Pending.
+// The scan that would complete the stable time ends exactly at the deadline. It can only be processed once an IMU
+// sample at or past its end has arrived, and that sample, the first one past the deadline, latches first: the
+// recovery is too late. With a budget 0.1 s longer the same scan ends Pending.
 TEST(AnchorLifecycleIdle, AConfirmationAtTheDeadlineIsTooLate)
 {
   for (const double total : {kIdleBudget, kIdleBudget + 0.1}) {
@@ -2588,7 +2804,8 @@ TEST(AnchorLifecycleIdle, AConfirmationAtTheDeadlineIsTooLate)
     ASSERT_EQ(completesRun(after, 0, 500000000), &last);
     for (std::size_t i = 0; i + 1 < after.size(); ++i)
       EXPECT_EQ(after[i]->record.trust_post, fast_lio::RecoveryTrust::kPending) << "step " << after[i]->step;
-    EXPECT_EQ(last.record.trust_pre, fast_lio::RecoveryTrust::kPending);
+    EXPECT_EQ(last.record.trust_pre,
+              in_time ? fast_lio::RecoveryTrust::kPending : fast_lio::RecoveryTrust::kUnanchored);
     const auto qualified = recoveryLines(r, "qualified");
     const auto latched = recoveryLines(r, "unanchored");
     const auto later = r.phase(Phase::kLater);
@@ -2606,9 +2823,15 @@ TEST(AnchorLifecycleIdle, AConfirmationAtTheDeadlineIsTooLate)
       EXPECT_TRUE(qualified.empty());
       ASSERT_EQ(latched.size(), 1u);
       EXPECT_EQ(valueOf(latched.front(), "reason"), "deadline") << latched.front();
-      EXPECT_EQ(valueOf(latched.front(), "stamp_ns"), std::to_string(deadline)) << latched.front();
-      EXPECT_EQ(valueOf(latched.front(), "scan_seq"), std::to_string(last.record.scan_seq)) << latched.front();
-      EXPECT_EQ(valueOf(latched.front(), "path"), "scan") << latched.front();
+      // The first IMU sample past the deadline arrives while the last scan waits: it latches at its own time,
+      // naming the scan taken before.
+      const std::int64_t first_past = firstGridImuAtOrAfter(deadline);
+      ASSERT_EQ(first_past, deadline + 2500000);
+      EXPECT_EQ(valueOf(latched.front(), "stamp_ns"), std::to_string(first_past)) << latched.front();
+      EXPECT_EQ(inputNsOf(r, latched.front()), first_past) << latched.front();
+      EXPECT_EQ(valueOf(latched.front(), "scan_seq"), std::to_string(after[after.size() - 2]->record.scan_seq))
+        << latched.front();
+      EXPECT_EQ(valueOf(latched.front(), "path"), "idle") << latched.front();
       EXPECT_EQ(last.record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
       EXPECT_EQ(odomFlags(last), kFlagDegraded);
       for (const auto * o : later) {
@@ -2680,6 +2903,149 @@ TEST(AnchorLifecycleIdle, AnImuSamplePastTheDeadlineLatchesBeforeTheScanInTransi
   EXPECT_EQ(previous->record.trust_post, fast_lio::RecoveryTrust::kPending);
   EXPECT_EQ(at_deadline->record.trust_pre, fast_lio::RecoveryTrust::kUnanchored);
   EXPECT_EQ(at_deadline->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
+}
+
+// ---------------------------------------------------------------------------
+// The deadline while a scan waits for its IMU
+// ---------------------------------------------------------------------------
+
+// The scan whose end is 0.2 s past the deadline is queued, then the IMU samples come one by one across the
+// deadline. The sample on the deadline latches Unanchored at its own time, naming the last scan taken, and
+// publishes nothing. The queued scan is processed under the latch: it confirms nothing and uses no anchor, and
+// neither do the healthy parked scans after it.
+TEST(AnchorLifecycleQueued, TheSampleOnTheDeadlineLatchesWhileAScanIsQueued)
+{
+  const ChildResult r = runScenario(scanQueuedPastTheDeadline());
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const auto before = r.phase(Phase::kBefore);
+  const auto event = r.phase(Phase::kEvent);
+  const auto queued = r.phase(Phase::kAfter);
+  const auto later = r.phase(Phase::kLater);
+  ASSERT_EQ(before.size(), 1u);
+  ASSERT_EQ(event.size(), static_cast<std::size_t>(kOnSampleDegraded));
+  ASSERT_EQ(queued.size(), 1u);
+  ASSERT_EQ(later.size(), 6u);
+  const std::int64_t deadline = before.back()->record.end_ns + kOnSampleBudgetNs;
+  // The fixture's premise, read from what the front end reports of the IMU samples it takes: it took one at a stamp
+  // exactly on the deadline. No cloud of this scenario is stamped there, so that input is the sample sent on the
+  // deadline. The last scan taken ends 0.1 s before the deadline, the queued one 0.2 s past it.
+  ASSERT_EQ(nearestReportedInputNs(r, deadline), deadline)
+    << "the front end took no IMU sample at a stamp on the deadline, out of " << r.idle.size() << " reports";
+  ASSERT_EQ(event.back()->record.end_ns, deadline - kScanPeriodNs);
+  ASSERT_EQ(queued.front()->record.end_ns, deadline + 2 * kScanPeriodNs);
+  for (const auto * o : event)
+    EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kPending) << "step " << o->step;
+  const auto pending = recoveryLines(r, "pending");
+  ASSERT_EQ(pending.size(), 1u);
+  EXPECT_EQ(valueOf(pending.front(), "deadline_ns"), std::to_string(deadline)) << pending.front();
+  const auto latched = recoveryLines(r, "unanchored");
+  ASSERT_EQ(latched.size(), 1u);
+  const std::string & latch = latched.front();
+  EXPECT_EQ(valueOf(latch, "reason"), "deadline") << latch;
+  EXPECT_EQ(valueOf(latch, "path"), "idle") << latch;
+  EXPECT_EQ(valueOf(latch, "stamp_ns"), std::to_string(deadline)) << "not the sample on the deadline: " << latch;
+  EXPECT_EQ(inputNsOf(r, latch), deadline) << "logged while another sample was the newest: " << latch;
+  EXPECT_EQ(valueOf(latch, "scan_seq"), std::to_string(event.back()->record.scan_seq)) << latch;
+  std::vector<const Observation *> from_latch = queued;
+  from_latch.insert(from_latch.end(), later.begin(), later.end());
+  expectLatchedFrom(r, from_latch);
+  expectOdometryOnlyForPublishedScans(r);
+  EXPECT_EQ(counterValue(r, "recovery_expired"), "1");
+}
+
+// A matching run reaches the 1 s stable time on a scan that ends 1 ms before the deadline, and that scan is queued
+// when the IMU sample 2.5 ms past its end, the first one past the deadline, arrives. The sample latches at its own
+// time; the scan is processed under the latch and cannot confirm the recovery, and neither can the healthy parked
+// scans after it. With the deadline 5.5 ms past the scan's end, the control, the same scan confirms it.
+TEST(AnchorLifecycleQueued, AConfirmationStillQueuedAtTheDeadlineDoesNotEscapeTheLatch)
+{
+  for (const double total : {kConfirmLate, kConfirmInTime}) {
+    const bool in_time = total > kConfirmLate;
+    const Scenario scenario = confirmationQueuedAtTheDeadline(total);
+    const ChildResult r = runScenario(scenario);
+    SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+    ASSERT_TRUE(r.ok());
+    const auto before = r.phase(Phase::kBefore);
+    const auto event = r.phase(Phase::kEvent);
+    const auto after = r.phase(Phase::kAfter);
+    const auto later = r.phase(Phase::kLater);
+    ASSERT_EQ(before.size(), 1u);
+    ASSERT_EQ(event.size(), 1u);
+    ASSERT_EQ(after.size(), static_cast<std::size_t>(kConfirmRun));
+    ASSERT_EQ(later.size(), 6u);
+    const std::int64_t deadline = before.back()->record.end_ns + static_cast<std::int64_t>(std::llround(total * 1e9));
+    const Observation & last = *after.back();
+    // The fixture's premise: the run spans the stable time on its last scan and not on the one before; that scan
+    // ends before the deadline, and the first IMU sample at or past the deadline comes after its end.
+    ASSERT_EQ(completesRun(after, 0, kConfirmStableNs), &last);
+    ASSERT_LT(last.record.end_ns, deadline);
+    const std::int64_t first_past = firstGridImuAtOrAfter(deadline);
+    ASSERT_EQ(first_past, last.record.end_ns + (in_time ? 7500000 : 2500000));
+    for (std::size_t i = 0; i + 1 < after.size(); ++i)
+      EXPECT_EQ(after[i]->record.trust_post, fast_lio::RecoveryTrust::kPending) << "step " << after[i]->step;
+    const auto qualified = recoveryLines(r, "qualified");
+    const auto latched = recoveryLines(r, "unanchored");
+    if (in_time) {
+      EXPECT_TRUE(latched.empty());
+      ASSERT_EQ(qualified.size(), 1u);
+      EXPECT_EQ(valueOf(qualified.front(), "scan_seq"), std::to_string(last.record.scan_seq)) << qualified.front();
+      EXPECT_EQ(last.record.trust_pre, fast_lio::RecoveryTrust::kPending);
+      EXPECT_EQ(last.record.trust_post, fast_lio::RecoveryTrust::kLocalQualified);
+      for (const auto * o : later)
+        EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kLocalQualified) << "step " << o->step;
+    } else {
+      ASSERT_EQ(latched.size(), 1u);
+      const std::string & latch = latched.front();
+      EXPECT_EQ(valueOf(latch, "reason"), "deadline") << latch;
+      EXPECT_EQ(valueOf(latch, "path"), "idle") << latch;
+      EXPECT_EQ(valueOf(latch, "stamp_ns"), std::to_string(first_past)) << latch;
+      EXPECT_EQ(inputNsOf(r, latch), first_past) << latch;
+      EXPECT_EQ(valueOf(latch, "scan_seq"), std::to_string(after[after.size() - 2]->record.scan_seq)) << latch;
+      std::vector<const Observation *> from_latch = {&last};
+      from_latch.insert(from_latch.end(), later.begin(), later.end());
+      expectLatchedFrom(r, from_latch);
+    }
+    expectOdometryOnlyForPublishedScans(r);
+  }
+}
+
+// Every input stops after two degraded scans, and the LiDAR is back first: its scan, 0.3 s past the deadline, is
+// queued before any IMU sample. The first IMU sample back, 0.2 s past the deadline, latches at its own time,
+// naming the last scan taken before the hole. The queued scan is processed under the latch, and so are the
+// healthy parked scans after it.
+TEST(AnchorLifecycleQueued, WhenTheLidarIsBackFirstTheFirstImuSampleBackLatches)
+{
+  const ChildResult r = runScenario(lidarBackBeforeTheImu());
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const auto before = r.phase(Phase::kBefore);
+  const auto event = r.phase(Phase::kEvent);
+  const auto back = r.phase(Phase::kAfter);
+  const auto later = r.phase(Phase::kLater);
+  ASSERT_EQ(before.size(), 1u);
+  ASSERT_EQ(event.size(), 2u);
+  ASSERT_EQ(back.size(), 1u);
+  ASSERT_EQ(later.size(), 6u);
+  const std::int64_t deadline = before.back()->record.end_ns + kIdleBudgetNs;
+  const std::int64_t resume = deadline + static_cast<std::int64_t>(std::llround(kLidarBackAfterDeadline * 1e9));
+  // The fixture's premise: the queued scan ends 0.3 s past the deadline, after the IMU is back.
+  ASSERT_EQ(back.front()->record.end_ns, deadline + 3 * kScanPeriodNs);
+  const std::int64_t first_back = firstGridImuAtOrAfter(resume);
+  ASSERT_LT(first_back, back.front()->record.end_ns);
+  const auto latched = recoveryLines(r, "unanchored");
+  ASSERT_EQ(latched.size(), 1u);
+  const std::string & latch = latched.front();
+  EXPECT_EQ(valueOf(latch, "reason"), "deadline") << latch;
+  EXPECT_EQ(valueOf(latch, "path"), "idle") << latch;
+  EXPECT_EQ(valueOf(latch, "stamp_ns"), std::to_string(first_back)) << "not the first sample back: " << latch;
+  EXPECT_EQ(inputNsOf(r, latch), first_back) << latch;
+  EXPECT_EQ(valueOf(latch, "scan_seq"), std::to_string(event.back()->record.scan_seq)) << latch;
+  std::vector<const Observation *> from_latch = back;
+  from_latch.insert(from_latch.end(), later.begin(), later.end());
+  expectLatchedFrom(r, from_latch);
+  expectOdometryOnlyForPublishedScans(r);
+  EXPECT_EQ(counterValue(r, "recovery_expired"), "1");
 }
 
 // ---------------------------------------------------------------------------

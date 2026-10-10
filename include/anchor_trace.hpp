@@ -166,10 +166,11 @@
 //   elapsed_ns   stamp_ns - start_ns; -1 when either is unknown.
 //   reset_count  local map resets so far.
 //   path         scan: written while a scan was being processed. idle: written
-//                by the check each IMU sample runs while no scan is queued; that
-//                check finds a deadline that has passed, and a scan hole once
-//                the allowance for a scan in transit has run out. A scan that
-//                is queued is judged on the scan path, at its own end time.
+//                by the check each IMU sample the front end takes runs; that
+//                check finds a deadline that has passed, whether or not a scan
+//                is queued, and, while no scan is queued, a scan hole once the
+//                allowance for a scan in transit has run out. A queued scan's
+//                hole is judged on the scan path, when that scan is processed.
 //
 // 3. Scan records: one per scan, only with the parameter zupt_anchor_trace_en.
 //
@@ -480,7 +481,7 @@ enum class RecoveryTraceEvent : std::uint8_t
   kUnanchored,
 };
 
-/// Where a recovery record was written: on the scan path, or by the check the IMU samples run while no scan is queued.
+/// Where a recovery record was written: on the scan path, or by the check every IMU sample the front end takes runs.
 enum class RecoveryTracePath : std::uint8_t
 {
   kScan,

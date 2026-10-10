@@ -253,6 +253,7 @@ if(BUILD_TESTING)
       "AnchorLifecycleNode:core:480"
       "AnchorLifecycleTraceSwitch:trace_switch:600"
       "AnchorLifecycleIdle:idle:180"
+      "AnchorLifecycleQueued:queued:240"
       "AnchorLifecycleEvidence:evidence:300"
       "AnchorLifecycleInputs:inputs:240"
       "AnchorLifecycleGate:gate:480")

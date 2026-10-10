@@ -5,8 +5,8 @@
 // reset in rebuild_local_map and the /Odometry publisher. FASTLIO_TEST_HOOKS
 // fix only what a synthetic stream cannot produce on demand: the divergence
 // guard's verdict, the state registration hands to the anchor step, and a
-// runaway trip for the late map reset. The static verdict is the real one,
-// computed from the IMU windows the fixture sends.
+// runaway trip for the watchdog's late map reset or hold. The static verdict
+// is the real one, computed from the IMU windows the fixture sends.
 //
 // The anchor and pre-event positions are the three frozen cases F1-F3.
 // Attitude, velocity and covariance are fixed fixture values (identity, a
@@ -67,6 +67,7 @@
 #include "anchor_trace.hpp"
 #include "frontend_observation.hpp"
 #include "laser_mapping_test_hooks.hpp"
+#include "odom_covariance_contract.hpp"
 #include "preprocess.h"
 
 namespace
@@ -2513,6 +2514,66 @@ Scenario resetRebuildsNoMap(bool prior, bool policy)
   return s;
 }
 
+// ---- The runaway watchdog's hold action ------------------------------------------------------------------------
+
+// A late trip with the watchdog's hold action in place of the map reset, ZUPT on or off.
+Scenario withHold(Scenario s, const std::string & name, bool zupt)
+{
+  s.name = name;
+  setParam(s, rclcpp::Parameter("runaway_on_trip", "hold"));
+  setParam(s, rclcpp::Parameter("zupt_en", zupt));
+  return s;
+}
+
+// Degraded parked scans held on the anchor, then the trip on the next one (with ZUPT off nothing is pinned).
+Scenario pinThenLateHold(bool zupt)
+{
+  return withHold(pinThenLateReset(), zupt ? "pin_late_hold_zupt_on" : "pin_late_hold_zupt_off", zupt);
+}
+
+// Healthy parked scans the parked prior pulls toward the anchor, then the trip on the next one.
+Scenario parkedPriorThenLateHold(bool zupt)
+{
+  return withHold(parkedPriorThenLateReset(zupt), zupt ? "prior_late_hold_zupt_on" : "prior_late_hold_zupt_off", zupt);
+}
+
+// The pose covariance the fixture gives a scan before its anchor step, as /Odometry encodes it.
+std::array<double, 36> fixtureOdomCovariance(bool degraded)
+{
+  Eigen::Matrix<double, 6, 6> pose = Eigen::Matrix<double, 6, 6>::Zero();
+  for (int i = 0; i < 6; ++i)
+    pose(i, i) = kFixtureCovDiag[static_cast<std::size_t>(i)];
+  return fast_lio::makeOdomCovariance(pose, degraded);
+}
+
+// What a scan whose anchor write was taken back, or never made, publishes: the pose it brought, with its attitude
+// and pose covariance, and `velocity`. `wrote` says whether the anchor step wrote the state: only then does the
+// record carry a pose covariance, which must be the one from before the step. /Odometry carries the covariance
+// the fixture gave the scan either way, as a scan reported `degraded` encodes it.
+void expectTheScanOwnState(const Observation & o,
+                           const std::array<double, 3> & position,
+                           const std::array<double, 3> & velocity,
+                           bool wrote,
+                           bool degraded)
+{
+  const auto & x = o.record;
+  EXPECT_TRUE(samePosition(x.pre_p, position) && samePosition(x.post_p, position))
+    << "pre " << formatPosition(x.pre_p) << " post " << formatPosition(x.post_p);
+  for (int i = 0; i < 4; ++i)
+    EXPECT_TRUE(sameBits(x.pre_q[i], x.post_q[i])) << "attitude component " << i;
+  for (int i = 0; i < 3; ++i)
+    EXPECT_TRUE(sameBits(x.post_v[i], velocity[static_cast<std::size_t>(i)]))
+      << "velocity component " << i << " is " << x.post_v[i];
+  if (wrote)
+    EXPECT_TRUE(x.have_cov && samePoseCovariance(x)) << "the anchor write's pose covariance outlived its take-back";
+  else
+    EXPECT_FALSE(x.have_cov) << "the record carries a pose covariance, as if the anchor step had written the state";
+  EXPECT_TRUE(o.odom_seen && samePosition(o.odom_p, position)) << formatPosition(o.odom_p);
+  const std::array<double, 36> own = fixtureOdomCovariance(degraded);
+  EXPECT_TRUE(o.odom_seen && sameArray(o.odom_cov, own.data(), own.size()))
+    << "the published pose covariance is not the scan's own";
+}
+
 }  // namespace
 
 // Parked again after a moving degraded stretch: the motion ended the anchor taken before it, so nothing pins to
@@ -3960,6 +4021,139 @@ TEST(AnchorLifecycleRebuild, AResetWhoseRebuildTakesNoPointEndsTheAnchorOnce)
       }
       expectOdometryOnlyForPublishedScans(r);
       expectTraceAccountsForEveryScan(r, true, scenario.name);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The runaway watchdog's hold action
+// ---------------------------------------------------------------------------
+
+// A trip with the hold action on a degraded parked scan held on its anchor. The pin of that scan is taken back
+// before the front end declares itself lost: the scan publishes its own pose, attitude and pose covariance with the
+// velocity alone zeroed, as a zero-only scan, and its outputs carry Lost without StaticHold. The anchor ends for
+// that reason. With ZUPT off nothing was pinned and nothing is taken back: the scan publishes the state it brought.
+// The loss is that scan's: the degraded parked scans after it report Degraded alone.
+TEST(AnchorLifecycleHold, AHoldTakesBackThePinOfItsScanAndReportsLost)
+{
+  const FieldCase & c = kFieldCases[0];
+  const std::array<double, 3> nudged = nudgedAnchor(c);
+  const std::array<double, 3> zero = {0.0, 0.0, 0.0};
+  for (const bool zupt : {true, false}) {
+    const Scenario scenario = pinThenLateHold(zupt);
+    const ChildResult r = runScenario(scenario);
+    SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+    ASSERT_TRUE(r.ok());
+    const std::uint64_t old_id = oldAnchorId(r);
+    ASSERT_NE(old_id, 0u);
+    ASSERT_TRUE(anchorWasValidAtTheOldPose(r, c));
+    const auto held = r.phase(Phase::kHold);
+    ASSERT_EQ(held.size(), 2u);
+    for (const auto * o : held) {
+      EXPECT_EQ(o->record.action, zupt ? fast_lio::AnchorTraceAction::kPin : fast_lio::AnchorTraceAction::kNone)
+        << "step " << o->step;
+      EXPECT_EQ(o->record.anchor_used, zupt ? old_id : 0u) << "step " << o->step;
+      EXPECT_EQ(odomFlags(*o), zupt ? kFlagDegraded | kFlagStaticHold : kFlagDegraded) << "step " << o->step;
+    }
+    const auto trip = r.phase(Phase::kHoldReset);
+    ASSERT_EQ(trip.size(), 1u);
+    const Observation & t = *trip.front();
+    const auto & tr = t.record;
+    EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventRunawayTrip));
+    EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventLost));
+    EXPECT_FALSE(hasEvent(t, fast_lio::kAnchorEventMapReset));
+    EXPECT_EQ(tr.anchor_used, 0u);
+    EXPECT_FALSE(tr.parked_applied);
+    if (zupt) {
+      EXPECT_TRUE(tr.usable) << "the anchor step ran, and pinned, before the trip";
+      EXPECT_EQ(tr.action, fast_lio::AnchorTraceAction::kZeroVelocity);
+      EXPECT_TRUE(tr.zero_only);
+    } else {
+      EXPECT_EQ(tr.action, fast_lio::AnchorTraceAction::kNone);
+      EXPECT_FALSE(tr.zero_only);
+    }
+    expectTheScanOwnState(t, nudged, zupt ? zero : kFixtureVelocity, zupt, true);
+    EXPECT_EQ(tr.anchor_state, fast_lio::AnchorState::kEmpty);
+    EXPECT_FALSE(tr.static_hold);
+    EXPECT_EQ(odomFlags(t), kFlagDegraded | kFlagLost);
+    EXPECT_EQ(tr.flags, static_cast<int>(kFlagDegraded | kFlagLost));
+    expectInvalidatedOnce(r, old_id, "lost", scenario.name);
+    EXPECT_EQ(counterValue(r, "lost"), "1");
+    EXPECT_EQ(counterValue(r, "map_reset"), "0");
+    EXPECT_EQ(counterValue(r, "pin_applied"), zupt ? "2" : "0")
+      << "only the scans whose published pose is the anchor's";
+    EXPECT_EQ(counterValue(r, "zero_only_unanchored"), zupt ? "3" : "0") << "the trip scan and the two after it";
+    const auto after = r.phase(Phase::kAfterReset);
+    ASSERT_EQ(after.size(), 2u);
+    for (const auto * o : after) {
+      if (zupt) {
+        std::string why;
+        EXPECT_TRUE(zeroedVelocityOnly(*o, nudged, &why)) << "step " << o->step << ": " << why;
+      } else {
+        EXPECT_EQ(o->record.action, fast_lio::AnchorTraceAction::kNone) << "step " << o->step;
+        EXPECT_EQ(o->record.anchor_used, 0u) << "step " << o->step;
+        EXPECT_TRUE(o->odom_seen && samePosition(o->odom_p, nudged)) << formatPosition(o->odom_p);
+        EXPECT_EQ(odomFlags(*o), kFlagDegraded) << "step " << o->step;
+      }
+    }
+  }
+}
+
+// A trip with the hold action on a healthy parked scan the parked prior pulled toward its anchor. The pull is taken
+// back before the front end declares itself lost: the scan publishes its own pose, attitude and pose covariance,
+// with the velocity zeroed where ZUPT zeroes it, and its outputs carry Lost without StaticHold. The anchor ends for
+// that reason; the parked scans after it start a new candidate and report nothing.
+TEST(AnchorLifecycleHold, AHoldTakesBackTheParkedPriorOfItsScanAndReportsLost)
+{
+  const FieldCase & c = kFieldCases[0];
+  const std::array<double, 3> nudged = nudgedAnchor(c);
+  const std::array<double, 3> zero = {0.0, 0.0, 0.0};
+  for (const bool zupt : {true, false}) {
+    const Scenario scenario = parkedPriorThenLateHold(zupt);
+    const ChildResult r = runScenario(scenario);
+    SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+    ASSERT_TRUE(r.ok());
+    const std::uint64_t old_id = oldAnchorId(r);
+    ASSERT_NE(old_id, 0u);
+    ASSERT_TRUE(anchorWasValidAtTheOldPose(r, c));
+    const auto written = zupt ? fast_lio::AnchorTraceAction::kZeroVelocity : fast_lio::AnchorTraceAction::kNone;
+    const auto held = r.phase(Phase::kHold);
+    ASSERT_EQ(held.size(), 2u);
+    for (const auto * o : held) {
+      EXPECT_TRUE(o->record.parked_applied) << "step " << o->step;
+      EXPECT_EQ(o->record.anchor_used, old_id) << "step " << o->step;
+      EXPECT_EQ(odomFlags(*o), kFlagStaticHold) << "step " << o->step;
+    }
+    const auto trip = r.phase(Phase::kHoldReset);
+    ASSERT_EQ(trip.size(), 1u);
+    const Observation & t = *trip.front();
+    const auto & tr = t.record;
+    EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventRunawayTrip));
+    EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventLost));
+    EXPECT_FALSE(hasEvent(t, fast_lio::kAnchorEventMapReset));
+    EXPECT_TRUE(tr.usable) << "the anchor step ran, and applied the prior, before the trip";
+    EXPECT_FALSE(tr.parked_applied);
+    EXPECT_EQ(tr.anchor_used, 0u);
+    EXPECT_EQ(tr.action, written);
+    EXPECT_FALSE(tr.zero_only);
+    expectTheScanOwnState(t, nudged, zupt ? zero : kFixtureVelocity, true, false);
+    EXPECT_EQ(tr.anchor_state, fast_lio::AnchorState::kEmpty);
+    EXPECT_FALSE(tr.static_hold);
+    EXPECT_EQ(odomFlags(t), kFlagLost);
+    EXPECT_EQ(tr.flags, static_cast<int>(kFlagLost));
+    expectInvalidatedOnce(r, old_id, "lost", scenario.name);
+    EXPECT_EQ(counterValue(r, "lost"), "1");
+    EXPECT_EQ(counterValue(r, "map_reset"), "0");
+    EXPECT_EQ(counterValue(r, "parked_prior_applied"), "2") << "only the two scans whose published pose carries it";
+    EXPECT_EQ(counterValue(r, "zero_only_unanchored"), "0") << "a healthy scan is no zero-only scan";
+    const auto after = r.phase(Phase::kAfterReset);
+    ASSERT_EQ(after.size(), 2u);
+    for (const auto * o : after) {
+      EXPECT_FALSE(o->record.parked_applied) << "step " << o->step;
+      EXPECT_EQ(o->record.anchor_used, 0u) << "step " << o->step;
+      EXPECT_EQ(o->record.anchor_id, old_id + 1) << "step " << o->step;
+      EXPECT_TRUE(o->odom_seen && samePosition(o->odom_p, nudged)) << formatPosition(o->odom_p);
+      EXPECT_EQ(odomFlags(*o), 0u) << "step " << o->step;
     }
   }
 }

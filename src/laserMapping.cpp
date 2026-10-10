@@ -2094,7 +2094,8 @@ constexpr std::int64_t kAnchorIdleSettleMinNs = 500000000;
 // only while no scan is queued, once the stretch has outlasted the gap bound by the settle allowance. The Pending it
 // opens is timed from the last supported scan like any other, and has run out at once when that was long enough
 // ago. The next scan re-checks both before anything uses an anchor. No pose is made up: /Odometry changes at the
-// next published scan. Without a Pending episode the check writes nothing.
+// next published scan. Without a Pending episode the expiry writes nothing and changes nothing, so a sample taken
+// while a scan is queued leaves no trace; with no scan queued the hole check can still open a Pending, as above.
 void checkAnchorEvidenceOnImu(double imu_stamp, bool scan_waiting)
 {
   const std::int64_t now_ns = fast_lio::traceNs(imu_stamp);

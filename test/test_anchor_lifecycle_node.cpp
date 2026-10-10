@@ -50,6 +50,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <rcl/error_handling.h>
+#include <rcl/timer.h>
+#include <rcl/wait.h>
 #include <set>
 #include <sstream>
 #include <string>
@@ -87,6 +90,9 @@ constexpr double kGapMargin = 0.010;  // s of IMU kept at each end of a gap scan
 constexpr int kWarmupPublished = 2;
 constexpr int kWarmupMaxScans = 12;
 constexpr double kScanWaitSeconds = 20.0;
+constexpr double kReceiptWaitSeconds = 5.0;  // bound on waiting for the node to show it took what a slot sent
+constexpr std::int64_t kReceiptWaitNs = 5000000000;
+constexpr std::int64_t kScanPathPeriodNs = 10000000;  // the front end runs its scan path off a 100 Hz timer
 constexpr unsigned kChildAlarmSeconds = 300;
 
 constexpr std::array<double, 3> kFixtureVelocity = {0.4, -0.3, 0.05};  // m/s, below divergence_guard_max_speed
@@ -822,7 +828,7 @@ private:
   // A cloud just sent is in the front end's queue: from here on an IMU sample finds a scan waiting.
   bool waitUntilQueued()
   {
-    return spinUntil([] { return fast_lio_test::inspectImuInput().lidarQueued > 0; }, 5.0);
+    return spinUntil([] { return fast_lio_test::inspectImuInput().lidarQueued > 0; }, kReceiptWaitSeconds);
   }
 
   // Sends scan number `scan_` (step `index`, -1 for warm-up) and waits until the node has finished it.
@@ -975,11 +981,141 @@ private:
     return "";
   }
 
-  void spinFor(double seconds)
+  // The front end's own subscription to the relocalization result.
+  rclcpp::SubscriptionBase::SharedPtr relocalizationSubscription()
   {
-    const auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
-    while (std::chrono::steady_clock::now() < until)
-      executor_->spin_once(std::chrono::milliseconds(2));
+    return subject_->get_node_base_interface()->get_default_callback_group()->find_subscription_ptrs_if(
+      [](const rclcpp::SubscriptionBase::SharedPtr & subscription) {
+        return std::strcmp(subscription->get_topic_name(), kRelocalizationTopic) == 0;
+      });
+  }
+
+  // The timer the front end runs its scan path from: the one timer of the node with that period.
+  rclcpp::TimerBase::SharedPtr scanPathTimer()
+  {
+    int found = 0;
+    rclcpp::TimerBase::SharedPtr match;
+    subject_->get_node_base_interface()->get_default_callback_group()->find_timer_ptrs_if(
+      [&](const rclcpp::TimerBase::SharedPtr & timer) {
+        std::int64_t period_ns = 0;
+        if (rcl_timer_get_period(timer->get_timer_handle().get(), &period_ns) != RCL_RET_OK) {
+          rcl_reset_error();
+        } else if (period_ns == kScanPathPeriodNs) {
+          ++found;
+          match = timer;
+        }
+        return false;
+      });
+    return found == 1 ? match : nullptr;
+  }
+
+  // Waits up to `timeout_ns` for `subscription` to hold a message nobody has taken yet or, when no subscription is
+  // given, for `timer` to come due, and says in `ready` whether it does. Nothing spins meanwhile, so nothing takes
+  // the message or runs the timer. Returns what went wrong with the wait itself.
+  std::string
+  waitUnspun(const rcl_subscription_t * subscription, const rcl_timer_t * timer, std::int64_t timeout_ns, bool * ready)
+  {
+    *ready = false;
+    const bool message = subscription != nullptr;
+    rcl_wait_set_t wait_set = rcl_get_zero_initialized_wait_set();
+    const auto context = subject_->get_node_base_interface()->get_context()->get_rcl_context();
+    if (rcl_wait_set_init(
+          &wait_set, message ? 1 : 0, 0, message ? 0 : 1, 0, 0, 0, context.get(), rcl_get_default_allocator()) !=
+        RCL_RET_OK) {
+      const std::string error = rcl_get_error_string().str;
+      rcl_reset_error();
+      return "wait set: " + error;
+    }
+    std::string error;
+    rcl_ret_t ret = message ? rcl_wait_set_add_subscription(&wait_set, subscription, nullptr)
+                            : rcl_wait_set_add_timer(&wait_set, timer, nullptr);
+    if (ret == RCL_RET_OK)
+      ret = rcl_wait(&wait_set, timeout_ns);
+    if (ret == RCL_RET_OK)
+      *ready = message ? wait_set.subscriptions[0] != nullptr : wait_set.timers[0] != nullptr;
+    else if (ret != RCL_RET_TIMEOUT)
+      error = std::string(message ? "wait on the subscription: " : "wait on the timer: ") + rcl_get_error_string().str;
+    rcl_reset_error();
+    if (rcl_wait_set_fini(&wait_set) != RCL_RET_OK)
+      rcl_reset_error();
+    return error;
+  }
+
+  // Says in `held` whether `subscription` holds, within `timeout_ns`, a message nobody has taken yet.
+  std::string
+  pollMessage(const rclcpp::SubscriptionBase::SharedPtr & subscription, std::int64_t timeout_ns, bool * held)
+  {
+    return waitUnspun(subscription->get_subscription_handle().get(), nullptr, timeout_ns, held);
+  }
+
+  // The scan path acts on what the input callbacks left it, and nothing it does without a scan is reported. Its
+  // receipt is the timer it runs from: the timer comes due, with nothing spinning meanwhile, and then the executor
+  // has run it. `what` names, in a failure, what the run was waited for.
+  std::string runScanPath(const std::string & what)
+  {
+    std::ostringstream out;
+    out << what << ": ";
+    const auto timer = scanPathTimer();
+    if (!timer) {
+      out << "the front end does not have exactly one timer with the scan path's period";
+      return out.str();
+    }
+    bool due = false;
+    const std::string error = waitUnspun(nullptr, timer->get_timer_handle().get(), kReceiptWaitNs, &due);
+    if (!error.empty()) {
+      out << error;
+      return out.str();
+    }
+    if (!due && !timer->is_ready()) {
+      out << "the scan path's timer did not come due within " << kReceiptWaitSeconds << " s";
+      return out.str();
+    }
+    if (!spinUntil([&] { return !timer->is_ready(); }, kReceiptWaitSeconds)) {
+      out << "the scan path's timer came due, but the executor did not run it within " << kReceiptWaitSeconds << " s";
+      return out.str();
+    }
+    return "";
+  }
+
+  // The front end takes the relocalization result over DDS, and its callback only stores the transform, so the
+  // receipt is the subscription itself: it held the message, then the executor took it off the subscription, which
+  // runs the callback.
+  std::string deliverRelocalization(int number, const geometry_msgs::msg::TransformStamped & message)
+  {
+    std::ostringstream out;
+    out << "relocalization result #" << number;
+    const auto subscription = relocalizationSubscription();
+    if (!subscription) {
+      out << ": the front end has no subscription to " << kRelocalizationTopic;
+      return out.str();
+    }
+    relocalization_->publish(message);
+    bool held = false;
+    std::string error = pollMessage(subscription, kReceiptWaitNs, &held);
+    if (error.empty() && !held) {
+      out << " never reached the front end's subscription within " << kReceiptWaitSeconds << " s";
+      return out.str();
+    }
+    bool taken = false;
+    if (error.empty()) {
+      taken = spinUntil(
+        [&] {
+          bool still = false;
+          error = pollMessage(subscription, 0, &still);
+          return !error.empty() || !still;
+        },
+        kReceiptWaitSeconds);
+    }
+    if (!error.empty()) {
+      out << ": " << error;
+      return out.str();
+    }
+    if (!taken) {
+      out << " reached the front end's subscription, but its callback did not take it within " << kReceiptWaitSeconds
+          << " s";
+      return out.str();
+    }
+    return "";
   }
 
   std::string runSlot(int index)
@@ -1004,8 +1140,9 @@ private:
       message.transform.translation.y = target.translation[1];
       message.transform.translation.z = target.translation[2];
       message.transform.rotation.w = 1.0;
-      relocalization_->publish(message);
-      spinFor(0.3);  // over DDS: the callback only stores the transform, nothing else shows it arrived
+      const std::string error = deliverRelocalization(++relocalizations_sent_, message);
+      if (!error.empty())
+        return error;
     }
     if (s.wheel) {
       geometry_msgs::msg::TwistStamped message;
@@ -1016,6 +1153,7 @@ private:
     }
     if (s.clock_back)
       publishImu(std::max<std::int64_t>(1, newest_imu_ns_ - 1500000000LL), 0.0);
+    const std::uint64_t refused = fast_lio_test::inspectImuInput().rejectedLidar;
     const bool send = s.cloud != Cloud::kNone;
     const bool cloud_first = send && s.cloud_first;
     const bool lidar_first = send && !cloud_first && scenario_.lidar_first;
@@ -1032,12 +1170,27 @@ private:
       publishImu(newest_imu_ns_ - 50000000LL, 0.0);
     if (send && !cloud_first && !lidar_first)
       sendLidar(scanStart(scan), s.cloud);
-    if (send && s.expect_scan)
+    if (send && s.expect_scan) {
       pending_.push_back({scan, index, s.cloud != Cloud::kEmpty});
-    else if (send)
-      spinFor(0.05);  // nothing will say the node is done with a scan it does not take
-    else
+    } else if (send) {
+      // A scan the node does not take leaves no record. Its cloud is refused where it arrives, and the count of
+      // refused clouds is that receipt; the scan path then has its run, so what it does about the refusal is done
+      // before the next slot, or the end of the scenario.
+      std::ostringstream out;
+      out << "scan " << scan << " (step " << index << ")";
+      if (!spinUntil([&] { return fast_lio_test::inspectImuInput().rejectedLidar > refused; }, kReceiptWaitSeconds)) {
+        const auto input = fast_lio_test::inspectImuInput();
+        out << " was not refused within " << kReceiptWaitSeconds << " s: refused clouds stayed at "
+            << input.rejectedLidar << ", " << input.lidarQueued << " queued";
+        return out.str();
+      }
+      out << " was refused";
+      const std::string error = runScanPath(out.str());
+      if (!error.empty())
+        return error;
+    } else {
       executor_->spin_some();
+    }
     return settle(false);
   }
 
@@ -1091,6 +1244,7 @@ private:
   std::vector<std::string> lines_;
   std::int64_t next_imu_ns_ = kImuFirstNs;
   int scan_ = 0;
+  int relocalizations_sent_ = 0;
 };
 
 // ---------------------------------------------------------------------------

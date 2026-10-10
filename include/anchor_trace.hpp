@@ -14,7 +14,7 @@
 // Pure C++. No ROS, no Eigen.
 //
 // ===========================================================================
-// Trace format, version 3. This comment is the specification; a checker must
+// Trace format, version 4. This comment is the specification; a checker must
 // depend on nothing else.
 // ===========================================================================
 //
@@ -48,6 +48,24 @@
 // the keys appended to each record: `streak` (section 1), `path` (section 2),
 // act_p ... upd_dq (section 3). The version-2 keys keep their order and meaning.
 //
+// Since version 3: no key is added, removed or moved. What a recovery record's
+// `path` says, and where a deadline is recorded, are different (section 2).
+// path=idle does not say that no scan was queued. Every IMU sample the front
+// end takes acts on a pending episode's deadline, whether or not a scan is
+// queued: the first one taken at or past deadline_ns while the episode is
+// pending writes the unanchored record. That record's stamp_ns is the sample's
+// own time, not a scan's end, so its elapsed_ns can be more than deadline_ns -
+// start_ns; its scan_seq is the last scan taken off the queue, and a scan
+// still queued has no number yet. A scan processed after that record starts
+// from trust_pre=unanchored, also when its end is before deadline_ns. The scan
+// path is as before: every scan that is processed acts on the deadline first,
+// at its own end, and writes the record with path=scan when that end is at or
+// past deadline_ns and no IMU sample wrote it before. So when an episode
+// opens after the samples at or past its deadline_ns were taken, the record
+// comes from whichever is processed next: an IMU sample (path=idle), or a scan
+// whose end is at or past deadline_ns (path=scan). Only the scan hole the idle
+// check finds still means that no scan was queued.
+//
 // Sequence rules
 //   event_seq   1, 2, 3, ... over the process lifetime, one per transition record
 //               of either tag (the counter summary included). Never repeats,
@@ -71,7 +89,7 @@
 //
 // 1. Anchor transition records: always on, never throttled, one line per event.
 //
-//   [ZUPT-ANCHOR] v=3 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
+//   [ZUPT-ANCHOR] v=4 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
 //     stamp_ns=<ns> anchor_id=<id> anchor_valid=<0|1> created_ns=<ns>
 //     last_evidence_ns=<ns> anchor_state=<state> stationary_episode=<n>
 //     reference_generation=<n> streak=<n>
@@ -138,7 +156,7 @@
 //    event; event_seq is drawn from the same sequence as the anchor records.
 //    Only with the platform policy on (reanchor_total_timeout_sec > 0).
 //
-//   [FE-RECOVERY] v=3 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
+//   [FE-RECOVERY] v=4 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
 //     stamp_ns=<ns> episode=<n> start_ns=<ns> deadline_ns=<ns> elapsed_ns=<ns>
 //     reset_count=<n> path=<path>
 //
@@ -174,7 +192,7 @@
 //
 // 3. Scan records: one per scan, only with the parameter zupt_anchor_trace_en.
 //
-//   [ZUPT-ANCHOR-SCAN] v=3 scan_seq=<n> outcome=<outcome> beg_ns=<ns>
+//   [ZUPT-ANCHOR-SCAN] v=4 scan_seq=<n> outcome=<outcome> beg_ns=<ns>
 //     end_ns=<ns> gap_ns=<ns> anchor_id=<id> anchor_valid=<0|1>
 //     anchor_created_ns=<ns> body=<body> imu_n=<n> gyr_max=<rad/s>
 //     acc_span=<ratio> wheel_age=<s> wheel_speed=<m/s> guard_degraded=<0|1>
@@ -296,7 +314,7 @@
 // 4. Counter summary: once, when the node shuts down. An anchor transition
 //    record with its own keys, all saturating unsigned 64-bit counts:
 //
-//   [ZUPT-ANCHOR] v=3 event=counters event_seq=<n> scans=<n> events=<n>
+//   [ZUPT-ANCHOR] v=4 event=counters event_seq=<n> scans=<n> events=<n>
 //     candidates=<n> created=<n> candidates_dropped=<n> invalidated=<n>
 //     invalidated_motion=<n> invalidated_evidence_unknown=<n>
 //     invalidated_scan_hole=<n> invalidated_imu_coverage_gap=<n>
@@ -346,7 +364,7 @@
 namespace fast_lio
 {
 
-constexpr int kAnchorTraceVersion = 3;
+constexpr int kAnchorTraceVersion = 4;
 
 /// Counts that reach the top stay there: a wrapped counter would read as a
 /// small, plausible number.

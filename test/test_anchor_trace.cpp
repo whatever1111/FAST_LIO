@@ -59,6 +59,13 @@ bool sameBits(double a, double b)
 
 }  // namespace
 
+// `v` names the specification a record follows: the header comment of anchor_trace.hpp. A reader rejects a version
+// it does not know, so the number moves with any change to what a record says, here as well as there.
+TEST(AnchorTrace, TheFormatVersionIsFour)
+{
+  EXPECT_EQ(fast_lio::kAnchorTraceVersion, 4);
+}
+
 TEST(AnchorTrace, TransitionRecordHasTheSpecifiedKeysInOrder)
 {
   fast_lio::AnchorTransition t;
@@ -75,7 +82,7 @@ TEST(AnchorTrace, TransitionRecordHasTheSpecifiedKeysInOrder)
   t.ref_gen = 2;
   t.streak = 5;
   EXPECT_EQ(fast_lio::formatAnchorTransition(t),
-            "[ZUPT-ANCHOR] v=3 event=pin_engaged reason=- event_seq=7 scan_seq=42 stamp_ns=1700000000123456789 "
+            "[ZUPT-ANCHOR] v=4 event=pin_engaged reason=- event_seq=7 scan_seq=42 stamp_ns=1700000000123456789 "
             "anchor_id=3 anchor_valid=1 created_ns=1700000000000000000 last_evidence_ns=1700000000100000000 "
             "anchor_state=valid stationary_episode=4 reference_generation=2 streak=5");
 }
@@ -152,7 +159,7 @@ TEST(AnchorTrace, RecoveryRecordHasTheSpecifiedKeysInOrder)
   t.elapsed_ns = 10000000000LL;
   t.reset_count = 1;
   EXPECT_EQ(fast_lio::formatRecoveryTransition(t),
-            "[FE-RECOVERY] v=3 event=unanchored reason=deadline event_seq=12 scan_seq=300 "
+            "[FE-RECOVERY] v=4 event=unanchored reason=deadline event_seq=12 scan_seq=300 "
             "stamp_ns=1700000010100000000 episode=2 start_ns=1700000000100000000 "
             "deadline_ns=1700000010100000000 elapsed_ns=10000000000 reset_count=1 path=scan");
   t.path = fast_lio::RecoveryTracePath::kIdle;
@@ -248,7 +255,7 @@ TEST(AnchorTrace, ScanRecordPrintsEveryKeyEvenWhenTheAnchorStepDidNotRun)
                                              "upd_dp",
                                              "upd_dq"};
   EXPECT_EQ(keysOf(line), expected);
-  EXPECT_EQ(line.rfind("[ZUPT-ANCHOR-SCAN] v=3 ", 0), 0u);
+  EXPECT_EQ(line.rfind("[ZUPT-ANCHOR-SCAN] v=4 ", 0), 0u);
   for (const char * key :
        {"act_p", "act_q", "act_v", "p_pose_act", "target_p", "target_q", "anchor_p", "anchor_q", "upd_dp", "upd_dq"}) {
     EXPECT_EQ(valueOf(line, key), "na") << key;
@@ -632,7 +639,7 @@ TEST(AnchorTrace, CounterSummaryCarriesEveryCounter)
                                              "map_reset_unanchored",
                                              "sequence_exhausted"};
   EXPECT_EQ(keysOf(line), expected);
-  EXPECT_EQ(line.rfind("[ZUPT-ANCHOR] v=3 ", 0), 0u);
+  EXPECT_EQ(line.rfind("[ZUPT-ANCHOR] v=4 ", 0), 0u);
   EXPECT_EQ(valueOf(line, "event"), "counters");
   EXPECT_EQ(valueOf(line, "event_seq"), "99");
   EXPECT_EQ(valueOf(line, "invalidated_motion"), "21");

@@ -99,6 +99,7 @@
 
 #include "IMU_Processing.hpp"
 #include "adaptive_downsample.hpp"
+#include "anchor_trace.hpp"
 #include "attitude_hold.hpp"
 #include "cached_plane.hpp"
 #include "correspondence_compaction.hpp"
@@ -487,6 +488,25 @@ int zupt_hold_scans = 0;
 // HEALTHY.
 fast_lio::ParkedHoldParams parked_hold_params;
 fast_lio::ParkedHoldState parked_hold_state;
+// Stationary-anchor trace (anchor_trace.hpp specifies the format). Observation only: the estimator never reads
+// any of it back. Transition records and counters are always on; scan records need zupt_anchor_trace_en.
+constexpr const char * kAnchorTraceLogger = "laser_mapping.zupt_anchor";
+bool zupt_anchor_trace_en = false;
+fast_lio::AnchorTraceCounters anchor_trace_counters;
+fast_lio::MonotonicSequence anchor_event_seq;
+fast_lio::MonotonicSequence anchor_scan_seq;
+fast_lio::MonotonicSequence anchor_id_seq;
+std::uint64_t zupt_anchor_id = 0;               // anchor_id of zupt_anchor_pos/rot; 0 = none
+std::int64_t zupt_anchor_created_ns = -1;       // end of the scan whose pose became the anchor
+std::int64_t anchor_last_evidence_ns = -1;      // end of the last scan the anchor step evaluated
+std::int64_t anchor_trace_hole_ns = 300000000;  // a longer gap is a scan hole: 3 scan periods
+fast_lio::AnchorScanRecord anchor_scan_record;  // the scan being processed
+bool anchor_scan_record_open = false;
+bool anchor_trace_body_was_static = false;  // the previous evaluated verdict, for motion edges
+bool anchor_trace_gap_run = false;          // inside a run of scans with IMU coverage gaps
+bool anchor_trace_bridge_run = false;       // inside a run of scans with bridged IMU gaps
+bool anchor_trace_epoch_reported = false;
+double input_epoch_fault_stamp = std::numeric_limits<double>::quiet_NaN();  // under mtx_buffer
 double last_twist_stamp = -1.0;  // newest wheel-speed sample time (s); -1 = none yet
 double last_twist_speed = 0.0;   // |v| of the newest wheel sample (m/s)
 V3D last_twist_v_body = V3D::Zero();  // the newest finite wheel sample, body frame (m/s), under mtx_twist
@@ -1089,13 +1109,15 @@ bool acceptInputEpoch(double previous, double current, const char * source)
     if (validImuForConsumption(sample.message))
       ++imu_consumption_counters.epochValidLost;
   clearBufferedInputsLocked();
-  if (!already_faulted)
+  if (!already_faulted) {
+    input_epoch_fault_stamp = current;
     RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
                  "[INPUT-EPOCH] %s clock discontinuity %.9f -> %.9f: input processing and odometry stopped; "
                  "restart the node after clocks stabilize to reset estimator and map state",
                  source,
                  previous,
                  current);
+  }
   return false;
 }
 
@@ -1408,8 +1430,9 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
 
 // Independent, front-end-agnostic evidence that the platform is parked. The
 // verdict itself lives in static_evidence.hpp (pure, unit-tested); this only
-// summarises the scan's IMU window and reads the newest wheel sample.
-bool body_is_static(const MeasureGroup & meas, double now)
+// summarises the scan's IMU window and reads the newest wheel sample. `trace`, when given, receives the verdict and
+// its inputs for the anchor trace.
+bool body_is_static(const MeasureGroup & meas, double now, fast_lio::AnchorScanRecord * trace = nullptr)
 {
   fast_lio::ImuWindowStats imu;
   imu.acc_min = std::numeric_limits<double>::max();
@@ -1442,7 +1465,17 @@ bool body_is_static(const MeasureGroup & meas, double now)
   params.wheel_speed_thresh = zupt_wheel_speed_thresh;
   params.wheel_max_age = zupt_wheel_max_age;
   params.require_wheel = zupt_require_wheel;
-  return fast_lio::bodyIsStatic(imu, wheel_age, wheel_speed, params);
+  const bool verdict = fast_lio::bodyIsStatic(imu, wheel_age, wheel_speed, params);
+  if (trace != nullptr) {
+    trace->body = verdict ? fast_lio::AnchorTraceBody::kStatic : fast_lio::AnchorTraceBody::kMoving;
+    trace->imu_n = imu.samples;
+    trace->gyr_max = imu.samples > 0 ? imu.gyr_max : std::numeric_limits<double>::quiet_NaN();
+    trace->acc_span = imu.samples > 0 && imu.acc_mean > 0.0 ? (imu.acc_max - imu.acc_min) / imu.acc_mean
+                                                            : std::numeric_limits<double>::quiet_NaN();
+    trace->wheel_age = wheel_age;
+    trace->wheel_speed = wheel_stamp > 0.0 ? wheel_speed : std::numeric_limits<double>::quiet_NaN();
+  }
+  return verdict;
 }
 
 double max_scan_duration_s = 0.0;  // 0 disables the device-specific upper bound.
@@ -1460,9 +1493,227 @@ void popLidarScan()
     lidar_receive_time_buffer.pop_front();
   lidar_pushed = false;
 }
+
+// Stationary-anchor trace (anchor_trace.hpp). Everything from here to markImuCoverageGap only reads the
+// estimator and writes the trace's own state.
+fast_lio::AnchorTraceGate anchorTraceGate(fast_lio::ReanchorState state)
+{
+  switch (state) {
+    case fast_lio::ReanchorState::kHealthy:
+      return fast_lio::AnchorTraceGate::kHealthy;
+    case fast_lio::ReanchorState::kBlind:
+      return fast_lio::AnchorTraceGate::kBlind;
+    case fast_lio::ReanchorState::kVerifying:
+      return fast_lio::AnchorTraceGate::kVerifying;
+    case fast_lio::ReanchorState::kLost:
+      return fast_lio::AnchorTraceGate::kLost;
+  }
+  return fast_lio::AnchorTraceGate::kNa;
+}
+
+void emitAnchorTraceLine(const std::string & line)
+{
+  RCLCPP_INFO(rclcpp::get_logger(kAnchorTraceLogger), "%s", line.c_str());
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::afterAnchorTraceLine)
+    fast_lio_test::afterAnchorTraceLine(line);
+#endif
+}
+
+// One transition record. Never throttled: the checker counts them.
+void anchorTransition(fast_lio::AnchorTraceEvent event, fast_lio::AnchorTraceReason reason, double stamp)
+{
+  fast_lio::AnchorTransition transition;
+  transition.event = event;
+  transition.reason = reason;
+  transition.event_seq = anchor_event_seq.next();
+  transition.scan_seq = anchor_scan_seq.last();
+  transition.stamp_ns = fast_lio::traceNs(stamp);
+  transition.anchor_id = zupt_anchor_id;
+  transition.anchor_valid = zupt_anchor_valid;
+  transition.created_ns = zupt_anchor_created_ns;
+  transition.last_evidence_ns = anchor_last_evidence_ns;
+  fast_lio::saturatingIncrement(&anchor_trace_counters.events);
+  emitAnchorTraceLine(fast_lio::formatAnchorTransition(transition));
+}
+
+// An input event that breaks the static evidence behind an anchor: counted every time, marked on the open scan
+// record, and logged when `report` is set.
+void anchorEvidence(
+  fast_lio::AnchorTraceReason reason, std::uint32_t bit, std::uint64_t * counter, double stamp, bool report)
+{
+  fast_lio::saturatingIncrement(counter);
+  if (anchor_scan_record_open)
+    anchor_scan_record.events |= bit;
+  if (report)
+    anchorTransition(fast_lio::AnchorTraceEvent::kEvidence, reason, stamp);
+}
+
+void beginAnchorScanRecord(double beg, double end)
+{
+  anchor_scan_record = fast_lio::AnchorScanRecord{};
+  anchor_scan_record.scan_seq = anchor_scan_seq.next();
+  fast_lio::saturatingIncrement(&anchor_trace_counters.scans);
+  anchor_scan_record.beg_ns = fast_lio::traceNs(beg);
+  anchor_scan_record.end_ns = fast_lio::traceNs(end);
+  if (anchor_last_evidence_ns >= 0 && anchor_scan_record.beg_ns >= 0)
+    anchor_scan_record.gap_ns = anchor_scan_record.beg_ns - anchor_last_evidence_ns;
+  anchor_scan_record.gate_pre = anchorTraceGate(reanchor_gate.state);
+  anchor_scan_record_open = true;
+}
+
+bool anchorTraceWantsCovariance()
+{
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::afterAnchorScanRecord)
+    return true;
+#endif
+  return zupt_anchor_trace_en;
+}
+
+template<class Matrix>
+void copyPoseCovarianceBlock(const Matrix & P, double out[36])
+{
+  for (int r = 0; r < 6; ++r)
+    for (int c = 0; c < 6; ++c)
+      out[r * 6 + c] = P(r, c);
+}
+
+void copyTraceState(const state_ikfom & x, double p[3], double q[4], double v[3])
+{
+  const auto & coeffs = x.rot.coeffs();  // x, y, z, w
+  q[0] = coeffs[3];
+  q[1] = coeffs[0];
+  q[2] = coeffs[1];
+  q[3] = coeffs[2];
+  for (int i = 0; i < 3; ++i) {
+    p[i] = x.pos[i];
+    v[i] = x.vel[i];
+  }
+}
+
+// The state the anchor step starts from.
+void anchorTraceBeforeStep(bool guard_degraded, bool degraded)
+{
+  if (!anchor_scan_record_open)
+    return;
+  auto & r = anchor_scan_record;
+  r.anchor_step = true;
+  r.guard_degraded = guard_degraded;
+  r.degraded = degraded;
+  r.action = fast_lio::AnchorTraceAction::kNone;
+  r.have_pre = true;
+  copyTraceState(kf.get_x(), r.pre_p, r.pre_q, r.pre_v);
+  copyPoseCovarianceBlock(kf.get_P(), r.p_pose_pre);
+}
+
+// What the anchor step wrote; `used` is the anchor the pose came from, 0 for none.
+void anchorTraceAction(fast_lio::AnchorTraceAction action, std::uint64_t used)
+{
+  if (!anchor_scan_record_open)
+    return;
+  anchor_scan_record.action = action;
+  if (used != 0)
+    anchor_scan_record.anchor_used = used;
+  anchor_scan_record.have_cov = true;
+}
+
+void anchorTraceRefreshed(double end)
+{
+  zupt_anchor_id = anchor_id_seq.next();
+  zupt_anchor_created_ns = fast_lio::traceNs(end);
+  fast_lio::saturatingIncrement(&anchor_trace_counters.anchor_refreshed);
+}
+
+void anchorTraceAfterStep(double end)
+{
+  anchor_last_evidence_ns = fast_lio::traceNs(end);
+  if (!anchor_scan_record_open)
+    return;
+  auto & r = anchor_scan_record;
+  r.zupt_active = zupt_active;
+  r.parked = parked_hold_state.active;
+  r.outcome = fast_lio::AnchorScanOutcome::kAfterAnchorStep;
+  if ((r.events & fast_lio::kAnchorEventImuCoverageGap) == 0u)
+    anchor_trace_gap_run = false;
+  if ((r.events & fast_lio::kAnchorEventImuBridge) == 0u)
+    anchor_trace_bridge_run = false;
+}
+
+// The state after the scan's last writer: what /Odometry carries.
+void captureAnchorPost()
+{
+  if (!anchor_scan_record_open)
+    return;
+  auto & r = anchor_scan_record;
+  r.have_post = true;
+  copyTraceState(state_point, r.post_p, r.post_q, r.post_v);
+  if (!r.have_cov)
+    return;
+  const auto P = kf.get_P();
+  copyPoseCovarianceBlock(P, r.p_pose_post);
+  if (!anchorTraceWantsCovariance())
+    return;
+  r.p_finite = P.allFinite();
+  using Covariance = std::decay_t<decltype(P)>;
+  const Covariance symmetric = 0.5 * (P + P.transpose());
+  const Eigen::SelfAdjointEigenSolver<Covariance> eig(symmetric, Eigen::EigenvaluesOnly);
+  r.p_min_eig = eig.eigenvalues().minCoeff();
+  const double spectral = eig.eigenvalues().cwiseAbs().maxCoeff();
+  r.p_sym = (P - P.transpose()).cwiseAbs().maxCoeff() / std::max(1.0, spectral);
+}
+
+void finishAnchorScanRecord()
+{
+  if (!anchor_scan_record_open)
+    return;
+  anchor_scan_record_open = false;
+  auto & r = anchor_scan_record;
+  r.anchor_id = zupt_anchor_id;
+  r.anchor_valid = zupt_anchor_valid;
+  r.anchor_created_ns = zupt_anchor_created_ns;
+  r.gate_post = anchorTraceGate(reanchor_gate.state);
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::afterAnchorScanRecord)
+    fast_lio_test::afterAnchorScanRecord(r);
+#endif
+  if (zupt_anchor_trace_en)
+    emitAnchorTraceLine(fast_lio::formatAnchorScanRecord(r));
+}
+
+// The counter summary (anchor_trace.hpp section 3), once at shutdown.
+void emitAnchorTraceCounters()
+{
+  const bool exhausted = anchor_event_seq.exhausted() || anchor_scan_seq.exhausted() || anchor_id_seq.exhausted();
+  emitAnchorTraceLine(fast_lio::formatAnchorCounters(anchor_trace_counters, anchor_event_seq.next(), exhausted));
+}
+
+// A scan dropped before processing still gets its record, so the trace accounts for every scan taken.
+void recordDroppedAnchorScan(fast_lio::AnchorScanOutcome outcome, double beg, double end)
+{
+  beginAnchorScanRecord(beg, end);
+  anchor_scan_record.outcome = outcome;
+  finishAnchorScanRecord();
+}
+
+// Closes the scan's record on every way out of the scan path, early returns included.
+struct AnchorScanTraceScope
+{
+  AnchorScanTraceScope(double beg, double end) { beginAnchorScanRecord(beg, end); }
+  ~AnchorScanTraceScope() { finishAnchorScanRecord(); }
+  AnchorScanTraceScope(const AnchorScanTraceScope &) = delete;
+  AnchorScanTraceScope & operator=(const AnchorScanTraceScope &) = delete;
+};
+
 void markImuCoverageGap(double end)
 {
   ++imu_coverage_drop_count;
+  anchorEvidence(fast_lio::AnchorTraceReason::kImuCoverageGap,
+                 fast_lio::kAnchorEventImuCoverageGap,
+                 &anchor_trace_counters.imu_coverage_gap,
+                 end,
+                 !anchor_trace_gap_run);
+  anchor_trace_gap_run = true;
   fast_lio::updateReanchorGate(&reanchor_gate, true, 0, 0.0, end, reanchor_params);
   flio_map_frozen = true;
   flio_degraded_odom = true;
@@ -1581,6 +1832,14 @@ bool finishImuBatch(const fast_lio::ImuProcessOutcome & outcome)
 bool sync_packages(MeasureGroup & meas)
 {
   std::unique_lock<std::mutex> lock(mtx_buffer);
+  if (input_epoch_guard.faulted() && !anchor_trace_epoch_reported) {
+    anchor_trace_epoch_reported = true;
+    anchorEvidence(fast_lio::AnchorTraceReason::kTimeEpoch,
+                   fast_lio::kAnchorEventTimeEpoch,
+                   &anchor_trace_counters.time_epoch,
+                   input_epoch_fault_stamp,
+                   true);
+  }
   if (!imu_fifo_transaction.acceptsInput(input_epoch_guard.faulted()))
     return false;
   if (lidar_buffer.empty() || imu_buffer.empty()) {
@@ -1616,6 +1875,9 @@ bool sync_packages(MeasureGroup & meas)
                            "[INPUT-TIME] invalid scan timing reason=%d count=%lu",
                            static_cast<int>(timing.status),
                            static_cast<unsigned long>(invalid_scan_time_count));
+      recordDroppedAnchorScan(fast_lio::AnchorScanOutcome::kDroppedInvalidTime,
+                              meas.lidar_beg_time,
+                              std::numeric_limits<double>::quiet_NaN());
       meas.imu.clear();
       popLidarScan();
       return false;
@@ -1633,6 +1895,7 @@ bool sync_packages(MeasureGroup & meas)
                            5000,
                            "[INPUT-TIME] nonadvancing scan count=%lu",
                            static_cast<unsigned long>(nonadvancing_scan_count));
+      recordDroppedAnchorScan(fast_lio::AnchorScanOutcome::kDroppedNonadvancing, meas.lidar_beg_time, lidar_end_time);
       meas.imu.clear();
       popLidarScan();
       return false;
@@ -1664,8 +1927,11 @@ bool sync_packages(MeasureGroup & meas)
     imu_fifo_transaction.settle(imu_buffer, pending_imu_token, fast_lio::ImuDisposition::kUncommitted);
     ++empty_scan_imu_count;
     frontendDrop();
+    beginAnchorScanRecord(meas.lidar_beg_time, meas.lidar_end_time);
+    anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kDroppedEmptyImu;
     markImuCoverageGap(meas.lidar_end_time);
     lock.unlock();
+    finishAnchorScanRecord();
     RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping.imu_transactions"),
                  "[IMU-CONSUMPTION-SYNC] reason=empty begin=%.9f end=%.9f token=%lu",
                  meas.lidar_beg_time,
@@ -1734,6 +2000,11 @@ std::function<void(std::size_t, double)> afterScanPrepared;
 std::function<void(std::size_t, double, int)> afterHModelRows;
 std::function<void(std::uint64_t, int, int, std::size_t, std::size_t, std::uint64_t)> afterImuConsumption;
 std::function<void()> beforeImuProcess;
+std::function<int(double)> overrideGuardDegraded;
+std::function<void(double, AnchorFixtureState &)> beforeAnchorStep;
+std::function<bool(double)> forceRunawayTrip;
+std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
+std::function<void(const std::string &)> afterAnchorTraceLine;
 
 ImuInputSnapshot inspectImuInput()
 {
@@ -1759,6 +2030,59 @@ int reconfirmLastImuBatch()
 }
 }  // namespace fast_lio_test
 #endif
+
+// The divergence guard's verdict for this scan. A test build may replace it to drive the anchor logic through a
+// fixed sequence; a production build returns it unchanged.
+bool guardVerdictForTest(bool verdict)
+{
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::overrideGuardDegraded) {
+    const int forced = fast_lio_test::overrideGuardDegraded(lidar_end_time);
+    if (forced >= 0)
+      return forced != 0;
+  }
+#endif
+  return verdict;
+}
+
+// The runaway watchdog's verdict for this scan; a test build may force a trip to reach the late map reset.
+fast_lio::RunawayVerdict runawayVerdictForTest(fast_lio::RunawayVerdict verdict)
+{
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::forceRunawayTrip && fast_lio_test::forceRunawayTrip(lidar_end_time)) {
+    verdict.tripped = true;
+    verdict.reason = fast_lio::RunawayReason::kWheel;
+  }
+#endif
+  return verdict;
+}
+
+// A test build may set the filter state right before the anchor step: the fixture's stand-in for what
+// registration produced. A production build does nothing here.
+void applyAnchorFixtureForTest()
+{
+#ifdef FASTLIO_TEST_HOOKS
+  if (!fast_lio_test::beforeAnchorStep)
+    return;
+  fast_lio_test::AnchorFixtureState fixture;
+  fast_lio_test::beforeAnchorStep(lidar_end_time, fixture);
+  if (fixture.overwrite) {
+    state_ikfom st = kf.get_x();
+    st.pos = V3D(fixture.pos[0], fixture.pos[1], fixture.pos[2]);
+    st.rot = SO3(fixture.rot_wxyz[0], fixture.rot_wxyz[1], fixture.rot_wxyz[2], fixture.rot_wxyz[3]);
+    st.vel = V3D(fixture.vel[0], fixture.vel[1], fixture.vel[2]);
+    kf.change_x(st);
+  }
+  if (fixture.overwrite_cov) {
+    auto P = kf.get_P();
+    P.setZero();
+    for (int i = 0; i < P.rows() && i < 23; ++i)
+      P(i, i) = fixture.cov_diag[i];
+    kf.change_P(P);
+  }
+  state_point = kf.get_x();
+#endif
+}
 
 void mapWorkerLoop()
 {
@@ -2192,6 +2516,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     if (gravity_align_degraded_active)
       health_flags |= 1u << 3;  // kFeHealthFlagLevelling: roll/pitch pulled onto the accel window mean
     odomAftMapped.twist.covariance[1] = static_cast<double>(health_flags);
+    if (anchor_scan_record_open)
+      anchor_scan_record.flags = static_cast<int>(health_flags);
     odomAftMapped.twist.covariance[7] = scan_obs_along;
     odomAftMapped.twist.covariance[14] = static_cast<double>(effct_feat_num);
     odomAftMapped.twist.covariance[21] = scan_far_frac;
@@ -3163,6 +3489,7 @@ public:
     this->declare_parameter<double>("zupt_wheel_speed_thresh", 0.05);
     this->declare_parameter<double>("zupt_wheel_max_age", 0.5);
     this->declare_parameter<bool>("zupt_require_wheel", false);
+    this->declare_parameter<bool>("zupt_anchor_trace_en", false);
     this->declare_parameter<bool>("zupt_parked_hold_en", false);
     this->declare_parameter<int>("zupt_parked_hold_scans", 3);
     this->declare_parameter<double>("zupt_hold_pos_noise", 0.05);
@@ -3535,6 +3862,7 @@ public:
     this->get_parameter_or<double>("zupt_wheel_speed_thresh", zupt_wheel_speed_thresh, 0.05);
     this->get_parameter_or<double>("zupt_wheel_max_age", zupt_wheel_max_age, 0.5);
     this->get_parameter_or<bool>("zupt_require_wheel", zupt_require_wheel, false);
+    this->get_parameter_or<bool>("zupt_anchor_trace_en", zupt_anchor_trace_en, false);
     this->get_parameter_or<bool>("zupt_parked_hold_en", parked_hold_params.enabled, false);
     this->get_parameter_or<int>("zupt_parked_hold_scans", parked_hold_params.engage_scans, 3);
     this->get_parameter_or<double>("zupt_hold_pos_noise", parked_hold_params.pos_noise, 0.05);
@@ -3614,6 +3942,8 @@ public:
     this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
     this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
     this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
+    // The anchor trace calls a gap of more than three scan periods a scan hole.
+    anchor_trace_hole_ns = p_pre->SCAN_RATE > 0 ? std::llround(3e9 / p_pre->SCAN_RATE) : 300000000;
     this->get_parameter_or<double>("preprocess.max_scan_duration_s", max_scan_duration_s, 0.0);
     this->get_parameter_or<double>("imu_coverage.max_gap_s", p_imu->coverage_params.max_gap_s, 0.0);
     this->get_parameter_or<double>("imu_coverage.max_extrapolation_s", p_imu->coverage_params.max_extrapolation_s, 0.0);
@@ -4035,6 +4365,7 @@ public:
 
   ~LaserMappingNode()
   {
+    emitAnchorTraceCounters();
     {
       std::lock_guard<std::mutex> lock(mtx_buffer);
       std::uint64_t pendingValid = 0;
@@ -4165,6 +4496,14 @@ private:
   void timer_callback()
   {
     if (sync_packages(Measures)) {
+      const AnchorScanTraceScope anchor_trace_scope(Measures.lidar_beg_time, Measures.lidar_end_time);
+      if (anchor_scan_record.gap_ns > anchor_trace_hole_ns) {
+        anchorEvidence(fast_lio::AnchorTraceReason::kScanHole,
+                       fast_lio::kAnchorEventScanHole,
+                       &anchor_trace_counters.scan_hole,
+                       Measures.lidar_end_time,
+                       true);
+      }
       frontend_runaway = false;
       if (imu_backlog_reanchor_required) {
         markImuCoverageGap(Measures.lidar_end_time);
@@ -4175,6 +4514,7 @@ private:
         p_imu->first_lidar_time = first_lidar_time;
         flg_first_scan = false;
         finishImuBatch({fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kBootstrap});
+        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kBootstrap;
         return;
       }
 
@@ -4210,11 +4550,13 @@ private:
         feats_undistort->clear();
         finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation});
         RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: %s", error.what());
+        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
         return;
       } catch (...) {
         feats_undistort->clear();
         finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation});
         RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: unknown exception");
+        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
         return;
       }
       if (p_imu->initializationDegraded() && !imu_init_degraded_warned_) {
@@ -4223,10 +4565,14 @@ private:
                     "[IMU-INIT] sustained still-gate timeout: initialized from a MOVING IMU window; "
                     "map roll/pitch may be biased (initialization degraded)");
       }
-      if (!finishImuBatch(p_imu->lastOutcome()))
+      if (!finishImuBatch(p_imu->lastOutcome())) {
+        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
         return;
+      }
       if (!processed) {
+        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuNotProcessed;
         if (p_imu->lastStatus() == ImuProcess::ProcessStatus::kCoverageGap) {
+          anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuCoverageGap;
           markImuCoverageGap(Measures.lidar_end_time);
           frontendDrop();
           if (frontend_observation_en)
@@ -4248,6 +4594,12 @@ private:
       if (p_imu->gap_summary.gaps > 0) {
         const fast_lio::ImuGapSummary & gaps = p_imu->gap_summary;
         ++imu_gap_bridged_count;
+        anchorEvidence(fast_lio::AnchorTraceReason::kImuBridge,
+                       fast_lio::kAnchorEventImuBridge,
+                       &anchor_trace_counters.imu_bridge,
+                       Measures.lidar_end_time,
+                       !anchor_trace_bridge_run);
+        anchor_trace_bridge_run = true;
         RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping.imu_transactions"),
                      "[IMU-CONSUMPTION-GAP] token=%lu begin=%.9f end=%.9f gaps=%d longest_interval=%.9f total=%.9f "
                      "scans_total=%lu",
@@ -4327,6 +4679,7 @@ private:
         }
         RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
         frontendDrop();
+        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kNoCloud;
         return;
       }
 
@@ -4931,8 +5284,8 @@ private:
           flio_engulfed = engulf_latched;
         }
       }
-      const bool flio_in_degraded =
-        divergence_guard_en && (consec_low_eff >= divergence_guard_streak || flio_vel_runaway || flio_engulfed);
+      const bool flio_in_degraded = guardVerdictForTest(
+        divergence_guard_en && (consec_low_eff >= divergence_guard_streak || flio_vel_runaway || flio_engulfed));
 
       /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
        *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll
@@ -5249,6 +5602,11 @@ private:
       // from this scan at the current pose. The jump is real, is logged, and
       // reaches consumers through the health flags.
       auto rebuild_local_map = [&](const char * tag) {
+        anchorEvidence(fast_lio::AnchorTraceReason::kMapReset,
+                       fast_lio::kAnchorEventMapReset,
+                       &anchor_trace_counters.map_reset,
+                       lidar_end_time,
+                       true);
         int map_before = 0;
         const bool kept_prior = rebuildLocalMapStorage(map_before);
         if (kept_prior) {
@@ -5304,8 +5662,15 @@ private:
                     res_mean_last,
                     reanchor_reference.res_median,
                     reanchor_gate.reanchors);
+        if (anchor_scan_record_open)
+          anchor_scan_record.events |= fast_lio::kAnchorEventReanchored;
       }
       if (reanchor.just_lost) {
+        anchorEvidence(fast_lio::AnchorTraceReason::kLost,
+                       fast_lio::kAnchorEventLost,
+                       &anchor_trace_counters.lost,
+                       lidar_end_time,
+                       true);
         RCLCPP_ERROR(this->get_logger(),
                      "[REANCHOR] LOST: no re-registration within %.1fs (effct=%d res=%.3fm) — the pose no longer fits "
                      "the map; policy=%s",
@@ -5323,7 +5688,7 @@ private:
       // stretch resumes motion.  Left raised while moving, it tells the fusion
       // node to publish IMU dead reckoning as a pinned pose and to reject the
       // GNSS displacement that is the platform actually moving.
-      const auto release_static_hold = [&](const char * reason) {
+      const auto release_static_hold = [&](const char * reason, fast_lio::AnchorTraceReason trace_reason) {
         if (!zupt_active) {
           return;
         }
@@ -5335,12 +5700,24 @@ private:
                     scan_far_frac);
         zupt_active = false;
         zupt_hold_scans = 0;
+        anchorTransition(fast_lio::AnchorTraceEvent::kPinReleased, trace_reason, lidar_end_time);
       };
+      applyAnchorFixtureForTest();
+      anchorTraceBeforeStep(flio_in_degraded, reanchor.degraded);
       // One verdict per scan: the static hold, the parked ZUPT on the healthy
       // branch and the runaway watchdog must all answer "is it parked?" the same
       // way, and the summary costs an IMU-window pass. What that verdict is
       // allowed to do to the state is the decision table in zupt_policy.hpp.
-      const bool body_static = body_is_static(Measures, lidar_end_time);
+      const bool body_static =
+        body_is_static(Measures, lidar_end_time, anchor_scan_record_open ? &anchor_scan_record : nullptr);
+      if (!body_static && anchor_trace_body_was_static) {
+        anchorEvidence(fast_lio::AnchorTraceReason::kMotion,
+                       fast_lio::kAnchorEventMotion,
+                       &anchor_trace_counters.motion,
+                       lidar_end_time,
+                       true);
+      }
+      anchor_trace_body_was_static = body_static;
       fast_lio::ZuptPolicyInputs zupt_in;
       zupt_in.scan_degraded = reanchor.degraded;
       zupt_in.zupt_enabled = zupt_en;
@@ -5354,8 +5731,14 @@ private:
       // honest rather than reporting a hold that has no reference.
       const auto parked = fast_lio::updateParkedHold(
         &parked_hold_state, body_static && zupt_anchor_valid, parked_hold_params);
+      if (parked.just_engaged) {
+        anchorTransition(
+          fast_lio::AnchorTraceEvent::kParkedPriorEngaged, fast_lio::AnchorTraceReason::kNone, lidar_end_time);
+      }
       if (parked.just_released) {
         RCLCPP_WARN(this->get_logger(), "[ZUPT] parked hold released: the platform is moving again");
+        anchorTransition(
+          fast_lio::AnchorTraceEvent::kParkedPriorReleased, fast_lio::AnchorTraceReason::kMotion, lidar_end_time);
       }
       if (reanchor.degraded) {
         state_ikfom st = kf.get_x();
@@ -5373,6 +5756,8 @@ private:
           resetVelocityCovariance(zupt_vel_reset_sigma);
           state_point = kf.get_x();
           ++zupt_hold_scans;
+          anchorTraceAction(fast_lio::AnchorTraceAction::kPin, zupt_anchor_id);
+          fast_lio::saturatingIncrement(&anchor_trace_counters.pin_applied);
           if (!zupt_active) {
             zupt_active = true;
             RCLCPP_WARN(this->get_logger(),
@@ -5382,12 +5767,15 @@ private:
                         zupt_anchor_pos[0],
                         zupt_anchor_pos[1],
                         zupt_anchor_pos[2]);
+            anchorTransition(
+              fast_lio::AnchorTraceEvent::kPinEngaged, fast_lio::AnchorTraceReason::kNone, lidar_end_time);
           }
         } else {
           // Not parked, and the scan still cannot confirm the pose: this is the
           // stretch the hold must NOT survive into.
-          release_static_hold("moving again while degraded");
+          release_static_hold("moving again while degraded", fast_lio::AnchorTraceReason::kMotion);
           if (zupt_verdict.action == fast_lio::ZuptAction::kZeroVelocity) {
+            anchorTraceAction(fast_lio::AnchorTraceAction::kZeroVelocity, 0);
             // A body speed above the platform's physical maximum is a
             // GUARANTEED-WRONG state, not a bound to enforce. Clamping it to
             // max_speed (the old behaviour) turned the clamp into an
@@ -5443,8 +5831,9 @@ private:
           zupt_anchor_pos = state_point.pos;
           zupt_anchor_rot = state_point.rot;
           zupt_anchor_valid = true;
+          anchorTraceRefreshed(lidar_end_time);
         }
-        release_static_hold("scan healthy");
+        release_static_hold("scan healthy", fast_lio::AnchorTraceReason::kScanHealthy);
         // A parked platform has zero velocity, and a healthy-looking scan does not
         // enforce that: with far_frac 0.84 the correspondences pin rotation and
         // leave translation nearly free, so the velocity state rides the IMU bias
@@ -5455,6 +5844,7 @@ private:
         // only: the healthy scan owns the pose, so a false "parked" costs one scan
         // of re-convergence rather than a pin at the wrong place.
         if (zupt_verdict.action == fast_lio::ZuptAction::kZeroVelocity) {
+          anchorTraceAction(fast_lio::AnchorTraceAction::kZeroVelocity, 0);
           state_ikfom st = kf.get_x();
           st.vel.setZero();
           gravity_align_vel_overwritten = true;
@@ -5494,6 +5884,11 @@ private:
           if (fast_lio::parkedHoldShouldApply(zupt_anchor_pos, anchor_rot, stp.pos, est_rot, parked_hold_params)) {
             const auto hold = fast_lio::parkedHoldMeasurement(
               zupt_anchor_pos, anchor_rot, stp.pos, est_rot, stp.vel, parked_hold_params);
+            if (anchor_scan_record_open) {
+              anchor_scan_record.parked_applied = true;
+              anchorTraceAction(anchor_scan_record.action, zupt_anchor_id);
+            }
+            fast_lio::saturatingIncrement(&anchor_trace_counters.parked_prior_applied);
             kf.update_simple(hold.H, hold.residual, hold.R_diag);
             state_point = kf.get_x();
             RCLCPP_WARN_THROTTLE(this->get_logger(),
@@ -5525,15 +5920,12 @@ private:
           wheel_speed = last_twist_speed;
         }
         const double wheel_age = wheel_stamp > 0.0 ? std::fabs(lidar_end_time - wheel_stamp) : -1.0;
-        const auto runaway = fast_lio::updateRunawayWatchdog(&runaway_state,
-                                                             lidar_end_time,
-                                                             state_point.vel.norm(),
-                                                             body_static,
-                                                             wheel_age,
-                                                             wheel_speed,
-                                                             runaway_params);
+        const auto runaway = runawayVerdictForTest(fast_lio::updateRunawayWatchdog(
+          &runaway_state, lidar_end_time, state_point.vel.norm(), body_static, wheel_age, wheel_speed, runaway_params));
         if (runaway.tripped) {
           frontend_runaway = true;
+          if (anchor_scan_record_open)
+            anchor_scan_record.events |= fast_lio::kAnchorEventRunawayTrip;
           RCLCPP_ERROR(this->get_logger(),
                        "[RUNAWAY] estimate contradicted for %.1fs (%s): speed=%.2fm/s wheel=%.2fm/s effct=%d "
                        "res=%.3fm — trip #%u, policy=%s",
@@ -5568,9 +5960,15 @@ private:
             // hold: freeze the map and let the health flags stop downstream from
             // consuming a pose we no longer believe.
             fast_lio::tripReanchorLost(&reanchor_gate);
+            anchorEvidence(fast_lio::AnchorTraceReason::kLost,
+                           fast_lio::kAnchorEventLost,
+                           &anchor_trace_counters.lost,
+                           lidar_end_time,
+                           true);
           }
         }
       }
+      anchorTraceAfterStep(lidar_end_time);
 
       /*** Optional degeneracy diagnostics ***/
       if (degeneracy_debug) {
@@ -5719,7 +6117,12 @@ private:
       }
 
       /******* Publish odometry *******/
+      captureAnchorPost();
       publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+      if (anchor_scan_record_open) {
+        anchor_scan_record.published = true;
+        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kPublished;
+      }
       if (frontend_observation_en)
         publishFrontendObservation(true);
 
@@ -5976,6 +6379,11 @@ private:
     prior_map_installed_T_ = T_map_lidar_odom;
     prior_map_installed_ = true;
     ++prior_map_installs_;
+    anchorEvidence(fast_lio::AnchorTraceReason::kReferenceChanged,
+                   fast_lio::kAnchorEventReferenceChanged,
+                   &anchor_trace_counters.reference_changed,
+                   lidar_end_time,
+                   true);
 
     const Eigen::Vector3d t = T_map_lidar_odom.translation();
     const Eigen::Matrix3d & r = T_map_lidar_odom.linear();

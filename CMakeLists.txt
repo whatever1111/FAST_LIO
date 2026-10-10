@@ -244,6 +244,22 @@ if(BUILD_TESTING)
       endif()
     endforeach()
     target_compile_definitions(test_ros_imu_fault PRIVATE FASTLIO_INPUT_FAULT_TEST)
+    # The stationary anchor on the production call chain. Each scenario activates the component in its own
+    # forked child; like the scan fixtures it uses the broker's ROS domain and the real /Odometry endpoint.
+    ament_add_gtest(test_anchor_lifecycle_node test/test_anchor_lifecycle_node.cpp TIMEOUT 600)
+    set_tests_properties(test_anchor_lifecycle_node PROPERTIES RUN_SERIAL TRUE)
+    target_include_directories(test_anchor_lifecycle_node PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})
+    target_compile_definitions(test_anchor_lifecycle_node PRIVATE
+      FASTLIO_TEST_COMPONENT_PATH="$<TARGET_FILE:fastlio_mapping_test_component>")
+    target_link_libraries(test_anchor_lifecycle_node fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen)
+    ament_target_dependencies(test_anchor_lifecycle_node ${dependencies} class_loader)
+    if(cpp_typesupport_target)
+      target_link_libraries(test_anchor_lifecycle_node ${cpp_typesupport_target})
+    else()
+      rosidl_target_interfaces(test_anchor_lifecycle_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
+    endif()
     # One actual component activation per process: production globals are not reset between nodes.
     foreach(capacity_case negative zero small)
       # Direct linking and ClassLoader must resolve the same physical build DSO.
@@ -332,6 +348,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_runaway_watchdog test/test_runaway_watchdog.cpp)
   if(TARGET test_runaway_watchdog)
     target_include_directories(test_runaway_watchdog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
+  # Pure header, no ROS: the stationary-anchor trace format a checker parses.
+  ament_add_gtest(test_anchor_trace test/test_anchor_trace.cpp)
+  if(TARGET test_anchor_trace)
+    target_include_directories(test_anchor_trace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
   ament_add_gtest(test_adaptive_downsample test/test_adaptive_downsample.cpp)
   if(TARGET test_adaptive_downsample)

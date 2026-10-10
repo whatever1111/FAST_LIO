@@ -57,14 +57,20 @@
 // own time, not a scan's end, so its elapsed_ns can be more than deadline_ns -
 // start_ns; its scan_seq is the last scan taken off the queue, and a scan
 // still queued has no number yet. A scan processed after that record starts
-// from trust_pre=unanchored, also when its end is before deadline_ns. The scan
-// path is as before: every scan that is processed acts on the deadline first,
-// at its own end, and writes the record with path=scan when that end is at or
-// past deadline_ns and no IMU sample wrote it before. So when an episode
-// opens after the samples at or past its deadline_ns were taken, the record
-// comes from whichever is processed next: an IMU sample (path=idle), or a scan
-// whose end is at or past deadline_ns (path=scan). Only the scan hole the idle
-// check finds still means that no scan was queued.
+// from trust_pre=unanchored, also when its end is before deadline_ns. On the
+// scan path, the entry checks of every scan that is processed first find a
+// scan hole, which may open an episode, then check the deadline at that
+// scan's end. A deadline record is written with path=scan only if that check
+// still finds the episode pending and the end is at or past deadline_ns. An
+// episode opened by that scan-hole check can therefore expire in the same
+// scan. The IMU check also checks the deadline again after opening a
+// scan-hole episode, so the same accepted sample can write both pending and
+// unanchored with path=idle. If an episode opens after the last deadline
+// check for its input, earlier accepted IMU samples are not replayed against
+// it. A later deadline check writes the record only while it remains pending
+// and that check's input time is at or past deadline_ns, using that input's
+// stamp and path. Only the scan hole the idle check finds still means that no
+// scan was queued.
 //
 // Sequence rules
 //   event_seq   1, 2, 3, ... over the process lifetime, one per transition record

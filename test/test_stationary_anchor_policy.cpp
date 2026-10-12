@@ -74,6 +74,20 @@ public:
   // Scans that return before their anchor step (no evidence evaluated, nothing dropped explicitly).
   void skip(int scans) { next += scans; }
 
+  // A scan that returns before its anchor step, closed the way the node closes it: the static evidence of the IMU
+  // window the filter committed for it (`committed`) may end the anchor, then a candidate ends as unevaluated.
+  // Returns what the window check dropped.
+  AnchorDrop exit(StaticEvidence window, bool committed = true)
+  {
+    last_start = fast_lio::beginAnchorScan(&anchor, beginOf(next), params);
+    const AnchorDrop drop = fast_lio::unevaluatedConsumedImuDrop(anchor, committed, window);
+    if (drop != AnchorDrop::kNone)
+      fast_lio::dropAnchor(&anchor, drop);
+    fast_lio::dropUnevaluatedCandidate(&anchor, endOf(next));
+    ++next;
+    return drop;
+  }
+
   StationaryAnchor anchor;
   StationaryAnchorParams params;
   AnchorScanStart last_start;
@@ -429,6 +443,221 @@ TEST(StationaryAnchorPolicy, ARepeatedOrOldScanThatWasNotEvaluatedIsNoMissingSca
   EXPECT_TRUE(fast_lio::dropUnevaluatedCandidate(&life.anchor, -1));
   EXPECT_EQ(life.anchor.state, AnchorState::kEmpty);
   EXPECT_FALSE(fast_lio::dropUnevaluatedCandidate(&life.anchor, endOf(life.next))) << "nothing left to end";
+}
+
+// ── Scans that took their IMU window and returned before the anchor step ─────
+
+TEST(StationaryAnchorPolicy, ACommittedWindowThatIsNotParkedEndsTheAnchor)
+{
+  // No later scan sees a window the filter has taken, so motion in it, or evidence that cannot tell, ends the
+  // anchor on the scan that took it, for good. The degraded parked scan after it has nothing to hold to and only
+  // zeroes its velocity; a new anchor needs its own run of healthy parked scans and a new ID.
+  for (const StaticEvidence window : {StaticEvidence::kMoving, StaticEvidence::kUnknown}) {
+    const AnchorDrop expected = window == StaticEvidence::kMoving ? AnchorDrop::kMotion : AnchorDrop::kEvidenceUnknown;
+    Lifecycle life;
+    const std::uint64_t old_id = life.commit();
+    const std::int64_t watermark = life.anchor.last_evidence_end_ns;
+    EXPECT_EQ(life.exit(window), expected);
+    EXPECT_EQ(life.anchor.state, AnchorState::kEmpty);
+    EXPECT_EQ(life.anchor.last_drop, expected);
+    EXPECT_EQ(life.anchor.id, old_id) << "the anchor that ended keeps its ID";
+    EXPECT_EQ(life.anchor.last_evidence_end_ns, watermark) << "the window is no evaluated evidence";
+
+    const AnchorStep parked = life.stationary(true);
+    EXPECT_FALSE(parked.usable || parked.started || parked.committed);
+    fast_lio::ZuptPolicyInputs in;
+    in.scan_degraded = true;
+    in.zupt_enabled = true;
+    in.anchor_valid = parked.usable;
+    in.body_static = true;
+    in.speed = 0.4;
+    in.max_speed = 30.0;
+    const fast_lio::ZuptDecision decision = fast_lio::decideZupt(in);
+    EXPECT_EQ(decision.action, fast_lio::ZuptAction::kZeroVelocity);
+    EXPECT_FALSE(decision.hold);
+
+    const std::uint64_t new_id = life.commit();
+    EXPECT_GT(new_id, old_id);
+    EXPECT_TRUE(life.stationary(true).usable);
+    EXPECT_EQ(life.anchor.id, new_id);
+  }
+}
+
+TEST(StationaryAnchorPolicy, ParkedCommittedWindowsKeepTheAnchorAndAreNoEvidence)
+{
+  // Up to three such scans with the platform parked in their windows end nothing and count for nothing: the anchor
+  // keeps its ID, episode, count and times, and the degraded parked scan after them, as far from the last evaluated
+  // scan as the bound allows, holds to it.
+  for (int exits = 1; exits <= 3; ++exits) {
+    Lifecycle life;
+    const std::uint64_t id = life.commit();
+    const StationaryAnchor before = life.anchor;
+    for (int i = 0; i < exits; ++i) {
+      EXPECT_EQ(life.exit(StaticEvidence::kStationary), AnchorDrop::kNone) << exits << " exits";
+      EXPECT_FALSE(life.last_start.hole) << exits << " exits";
+    }
+    EXPECT_EQ(life.anchor.state, AnchorState::kValid) << exits << " exits";
+    EXPECT_EQ(life.anchor.id, id);
+    EXPECT_EQ(life.anchor.episode, before.episode);
+    EXPECT_EQ(life.anchor.confirmed_scans, before.confirmed_scans);
+    EXPECT_EQ(life.anchor.created_ns, before.created_ns);
+    EXPECT_EQ(life.anchor.committed_ns, before.committed_ns);
+    EXPECT_EQ(life.anchor.last_evidence_end_ns, before.last_evidence_end_ns);
+    const AnchorStep parked = life.stationary(true);
+    EXPECT_FALSE(life.last_start.hole) << exits << " exits";
+    EXPECT_EQ(life.last_start.gap_ns, exits * kPeriod);
+    EXPECT_TRUE(parked.usable) << exits << " exits";
+    EXPECT_EQ(life.anchor.id, id);
+  }
+}
+
+TEST(StationaryAnchorPolicy, AWindowTheFilterDidNotCommitIsLeftToTheScanThatTakesIt)
+{
+  // A window the filter kept, or never took, is not spent: whatever it would show, the scan that takes it judges
+  // it at its own anchor step. The "unknown" of a window nobody evaluated ends nothing.
+  for (const StaticEvidence window : {StaticEvidence::kStationary, StaticEvidence::kMoving, StaticEvidence::kUnknown}) {
+    Lifecycle life;
+    const std::uint64_t id = life.commit();
+    EXPECT_EQ(life.exit(window, false), AnchorDrop::kNone);
+    EXPECT_EQ(life.anchor.state, AnchorState::kValid);
+    EXPECT_EQ(life.anchor.id, id);
+    const AnchorStep taken = life.scan(window, true);
+    EXPECT_EQ(taken.usable, window == StaticEvidence::kStationary);
+    EXPECT_EQ(taken.dropped, window != StaticEvidence::kStationary);
+  }
+}
+
+TEST(StationaryAnchorPolicy, ACandidateKeepsTheRuleForScansThatWereNotEvaluated)
+{
+  // A candidate's confirming scans must be consecutive, whatever the window of the scan that broke the run: it
+  // ends as scan_not_evaluated, and the count starts again on a new candidate.
+  for (const bool committed : {true, false}) {
+    for (const StaticEvidence window :
+         {StaticEvidence::kStationary, StaticEvidence::kMoving, StaticEvidence::kUnknown}) {
+      Lifecycle life;
+      life.stationary();
+      life.stationary();
+      ASSERT_EQ(life.anchor.state, AnchorState::kQualifying);
+      const std::uint64_t candidate = life.anchor.id;
+      EXPECT_EQ(life.exit(window, committed), AnchorDrop::kNone);
+      EXPECT_EQ(life.anchor.state, AnchorState::kEmpty);
+      EXPECT_EQ(life.anchor.last_drop, AnchorDrop::kScanNotEvaluated);
+      EXPECT_TRUE(life.stationary().started);
+      EXPECT_GT(life.anchor.id, candidate);
+      EXPECT_FALSE(life.stationary().committed);
+      EXPECT_TRUE(life.stationary().committed);
+    }
+  }
+}
+
+TEST(StationaryAnchorPolicy, AWindowFindsNothingToEndOnceTheAnchorIsGone)
+{
+  // No anchor yet, or one an earlier event of the same scan already ended: the window ends nothing, the first
+  // reason stands, and nothing is started or revived.
+  for (const StaticEvidence window : {StaticEvidence::kMoving, StaticEvidence::kUnknown}) {
+    Lifecycle empty;
+    EXPECT_EQ(empty.exit(window), AnchorDrop::kNone);
+    EXPECT_EQ(empty.anchor.state, AnchorState::kEmpty);
+    EXPECT_EQ(empty.anchor.id, 0u);
+
+    Lifecycle life;
+    const std::uint64_t id = life.commit();
+    fast_lio::beginAnchorScan(&life.anchor, beginOf(life.next), life.params);
+    ASSERT_TRUE(fast_lio::dropAnchor(&life.anchor, AnchorDrop::kImuCoverageGap));
+    EXPECT_EQ(fast_lio::unevaluatedConsumedImuDrop(life.anchor, true, window), AnchorDrop::kNone);
+    EXPECT_EQ(life.anchor.state, AnchorState::kEmpty);
+    EXPECT_EQ(life.anchor.last_drop, AnchorDrop::kImuCoverageGap);
+    EXPECT_EQ(life.anchor.id, id);
+  }
+}
+
+TEST(StationaryAnchorPolicy, OneWindowThatIsNotParkedInARunOfExitsEndsTheAnchorOnce)
+{
+  // One to three such scans, the first, a middle or the last of them with motion (or evidence that cannot tell)
+  // in its window and the platform parked in the others: each window is judged on its own, so parked windows
+  // neither average the motion away nor bring the anchor back. It ends once, on the window that showed it.
+  for (const StaticEvidence shown : {StaticEvidence::kMoving, StaticEvidence::kUnknown}) {
+    const AnchorDrop expected = shown == StaticEvidence::kMoving ? AnchorDrop::kMotion : AnchorDrop::kEvidenceUnknown;
+    for (int exits = 1; exits <= 3; ++exits) {
+      for (int at = 0; at < exits; ++at) {
+        Lifecycle life;
+        const std::uint64_t id = life.commit();
+        int drops = 0;
+        for (int i = 0; i < exits; ++i) {
+          const AnchorDrop drop = life.exit(i == at ? shown : StaticEvidence::kStationary);
+          EXPECT_EQ(drop, i == at ? expected : AnchorDrop::kNone) << exits << " exits, shown at " << at << ", " << i;
+          drops += drop != AnchorDrop::kNone ? 1 : 0;
+          EXPECT_EQ(life.anchor.state, i < at ? AnchorState::kValid : AnchorState::kEmpty);
+          EXPECT_EQ(life.anchor.id, id);
+        }
+        EXPECT_EQ(drops, 1);
+        EXPECT_EQ(life.anchor.last_drop, expected);
+        EXPECT_FALSE(life.stationary(true).usable) << exits << " exits, shown at " << at;
+      }
+    }
+  }
+}
+
+TEST(StationaryAnchorPolicy, ParkedWindowsDoNotMoveTheGapBound)
+{
+  // Parked windows are no evaluated evidence: the bound still runs from the last scan the anchor step evaluated,
+  // to the nanosecond and both ways.
+  for (const std::int64_t delta : {-1, 0, 1}) {
+    for (const std::int64_t sign : {1, -1}) {
+      Lifecycle life;
+      life.commit();
+      const std::int64_t watermark = life.anchor.last_evidence_end_ns;
+      life.exit(StaticEvidence::kStationary);
+      life.exit(StaticEvidence::kStationary);
+      ASSERT_EQ(life.anchor.state, AnchorState::kValid);
+      const std::int64_t gap = sign * (life.params.max_scan_gap_ns + delta);
+      const AnchorScanStart start = fast_lio::beginAnchorScan(&life.anchor, watermark + gap, life.params);
+      EXPECT_EQ(start.gap_ns, gap);
+      EXPECT_EQ(start.hole, delta > 0) << "gap " << gap << " ns";
+      EXPECT_EQ(life.anchor.state == AnchorState::kValid, delta <= 0) << "gap " << gap << " ns";
+    }
+  }
+  // Four parked windows in a row: the fourth still begins within the bound, the scan after it does not.
+  Lifecycle life;
+  life.commit();
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(life.exit(StaticEvidence::kStationary), AnchorDrop::kNone);
+    EXPECT_FALSE(life.last_start.hole) << "exit " << i + 1;
+  }
+  EXPECT_FALSE(life.stationary(true).usable);
+  EXPECT_TRUE(life.last_start.hole);
+  EXPECT_EQ(life.last_start.gap_ns, 4 * kPeriod);
+  EXPECT_EQ(life.anchor.last_drop, AnchorDrop::kScanHole);
+}
+
+TEST(StationaryAnchorPolicy, AfterAWindowEndedTheAnchorZuptKeepsItsTable)
+{
+  // The window check only ends the anchor; what a later scan writes is decideZupt's, from that scan's own
+  // evidence and without the anchor. Evidence that still cannot tell is not "parked": nothing is pinned, and the
+  // velocity is zeroed only above the speed ceiling, as with ZUPT off.
+  Lifecycle life;
+  life.commit();
+  ASSERT_EQ(life.exit(StaticEvidence::kUnknown), AnchorDrop::kEvidenceUnknown);
+  const AnchorStep unknown = life.scan(StaticEvidence::kUnknown, true);
+  EXPECT_FALSE(unknown.usable || unknown.started || unknown.dropped);
+  for (const bool enabled : {true, false}) {
+    for (const bool body_static : {false, true}) {
+      for (const double speed : {0.4, 31.0}) {
+        fast_lio::ZuptPolicyInputs in;
+        in.scan_degraded = true;
+        in.zupt_enabled = enabled;
+        in.anchor_valid = unknown.usable;
+        in.body_static = body_static;
+        in.speed = speed;
+        in.max_speed = 30.0;
+        const fast_lio::ZuptDecision decision = fast_lio::decideZupt(in);
+        const bool zero = (enabled && body_static) || speed > in.max_speed;
+        EXPECT_EQ(decision.action, zero ? fast_lio::ZuptAction::kZeroVelocity : fast_lio::ZuptAction::kNone)
+          << "zupt " << enabled << " static " << body_static << " speed " << speed;
+        EXPECT_FALSE(decision.hold);
+      }
+    }
+  }
 }
 
 TEST(StationaryAnchorPolicy, AScanWithoutABeginTimeIsAHole)

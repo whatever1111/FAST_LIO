@@ -2040,7 +2040,8 @@ void beginAnchorLifecycleScan(double beg, double end)
 }
 
 // A scan that was taken and ended without its static evidence being evaluated is a missing scan to a candidate,
-// whose confirming scans must be consecutive (stationary_anchor_policy.hpp). An anchor is left to the scan-gap bound.
+// whose confirming scans must be consecutive (stationary_anchor_policy.hpp). An anchor is left to the scan-gap bound
+// and to the IMU window the filter committed for the scan (AnchorScanScope).
 void dropUnevaluatedAnchorCandidate(double end)
 {
   const fast_lio::AnchorState before = stationary_anchor.state;
@@ -2049,19 +2050,29 @@ void dropUnevaluatedAnchorCandidate(double end)
 }
 
 // The scan path's bracket around one scan: its record and the start-of-scan checks on the way in; on every way
-// out, early returns included, the candidate a scan that never reached the anchor step leaves behind, then the
-// record. The loss the gate declared belongs to this scan's outputs only and ends with it.
+// out, early returns included, what a scan that never reached the anchor step leaves behind, then the record. Such a
+// scan ends a valid anchor when the IMU window the filter committed for it shows motion or cannot show the platform
+// parked (stationary_anchor_policy.hpp), and a candidate in any case. The loss the gate declared belongs to this
+// scan's outputs only and ends with it.
 struct AnchorScanScope
 {
-  AnchorScanScope(double beg, double end) : end_(end)
+  explicit AnchorScanScope(const MeasureGroup & measures) : measures_(measures), end_(measures.lidar_end_time)
   {
-    beginAnchorScanRecord(beg, end);
-    beginAnchorLifecycleScan(beg, end);
+    beginAnchorScanRecord(measures.lidar_beg_time, end_);
+    beginAnchorLifecycleScan(measures.lidar_beg_time, end_);
   }
   ~AnchorScanScope()
   {
-    if (!anchor_scan_evaluated)
+    if (!anchor_scan_evaluated) {
+      if (imu_committed_ && stationary_anchor.state == fast_lio::AnchorState::kValid) {
+        const fast_lio::StaticEvidenceVerdict verdict = static_evidence_of(measures_, end_, nullptr);
+        const fast_lio::AnchorDrop drop =
+          fast_lio::unevaluatedConsumedImuDrop(stationary_anchor, imu_committed_, verdict.evidence);
+        if (drop != fast_lio::AnchorDrop::kNone)
+          dropStationaryAnchor(drop, end_);
+      }
       dropUnevaluatedAnchorCandidate(end_);
+    }
     finishAnchorScanRecord();
     reanchor_lost_this_scan = false;
     anchor_write.writer = AnchorWrite::Writer::kNone;
@@ -2069,8 +2080,17 @@ struct AnchorScanScope
   AnchorScanScope(const AnchorScanScope &) = delete;
   AnchorScanScope & operator=(const AnchorScanScope &) = delete;
 
+  // The scan's IMU batch was settled with `outcome`. Its disposition, not whether the filter produced a cloud, says
+  // whether the window is spent.
+  void noteImuSettlement(const fast_lio::ImuProcessOutcome & outcome) noexcept
+  {
+    imu_committed_ = outcome.disposition == fast_lio::ImuDisposition::kCommitted;
+  }
+
 private:
+  const MeasureGroup & measures_;  // the scan's batch; the next sync refills it only after the scope has ended
   double end_;
+  bool imu_committed_ = false;
 };
 
 // A scan dropped before processing still gets its record, so the trace accounts for every scan taken.
@@ -4977,7 +4997,7 @@ private:
   void timer_callback()
   {
     if (sync_packages(Measures)) {
-      const AnchorScanScope anchor_scan_scope(Measures.lidar_beg_time, Measures.lidar_end_time);
+      AnchorScanScope anchor_scan_scope(Measures);
       frontend_runaway = false;
       if (imu_backlog_reanchor_required) {
         markImuCoverageGap(Measures.lidar_end_time);
@@ -5046,6 +5066,7 @@ private:
         dropAnchorForLostImu(Measures.lidar_end_time);
         return;
       }
+      anchor_scan_scope.noteImuSettlement(p_imu->lastOutcome());
       if (!processed) {
         anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuNotProcessed;
         if (p_imu->lastOutcome().disposition == fast_lio::ImuDisposition::kInvalid)

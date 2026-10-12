@@ -322,10 +322,11 @@ beginAnchorScan(StationaryAnchor * anchor, std::int64_t begin_ns, const Stationa
 
 /// A scan was taken and ended without reaching the anchor step (no usable timing or cloud, its IMU batch not
 /// processed, map initialisation, too few points). A candidate's confirming scans must be consecutive, so the
-/// candidate ends. An anchor does not: how long it may go without evaluated evidence is the scan-gap bound's
-/// decision. A scan that does not end after the last evaluated evidence is a repeated or old sample, not a new
-/// scan, and changes nothing; a scan without a usable end time (`end_ns` < 0) cannot be shown to be one, and counts
-/// as new. True when the candidate was dropped.
+/// candidate ends. An anchor does not end here: how long it may go without evaluated evidence is the scan-gap
+/// bound's decision, and what an IMU window the filter took on such a scan shows is unevaluatedConsumedImuDrop's.
+/// A scan that does not end after the last evaluated evidence is a repeated or old sample, not a new scan, and
+/// changes nothing; a scan without a usable end time (`end_ns` < 0) cannot be shown to be one, and counts as new.
+/// True when the candidate was dropped.
 inline bool dropUnevaluatedCandidate(StationaryAnchor * anchor, std::int64_t end_ns)
 {
   if (anchor->state != AnchorState::kQualifying) {
@@ -335,6 +336,23 @@ inline bool dropUnevaluatedCandidate(StationaryAnchor * anchor, std::int64_t end
     return false;
   }
   return dropAnchor(anchor, AnchorDrop::kScanNotEvaluated);
+}
+
+/// A scan ended without reaching the anchor step after the filter had committed its IMU window (`imu_committed`):
+/// the platform's motion in that window is past, and no later scan sees it again. When the window's static evidence
+/// is not "stationary", the anchor, which only ever belongs to one stationary episode, ends on it, as it would have
+/// at the anchor step: kMotion for motion, kEvidenceUnknown when the evidence cannot tell. A stationary window ends
+/// nothing, and is no evaluated evidence either: the confirmation count, the episode and the evidence watermark stay
+/// as they are, so the scan-gap bound still runs from the last scan the anchor step evaluated. A window the filter
+/// did not commit is still to come, and a candidate keeps dropUnevaluatedCandidate's rule. The drop to make, kNone
+/// when there is none.
+inline AnchorDrop
+unevaluatedConsumedImuDrop(const StationaryAnchor & anchor, bool imu_committed, StaticEvidence evidence) noexcept
+{
+  if (!imu_committed || anchor.state != AnchorState::kValid || evidence == StaticEvidence::kStationary) {
+    return AnchorDrop::kNone;
+  }
+  return evidence == StaticEvidence::kMoving ? AnchorDrop::kMotion : AnchorDrop::kEvidenceUnknown;
 }
 
 struct AnchorStepInput

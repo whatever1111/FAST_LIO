@@ -145,6 +145,142 @@ TEST(AnchorTrace, ACandidateDroppedForAnUnevaluatedScanSaysSoAndCarriesTheCleare
   EXPECT_EQ(keysOf(line).back(), "streak");
 }
 
+// An anchor that ends on the IMU window of a scan that stopped before the anchor step ends with one of the two
+// reasons the anchor step's own evidence uses, never with scan_not_evaluated, which is a candidate's. Its records,
+// in the order the node writes them: the invalidation and the release of the parked prior, numbered on from the
+// events before them and belonging to that scan; the scan's record, every anchor-step field na and no event of its
+// own; and a counter summary that counts an invalidation by that reason and no evidence the anchor step saw.
+TEST(AnchorTrace, AnAnchorEndedOnTheWindowOfAScanThatStoppedEarlyIsAnInvalidationOfThatScan)
+{
+  using fast_lio::AnchorDrop;
+  using fast_lio::AnchorState;
+  using fast_lio::StaticEvidence;
+  for (const AnchorState state : {AnchorState::kEmpty, AnchorState::kQualifying, AnchorState::kValid}) {
+    for (const bool committed : {false, true}) {
+      for (const StaticEvidence evidence :
+           {StaticEvidence::kStationary, StaticEvidence::kMoving, StaticEvidence::kUnknown}) {
+        fast_lio::StationaryAnchor anchor;
+        anchor.state = state;
+        const AnchorDrop drop = fast_lio::unevaluatedConsumedImuDrop(anchor, committed, evidence);
+        const bool ends = committed && state == AnchorState::kValid && evidence != StaticEvidence::kStationary;
+        const AnchorDrop expected = !ends                                 ? AnchorDrop::kNone
+                                    : evidence == StaticEvidence::kMoving ? AnchorDrop::kMotion
+                                                                          : AnchorDrop::kEvidenceUnknown;
+        EXPECT_EQ(drop, expected) << static_cast<int>(state) << committed << static_cast<int>(evidence);
+      }
+    }
+  }
+
+  for (const StaticEvidence window : {StaticEvidence::kMoving, StaticEvidence::kUnknown}) {
+    const std::string reason = window == StaticEvidence::kMoving ? "motion" : "evidence_unknown";
+    const std::string other = window == StaticEvidence::kMoving ? "evidence_unknown" : "motion";
+    fast_lio::StationaryAnchor anchor;
+    anchor.state = AnchorState::kValid;
+    anchor.id = 3;
+    anchor.last_id = 3;
+    anchor.episode = 2;
+    anchor.confirmed_scans = 3;
+    anchor.created_ns = 1700000000000000000LL;
+    anchor.committed_ns = 1700000000200000000LL;
+    anchor.last_evidence_end_ns = 1700000000200000000LL;
+    const AnchorDrop drop = fast_lio::unevaluatedConsumedImuDrop(anchor, true, window);
+    ASSERT_TRUE(fast_lio::dropAnchor(&anchor, drop));
+    bool counted = false;
+    for (const auto invalidation : fast_lio::kAnchorInvalidationReasons) {
+      counted = counted || invalidation == drop;
+    }
+    EXPECT_TRUE(counted) << reason << " has no invalidated_* counter";
+
+    // The scan after the anchor's, taken as the eighth; the records of the events come while it is open.
+    fast_lio::MonotonicSequence scan_seq;
+    fast_lio::MonotonicSequence event_seq;
+    scan_seq.skipTo(7);
+    event_seq.skipTo(5);
+    fast_lio::AnchorScanRecord scan;
+    scan.scan_seq = scan_seq.next();
+    scan.outcome = fast_lio::AnchorScanOutcome::kBeforeAnchorStep;
+    scan.beg_ns = 1700000000200000000LL;
+    scan.end_ns = 1700000000300000000LL;
+    scan.gap_ns = scan.beg_ns - anchor.last_evidence_end_ns;
+    std::vector<std::string> lines;
+    fast_lio::AnchorTraceCounters counters;
+    for (const auto event :
+         {fast_lio::AnchorTraceEvent::kInvalidated, fast_lio::AnchorTraceEvent::kParkedPriorReleased}) {
+      fast_lio::AnchorTransition t;
+      t.event = event;
+      t.reason = fast_lio::anchorTraceReasonOf(drop);
+      t.event_seq = event_seq.next();
+      t.scan_seq = scan_seq.last();
+      t.stamp_ns = scan.end_ns;
+      t.anchor_id = anchor.id;
+      t.anchor_valid = anchor.state == AnchorState::kValid;
+      t.created_ns = anchor.created_ns;
+      t.last_evidence_ns = anchor.last_evidence_end_ns;
+      t.anchor_state = anchor.state;
+      t.episode = anchor.episode;
+      fast_lio::saturatingIncrement(&counters.events);
+      lines.push_back(fast_lio::formatAnchorTransition(t));
+    }
+    fast_lio::saturatingIncrement(&counters.invalidated);
+    fast_lio::saturatingIncrement(&counters.invalidated_by[static_cast<std::size_t>(drop)]);
+    scan.anchor_id = anchor.id;
+    scan.anchor_valid = anchor.state == AnchorState::kValid;
+    scan.anchor_created_ns = anchor.created_ns;
+    scan.anchor_state = anchor.state;
+    scan.episode = anchor.episode;
+    lines.push_back(fast_lio::formatAnchorScanRecord(scan));
+    lines.push_back(fast_lio::formatAnchorCounters(counters, event_seq.next(), false));
+
+    const std::string & ended = lines[0];
+    const std::string & released = lines[1];
+    const std::string & record = lines[2];
+    const std::string & summary = lines[3];
+    EXPECT_EQ(valueOf(ended, "event"), "invalidated");
+    EXPECT_EQ(valueOf(released, "event"), "parked_prior_released");
+    for (const std::string & line : {ended, released}) {
+      EXPECT_EQ(valueOf(line, "reason"), reason) << line;
+      EXPECT_EQ(valueOf(line, "scan_seq"), "8") << line;
+      EXPECT_EQ(valueOf(line, "stamp_ns"), "1700000000300000000") << line;
+      EXPECT_EQ(valueOf(line, "anchor_id"), "3") << line;
+      EXPECT_EQ(valueOf(line, "anchor_valid"), "0") << line;
+      EXPECT_EQ(valueOf(line, "anchor_state"), "empty") << line;
+      EXPECT_EQ(valueOf(line, "last_evidence_ns"), "1700000000200000000") << line;
+      EXPECT_EQ(valueOf(line, "streak"), "0") << line;
+    }
+    EXPECT_EQ(valueOf(ended, "event_seq"), "6");
+    EXPECT_EQ(valueOf(released, "event_seq"), "7");
+
+    EXPECT_EQ(valueOf(record, "scan_seq"), "8");
+    EXPECT_EQ(valueOf(record, "outcome"), "before_anchor_step");
+    EXPECT_EQ(valueOf(record, "gap_ns"), "0");
+    EXPECT_EQ(valueOf(record, "anchor_id"), "3");
+    EXPECT_EQ(valueOf(record, "anchor_valid"), "0");
+    EXPECT_EQ(valueOf(record, "anchor_state"), "empty");
+    EXPECT_EQ(valueOf(record, "events"), "-") << "the window's verdict is no event of the scan";
+    EXPECT_EQ(valueOf(record, "action"), "na");
+    EXPECT_EQ(valueOf(record, "anchor_used"), "0");
+    for (const char * key :
+         {"body",        "imu_n",    "gyr_max",        "acc_span",    "wheel_age", "wheel_speed",     "guard_degraded",
+          "degraded",    "parked",   "parked_applied", "zupt_active", "evidence",  "evidence_reason", "imu_only",
+          "wheel_valid", "usable",   "zero_only",      "supported",   "act_p",     "act_q",           "act_v",
+          "p_pose_act",  "target_p", "target_q",       "anchor_p",    "anchor_q"}) {
+      EXPECT_EQ(valueOf(record, key), "na") << key;
+    }
+
+    EXPECT_EQ(valueOf(summary, "event_seq"), "8");
+    EXPECT_EQ(valueOf(summary, "events"), "2");
+    EXPECT_EQ(valueOf(summary, "invalidated"), "1");
+    EXPECT_EQ(valueOf(summary, "invalidated_" + reason), "1");
+    EXPECT_EQ(valueOf(summary, "invalidated_" + other), "0");
+    EXPECT_EQ(valueOf(summary, "candidates_dropped"), "0");
+    EXPECT_EQ(valueOf(summary, "motion"), "0") << "the anchor step saw no motion";
+    EXPECT_EQ(valueOf(summary, "evidence_unknown"), "0") << "the anchor step saw no unknown evidence";
+    for (const auto & line : lines) {
+      EXPECT_FALSE(valueOf(line, "event") == "invalidated" && valueOf(line, "reason") == "scan_not_evaluated") << line;
+    }
+  }
+}
+
 TEST(AnchorTrace, RecoveryRecordHasTheSpecifiedKeysInOrder)
 {
   fast_lio::RecoveryTransition t;

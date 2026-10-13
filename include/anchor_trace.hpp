@@ -121,11 +121,18 @@
 //                      anchor step evaluated its static evidence (a scan without
 //                      usable timing or cloud, an IMU batch not processed, map
 //                      initialisation, too few points), so the candidate's scans
-//                      are no longer consecutive. An anchor does not end with
-//                      such a scan: the scan-gap bound decides how long it may
-//                      go without evaluated evidence. For evidence: motion (the
-//                      static verdict went from stationary to moving),
-//                      evidence_unknown (from stationary to unknown), scan_hole,
+//                      are no longer consecutive. Such a scan ends an anchor
+//                      only when the IMU window the filter committed for it
+//                      shows motion or cannot show the platform parked:
+//                      invalidated, as motion or evidence_unknown, while the
+//                      scan's record keeps the outcome where it stopped and
+//                      its anchor-step fields na, so the trace carries neither
+//                      that verdict nor its inputs. Otherwise the scan-gap
+//                      bound decides how long an anchor may go without
+//                      evaluated evidence, which a parked window is not. For
+//                      evidence: motion (the static verdict went from
+//                      stationary to moving), evidence_unknown (from
+//                      stationary to unknown), scan_hole,
 //                      imu_coverage_gap, imu_bridge, map_reset,
 //                      reference_changed, lost, time_epoch. For pin_released and
 //                      parked_prior_released: scan_healthy, motion, or the
@@ -148,7 +155,7 @@
 //                      whether it is the anchor, and the end time of the scan
 //                      whose pose it carries.
 //   last_evidence_ns   end time of the last scan whose static evidence the anchor
-//                      logic evaluated.
+//                      step evaluated.
 //   anchor_state       empty, qualifying or valid, after the event.
 //   streak             the parked streak after the event: the consecutive
 //                      stationary scans the anchor step has counted on one
@@ -347,7 +354,10 @@
 //   whose pin was taken back is a zero-only scan and counts in both: this is
 //   the one source of blocked_stale_use on which an anchor of the current
 //   episode existed at the anchor step. evidence_unknown the scans whose static
-//   evidence was unknown; motion the changes from stationary to moving;
+//   evidence the anchor step found unknown; motion the changes from stationary
+//   to moving the anchor step saw. An anchor that ended on the IMU window of a
+//   scan that stopped before the anchor step counts in invalidated and
+//   invalidated_motion or invalidated_evidence_unknown, not in these two;
 //   scan_hole ... time_epoch the input events, every occurrence;
 //   recovery_started the unsupported-recovery episodes started by a degraded
 //   scan, a scan hole, an IMU coverage gap or lost batch, or an IMU bridge,

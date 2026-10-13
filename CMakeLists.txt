@@ -258,7 +258,8 @@ if(BUILD_TESTING)
       "AnchorLifecycleInputs:inputs:240"
       "AnchorLifecycleGate:gate:480"
       "AnchorLifecycleRebuild:rebuild:240"
-      "AnchorLifecycleHold:hold:240")
+      "AnchorLifecycleHold:hold:240"
+      "AnchorLifecycleExport:export:240")
     ament_add_gtest_executable(test_anchor_lifecycle_node test/test_anchor_lifecycle_node.cpp)
     set(anchor_node_suites "")
     foreach(anchor_node_entry ${anchor_node_entries})

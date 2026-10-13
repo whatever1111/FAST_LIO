@@ -1995,10 +1995,12 @@ Scenario earlyExitBetweenCandidateScans(Cloud cloud)
 
 constexpr double kBridgeHoleFrom = -0.065;  // s from the event scan's end: 35 ms into its IMU window
 
-Scenario imuBridge(double hole_s, double total)
+// `event_guard` is the guard's verdict on the scan the bridge starts on.
+Scenario imuBridge(double hole_s, double total, Guard event_guard = Guard::kHealthy)
 {
   std::ostringstream name;
-  name << "imu_bridge_" << hole_s << (total > 0.0 ? "_policy_on" : "_policy_off");
+  name << "imu_bridge_" << hole_s << (total > 0.0 ? "_policy_on" : "_policy_off")
+       << (event_guard == Guard::kDegraded ? "_degraded" : "");
   Scenario s = inputScenario(name.str());
   setParam(s, rclcpp::Parameter("reanchor_en", true));
   setParam(s, rclcpp::Parameter("imu_gap_prior_en", true));
@@ -2007,7 +2009,7 @@ Scenario imuBridge(double hole_s, double total)
   setParam(s, rclcpp::Parameter("imu_gap_empty_scans", true));
   setPolicy(s, total, 1.0);
   append(s, 5, slot(Phase::kBefore));
-  Step event = slot(Phase::kEvent);
+  Step event = slot(Phase::kEvent, Imu::kStatic, event_guard);
   event.hole_from = kBridgeHoleFrom;
   event.hole_to = kBridgeHoleFrom + hole_s;
   s.steps.push_back(event);
@@ -2572,6 +2574,86 @@ void expectTheScanOwnState(const Observation & o,
   const std::array<double, 36> own = fixtureOdomCovariance(degraded);
   EXPECT_TRUE(o.odom_seen && sameArray(o.odom_cov, own.data(), own.size()))
     << "the published pose covariance is not the scan's own";
+}
+
+// ---- K6-R9: what a scan reports while the recovery is pending --------------------------------------------------
+
+constexpr double kExportBudget = 10.0;        // s, the platform's budget: the matching run ends Pending well within it
+constexpr double kExportShortBudget = 1.2;    // s: above the stable 1.0 s, it runs out before the matching run ends
+constexpr int kExportRun = 11;                // healthy parked scans of a run that spans the stable 1.0 s
+constexpr double kDegradedInflation = 100.0;  // m2 the Degraded verdict adds to each wire translation variance
+
+// One healthy moving scan, the last supported one; degraded parked scans with no anchor to hold to, which start
+// Pending; healthy parked scans, the matching run; healthy parked scans that commit a new anchor; degraded parked
+// scans that may hold on it. With kExportBudget the run ends Pending on its kExportRun-th scan; with
+// kExportShortBudget the budget runs out first and latches Unanchored. The typed observation is on.
+Scenario pendingExport(double total)
+{
+  Scenario s = inputScenario(total < kExportBudget ? "pending_export_runs_out" : "pending_export");
+  s.typed = true;
+  setParam(s, rclcpp::Parameter("publish.frontend_observation", true));
+  setParam(s, rclcpp::Parameter("publish.frontend_clock_domain", "fixture"));
+  setPolicy(s, total, 1.0);
+  append(s, 1, slot(Phase::kBefore, Imu::kMoving));
+  append(s, 3, slot(Phase::kEvent, Imu::kStatic, Guard::kDegraded));
+  append(s, kExportRun + 1, slot(Phase::kAfter));
+  append(s, 5, slot(Phase::kLater));
+  append(s, 2, slot(Phase::kHold, Imu::kStatic, Guard::kDegraded));
+  return s;
+}
+
+// The fixture's own translation variances are far below the inflation, so the two never overlap.
+bool degradedInflation(const Observation & o)
+{
+  return o.odom_cov[21] >= kDegradedInflation && o.odom_cov[28] >= kDegradedInflation &&
+         o.odom_cov[35] >= kDegradedInflation;
+}
+
+bool noDegradedInflation(const Observation & o)
+{
+  return o.odom_cov[21] < kDegradedInflation && o.odom_cov[28] < kDegradedInflation &&
+         o.odom_cov[35] < kDegradedInflation;
+}
+
+// What a published scan reports (K6-R9): the Degraded flag, the pose covariance's inflation and the trace's export
+// field carry the scan's own verdict, the re-anchor gate's `degraded`, or Unanchored; only a LocalQualified scan
+// may carry StaticHold. These scenarios declare nothing lost.
+void expectTheScanOwnVerdict(const Observation & o)
+{
+  const auto & x = o.record;
+  ASSERT_TRUE(x.published && o.odom_seen) << "step " << o.step;
+  const bool degraded = x.degraded || x.trust_post == fast_lio::RecoveryTrust::kUnanchored;
+  EXPECT_EQ(x.eff_degraded, degraded) << "step " << o.step;
+  EXPECT_EQ(odomFlags(o) & (kFlagDegraded | kFlagLost), degraded ? kFlagDegraded : 0u) << "step " << o.step;
+  EXPECT_TRUE(degraded ? degradedInflation(o) : noDegradedInflation(o))
+    << "step " << o.step << ": translation variances " << o.odom_cov[21] << ' ' << o.odom_cov[28] << ' '
+    << o.odom_cov[35];
+  if (x.trust_post != fast_lio::RecoveryTrust::kLocalQualified) {
+    EXPECT_FALSE(x.static_hold) << "step " << o.step;
+    EXPECT_EQ(odomFlags(o) & kFlagStaticHold, 0u) << "step " << o.step;
+  }
+}
+
+// The typed observation of the same scan: the original verdict on the same facts. With the re-anchor gate off and
+// nothing else forced, a scan reported Degraded is Unknown with no axes, any other one is Full.
+void expectTheTypedOwnVerdict(const Observation & o)
+{
+  const auto & x = o.record;
+  ASSERT_TRUE(o.typed_seen) << "step " << o.step;
+  const bool degraded = x.degraded || x.trust_post == fast_lio::RecoveryTrust::kUnanchored;
+  EXPECT_EQ(o.typed_health & fast_lio::kFrontendHealthDegraded, degraded ? fast_lio::kFrontendHealthDegraded : 0u)
+    << "step " << o.step;
+  EXPECT_EQ(o.typed_state,
+            typedValue(degraded ? fast_lio::FrontendState::kDegraded : fast_lio::FrontendState::kTracking))
+    << "step " << o.step;
+  EXPECT_EQ(o.typed_validity,
+            static_cast<unsigned>(degraded ? fast_lio::FrontendValidity::kUnknown : fast_lio::FrontendValidity::kFull))
+    << "step " << o.step;
+  EXPECT_EQ(o.typed_axes, degraded ? 0u : static_cast<unsigned>(fast_lio::kFrontendAllAxes)) << "step " << o.step;
+  if (x.trust_post != fast_lio::RecoveryTrust::kLocalQualified) {
+    EXPECT_EQ(o.typed_health & fast_lio::kFrontendHealthStaticHold, 0u) << "step " << o.step;
+    EXPECT_NE(o.typed_substate, static_cast<unsigned>(fast_lio::FrontendSubstate::kStaticHold)) << "step " << o.step;
+  }
 }
 
 }  // namespace
@@ -3399,13 +3481,14 @@ TEST(AnchorLifecycleEvidence, AShortImuBridgeStartsARecoveryAndLeavesTheGateAlon
   ASSERT_EQ(qualified.size(), 1u);
   EXPECT_EQ(valueOf(qualified.front(), "scan_seq"), std::to_string(confirming->record.scan_seq)) << qualified.front();
   EXPECT_TRUE(recoveryLines(r, "unanchored").empty());
+  // Each scan reports its own verdict, healthy on every one of them: the Pending ones and the bridged one included.
   for (const auto * o : scans) {
     const bool pending_scan = o->record.scan_seq < confirming->record.scan_seq;
     EXPECT_EQ(o->record.trust_post,
               pending_scan ? fast_lio::RecoveryTrust::kPending : fast_lio::RecoveryTrust::kLocalQualified)
       << "step " << o->step;
-    EXPECT_EQ(o->record.eff_degraded, pending_scan) << "step " << o->step;
-    EXPECT_EQ(odomFlags(*o), pending_scan ? kFlagDegraded : 0u) << "step " << o->step;
+    EXPECT_FALSE(o->record.eff_degraded) << "step " << o->step;
+    EXPECT_EQ(odomFlags(*o), 0u) << "step " << o->step;
   }
   expectNeverUsed(scans, old_id, scenario.name);
   EXPECT_EQ(scans.back()->record.anchor_state, fast_lio::AnchorState::kValid);
@@ -4156,4 +4239,143 @@ TEST(AnchorLifecycleHold, AHoldTakesBackTheParkedPriorOfItsScanAndReportsLost)
       EXPECT_EQ(odomFlags(*o), 0u) << "step " << o->step;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// What a scan reports while the recovery is pending (K6-R9)
+// ---------------------------------------------------------------------------
+
+// Pending stays inside the front end: each Pending scan reports its own verdict in every encoding. The degraded
+// parked scans that start it report Degraded; the healthy parked scans of the matching run report neither Degraded
+// nor StaticHold, carry no degraded covariance inflation and are Full. The platform is parked throughout and no
+// Pending scan claims a hold; the first one is the pin on the anchor committed after the recovery qualified.
+TEST(AnchorLifecycleExport, APendingScanReportsItsOwnVerdictAndNoHold)
+{
+  const Scenario scenario = pendingExport(kExportBudget);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const auto event = r.phase(Phase::kEvent);
+  const auto after = r.phase(Phase::kAfter);
+  const auto held = r.phase(Phase::kHold);
+  ASSERT_EQ(event.size(), 3u);
+  ASSERT_EQ(after.size(), static_cast<std::size_t>(kExportRun + 1));
+  ASSERT_EQ(held.size(), 2u);
+  const auto pending = recoveryLines(r, "pending");
+  ASSERT_EQ(pending.size(), 1u);
+  EXPECT_EQ(valueOf(pending.front(), "reason"), "degraded") << pending.front();
+  EXPECT_EQ(valueOf(pending.front(), "scan_seq"), std::to_string(event.front()->record.scan_seq)) << pending.front();
+  const Observation * confirming = completesRun(after, 0, kNsPerSecond);
+  ASSERT_EQ(confirming, after[static_cast<std::size_t>(kExportRun - 1)]);
+  const auto qualified = recoveryLines(r, "qualified");
+  ASSERT_EQ(qualified.size(), 1u);
+  EXPECT_EQ(valueOf(qualified.front(), "scan_seq"), std::to_string(confirming->record.scan_seq)) << qualified.front();
+  EXPECT_TRUE(recoveryLines(r, "unanchored").empty());
+
+  for (const auto * o : fromPhase(r, Phase::kEvent)) {
+    expectTheScanOwnVerdict(*o);
+    expectTheTypedOwnVerdict(*o);
+    if (o->record.trust_post == fast_lio::RecoveryTrust::kPending) {
+      EXPECT_EQ(o->record.anchor_used, 0u) << "step " << o->step;
+      EXPECT_NE(o->record.action, fast_lio::AnchorTraceAction::kPin) << "step " << o->step;
+    }
+  }
+  for (const auto * o : event) {
+    EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kPending) << "step " << o->step;
+    EXPECT_TRUE(o->record.degraded) << "step " << o->step;
+    EXPECT_EQ(odomFlags(*o), kFlagDegraded) << "step " << o->step;
+  }
+  for (std::size_t i = 0; i + 1 < static_cast<std::size_t>(kExportRun); ++i) {
+    const Observation & o = *after[i];
+    EXPECT_EQ(o.record.trust_post, fast_lio::RecoveryTrust::kPending) << "step " << o.step;
+    EXPECT_FALSE(o.record.degraded) << "step " << o.step;
+    EXPECT_FALSE(o.record.eff_degraded) << "step " << o.step;
+    EXPECT_EQ(odomFlags(o), 0u) << "step " << o.step;
+    EXPECT_TRUE(noDegradedInflation(o)) << "step " << o.step;
+    EXPECT_EQ(o.typed_validity, static_cast<unsigned>(fast_lio::FrontendValidity::kFull)) << "step " << o.step;
+  }
+  // The same degraded parked scans claim the hold once the reference is LocalQualified and an anchor is committed.
+  for (const auto * o : held) {
+    EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kLocalQualified) << "step " << o->step;
+    EXPECT_EQ(o->record.action, fast_lio::AnchorTraceAction::kPin) << "step " << o->step;
+    EXPECT_TRUE(o->record.static_hold) << "step " << o->step;
+    EXPECT_EQ(odomFlags(*o), kFlagDegraded | kFlagStaticHold) << "step " << o->step;
+    EXPECT_NE(o->typed_health & fast_lio::kFrontendHealthStaticHold, 0u) << "step " << o->step;
+  }
+  EXPECT_EQ(counterValue(r, "recovery_started"), "1");
+  EXPECT_EQ(counterValue(r, "recovery_qualified"), "1");
+}
+
+// The same scans with a 1.2 s budget: it runs out on the matching run and latches Unanchored. The Pending scans before
+// the latch report their own verdict; every scan from it on reports Degraded in every encoding, its registration
+// healthy or not, is Unknown with no axes, and neither takes an anchor nor claims a hold.
+TEST(AnchorLifecycleExport, AnUnanchoredScanStaysDegradedWhateverItsRegistration)
+{
+  const Scenario scenario = pendingExport(kExportShortBudget);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const auto latched = recoveryLines(r, "unanchored");
+  ASSERT_EQ(latched.size(), 1u);
+  EXPECT_EQ(valueOf(latched.front(), "reason"), "deadline") << latched.front();
+  std::vector<const Observation *> under_latch;
+  int pending_clear = 0;
+  for (const auto * o : fromPhase(r, Phase::kEvent)) {
+    expectTheScanOwnVerdict(*o);
+    expectTheTypedOwnVerdict(*o);
+    if (o->record.trust_pre == fast_lio::RecoveryTrust::kUnanchored)
+      under_latch.push_back(o);
+    else if (o->record.trust_post == fast_lio::RecoveryTrust::kPending && !o->record.degraded)
+      ++pending_clear;
+  }
+  EXPECT_GT(pending_clear, 0) << "no healthy Pending scan before the latch";
+  ASSERT_FALSE(under_latch.empty());
+  expectLatchedFrom(r, under_latch);
+  int healthy_under_latch = 0;
+  for (const auto * o : under_latch) {
+    healthy_under_latch += o->record.degraded ? 0 : 1;
+    EXPECT_TRUE(degradedInflation(*o)) << "step " << o->step;
+  }
+  const auto later = r.phase(Phase::kLater);
+  ASSERT_EQ(later.size(), 5u);
+  for (const auto * o : later) {
+    EXPECT_EQ(o->record.trust_pre, fast_lio::RecoveryTrust::kUnanchored) << "step " << o->step;
+    EXPECT_FALSE(o->record.degraded) << "step " << o->step << ": the registration is healthy";
+  }
+  EXPECT_GE(healthy_under_latch, 5);
+}
+
+// A bridged scan reports its own verdict like any other: the bridge adds no veto of its own. This is the short
+// bridge of AShortImuBridgeStartsARecoveryAndLeavesTheGateAlone, where every scan is healthy and reports nothing,
+// with the guard calling the bridged scan degraded: the re-anchor gate goes blind and verifies on the scans after
+// it. The scans the gate calls degraded report Degraded; the Pending scans after its verification report nothing.
+TEST(AnchorLifecycleExport, ABridgedScanReportsItsOwnVerdict)
+{
+  const Scenario scenario = imuBridge(0.2, 10.0, Guard::kDegraded);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const auto event = r.phase(Phase::kEvent);
+  ASSERT_EQ(event.size(), 1u);
+  const Observation & bridged = *event.front();
+  EXPECT_TRUE(hasEvent(bridged, fast_lio::kAnchorEventImuBridge));
+  EXPECT_TRUE(bridged.record.degraded);
+  EXPECT_EQ(bridged.record.trust_post, fast_lio::RecoveryTrust::kPending);
+  EXPECT_EQ(odomFlags(bridged), kFlagDegraded);
+  const auto pending = recoveryLines(r, "pending");
+  ASSERT_EQ(pending.size(), 1u);
+  EXPECT_EQ(valueOf(pending.front(), "reason"), "imu_bridge") << pending.front();
+  int pending_degraded = 0;
+  int pending_clear = 0;
+  for (const auto * o : fromPhase(r, Phase::kEvent)) {
+    expectTheScanOwnVerdict(*o);
+    if (o->record.trust_post != fast_lio::RecoveryTrust::kPending)
+      continue;
+    if (o->record.degraded)
+      ++pending_degraded;
+    else
+      ++pending_clear;
+  }
+  EXPECT_GT(pending_degraded, 0);
+  EXPECT_GT(pending_clear, 0) << "no healthy Pending scan after the verification";
 }

@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <gtest/gtest.h>
 #include <limits>
+#include <set>
 #include <vector>
 
 #include "stationary_anchor_policy.hpp"
@@ -1012,7 +1013,8 @@ TEST(StationaryAnchorPolicy, StaticHoldIsClaimedOnlyForAHoldOnAUsableAnchor)
             in.trust = trust;
             const AnchorHealth health = fast_lio::anchorHealth(in);
             const bool trusted = trust == RecoveryTrust::kLocalQualified;
-            EXPECT_EQ(health.effective_degraded, degraded || !trusted);
+            EXPECT_EQ(health.effective_degraded, degraded || trust == RecoveryTrust::kUnanchored)
+              << "Pending adds nothing to the scan's own verdict";
             EXPECT_EQ(health.reported_static_hold, hold && usable && !lost && trusted);
             EXPECT_EQ(health.lost, lost) << "a loss is reported whatever else the scan is";
             if (!usable) {
@@ -1023,6 +1025,54 @@ TEST(StationaryAnchorPolicy, StaticHoldIsClaimedOnlyForAHoldOnAUsableAnchor)
       }
     }
   }
+}
+
+// Every cell of trust x degraded x hold_active x anchor_usable x lost, written out rather than derived. Degraded is
+// the scan's own verdict, set on every Unanchored cell and on no Pending cell that is not degraded itself; StaticHold
+// is the one cell per trust with a hold on a usable anchor and no loss, and only on LocalQualified; Lost is the input.
+TEST(StationaryAnchorPolicy, HealthTruthTableCellByCell)
+{
+  struct Cell
+  {
+    RecoveryTrust trust;
+    int degraded, hold, usable, lost;  // inputs
+    int want_degraded, want_hold, want_lost;
+  };
+  constexpr RecoveryTrust kL = RecoveryTrust::kLocalQualified;
+  constexpr RecoveryTrust kP = RecoveryTrust::kPending;
+  constexpr RecoveryTrust kU = RecoveryTrust::kUnanchored;
+  const Cell cells[] = {
+    // {trust, degraded, hold, usable, lost, -> degraded, static hold, lost}: one line per trust, degraded and hold;
+    // usable and lost run through 00, 01, 10, 11 along it.
+    {kL, 0, 0, 0, 0, 0, 0, 0}, {kL, 0, 0, 0, 1, 0, 0, 1}, {kL, 0, 0, 1, 0, 0, 0, 0}, {kL, 0, 0, 1, 1, 0, 0, 1},
+    {kL, 0, 1, 0, 0, 0, 0, 0}, {kL, 0, 1, 0, 1, 0, 0, 1}, {kL, 0, 1, 1, 0, 0, 1, 0}, {kL, 0, 1, 1, 1, 0, 0, 1},
+    {kL, 1, 0, 0, 0, 1, 0, 0}, {kL, 1, 0, 0, 1, 1, 0, 1}, {kL, 1, 0, 1, 0, 1, 0, 0}, {kL, 1, 0, 1, 1, 1, 0, 1},
+    {kL, 1, 1, 0, 0, 1, 0, 0}, {kL, 1, 1, 0, 1, 1, 0, 1}, {kL, 1, 1, 1, 0, 1, 1, 0}, {kL, 1, 1, 1, 1, 1, 0, 1},
+    {kP, 0, 0, 0, 0, 0, 0, 0}, {kP, 0, 0, 0, 1, 0, 0, 1}, {kP, 0, 0, 1, 0, 0, 0, 0}, {kP, 0, 0, 1, 1, 0, 0, 1},
+    {kP, 0, 1, 0, 0, 0, 0, 0}, {kP, 0, 1, 0, 1, 0, 0, 1}, {kP, 0, 1, 1, 0, 0, 0, 0}, {kP, 0, 1, 1, 1, 0, 0, 1},
+    {kP, 1, 0, 0, 0, 1, 0, 0}, {kP, 1, 0, 0, 1, 1, 0, 1}, {kP, 1, 0, 1, 0, 1, 0, 0}, {kP, 1, 0, 1, 1, 1, 0, 1},
+    {kP, 1, 1, 0, 0, 1, 0, 0}, {kP, 1, 1, 0, 1, 1, 0, 1}, {kP, 1, 1, 1, 0, 1, 0, 0}, {kP, 1, 1, 1, 1, 1, 0, 1},
+    {kU, 0, 0, 0, 0, 1, 0, 0}, {kU, 0, 0, 0, 1, 1, 0, 1}, {kU, 0, 0, 1, 0, 1, 0, 0}, {kU, 0, 0, 1, 1, 1, 0, 1},
+    {kU, 0, 1, 0, 0, 1, 0, 0}, {kU, 0, 1, 0, 1, 1, 0, 1}, {kU, 0, 1, 1, 0, 1, 0, 0}, {kU, 0, 1, 1, 1, 1, 0, 1},
+    {kU, 1, 0, 0, 0, 1, 0, 0}, {kU, 1, 0, 0, 1, 1, 0, 1}, {kU, 1, 0, 1, 0, 1, 0, 0}, {kU, 1, 0, 1, 1, 1, 0, 1},
+    {kU, 1, 1, 0, 0, 1, 0, 0}, {kU, 1, 1, 0, 1, 1, 0, 1}, {kU, 1, 1, 1, 0, 1, 0, 0}, {kU, 1, 1, 1, 1, 1, 0, 1},
+  };
+  std::set<int> seen;
+  for (const Cell & cell : cells) {
+    const int key = static_cast<int>(cell.trust) * 16 + cell.degraded * 8 + cell.hold * 4 + cell.usable * 2 + cell.lost;
+    EXPECT_TRUE(seen.insert(key).second) << "cell " << key << " is listed twice";
+    AnchorHealthInputs in;
+    in.degraded = cell.degraded != 0;
+    in.hold_active = cell.hold != 0;
+    in.anchor_usable = cell.usable != 0;
+    in.lost = cell.lost != 0;
+    in.trust = cell.trust;
+    const AnchorHealth health = fast_lio::anchorHealth(in);
+    EXPECT_EQ(health.effective_degraded, cell.want_degraded != 0) << "cell " << key;
+    EXPECT_EQ(health.reported_static_hold, cell.want_hold != 0) << "cell " << key;
+    EXPECT_EQ(health.lost, cell.want_lost != 0) << "cell " << key;
+  }
+  EXPECT_EQ(seen.size(), 48u) << "3 trust levels x 2^4 inputs";
 }
 
 TEST(StationaryAnchorPolicy, ZeroOnlyNeverPinsWhateverTheSpeed)

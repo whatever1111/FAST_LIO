@@ -62,6 +62,22 @@ inline ParkedHoldVerdict updateParkedHold(ParkedHoldState * state, bool body_sta
   return out;
 }
 
+/// The anchor the prior pulls toward has ended (stationary_anchor_policy.hpp). The hold and its streak go with
+/// it, so neither carries into the next stationary episode. True when a hold was engaged.
+inline bool dropParkedHold(ParkedHoldState * state)
+{
+  const bool was_active = state->active;
+  *state = ParkedHoldState{};
+  return was_active;
+}
+
+/// The prior is a measurement toward the anchor: it applies only while the hold is engaged and the anchor is
+/// usable on this scan, the same test the degraded pin uses. Without a usable anchor none of its rows is built.
+inline bool parkedHoldPriorApplies(const ParkedHoldVerdict & verdict, bool anchor_usable)
+{
+  return verdict.engaged && anchor_usable;
+}
+
 /// The prior carries the same information every scan, so applying it on all of
 /// them is not a repeated measurement — it is one fact counted thousands of
 /// times, and the position covariance collapses under it (IMU process noise at

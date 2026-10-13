@@ -3,7 +3,10 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
+
+#include "stationary_anchor_policy.hpp"
 
 using fast_lio::ReanchorGate;
 using fast_lio::ReanchorParams;
@@ -269,4 +272,142 @@ TEST(ReanchorGate, HealthyScanWindowKeepsTheMedianOfTheRecentPast)
   one.push(0.07);
   EXPECT_EQ(one.size(), 1u);
   EXPECT_DOUBLE_EQ(one.median(), 0.07);
+}
+
+// ------------------------------------------------- recovery trust and the gate
+//
+// The unsupported-recovery budget (stationary_anchor_policy.hpp) runs next to the gate, in the node's order: the
+// deadline first, then the gate, then the anchor step (a degraded scan without a hold starts an episode, any other
+// scan is supported), then the scan's match is shown to the episode.
+
+namespace
+{
+constexpr std::int64_t kScanNs = 100000000;
+
+struct GateAndTrust
+{
+  ReanchorGate gate;
+  ReanchorParams params;
+  fast_lio::RecoveryState trust;
+  fast_lio::RecoveryParams budget;
+  std::uint64_t seq = 0;
+  std::uint64_t generation = 0;
+
+  GateAndTrust()
+  {
+    budget.total_ns = 10000000000;
+    budget.stable_ns = 1000000000;
+  }
+
+  // One scan ending at `end_ns`; returns the gate's decision.
+  fast_lio::ReanchorDecision scan(std::int64_t end_ns, bool guard_degraded, int eff, double res)
+  {
+    ++seq;
+    fast_lio::expireRecovery(&trust, end_ns);
+    const auto d = updateReanchorGate(&gate, guard_degraded, eff, res, static_cast<double>(end_ns) * 1e-9, params);
+    if (d.degraded) {
+      fast_lio::startRecovery(&trust, fast_lio::RecoveryCause::kDegraded, end_ns, budget);
+    } else {
+      fast_lio::noteSupportedScan(&trust, end_ns);
+    }
+    const bool match =
+      !guard_degraded && gate.state != ReanchorState::kLost && fast_lio::reanchorMatchOk(eff, res, params);
+    fast_lio::observeRecoveryScan(&trust, seq, end_ns - kScanNs, end_ns, match, generation, budget);
+    return d;
+  }
+};
+}  // namespace
+
+// Blind and verifying alternate and the gate re-anchors again and again, but never for a full second of unbroken
+// matching: the episode's start and deadline stay where the first unsupported scan put them, and it expires.
+TEST(ReanchorGate, FlipsAndShortReanchorsDoNotMoveTheRecoveryDeadline)
+{
+  GateAndTrust s;
+  std::int64_t t = 1000000000;
+  for (int i = 0; i < 20; ++i) {
+    s.scan(t += kScanNs, false, kGoodEff, kGoodRes);  // supported
+  }
+  const std::int64_t last_supported = t;
+  s.scan(t += kScanNs, true, kBlindEff, kBlindRes);
+  ASSERT_EQ(s.trust.trust, fast_lio::RecoveryTrust::kPending);
+  EXPECT_EQ(s.trust.start_ns, last_supported);
+  const std::int64_t deadline = s.trust.deadline_ns;
+  EXPECT_EQ(deadline, last_supported + s.budget.total_ns);
+  int reanchors = 0;
+  while (t + kScanNs < deadline) {
+    // 2 blind, then 6 good: the gate re-anchors on the third good scan, the run of good scans lasts 0.6 s.
+    for (int i = 0; i < 2 && t + kScanNs < deadline; ++i) {
+      s.scan(t += kScanNs, true, kBlindEff, kBlindRes);
+    }
+    for (int i = 0; i < 6 && t + kScanNs < deadline; ++i) {
+      reanchors += s.scan(t += kScanNs, false, kGoodEff, kGoodRes).just_reanchored ? 1 : 0;
+    }
+    EXPECT_EQ(s.trust.deadline_ns, deadline);
+    EXPECT_EQ(s.trust.start_ns, last_supported);
+    ASSERT_EQ(s.trust.trust, fast_lio::RecoveryTrust::kPending);
+  }
+  EXPECT_GT(reanchors, 5);
+  s.scan(t += kScanNs, false, kGoodEff, kGoodRes);
+  EXPECT_EQ(s.trust.trust, fast_lio::RecoveryTrust::kUnanchored);
+  EXPECT_EQ(s.trust.cause, fast_lio::RecoveryCause::kDeadline);
+}
+
+// One unbroken second of matching inside the budget ends the episode; the re-anchor itself does not.
+TEST(ReanchorGate, AFullSecondOfMatchingEndsTheEpisode)
+{
+  GateAndTrust s;
+  std::int64_t t = 1000000000;
+  s.scan(t += kScanNs, false, kGoodEff, kGoodRes);
+  for (int i = 0; i < 30; ++i) {
+    s.scan(t += kScanNs, true, kBlindEff, kBlindRes);
+  }
+  ASSERT_EQ(s.trust.trust, fast_lio::RecoveryTrust::kPending);
+  int scans = 0;
+  bool reanchored_while_pending = false;
+  while (s.trust.trust == fast_lio::RecoveryTrust::kPending && scans < 50) {
+    ++scans;
+    const auto d = s.scan(t += kScanNs, false, kGoodEff, kGoodRes);
+    reanchored_while_pending |= d.just_reanchored && s.trust.trust == fast_lio::RecoveryTrust::kPending;
+  }
+  EXPECT_TRUE(reanchored_while_pending) << "the gate re-anchors after 3 scans; the episode needs 10";
+  EXPECT_EQ(scans, 10);
+  EXPECT_EQ(s.trust.trust, fast_lio::RecoveryTrust::kLocalQualified);
+}
+
+// Unanchored is not cleared by resetting the gate, by a rebuilt map that matches itself with a tiny residual, or by
+// the deadline machinery running on.
+TEST(ReanchorGate, ResetAndALowResidualMapDoNotClearUnanchored)
+{
+  GateAndTrust s;
+  std::int64_t t = 1000000000;
+  s.scan(t += kScanNs, false, kGoodEff, kGoodRes);
+  // The node's map reset: the map is rebuilt from this scan, the gate is declared healthy, the reference changes.
+  resetReanchorGate(&s.gate);
+  ++s.generation;
+  const auto reset = fast_lio::resetRecoveryReference(&s.trust, t, s.budget);
+  EXPECT_TRUE(reset.unanchored);
+  for (int i = 0; i < 300; ++i) {
+    s.scan(t += kScanNs, false, kGoodEff, 0.002);
+  }
+  EXPECT_EQ(s.gate.state, ReanchorState::kHealthy);
+  EXPECT_EQ(s.trust.trust, fast_lio::RecoveryTrust::kUnanchored);
+  EXPECT_EQ(s.trust.cause, fast_lio::RecoveryCause::kMapReset);
+}
+
+// A lost gate keeps the scans degraded, and its matches are not recovery evidence: the episode runs out.
+TEST(ReanchorGate, ALostGateNeverEndsTheEpisode)
+{
+  GateAndTrust s;
+  std::int64_t t = 1000000000;
+  s.scan(t += kScanNs, false, kGoodEff, kGoodRes);
+  fast_lio::tripReanchorLost(&s.gate);
+  for (int i = 0; i < 150; ++i) {
+    s.scan(t += kScanNs, false, kGoodEff, kGoodRes);
+    if (s.trust.trust != fast_lio::RecoveryTrust::kPending) {
+      break;
+    }
+  }
+  EXPECT_EQ(s.gate.state, ReanchorState::kLost);
+  EXPECT_EQ(s.trust.trust, fast_lio::RecoveryTrust::kUnanchored);
+  EXPECT_EQ(s.trust.cause, fast_lio::RecoveryCause::kDeadline);
 }

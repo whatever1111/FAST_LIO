@@ -5,6 +5,7 @@
 #include <string>
 
 #include "frontend_observation.hpp"
+#include "stationary_anchor_policy.hpp"
 
 namespace
 {
@@ -219,5 +220,174 @@ TEST(FrontendObservation, ExactStampAndHashGoldenVector)
   EXPECT_FALSE(fast_lio::frontendObservationId(instance, true, 7, 0, false, "sensor", digest));
   EXPECT_FALSE(fast_lio::frontendObservationId(instance, true, 7, 0, true, "", digest));
   EXPECT_FALSE(fast_lio::frontendObservationId(instance, true, 7, 0, true, std::string(49, 'x'), digest));
+}
+
+// The node fills `degraded` and `staticHold` from anchorHealth() (stationary_anchor_policy.hpp), the same verdict
+// the legacy flags carry. A pose the front end no longer vouches for (Unanchored) is degraded with unknown validity
+// and no axes, whatever the local registration says; a Pending scan is judged by its own verdict, like any other;
+// a static hold is claimed only on a usable anchor of a LocalQualified reference; Lost still wins.
+fast_lio::FrontendFacts factsFor(const fast_lio::AnchorHealthInputs & in)
+{
+  auto facts = healthy();
+  const auto health = fast_lio::anchorHealth(in);
+  facts.degraded = health.effective_degraded;
+  facts.staticHold = health.reported_static_hold;
+  facts.lost = in.lost;
+  return facts;
+}
+
+TEST(FrontendObservation, UnanchoredIsDegradedWithUnknownValidity)
+{
+  for (const bool held : {false, true}) {
+    fast_lio::AnchorHealthInputs in;
+    in.degraded = false;  // the local registration looks healthy
+    in.hold_active = held;
+    in.anchor_usable = held;
+    in.trust = fast_lio::RecoveryTrust::kUnanchored;
+    const auto verdict = fast_lio::frontendVerdict(factsFor(in));
+    EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kDegraded));
+    EXPECT_EQ(verdict.validity, fast_lio::frontendWire(fast_lio::FrontendValidity::kUnknown));
+    EXPECT_EQ(verdict.axes, 0);
+    EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthDegraded, fast_lio::kFrontendHealthDegraded);
+    EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthStaticHold, 0u);
+    EXPECT_NE(verdict.substate, fast_lio::frontendWire(fast_lio::FrontendSubstate::kStaticHold));
+  }
+}
+
+// A Pending scan whose own verdict is healthy is Full: the scan registered, which is all Full says here. It still
+// claims no static hold, held or not.
+TEST(FrontendObservation, PendingWithAHealthyVerdictIsFull)
+{
+  for (const bool held : {false, true}) {
+    fast_lio::AnchorHealthInputs in;
+    in.degraded = false;
+    in.hold_active = held;
+    in.anchor_usable = held;
+    in.trust = fast_lio::RecoveryTrust::kPending;
+    const auto verdict = fast_lio::frontendVerdict(factsFor(in));
+    EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kTracking)) << "held " << held;
+    EXPECT_EQ(verdict.validity, fast_lio::frontendWire(fast_lio::FrontendValidity::kFull)) << "held " << held;
+    EXPECT_EQ(verdict.axes, fast_lio::kFrontendAllAxes) << "held " << held;
+    EXPECT_EQ(verdict.health, 0u) << "held " << held;
+    EXPECT_EQ(verdict.substate, fast_lio::frontendWire(fast_lio::FrontendSubstate::kNormal)) << "held " << held;
+  }
+  // Without a hold Pending withholds nothing: field for field the verdict is the LocalQualified one.
+  for (const bool degraded : {false, true}) {
+    for (const bool lost : {false, true}) {
+      fast_lio::AnchorHealthInputs in;
+      in.degraded = degraded;
+      in.lost = lost;
+      in.trust = fast_lio::RecoveryTrust::kLocalQualified;
+      const auto qualified = fast_lio::frontendVerdict(factsFor(in));
+      in.trust = fast_lio::RecoveryTrust::kPending;
+      const auto pending = fast_lio::frontendVerdict(factsFor(in));
+      const std::string cell = std::string("degraded ") + (degraded ? "1" : "0") + " lost " + (lost ? "1" : "0");
+      EXPECT_EQ(pending.state, qualified.state) << cell;
+      EXPECT_EQ(pending.substate, qualified.substate) << cell;
+      EXPECT_EQ(pending.validity, qualified.validity) << cell;
+      EXPECT_EQ(pending.axes, qualified.axes) << cell;
+      EXPECT_EQ(pending.activity, qualified.activity) << cell;
+      EXPECT_EQ(pending.guards, qualified.guards) << cell;
+      EXPECT_EQ(pending.health, qualified.health) << cell;
+    }
+  }
+}
+
+// A Pending scan is Unknown, with no axes, for the reasons any scan is: its own degraded verdict, a gate that is
+// blind or verifying, a runaway, levelling, no initialization, a blocked input, an unknown context or stamp, a pose
+// that is not finite. Lost still makes it Invalid.
+TEST(FrontendObservation, PendingIsUnknownOnlyForAnOriginalCondition)
+{
+  fast_lio::AnchorHealthInputs in;
+  in.trust = fast_lio::RecoveryTrust::kPending;
+  in.degraded = true;
+  auto verdict = fast_lio::frontendVerdict(factsFor(in));
+  EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kDegraded));
+  EXPECT_EQ(verdict.validity, fast_lio::frontendWire(fast_lio::FrontendValidity::kUnknown));
+  EXPECT_EQ(verdict.axes, 0);
+  EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthDegraded, fast_lio::kFrontendHealthDegraded);
+
+  // The scan's own verdict is healthy from here on: whatever makes it Unknown is the condition, not Pending.
+  in.degraded = false;
+  const auto expectUnknown = [](const char * condition, const fast_lio::FrontendFacts & facts) {
+    const auto v = fast_lio::frontendVerdict(facts);
+    EXPECT_EQ(v.validity, fast_lio::frontendWire(fast_lio::FrontendValidity::kUnknown)) << condition;
+    EXPECT_EQ(v.axes, 0) << condition;
+    EXPECT_EQ(v.health & fast_lio::kFrontendHealthDegraded, 0u) << condition << ": Pending added Degraded";
+    EXPECT_EQ(v.health & fast_lio::kFrontendHealthStaticHold, 0u) << condition;
+  };
+  auto facts = factsFor(in);
+  facts.blind = true;
+  expectUnknown("blind", facts);
+  facts = factsFor(in);
+  facts.verifying = true;
+  expectUnknown("verifying", facts);
+  facts = factsFor(in);
+  facts.runaway = true;
+  expectUnknown("runaway", facts);
+  facts = factsFor(in);
+  facts.levelling = true;
+  expectUnknown("levelling", facts);
+  facts = factsFor(in);
+  facts.initialized = false;
+  expectUnknown("not initialized", facts);
+  facts = factsFor(in);
+  facts.blocked = true;
+  expectUnknown("blocked", facts);
+  facts = factsFor(in);
+  facts.contextKnown = false;
+  expectUnknown("unknown context", facts);
+  facts = factsFor(in);
+  facts.stampKnown = false;
+  expectUnknown("unknown stamp", facts);
+  facts = factsFor(in);
+  facts.pose[0] = std::numeric_limits<double>::quiet_NaN();
+  expectUnknown("pose not finite", facts);
+  in.lost = true;
+  verdict = fast_lio::frontendVerdict(factsFor(in));
+  EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kLost));
+  EXPECT_EQ(verdict.validity, fast_lio::frontendWire(fast_lio::FrontendValidity::kInvalid));
+  EXPECT_EQ(verdict.axes, 0);
+}
+
+TEST(FrontendObservation, ZeroOnlyIsDegradedAndNeverAStaticHold)
+{
+  fast_lio::AnchorHealthInputs in;
+  in.degraded = true;
+  in.hold_active = false;  // velocity zeroed, nothing pinned
+  in.anchor_usable = false;
+  for (const auto trust : {fast_lio::RecoveryTrust::kLocalQualified, fast_lio::RecoveryTrust::kPending}) {
+    in.trust = trust;
+    const auto verdict = fast_lio::frontendVerdict(factsFor(in));
+    EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kDegraded));
+    EXPECT_EQ(verdict.validity, fast_lio::frontendWire(fast_lio::FrontendValidity::kUnknown));
+    EXPECT_EQ(verdict.axes, 0);
+    EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthStaticHold, 0u);
+  }
+  // A hold that is still engaged but whose anchor is gone does not count either.
+  in.hold_active = true;
+  EXPECT_EQ(fast_lio::frontendVerdict(factsFor(in)).health & fast_lio::kFrontendHealthStaticHold, 0u);
+}
+
+TEST(FrontendObservation, AHoldOnAUsableAnchorIsReportedAndLostStillWins)
+{
+  fast_lio::AnchorHealthInputs in;
+  in.degraded = true;
+  in.hold_active = true;
+  in.anchor_usable = true;
+  auto verdict = fast_lio::frontendVerdict(factsFor(in));
+  EXPECT_EQ(verdict.substate, fast_lio::frontendWire(fast_lio::FrontendSubstate::kStaticHold));
+  EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthStaticHold, fast_lio::kFrontendHealthStaticHold);
+  EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kDegraded));
+  for (const auto trust : {fast_lio::RecoveryTrust::kLocalQualified,
+                           fast_lio::RecoveryTrust::kPending,
+                           fast_lio::RecoveryTrust::kUnanchored}) {
+    in.trust = trust;
+    in.lost = true;
+    verdict = fast_lio::frontendVerdict(factsFor(in));
+    EXPECT_EQ(verdict.state, fast_lio::frontendWire(fast_lio::FrontendState::kLost));
+    EXPECT_EQ(verdict.validity, fast_lio::frontendWire(fast_lio::FrontendValidity::kInvalid));
+    EXPECT_EQ(verdict.health & fast_lio::kFrontendHealthStaticHold, 0u);
+  }
 }
 }  // namespace

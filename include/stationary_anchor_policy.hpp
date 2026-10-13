@@ -626,23 +626,31 @@ struct AnchorHealthInputs
   RecoveryTrust trust = RecoveryTrust::kLocalQualified;
 };
 
+/// What the scan reports. The legacy flags, the published covariance's degraded inflation, the typed observation and
+/// the trace's export fields all read these.
 struct AnchorHealth
 {
-  bool effective_degraded = false;    ///< what the Degraded flag and the typed state report
-  bool reported_static_hold = false;  ///< what the StaticHold flag reports
+  bool effective_degraded = false;    ///< the scan's own degraded verdict, or Unanchored; never Pending by itself
+  bool reported_static_hold = false;  ///< a hold on a usable anchor of a LocalQualified reference, and not lost
   bool lost = false;                  ///< what the Lost flag and the typed state report
 };
 
-/// One verdict for every encoding of the scan. Pending and Unanchored are degraded whatever the local registration
-/// says; static hold is claimed only for a hold on a usable anchor, never for a zeroed velocity or a static verdict
-/// alone, and never while lost or unanchored. A loss is reported by the scan that declared it even when that scan
-/// went on to rebuild the map: the reset re-arms the gate for the scans after it, it does not undo the loss.
+/// One verdict for every encoding of the scan. Degraded is the front end's own verdict on the scan, and is set on
+/// every scan once Unanchored whatever the local registration says: the process no longer vouches for the position.
+/// Pending adds nothing to it. A Pending scan reports its own verdict, so the scans that do register are not withheld
+/// from the consumers for the whole recovery; a clear Degraded on such a scan says that it registered, not that the
+/// recovery is confirmed or the position checked. The confirmation stays inside the front end: the frozen map, no
+/// new anchor, the deadline and the latch. A static hold is claimed only for a hold on a usable anchor of a
+/// LocalQualified reference, never for a zeroed velocity or a static verdict alone, and never while lost, Pending or
+/// Unanchored. A loss is reported by the scan that declared it even when that scan went on to rebuild the map: the
+/// reset re-arms the gate for the scans after it, it does not undo the loss.
 inline AnchorHealth anchorHealth(const AnchorHealthInputs & in)
 {
   AnchorHealth health;
-  const bool untrusted = in.trust != RecoveryTrust::kLocalQualified;
-  health.effective_degraded = in.degraded || untrusted;
-  health.reported_static_hold = in.hold_active && in.anchor_usable && !in.lost && !untrusted;
+  const bool unanchored = in.trust == RecoveryTrust::kUnanchored;
+  const bool qualified = in.trust == RecoveryTrust::kLocalQualified;
+  health.effective_degraded = in.degraded || unanchored;
+  health.reported_static_hold = in.hold_active && in.anchor_usable && !in.lost && qualified;
   health.lost = in.lost;
   return health;
 }

@@ -1522,9 +1522,10 @@ void popLidarScan()
 }
 
 // What every encoding of the current scan reports (stationary_anchor_policy.hpp): the legacy flags, the published
-// covariance inflation and the typed observation all read this one verdict. Pending and Unanchored are degraded
-// whatever the local registration says; a static hold is claimed only for a hold on a usable anchor; and the scan
-// the gate declared lost reports the loss even when its own map reset has re-armed the gate since.
+// covariance inflation, the typed observation and the trace's export fields all read this one verdict. Degraded is
+// the scan's own verdict, flio_degraded_odom, and is set on every scan once Unanchored; Pending adds nothing to it.
+// A static hold is claimed only for a hold on a usable anchor of a LocalQualified reference, and the scan the gate
+// declared lost reports the loss even when its own map reset has re-armed the gate since.
 fast_lio::AnchorHealth currentAnchorHealth()
 {
   fast_lio::AnchorHealthInputs in;

@@ -111,6 +111,7 @@
 #include "gravity_align_kinematics.hpp"
 #include "imu_backlog_policy.hpp"
 #include "imu_gap_prior.hpp"
+#include "map_backend_reference.hpp"
 #include "parked_hold.hpp"
 #include "preprocess.h"
 #include "prior_map_load.hpp"
@@ -491,7 +492,11 @@ fast_lio::StationaryAnchorParams stationary_anchor_params;
 bool anchor_usable = false;        // this scan's anchor step found a usable anchor; cleared at scan start and on drops
 bool anchor_ever_created = false;  // an anchor has been created in this process
 // Recovery trust, the platform policy (on when reanchor_total_timeout_sec > 0): how long the front end may run
-// without support before its position is not trusted again in this process.
+// without support before its position is not trusted again in this process. recovery_state also holds the first
+// local reference: the constructor configures the start from prior_map_pcd before any input, the normal initial
+// map build records the reference, and a map reset, a replaced reference or a clock fault revokes a cold start.
+// Every access runs in timer_callback or the IMU callback (checkAnchorEvidenceOnImu), serial only while both stay
+// in the node's default mutually exclusive callback group; no other thread touches it.
 fast_lio::RecoveryParams recovery_params;
 fast_lio::RecoveryState recovery_state;
 std::uint64_t lifecycle_scan_seq = 0;  // one per scan the scan path starts on: a matching run is consecutive in it
@@ -1798,6 +1803,7 @@ void finishAnchorScanRecord()
   r.recovery_episode = recovery_state.episode;
   r.recovery_start_ns = recovery_state.start_ns;
   r.recovery_deadline_ns = recovery_state.deadline_ns;
+  r.startup_reference = fast_lio::recoveryStartupReference(recovery_state);
   const fast_lio::AnchorHealth health = currentAnchorHealth();
   r.eff_degraded = health.effective_degraded;
   r.static_hold = health.reported_static_hold;
@@ -1884,6 +1890,8 @@ void changeStationaryReference(fast_lio::AnchorDrop drop, double stamp)
   const fast_lio::AnchorState before = stationary_anchor.state;
   fast_lio::changeAnchorReference(&stationary_anchor, drop);
   noteAnchorEnded(before, drop, stamp);
+  // A replaced or rebuilt reference is no fresh start: a cold start still open ends here.
+  fast_lio::revokeRecoveryStartup(&recovery_state);
 }
 
 void noteRecoveryEvent(const fast_lio::RecoveryEvent & event, std::int64_t stamp_ns)
@@ -2296,6 +2304,7 @@ bool sync_packages(MeasureGroup & meas)
     // A changed clock epoch ends every proof timed in the old one; input stays stopped until a restart.
     dropStationaryAnchor(fast_lio::AnchorDrop::kTimeEpoch, input_epoch_fault_stamp);
     fast_lio::breakRecoveryRun(&recovery_state);
+    fast_lio::revokeRecoveryStartup(&recovery_state);
   }
   if (!imu_fifo_transaction.acceptsInput(input_epoch_guard.faulted()))
     return false;
@@ -2468,6 +2477,7 @@ std::function<void()> beforeImuProcess;
 std::function<int(double)> overrideGuardDegraded;
 std::function<void(double, AnchorFixtureState &)> beforeAnchorStep;
 std::function<bool(double)> forceRunawayTrip;
+std::function<bool(double)> initialBuildTakesNoPoint;
 std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 std::function<void(const std::string &)> afterAnchorTraceLine;
 
@@ -4543,6 +4553,10 @@ public:
     this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
     this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
     this->get_parameter_or<string>("prior_map_pcd", prior_map_pcd_, string(""));
+    // Recovery episodes wait for the first local reference only in a fresh process that builds its local map from
+    // its own scans. Decided here, once, from the configured parameter and before any input: the prior-map paths
+    // clear prior_map_pcd_ later, which grants nothing.
+    fast_lio::configureRecoveryStartup(&recovery_state, prior_map_pcd_.empty());
     this->get_parameter_or<bool>("prior_map_pinned", prior_map_pinned_, false);
     this->get_parameter_or<double>("prior_map_voxel", prior_map_voxel_, 0.0);
     this->get_parameter_or<bool>("prior_map_freeze", prior_map_freeze_, false);
@@ -5447,7 +5461,17 @@ private:
             for (int i = 0; i < feats_down_size; i++) {
               pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
             }
+#ifdef FASTLIO_TEST_HOOKS
+            if (fast_lio_test::initialBuildTakesNoPoint && fast_lio_test::initialBuildTakesNoPoint(lidar_end_time)) {
+              for (auto & point : feats_down_world->points)
+                point.x = std::numeric_limits<float>::quiet_NaN();
+            }
+#endif
             ikdtree.Build(feats_down_world->points);
+            // The first local reference: this build returned with the map backend holding points. Not a supported
+            // scan, and nothing else of the recovery state moves; a build that took no point records nothing.
+            if (fast_lio::mapBackendHoldsPoints(ikdtree))
+              fast_lio::commitInitialReference(&recovery_state);
             anchorTraceMapUpdated();
           }
         }

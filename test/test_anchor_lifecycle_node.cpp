@@ -3647,8 +3647,19 @@ TEST(AnchorNodeEntries, EverySuiteHasItsOwnCTestEntry)
       registered.insert(name);
   std::set<std::string> present;
   const auto * unit = ::testing::UnitTest::GetInstance();
-  for (int i = 0; i < unit->total_test_suite_count(); ++i) {
-    const std::string name = unit->GetTestSuite(i)->name();
+#ifdef INSTANTIATE_TEST_SUITE_P  // googletest 1.10 and later
+  const int suites = unit->total_test_suite_count();
+  const auto suite = [unit](int i) {
+    return unit->GetTestSuite(i);
+  };
+#else  // googletest 1.8 (Foxy) calls a suite a test case
+  const int suites = unit->total_test_case_count();
+  const auto suite = [unit](int i) {
+    return unit->GetTestCase(i);
+  };
+#endif
+  for (int i = 0; i < suites; ++i) {
+    const std::string name = suite(i)->name();
     if (name != "AnchorNodeEntries")
       present.insert(name);
   }

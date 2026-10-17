@@ -4,9 +4,10 @@
 // subscriptions, takes every scan through the production scan path, the map
 // reset in rebuild_local_map and the /Odometry publisher. FASTLIO_TEST_HOOKS
 // fix only what a synthetic stream cannot produce on demand: the divergence
-// guard's verdict, the state registration hands to the anchor step, and a
-// runaway trip for the watchdog's late map reset or hold. The static verdict
-// is the real one, computed from the IMU windows the fixture sends.
+// guard's verdict, the state registration hands to the anchor step, a runaway
+// trip for the watchdog's late map reset or hold, and a normal initial map
+// build whose points the map backend all skips. The static verdict is the
+// real one, computed from the IMU windows the fixture sends.
 //
 // The anchor and pre-event positions are the three frozen cases F1-F3.
 // Attitude, velocity and covariance are fixed fixture values (identity, a
@@ -194,6 +195,7 @@ struct Step
   // Input-driven slots: > 0 sends, in place of a new scan, the cloud of the scan this many slots back once more, stamp
   // and points alike. The slot's IMU samples still go out.
   int repeat = 0;
+  bool no_build_point = false;  // a normal initial map build on this scan is handed only points the backend skips
 };
 
 struct Relocalization
@@ -213,6 +215,7 @@ struct Scenario
   bool prior_map = false;    // a prior map waiting for /relocalization/result
   std::vector<Relocalization> relocalizations;
   double scan_length = kScanLength;  // s, last point time within each scan; kScanPeriod: scans that abut
+  bool warm_up = true;               // false: the steps are the process's first input, its start included
 };
 
 struct Observation
@@ -590,7 +593,7 @@ public:
     if (typed_ && !spinUntil([&] { return typed_->get_publisher_count() == 1; }))
       return "typed observation publisher never matched";
 
-    std::string error = warmUp();
+    std::string error = scenario_.warm_up ? warmUp() : std::string();
     for (std::size_t i = 0; error.empty() && i < scenario_.steps.size(); ++i)
       error = scenario_.flexible ? runSlot(static_cast<int>(i)) : runScan(static_cast<int>(i));
     if (error.empty() && scenario_.flexible)
@@ -667,6 +670,10 @@ private:
       const Step * s = stepAt(end);
       return s != nullptr && s->trip;
     };
+    fast_lio_test::initialBuildTakesNoPoint = [this](double end) {
+      const Step * s = stepAt(end);
+      return s != nullptr && s->no_build_point;
+    };
     // A scan's IMU batch is settled before its record is finished, so the record takes the batch reported since the
     // last record; a scan dropped where it is synced settles none. The hook runs with the input buffer unlocked.
     fast_lio_test::afterImuConsumption =
@@ -732,6 +739,7 @@ private:
     fast_lio_test::overrideGuardDegraded = {};
     fast_lio_test::beforeAnchorStep = {};
     fast_lio_test::forceRunawayTrip = {};
+    fast_lio_test::initialBuildTakesNoPoint = {};
     fast_lio_test::afterAnchorScanRecord = {};
     fast_lio_test::afterAnchorTraceLine = {};
     fast_lio_test::afterImuConsumption = {};
@@ -1538,6 +1546,7 @@ bool sameObservation(const Observation & a, const Observation & b, std::string *
   integer("recovery_episode", static_cast<long long>(x.recovery_episode), static_cast<long long>(y.recovery_episode));
   integer("recovery_start_ns", x.recovery_start_ns, y.recovery_start_ns);
   integer("recovery_deadline_ns", x.recovery_deadline_ns, y.recovery_deadline_ns);
+  integer("startup_reference", static_cast<int>(x.startup_reference), static_cast<int>(y.startup_reference));
   integer("eff_degraded", x.eff_degraded, y.eff_degraded);
   integer("static_hold", x.static_hold, y.static_hold);
   integer("imu_batch", a.imu_batch, b.imu_batch);
@@ -1936,7 +1945,8 @@ std::string describeRun(const ChildResult & r)
         << static_cast<int>(x.trust_post) << " supported " << x.supported << " ref " << x.ref_gen << " published "
         << x.published << " flags " << x.flags << " odom " << o.odom_seen << " typed " << o.typed_seen << ':'
         << o.typed_state << '/' << o.typed_validity << '/' << o.typed_health << " imu " << o.imu_batch << ':'
-        << o.imu_disposition << '/' << o.imu_reason << '/' << o.imu_samples << " gap " << x.gap_ns << '\n';
+        << o.imu_disposition << '/' << o.imu_reason << '/' << o.imu_samples << " gap " << x.gap_ns << " startup "
+        << static_cast<int>(x.startup_reference) << '\n';
   }
   for (std::size_t i = 0; i < r.lines.size(); ++i) {
     if (r.lines[i].rfind("[ZUPT-ANCHOR-SCAN] ", 0) == 0)
@@ -2967,6 +2977,180 @@ void expectConsumedExitOutputs(const ChildResult & r, const Scenario & s, const 
     << name << ": " << formatPosition(d.odom_p);
   EXPECT_EQ(odomFlags(d), moved ? kFlagDegraded : kFlagDegraded | kFlagStaticHold) << name;
   EXPECT_EQ(anchorLines(r, "invalidated", old_id).size(), moved ? 1u : 0u) << name;
+}
+
+// ---- The first local reference ---------------------------------------------------------------------------------
+
+// The process's first scans arrive before any IMU sample: each one is dropped for an empty window once the first
+// sample is in. The node keeps the five queued meanwhile (max_scan_backlog_sec 0.5 s).
+constexpr int kStartupGapScans = 5;
+constexpr double kStartupGapEnd = 0.40;  // s after the first scan's end: no IMU sample before then
+constexpr double kStartupBudget = 10.0;  // s, the platform's reanchor_total_timeout_sec
+constexpr std::int64_t kStartupBudgetNs = 10000000000;
+constexpr double kStillTimeout = 90.0;  // s, the platform's imu_init_still_timeout_s
+constexpr std::int64_t kStillTimeoutNs = 90000000000;
+constexpr int kStillInitScans = 11;       // parked scans the sustained still gate completes on: 1.0 s of samples
+constexpr int kColdPublished = 6;         // parked scans published after the map build, before the empty window
+constexpr int kColdAfter = 14;            // parked scans after an empty window: a 1 s matching run and some to spare
+constexpr int kMovingScans = 164;         // 16.4 s of motion while the IMU initialization waits for the platform
+constexpr int kLongMovingScans = 467;     // 46.7 s
+constexpr int kTimeoutMovingScans = 910;  // past the still timeout, then the map build and scans published after it
+
+// The first kStartupGapScans slots: no IMU sample until kStartupGapEnd after the first scan's end.
+void appendStartupGap(Scenario & s)
+{
+  Step first = slot(Phase::kGap);
+  first.hole_from = -kScanPeriod;
+  first.hole_to = kStartupGapEnd;
+  s.steps.push_back(first);
+  append(s, kStartupGapScans - 1, slot(Phase::kGap));
+}
+
+// A process started fresh, with no prior map, on the platform's recovery budget and IMU initialization, while the
+// platform moves: its first scans come before any IMU sample, then the sustained still gate restarts its window on
+// each of `moving` scans. With `parks` the platform then parks: the gate completes on kStillInitScans scans, the
+// next scan builds the local map and the parked scans after it are published; a scan whose window holds one sample
+// and one whose window holds none follow, then parked scans again. Without it the platform moves on through the
+// still timeout, and the initialization completes from a moving window.
+Scenario coldStart(int moving, bool parks, bool trace = true)
+{
+  Scenario s = traced(
+    inputScenario("cold_start_moving_" + std::to_string(moving) + (parks ? "_then_parked" : "_through_the_timeout")),
+    trace);
+  s.warm_up = false;
+  setPolicy(s, kStartupBudget, 1.0);
+  setParam(s, rclcpp::Parameter("imu_init_require_still", true));
+  setParam(s, rclcpp::Parameter("imu_init_still_sustained_en", true));
+  setParam(s, rclcpp::Parameter("imu_init_still_tol", 0.03));
+  setParam(s, rclcpp::Parameter("imu_init_still_timeout_s", kStillTimeout));
+  appendStartupGap(s);
+  append(s, moving, slot(Phase::kMove, Imu::kMoving));
+  if (!parks)
+    return s;
+  s.typed = true;
+  setParam(s, rclcpp::Parameter("publish.frontend_observation", true));
+  setParam(s, rclcpp::Parameter("publish.frontend_clock_domain", "fixture"));
+  append(s, kStillInitScans + 1 + kColdPublished, slot(Phase::kStatic));
+  Step thin = slot(Phase::kEvent);
+  thin.hole_from = -0.094;  // as in lostImu(LostImu::kEmpty)
+  thin.hole_to = 0.101;
+  s.steps.push_back(thin);
+  s.steps.push_back(slot(Phase::kEvent));
+  append(s, kColdAfter, slot(Phase::kAfter));
+  return s;
+}
+
+// A process started fresh whose first normal map builds take no point. The IMU initialization completes on the
+// second scan. The next three scans' builds take no point, the second of them on a window holding one sample, and
+// the scan between the second and the third is dropped for an empty window. The scan after the third build takes
+// the map, the next one is dropped for an empty window, and parked scans are published after it.
+Scenario emptyFirstBuilds()
+{
+  Scenario s = traced(inputScenario("empty_first_builds"), true);
+  s.warm_up = false;
+  setPolicy(s, kStartupBudget, 1.0);
+  append(s, 2, slot(Phase::kBefore));
+  Step attempt = slot(Phase::kEvent);
+  attempt.no_build_point = true;
+  s.steps.push_back(attempt);
+  Step thin = attempt;
+  thin.hole_from = -0.094;
+  thin.hole_to = 0.101;
+  s.steps.push_back(thin);
+  s.steps.push_back(slot(Phase::kEvent));
+  s.steps.push_back(attempt);
+  Step build = slot(Phase::kAfter);
+  build.hole_from = 0.001;  // the next scan's window holds no sample
+  build.hole_to = 0.101;
+  s.steps.push_back(build);
+  s.steps.push_back(slot(Phase::kAfter));
+  append(s, kColdAfter, slot(Phase::kLater));
+  return s;
+}
+
+// A process started with a prior map that needs no alignment: the same first scans before any IMU sample, then
+// parked scans, the IMU initialization, the map build from the prior map and the scan, and scans published after it.
+Scenario priorMapStart()
+{
+  Scenario s = traced(inputScenario("prior_map_start"), true);
+  s.warm_up = false;
+  setPolicy(s, kStartupBudget, 1.0);
+  setParam(s, rclcpp::Parameter("prior_map_pcd", priorMapPath()));
+  setParam(s, rclcpp::Parameter("prior_map_align", "as_delivered"));
+  appendStartupGap(s);
+  append(s, 3 + kColdAfter, slot(Phase::kAfter));
+  return s;
+}
+
+// The first scan whose record reports the first reference built: the scan of the build.
+const Observation * firstEstablished(const ChildResult & r)
+{
+  for (const auto & o : r.observations)
+    if (o.record.startup_reference == fast_lio::StartupReference::kEstablished)
+      return &o;
+  return nullptr;
+}
+
+std::size_t indexOf(const ChildResult & r, const Observation & o)
+{
+  return static_cast<std::size_t>(&o - r.observations.data());
+}
+
+// describeRun without the middle of a long IMU initialization: the first scans, and the scans from shortly before
+// the first reference on.
+std::string describeStart(const ChildResult & r)
+{
+  constexpr std::size_t kHead = kStartupGapScans + 3;
+  constexpr std::size_t kTail = 3;
+  const Observation * build = firstEstablished(r);
+  const std::size_t from = build == nullptr ? r.observations.size() : indexOf(r, *build);
+  ChildResult brief = r;
+  brief.observations.clear();
+  for (std::size_t i = 0; i < r.observations.size(); ++i)
+    if (i < kHead || i + kTail >= from)
+      brief.observations.push_back(r.observations[i]);
+  return describeRun(brief);
+}
+
+// Cold on every scan before `build` and established from it on: the phase moved forward once, at the build.
+void expectColdUntil(const ChildResult & r, const Observation & build)
+{
+  for (std::size_t i = 0; i < r.observations.size(); ++i) {
+    const auto & x = r.observations[i].record;
+    EXPECT_EQ(x.startup_reference,
+              i < indexOf(r, build) ? fast_lio::StartupReference::kCold : fast_lio::StartupReference::kEstablished)
+      << "scan " << x.scan_seq;
+  }
+}
+
+// Up to and including the scan of `build`, nothing of the recovery moved: no episode, no clock, the reference still
+// trusted as far as the local checks go, and no pose published. Every recovery record comes after that scan.
+void expectNothingStartedBefore(const ChildResult & r, const Observation & build)
+{
+  for (std::size_t i = 0; i <= indexOf(r, build); ++i) {
+    const auto & x = r.observations[i].record;
+    EXPECT_FALSE(x.published) << "scan " << x.scan_seq;
+    EXPECT_EQ(x.trust_pre, fast_lio::RecoveryTrust::kLocalQualified) << "scan " << x.scan_seq;
+    EXPECT_EQ(x.trust_post, fast_lio::RecoveryTrust::kLocalQualified) << "scan " << x.scan_seq;
+    EXPECT_EQ(x.recovery_episode, 0u) << "scan " << x.scan_seq;
+    EXPECT_EQ(x.recovery_start_ns, -1) << "scan " << x.scan_seq;
+    EXPECT_EQ(x.recovery_deadline_ns, -1) << "scan " << x.scan_seq;
+  }
+  for (const auto & line : linesTagged(r, "[FE-RECOVERY]"))
+    EXPECT_GT(toI64(valueOf(line, "scan_seq")), static_cast<std::int64_t>(build.record.scan_seq)) << line;
+}
+
+// The scan of the first reference: the normal initial build returned with points in the map. It returned before the
+// anchor step, published nothing and is no supported scan; no anchor or candidate exists.
+void expectTheBuildScan(const Observation & build)
+{
+  const auto & b = build.record;
+  EXPECT_EQ(b.outcome, fast_lio::AnchorScanOutcome::kBeforeAnchorStep);
+  EXPECT_TRUE(b.map_updated);
+  EXPECT_FALSE(b.anchor_step);
+  EXPECT_FALSE(b.published);
+  EXPECT_FALSE(b.supported);
+  EXPECT_EQ(b.anchor_state, fast_lio::AnchorState::kEmpty);
 }
 
 }  // namespace
@@ -4849,4 +5033,322 @@ TEST(AnchorLifecycleExport, ABridgedScanReportsItsOwnVerdict)
   }
   EXPECT_GT(pending_degraded, 0);
   EXPECT_GT(pending_clear, 0) << "no healthy Pending scan after the verification";
+}
+
+// ---------------------------------------------------------------------------
+// The first local reference: what starts an unsupported recovery before it
+// ---------------------------------------------------------------------------
+
+// A process started fresh while the platform moves. Its first scans come before any IMU sample: each one is dropped
+// for an empty window, breaks the anchor evidence and blinds the raw re-anchor gate as before, but starts no
+// recovery. The sustained still gate restarts its window on every moving scan, for 16.4 s or 46.7 s, far past the
+// 10 s budget, and nothing runs out: no episode was started. The scan after the initialization builds the local map,
+// the first reference; nothing is published before it, and it is no supported scan. From there on the rules apply as
+// before: a scan whose window holds no sample starts the recovery from the last supported scan, and the matching run
+// after it qualifies it.
+TEST(AnchorLifecycleStartup, AColdStartStartsNoRecoveryBeforeItsFirstReference)
+{
+  for (const int moving : {kMovingScans, kLongMovingScans}) {
+    const Scenario scenario = coldStart(moving, true);
+    const ChildResult r = runScenario(scenario);
+    SCOPED_TRACE(scenario.name + "\n" + describeStart(r));
+    ASSERT_TRUE(r.ok());
+    const Observation * build = firstEstablished(r);
+    ASSERT_NE(build, nullptr);
+    expectColdUntil(r, *build);
+    expectNothingStartedBefore(r, *build);
+    expectTheBuildScan(*build);
+
+    const auto gap = r.phase(Phase::kGap);
+    ASSERT_EQ(gap.size(), static_cast<std::size_t>(kStartupGapScans));
+    for (const auto * o : gap) {
+      EXPECT_EQ(o->record.outcome, fast_lio::AnchorScanOutcome::kDroppedEmptyImu) << "step " << o->step;
+      EXPECT_TRUE(hasEvent(*o, fast_lio::kAnchorEventImuCoverageGap)) << "step " << o->step;
+      EXPECT_EQ(o->record.gate_post, fast_lio::AnchorTraceGate::kBlind) << "step " << o->step;
+    }
+
+    // The first scan with IMU, a restart of the still window on every moving scan after it, and the completion on
+    // the scan before the build.
+    const std::size_t at = indexOf(r, *build);
+    ASSERT_GT(at, static_cast<std::size_t>(kStartupGapScans + moving));
+    EXPECT_EQ(r.observations[kStartupGapScans].record.outcome, fast_lio::AnchorScanOutcome::kBootstrap);
+    int restarts = 0;
+    int completions = 0;
+    for (const auto & o : r.observations) {
+      restarts += o.imu_reason == static_cast<int>(fast_lio::ImuProcessReason::kInitializationMotion) ? 1 : 0;
+      completions += o.imu_reason == static_cast<int>(fast_lio::ImuProcessReason::kInitializationComplete) ? 1 : 0;
+    }
+    EXPECT_EQ(restarts, moving - 1);
+    EXPECT_EQ(completions, 1);
+    EXPECT_EQ(r.observations[at - 1].imu_reason, static_cast<int>(fast_lio::ImuProcessReason::kInitializationComplete));
+    // A recovery started on the first dropped scan would have run out long before the build.
+    EXPECT_GT(build->record.end_ns - gap.front()->record.end_ns, kStartupBudgetNs + kK5BoundNs);
+
+    // Published from the scan after the build on: healthy, supported, the initialization diagnostic clear.
+    std::vector<const Observation *> published;
+    for (const auto * o : r.phase(Phase::kStatic))
+      if (o->record.published)
+        published.push_back(o);
+    ASSERT_GE(published.size(), 3u);
+    EXPECT_EQ(published.front()->record.scan_seq, build->record.scan_seq + 1);
+    for (const auto * o : published) {
+      EXPECT_TRUE(o->record.supported) << "step " << o->step;
+      EXPECT_EQ(odomFlags(*o) & (kFlagDegraded | kFlagLost), 0u) << "step " << o->step;
+      EXPECT_EQ(o->odom_twist_cov[5], 0.0) << "step " << o->step;
+    }
+
+    // After the reference the first scan with an empty window starts the recovery, from the last supported scan.
+    const auto event = r.phase(Phase::kEvent);
+    ASSERT_EQ(event.size(), 2u);
+    EXPECT_TRUE(event.front()->record.published);
+    const Observation & dropped = *event.back();
+    EXPECT_EQ(dropped.record.outcome, fast_lio::AnchorScanOutcome::kDroppedEmptyImu);
+    const Observation * supported = lastSupportedBefore(r, dropped);
+    ASSERT_NE(supported, nullptr);
+    EXPECT_GT(supported->record.scan_seq, build->record.scan_seq);
+    EXPECT_EQ(dropped.record.trust_post, fast_lio::RecoveryTrust::kPending);
+    EXPECT_EQ(dropped.record.recovery_start_ns, supported->record.end_ns);
+    EXPECT_EQ(dropped.record.recovery_deadline_ns, supported->record.end_ns + kStartupBudgetNs);
+    const auto pending = recoveryLines(r, "pending");
+    ASSERT_EQ(pending.size(), 1u);
+    EXPECT_EQ(valueOf(pending.front(), "reason"), "imu_coverage_gap") << pending.front();
+    EXPECT_EQ(valueOf(pending.front(), "scan_seq"), std::to_string(dropped.record.scan_seq)) << pending.front();
+    EXPECT_EQ(valueOf(pending.front(), "start_ns"), std::to_string(supported->record.end_ns)) << pending.front();
+    EXPECT_EQ(valueOf(pending.front(), "path"), "scan") << pending.front();
+    const auto after = r.phase(Phase::kAfter);
+    ASSERT_EQ(after.size(), static_cast<std::size_t>(kColdAfter));
+    const Observation * confirming = completesRun(after, 0, kNsPerSecond);
+    ASSERT_NE(confirming, nullptr);
+    const auto qualified = recoveryLines(r, "qualified");
+    ASSERT_EQ(qualified.size(), 1u);
+    EXPECT_EQ(valueOf(qualified.front(), "scan_seq"), std::to_string(confirming->record.scan_seq)) << qualified.front();
+    EXPECT_TRUE(recoveryLines(r, "unanchored").empty());
+    EXPECT_EQ(counterValue(r, "recovery_started"), "1");
+    EXPECT_EQ(counterValue(r, "recovery_qualified"), "1");
+    EXPECT_EQ(counterValue(r, "recovery_expired"), "0");
+    EXPECT_EQ(counterValue(r, "imu_coverage_gap"), std::to_string(kStartupGapScans + 1));
+
+    // Every published scan reports its own verdict, on /Odometry and in the typed observation alike.
+    for (const auto & o : r.observations) {
+      if (o.record.published) {
+        expectTheScanOwnVerdict(o);
+        expectTheTypedOwnVerdict(o);
+      }
+    }
+    expectOdometryOnlyForPublishedScans(r);
+    expectTraceAccountsForEveryScan(r, true, scenario.name);
+  }
+}
+
+// The per-scan trace changes nothing of a cold start: the same states, flags, phases and transition records with it
+// on as with it off. With it off the build is not observed, and it is the first reference all the same.
+TEST(AnchorLifecycleStartup, TheTraceSwitchChangesNothingOfAColdStart)
+{
+  const Scenario on = coldStart(kMovingScans, true, true);
+  const Scenario off = coldStart(kMovingScans, true, false);
+  const ChildResult a = runScenario(on);
+  const ChildResult b = runScenario(off);
+  ASSERT_TRUE(a.ok()) << on.name << " (trace on): " << a.describe();
+  ASSERT_TRUE(b.ok()) << off.name << " (trace off): " << b.describe();
+  expectSameRun(a, b, on.name);
+  EXPECT_EQ(transitionLines(a), transitionLines(b)) << on.name << ": transition records differ with the trace on";
+  expectTraceAccountsForEveryScan(a, true, on.name + " (trace on)");
+  expectTraceAccountsForEveryScan(b, false, off.name + " (trace off)");
+  const Observation * build = firstEstablished(b);
+  ASSERT_NE(build, nullptr);
+  expectColdUntil(b, *build);
+  EXPECT_FALSE(build->record.map_updated);
+  EXPECT_TRUE(writeTraceSample(a, on.name)) << on.name;
+}
+
+// The platform never stops: the still gate times out after 90 s and the initialization completes from a moving
+// window, which /Odometry keeps reporting in its own diagnostic cell. The build after it is the first reference all
+// the same, and the scans after it are published without Degraded. Nothing started on the scans dropped before any
+// IMU sample, 90 s earlier.
+TEST(AnchorLifecycleStartup, AStillGateThatTimesOutStillGivesTheFirstReference)
+{
+  const Scenario scenario = coldStart(kTimeoutMovingScans, false);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(scenario.name + "\n" + describeStart(r));
+  ASSERT_TRUE(r.ok());
+  const Observation * build = firstEstablished(r);
+  ASSERT_NE(build, nullptr);
+  expectColdUntil(r, *build);
+  expectNothingStartedBefore(r, *build);
+  expectTheBuildScan(*build);
+  const std::size_t at = indexOf(r, *build);
+  ASSERT_GT(at, static_cast<std::size_t>(kStartupGapScans + 2));
+  EXPECT_EQ(r.observations[kStartupGapScans].record.outcome, fast_lio::AnchorScanOutcome::kBootstrap);
+  const Observation & first_try = r.observations[kStartupGapScans + 1];
+  const Observation & completed = r.observations[at - 1];
+  EXPECT_EQ(completed.imu_reason, static_cast<int>(fast_lio::ImuProcessReason::kInitializationComplete));
+  EXPECT_GE(completed.record.beg_ns - first_try.record.beg_ns, kStillTimeoutNs);
+  int restarts = 0;
+  for (std::size_t i = kStartupGapScans + 1; i + 1 < at; ++i)
+    restarts += r.observations[i].imu_reason == static_cast<int>(fast_lio::ImuProcessReason::kInitializationMotion);
+  EXPECT_EQ(restarts, static_cast<int>(at - kStartupGapScans - 2));
+  int published = 0;
+  for (std::size_t i = at + 1; i < r.observations.size(); ++i) {
+    const Observation & o = r.observations[i];
+    EXPECT_TRUE(o.record.published) << "scan " << o.record.scan_seq;
+    EXPECT_EQ(o.record.trust_post, fast_lio::RecoveryTrust::kLocalQualified) << "scan " << o.record.scan_seq;
+    EXPECT_EQ(odomFlags(o) & (kFlagDegraded | kFlagLost), 0u) << "scan " << o.record.scan_seq;
+    EXPECT_EQ(o.odom_twist_cov[5], 1.0) << "scan " << o.record.scan_seq << ": initialized from a moving window";
+    published += o.record.published ? 1 : 0;
+  }
+  EXPECT_GE(published, 3);
+  EXPECT_TRUE(linesTagged(r, "[FE-RECOVERY]").empty());
+  EXPECT_EQ(counterValue(r, "recovery_started"), "0");
+  expectOdometryOnlyForPublishedScans(r);
+  expectTraceAccountsForEveryScan(r, true, scenario.name);
+}
+
+// Normal initial builds that take no point are no reference: the phase stays cold through them, and the scan with
+// an empty window between them starts nothing. The build that takes the scan is the first reference. The scan with
+// an empty window right after it starts the recovery at once, with its clock at that scan, there being no supported
+// scan before it; the scans published after it qualify the recovery.
+TEST(AnchorLifecycleStartup, AnInitialBuildThatTakesNoPointIsNoReference)
+{
+  const Scenario scenario = emptyFirstBuilds();
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const auto before = r.phase(Phase::kBefore);
+  const auto attempts = r.phase(Phase::kEvent);
+  const auto built = r.phase(Phase::kAfter);
+  const auto later = r.phase(Phase::kLater);
+  ASSERT_EQ(before.size(), 2u);
+  ASSERT_EQ(attempts.size(), 4u);
+  ASSERT_EQ(built.size(), 2u);
+  ASSERT_EQ(later.size(), static_cast<std::size_t>(kColdAfter));
+  EXPECT_EQ(before.front()->record.outcome, fast_lio::AnchorScanOutcome::kBootstrap);
+  EXPECT_EQ(before.back()->imu_reason, static_cast<int>(fast_lio::ImuProcessReason::kInitializationComplete));
+  for (std::size_t i = 0; i < attempts.size(); ++i) {
+    const auto & x = attempts[i]->record;
+    const bool dropped = i == 2;
+    EXPECT_EQ(x.outcome,
+              dropped ? fast_lio::AnchorScanOutcome::kDroppedEmptyImu : fast_lio::AnchorScanOutcome::kBeforeAnchorStep)
+      << "step " << attempts[i]->step;
+    // Each build ran on the scan's points, and the map backend kept none of them: the next scan builds again.
+    EXPECT_EQ(x.map_updated, !dropped) << "step " << attempts[i]->step;
+  }
+  EXPECT_TRUE(hasEvent(*attempts[2], fast_lio::kAnchorEventImuCoverageGap));
+
+  const Observation * build = firstEstablished(r);
+  ASSERT_EQ(build, built.front());
+  expectColdUntil(r, *build);
+  expectNothingStartedBefore(r, *build);
+  expectTheBuildScan(*build);
+
+  const Observation & dropped = *built.back();
+  EXPECT_EQ(dropped.record.outcome, fast_lio::AnchorScanOutcome::kDroppedEmptyImu);
+  EXPECT_EQ(lastSupportedBefore(r, dropped), nullptr);
+  EXPECT_EQ(dropped.record.trust_post, fast_lio::RecoveryTrust::kPending);
+  EXPECT_EQ(dropped.record.recovery_start_ns, dropped.record.end_ns);
+  EXPECT_EQ(dropped.record.recovery_deadline_ns, dropped.record.end_ns + kStartupBudgetNs);
+  const auto pending = recoveryLines(r, "pending");
+  ASSERT_EQ(pending.size(), 1u);
+  EXPECT_EQ(valueOf(pending.front(), "reason"), "imu_coverage_gap") << pending.front();
+  EXPECT_EQ(valueOf(pending.front(), "scan_seq"), std::to_string(dropped.record.scan_seq)) << pending.front();
+  EXPECT_EQ(valueOf(pending.front(), "start_ns"), std::to_string(dropped.record.end_ns)) << pending.front();
+  for (const auto * o : later)
+    EXPECT_TRUE(o->record.published) << "step " << o->step;
+  const Observation * confirming = completesRun(later, 0, kNsPerSecond);
+  ASSERT_NE(confirming, nullptr);
+  const auto qualified = recoveryLines(r, "qualified");
+  ASSERT_EQ(qualified.size(), 1u);
+  EXPECT_EQ(valueOf(qualified.front(), "scan_seq"), std::to_string(confirming->record.scan_seq)) << qualified.front();
+  EXPECT_TRUE(recoveryLines(r, "unanchored").empty());
+  EXPECT_EQ(counterValue(r, "recovery_started"), "1");
+  EXPECT_EQ(counterValue(r, "recovery_qualified"), "1");
+  EXPECT_EQ(counterValue(r, "recovery_expired"), "0");
+  expectOdometryOnlyForPublishedScans(r);
+  expectTraceAccountsForEveryScan(r, true, scenario.name);
+}
+
+// A map reset after the first reference: the reference stays established, the reset latches as before, and nothing
+// after it gives the process a cold start back. Here the rebuild takes no point, and every scan after it builds the
+// empty map again without taking a point either.
+TEST(AnchorLifecycleStartup, AMapResetAfterTheFirstReferenceLatchesAndIsNoColdStart)
+{
+  const Scenario scenario = resetRebuildsNoMap(false, true);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const Observation * build = firstEstablished(r);
+  ASSERT_NE(build, nullptr);
+  EXPECT_EQ(build->step, -1) << "the first reference is the warm-up's map build";
+  expectColdUntil(r, *build);
+  expectNothingStartedBefore(r, *build);
+  expectTheBuildScan(*build);
+  const auto reset = r.phase(Phase::kEvent);
+  ASSERT_EQ(reset.size(), 1u);
+  EXPECT_TRUE(hasEvent(*reset.front(), fast_lio::kAnchorEventMapReset));
+  EXPECT_EQ(reset.front()->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
+  const auto after = r.phase(Phase::kAfter);
+  ASSERT_EQ(after.size(), static_cast<std::size_t>(kRebuildAfter));
+  for (const auto * o : after) {
+    EXPECT_EQ(o->record.outcome, fast_lio::AnchorScanOutcome::kBeforeAnchorStep) << "step " << o->step;
+    EXPECT_TRUE(o->record.map_updated) << "step " << o->step;
+    EXPECT_FALSE(o->record.published) << "step " << o->step;
+    EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kUnanchored) << "step " << o->step;
+  }
+  const auto latched = recoveryLines(r, "unanchored");
+  ASSERT_EQ(latched.size(), 1u);
+  EXPECT_EQ(valueOf(latched.front(), "reason"), "map_reset") << latched.front();
+  EXPECT_TRUE(recoveryLines(r, "pending").empty());
+  EXPECT_EQ(counterValue(r, "map_reset_unanchored"), "1");
+}
+
+// A process started with a prior map is no cold start: every scan reports it excluded, and the first scan with an
+// empty window starts the recovery at once, with its clock at that scan. The map is built from the prior map and the
+// scan while the recovery runs, as before, and the scans published after it qualify the recovery. (The build of a
+// map that did not exist is the one map update a Pending scan makes, so the trace's own account of the run is not
+// asked of this one: it holds Pending scans to adding nothing to the map.)
+TEST(AnchorLifecycleStartup, AStartWithAPriorMapFollowsTheRulesFromTheBeginning)
+{
+  ASSERT_TRUE(writePriorMap(priorMapPath()));
+  const Scenario scenario = priorMapStart();
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  for (const auto & o : r.observations)
+    EXPECT_EQ(o.record.startup_reference, fast_lio::StartupReference::kExcluded) << "scan " << o.record.scan_seq;
+  const auto gap = r.phase(Phase::kGap);
+  ASSERT_EQ(gap.size(), static_cast<std::size_t>(kStartupGapScans));
+  const Observation & first = *gap.front();
+  EXPECT_EQ(first.record.outcome, fast_lio::AnchorScanOutcome::kDroppedEmptyImu);
+  EXPECT_EQ(first.record.trust_post, fast_lio::RecoveryTrust::kPending);
+  EXPECT_EQ(first.record.recovery_start_ns, first.record.end_ns);
+  EXPECT_EQ(first.record.recovery_deadline_ns, first.record.end_ns + kStartupBudgetNs);
+  const auto pending = recoveryLines(r, "pending");
+  ASSERT_EQ(pending.size(), 1u);
+  EXPECT_EQ(valueOf(pending.front(), "reason"), "imu_coverage_gap") << pending.front();
+  EXPECT_EQ(valueOf(pending.front(), "scan_seq"), std::to_string(first.record.scan_seq)) << pending.front();
+  EXPECT_EQ(valueOf(pending.front(), "start_ns"), std::to_string(first.record.end_ns)) << pending.front();
+
+  // The first scan with IMU, the one that completes the initialization, the map build, then the published scans.
+  const auto after = r.phase(Phase::kAfter);
+  ASSERT_EQ(after.size(), static_cast<std::size_t>(3 + kColdAfter));
+  EXPECT_EQ(after[0]->record.outcome, fast_lio::AnchorScanOutcome::kBootstrap);
+  EXPECT_EQ(after[1]->imu_reason, static_cast<int>(fast_lio::ImuProcessReason::kInitializationComplete));
+  const auto & b = after[2]->record;
+  EXPECT_EQ(b.outcome, fast_lio::AnchorScanOutcome::kBeforeAnchorStep);
+  EXPECT_TRUE(b.map_updated);
+  EXPECT_FALSE(b.published);
+  EXPECT_EQ(b.trust_post, fast_lio::RecoveryTrust::kPending);
+  const std::vector<const Observation *> published(after.begin() + 3, after.end());
+  for (const auto * o : published)
+    EXPECT_TRUE(o->record.published) << "step " << o->step;
+  const Observation * confirming = completesRun(published, 0, kNsPerSecond);
+  ASSERT_NE(confirming, nullptr);
+  const auto qualified = recoveryLines(r, "qualified");
+  ASSERT_EQ(qualified.size(), 1u);
+  EXPECT_EQ(valueOf(qualified.front(), "scan_seq"), std::to_string(confirming->record.scan_seq)) << qualified.front();
+  EXPECT_TRUE(recoveryLines(r, "unanchored").empty());
+  EXPECT_EQ(counterValue(r, "recovery_started"), "1");
+  EXPECT_EQ(counterValue(r, "recovery_qualified"), "1");
+  EXPECT_EQ(counterValue(r, "scans"), std::to_string(r.observations.size()));
+  EXPECT_EQ(linesTagged(r, "[ZUPT-ANCHOR-SCAN]").size(), r.observations.size());
+  expectOdometryOnlyForPublishedScans(r);
 }

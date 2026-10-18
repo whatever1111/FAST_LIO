@@ -26,6 +26,7 @@
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
@@ -198,6 +199,7 @@ struct Step
   // and points alike. The slot's IMU samples still go out.
   int repeat = 0;
   bool no_build_point = false;  // a normal initial map build on this scan is handed only points the backend skips
+  bool reset_before_reference = false;  // schedule the same production map-reset owner before normal Build
 };
 
 struct Relocalization
@@ -220,6 +222,8 @@ struct Scenario
   double scan_length = kScanLength;  // s, last point time within each scan; kScanPeriod: scans that abut
   bool warm_up = true;               // false: the steps are the process's first input, its start included
   bool capture_raw_state = false;    // startup-only: snapshot at scope exit or an unlocked empty-IMU drop
+  bool capture_tf_graph = false;     // independent old-output and disabled-publisher evidence
+  bool wait_for_reference_repeat = false;
 };
 
 struct Observation
@@ -285,6 +289,8 @@ struct ChildResult
   std::vector<fast_lio_interfaces::msg::ReferenceHealth> references;
   std::vector<fast_lio_interfaces::msg::FrontendObservation> typed_poses;
   std::vector<PosePublication> pose_publications;
+  std::vector<geometry_msgs::msg::TransformStamped> transforms;
+  std::uint64_t reference_publishers_before = 0, reference_publishers_after = 0;
 
   bool ok() const { return WIFEXITED(status) && WEXITSTATUS(status) == 0 && error.empty(); }
   std::string describe() const
@@ -612,6 +618,25 @@ public:
           reference_cdr_.emplace_back(reinterpret_cast<const char *>(data.buffer), data.buffer_length);
           if (message->has_scan_sequence && message->kind != 4)
             reference_scans_.insert(message->scan_sequence);
+          if (message->kind != 4 && !message->has_pose_binding)
+            last_reference_state_ = message->snapshot_sequence;
+          if (message->kind == 4)
+            repeated_reference_states_.insert(message->snapshot_sequence);
+        });
+    }
+    if (scenario_.capture_tf_graph) {
+      tf_ = observer_->create_subscription<tf2_msgs::msg::TFMessage>(
+        "/tf",
+        rclcpp::QoS(rclcpp::KeepLast(50)).best_effort(),
+        [this](tf2_msgs::msg::TFMessage::ConstSharedPtr message) {
+          for (const auto & transform : message->transforms) {
+            rclcpp::Serialization<geometry_msgs::msg::TransformStamped> serialization;
+            rclcpp::SerializedMessage wire;
+            serialization.serialize_message(&transform, &wire);
+            const auto & data = wire.get_rcl_serialized_message();
+            tf_cdr_.emplace_back(reinterpret_cast<const char *>(data.buffer), data.buffer_length);
+            tf_stamps_.insert(rclcpp::Time(transform.header.stamp).nanoseconds());
+          }
         });
     }
     if (scenario_.prior_map) {
@@ -631,12 +656,21 @@ public:
       return "typed observation publisher never matched";
     if (reference_ && !spinUntil([&] { return reference_->get_publisher_count() == 1; }))
       return "reference health publisher never matched";
+    if (tf_ && !spinUntil([&] { return tf_->get_publisher_count() == 1; }))
+      return "TF publisher never matched";
+    reference_publishers_before_ = observer_->count_publishers("/lio_slam/reference_health");
 
     std::string error = scenario_.warm_up ? warmUp() : std::string();
     for (std::size_t i = 0; error.empty() && i < scenario_.steps.size(); ++i)
       error = scenario_.flexible ? runSlot(static_cast<int>(i)) : runScan(static_cast<int>(i));
     if (error.empty() && scenario_.flexible)
       error = settle(true);
+    if (error.empty() && scenario_.wait_for_reference_repeat) {
+      const auto target = last_reference_state_;
+      if (target == 0 || !spinUntil([&] { return repeated_reference_states_.count(target) != 0; }))
+        error = "the final no-pose reference state was never actually repeated without input";
+    }
+    reference_publishers_after_ = observer_->count_publishers("/lio_slam/reference_health");
     teardown();
     return error;
   }
@@ -674,6 +708,12 @@ public:
     writeAll(fd, &publications, sizeof(publications));
     if (publications > 0)
       writeAll(fd, pose_publications_.data(), sizeof(PosePublication) * publications);
+    const auto transforms = static_cast<std::uint32_t>(tf_cdr_.size());
+    writeAll(fd, &transforms, sizeof(transforms));
+    for (const auto & bytes : tf_cdr_)
+      writeString(fd, bytes);
+    writeAll(fd, &reference_publishers_before_, sizeof(reference_publishers_before_));
+    writeAll(fd, &reference_publishers_after_, sizeof(reference_publishers_after_));
   }
 
 private:
@@ -725,6 +765,10 @@ private:
       const Step * s = stepAt(end);
       return s != nullptr && s->no_build_point;
     };
+    fast_lio_test::resetBeforeReference = [this](double end) {
+      const Step * s = stepAt(end);
+      return s != nullptr && s->reset_before_reference;
+    };
     // A scan's IMU batch is settled before its record is finished, so the record takes the batch reported since the
     // last record; a scan dropped where it is synced settles none. The hook runs with the input buffer unlocked.
     fast_lio_test::afterImuConsumption =
@@ -747,10 +791,10 @@ private:
       lines_.push_back(line);
       line_input_ns_.push_back(newest_imu_ns_);
     };
-    fast_lio_test::afterPosePublish = [this](std::uint8_t encoding, std::int64_t stamp,
-                                            const std::array<std::uint8_t, 32> & id) {
-      pose_publications_.push_back({encoding, stamp, id});
-    };
+    fast_lio_test::afterPosePublish =
+      [this](std::uint8_t encoding, std::int64_t stamp, const std::array<std::uint8_t, 32> & id) {
+        pose_publications_.push_back({encoding, stamp, id});
+      };
   }
 
   struct ImuBatch
@@ -821,6 +865,7 @@ private:
     fast_lio_test::afterAnchorTraceLine = {};
     fast_lio_test::afterImuConsumption = {};
     fast_lio_test::afterPosePublish = {};
+    fast_lio_test::resetBeforeReference = {};
   }
 
   const Step * stepAt(double end) const
@@ -977,6 +1022,8 @@ private:
       const auto * r = recordAt(end);
       return r != nullptr && (!r->published || odom_by_ms_.count(msKey(end)) > 0) &&
              (!scenario_.typed || !r->published || typed_by_ms_.count(msKey(end)) != 0) &&
+             (!scenario_.capture_tf_graph || !r->published ||
+              tf_stamps_.count(rclcpp::Time(odom_by_ms_.at(msKey(end)).header.stamp).nanoseconds()) != 0) &&
              (!scenario_.reference || reference_scans_.count(r->scan_seq) != 0);
     });
     if (!done) {
@@ -1099,6 +1146,9 @@ private:
       if (r->published) {
         const std::int64_t key = msKey(scanEnd(p.scan));
         if (odom_by_ms_.count(key) == 0 || (scenario_.typed && typed_by_ms_.count(key) == 0))
+          return;
+        if (scenario_.capture_tf_graph &&
+            tf_stamps_.count(rclcpp::Time(odom_by_ms_.at(key).header.stamp).nanoseconds()) == 0)
           return;
       }
       observe(p.index, *r);
@@ -1351,6 +1401,7 @@ private:
     odom_.reset();
     typed_.reset();
     reference_.reset();
+    tf_.reset();
     relocalization_.reset();
     wheel_.reset();
     imu_.reset();
@@ -1375,9 +1426,15 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_;
   rclcpp::Subscription<fast_lio_interfaces::msg::FrontendObservation>::SharedPtr typed_;
   rclcpp::Subscription<fast_lio_interfaces::msg::ReferenceHealth>::SharedPtr reference_;
+  rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_;
   std::vector<std::string> reference_cdr_;
   std::vector<std::string> typed_cdr_;
   std::vector<PosePublication> pose_publications_;
+  std::vector<std::string> tf_cdr_;
+  std::set<std::int64_t> tf_stamps_;
+  std::uint64_t reference_publishers_before_ = 0, reference_publishers_after_ = 0;
+  std::uint64_t last_reference_state_ = 0;
+  std::set<std::uint64_t> repeated_reference_states_;
   std::set<std::uint64_t> reference_scans_;
   std::map<std::int64_t, nav_msgs::msg::Odometry> odom_by_ms_;
   std::map<std::int64_t, TypedSample> typed_by_ms_;
@@ -1587,6 +1644,29 @@ ChildResult runScenario(const Scenario & scenario)
   result.pose_publications.resize(publications);
   if (publications > 0 && !reader.take(result.pose_publications.data(), sizeof(PosePublication) * publications))
     result.error = "child publication receipts truncated";
+  std::uint32_t transforms = 0;
+  if (!reader.take(&transforms, sizeof(transforms))) {
+    result.error = "child TF count truncated";
+    return result;
+  }
+  for (std::uint32_t i = 0; i < transforms; ++i) {
+    std::string bytes;
+    if (!reader.takeString(&bytes)) {
+      result.error = "child TF CDR truncated";
+      return result;
+    }
+    rclcpp::SerializedMessage wire(bytes.size());
+    auto & data = wire.get_rcl_serialized_message();
+    std::memcpy(data.buffer, bytes.data(), bytes.size());
+    data.buffer_length = bytes.size();
+    geometry_msgs::msg::TransformStamped message;
+    rclcpp::Serialization<geometry_msgs::msg::TransformStamped> serialization;
+    serialization.deserialize_message(&wire, &message);
+    result.transforms.push_back(std::move(message));
+  }
+  if (!reader.take(&result.reference_publishers_before, sizeof(result.reference_publishers_before)) ||
+      !reader.take(&result.reference_publishers_after, sizeof(result.reference_publishers_after)))
+    result.error = "child publisher graph counts truncated";
   return result;
 }
 
@@ -5673,15 +5753,23 @@ void expectCompleteClosedArm(const ChildResult & result, const char * arm)
   // pendingExport: warm-up 2 + Before 1 + Event 3 + After (11+1) + Later 5 + Hold 2.
   constexpr std::size_t kExpectedPoseCount = 25;
   const auto sent = [&](std::uint8_t encoding) {
-    return std::count_if(result.pose_publications.begin(), result.pose_publications.end(),
-                         [&](const auto & receipt) { return receipt.encoding == encoding; });
+    return std::count_if(result.pose_publications.begin(), result.pose_publications.end(), [&](const auto & receipt) {
+      return receipt.encoding == encoding;
+    });
   };
-  const auto published = std::count_if(result.observations.begin(), result.observations.end(),
-                                        [](const auto & observation) { return observation.record.published; });
-  std::printf("[R1-closed-arm] arm=%s scan_published=%zu odom_sent=%zu odom_received=%zu "
-              "pose_fo_sent=%zu pose_fo_received=%zu idle_fo=%zu\n",
-              arm, static_cast<std::size_t>(published), static_cast<std::size_t>(sent(0)), result.odom_ns.size(),
-              static_cast<std::size_t>(sent(1)), result.typed_poses.size(), result.idle.size());
+  const auto published = std::count_if(result.observations.begin(),
+                                       result.observations.end(),
+                                       [](const auto & observation) { return observation.record.published; });
+  std::printf(
+    "[R1-closed-arm] arm=%s scan_published=%zu odom_sent=%zu odom_received=%zu "
+    "pose_fo_sent=%zu pose_fo_received=%zu idle_fo=%zu\n",
+    arm,
+    static_cast<std::size_t>(published),
+    static_cast<std::size_t>(sent(0)),
+    result.odom_ns.size(),
+    static_cast<std::size_t>(sent(1)),
+    result.typed_poses.size(),
+    result.idle.size());
   ASSERT_EQ(static_cast<std::size_t>(published), kExpectedPoseCount);
   ASSERT_EQ(static_cast<std::size_t>(sent(0)), kExpectedPoseCount);
   ASSERT_EQ(static_cast<std::size_t>(sent(1)), kExpectedPoseCount);
@@ -5695,23 +5783,30 @@ void expectCompleteClosedArm(const ChildResult & result, const char * arm)
     EXPECT_TRUE(stamps.insert(message.observation_stamp_ns).second) << "duplicate pose stamp";
     EXPECT_TRUE(ids.insert(message.observation_id).second) << "duplicate observation ID";
     EXPECT_EQ(message.source_instance, result.typed_poses.front().source_instance);
-    EXPECT_TRUE(std::any_of(message.source_instance.begin(), message.source_instance.end(),
-                            [](auto byte) { return byte != 0; }));
+    EXPECT_TRUE(
+      std::any_of(message.source_instance.begin(), message.source_instance.end(), [](auto byte) { return byte != 0; }));
     std::array<std::uint8_t, 32> expected_id{};
-    ASSERT_TRUE(fast_lio::frontendObservationId(message.source_instance, message.has_source_instance,
-                                               message.completion_sequence, message.observation_stamp_ns,
-                                               message.has_observation_stamp, message.clock_domain, expected_id));
+    ASSERT_TRUE(fast_lio::frontendObservationId(message.source_instance,
+                                                message.has_source_instance,
+                                                message.completion_sequence,
+                                                message.observation_stamp_ns,
+                                                message.has_observation_stamp,
+                                                message.clock_domain,
+                                                expected_id));
     EXPECT_EQ(message.observation_id, expected_id);
     EXPECT_EQ(std::count(result.odom_ns.begin(), result.odom_ns.end(), message.observation_stamp_ns), 1);
     for (std::uint8_t encoding : {0, 1}) {
-      EXPECT_EQ(std::count_if(result.pose_publications.begin(), result.pose_publications.end(),
+      EXPECT_EQ(std::count_if(result.pose_publications.begin(),
+                              result.pose_publications.end(),
                               [&](const auto & receipt) {
-                                return receipt.encoding == encoding && receipt.stamp_ns == message.observation_stamp_ns &&
+                                return receipt.encoding == encoding &&
+                                       receipt.stamp_ns == message.observation_stamp_ns &&
                                        receipt.id == message.observation_id;
-                              }), 1);
+                              }),
+                1);
     }
   }
-  std::size_t warmup = 0;
+  std::size_t warmup = 0, exact = 0;
   for (const auto & observation : result.observations) {
     if (!observation.record.published)
       continue;
@@ -5719,6 +5814,9 @@ void expectCompleteClosedArm(const ChildResult & result, const char * arm)
     EXPECT_EQ(observation.typed_stamp_ns, observation.odom_stamp_ns);
     EXPECT_EQ(stamps.count(observation.odom_stamp_ns), 1u);
     EXPECT_EQ(ids.count(observation.typed_id), 1u);
+    if (observation.typed_stamp_ns == observation.odom_stamp_ns && stamps.count(observation.odom_stamp_ns) == 1u &&
+        ids.count(observation.typed_id) == 1u)
+      ++exact;
     if (observation.step < 0)
       ++warmup;
     if (!result.references.empty()) {
@@ -5728,8 +5826,32 @@ void expectCompleteClosedArm(const ChildResult & result, const char * arm)
     }
   }
   EXPECT_EQ(warmup, 2u);
-  std::printf("[R1-closed-arm] arm=%s warmup_pose_fo=%zu exact_ns_id=%zu missing=0 duplicate=0\n",
-              arm, warmup, stamps.size());
+  EXPECT_EQ(exact, kExpectedPoseCount);
+  ASSERT_EQ(result.transforms.size(), kExpectedPoseCount);
+  for (const auto & transform : result.transforms) {
+    const auto stamp = rclcpp::Time(transform.header.stamp).nanoseconds();
+    const auto pose = std::find_if(result.typed_poses.begin(), result.typed_poses.end(), [&](const auto & message) {
+      return message.observation_stamp_ns == stamp;
+    });
+    ASSERT_NE(pose, result.typed_poses.end());
+    EXPECT_EQ(transform.header.frame_id, pose->frame_id);
+    EXPECT_EQ(transform.child_frame_id, pose->child_frame_id);
+    EXPECT_EQ(transform.transform.translation.x, pose->pose.pose.position.x);
+    EXPECT_EQ(transform.transform.translation.y, pose->pose.pose.position.y);
+    EXPECT_EQ(transform.transform.translation.z, pose->pose.pose.position.z);
+    EXPECT_EQ(transform.transform.rotation, pose->pose.pose.orientation);
+  }
+  std::printf(
+    "[R1-closed-arm] arm=%s warmup_pose_fo=%zu exact_ns_id=%zu missing=%zu duplicate_ids=%zu "
+    "tf_received=%zu r1_publishers_before=%llu r1_publishers_after=%llu\n",
+    arm,
+    warmup,
+    exact,
+    kExpectedPoseCount - exact,
+    result.typed_poses.size() - ids.size(),
+    result.transforms.size(),
+    static_cast<unsigned long long>(result.reference_publishers_before),
+    static_cast<unsigned long long>(result.reference_publishers_after));
 }
 }  // namespace
 
@@ -5888,6 +6010,7 @@ TEST(AnchorLifecycleReference, PolicyOffAndPriorRemainReadOnlyProjections)
 TEST(AnchorLifecycleReference, ClosedArmAndTraceSwitchPreserveLegacyFields)
 {
   auto baseline = pendingExport(kExportBudget);
+  baseline.capture_tf_graph = true;
   baseline.trace = false;
   setParam(baseline, rclcpp::Parameter("zupt_anchor_trace_en", false));
   const auto off = runScenario(baseline);
@@ -5900,6 +6023,13 @@ TEST(AnchorLifecycleReference, ClosedArmAndTraceSwitchPreserveLegacyFields)
   ASSERT_NO_FATAL_FAILURE(expectCompleteClosedArm(off, "off"));
   ASSERT_NO_FATAL_FAILURE(expectCompleteClosedArm(on, "on"));
   ASSERT_NO_FATAL_FAILURE(expectCompleteClosedArm(traced, "traced"));
+  EXPECT_EQ(off.reference_publishers_before, 0u);
+  EXPECT_EQ(off.reference_publishers_after, 0u);
+  for (const auto * arm : {&on, &traced}) {
+    EXPECT_EQ(arm->reference_publishers_before, 1u);
+    EXPECT_EQ(arm->reference_publishers_after, 1u);
+    EXPECT_EQ(arm->transforms, off.transforms);
+  }
   EXPECT_TRUE(off.references.empty());
   ASSERT_EQ(off.observations.size(), on.observations.size());
   ASSERT_EQ(off.observations.size(), traced.observations.size());
@@ -5965,6 +6095,194 @@ TEST(AnchorLifecycleReference, EpochFaultPublishesNegativeWithoutPoseBeforeAndAf
     }
     EXPECT_GT(negatives, 0);
   }
+}
+
+TEST(AnchorLifecycleReference, PostBuildRawVerifyingStaysEstablishedWithoutWitness)
+{
+  auto scenario = withReference(coldStart(kMovingScans, true));
+  scenario.capture_raw_state = true;
+  setParam(scenario, rclcpp::Parameter("reanchor_en", true));
+  setParam(scenario, rclcpp::Parameter("reanchor_min_eff", 100000000));
+  auto control = scenario;
+  control.reference = false;
+  setParam(control, rclcpp::Parameter("publish.reference_health", false));
+  const auto result = runScenario(scenario);
+  const auto legacy = runScenario(control);
+  ASSERT_TRUE(result.ok() && legacy.ok()) << result.describe() << legacy.describe();
+  ASSERT_EQ(result.observations.size(), legacy.observations.size());
+  const auto * build = firstEstablished(result);
+  ASSERT_NE(build, nullptr);
+  std::size_t verifying = 0;
+  for (std::size_t i = 0; i < result.observations.size(); ++i) {
+    const auto & observation = result.observations[i];
+    const auto & old = legacy.observations[i];
+    ASSERT_TRUE(observation.raw_state_seen && old.raw_state_seen);
+    EXPECT_EQ(observation.record.gate_pre, old.record.gate_pre);
+    EXPECT_EQ(observation.record.gate_post, old.record.gate_post);
+    EXPECT_EQ(observation.map_frozen, old.map_frozen);
+    EXPECT_EQ(observation.raw_degraded, old.raw_degraded);
+    EXPECT_EQ(observation.record.map_updated, old.record.map_updated);
+    const auto * value = referenceFor(result, observation.record.scan_seq);
+    ASSERT_NE(value, nullptr);
+    expectReferenceProjection(observation, *value);
+    EXPECT_EQ(value->qualified_event_sequence, 0u);
+    if (observation.record.scan_seq <= build->record.scan_seq)
+      continue;
+    EXPECT_EQ(value->startup_reference, 2);
+    EXPECT_EQ(value->lifecycle, 2);
+    if (observation.record.gate_post == fast_lio::AnchorTraceGate::kVerifying) {
+      ++verifying;
+      EXPECT_EQ(value->local, 2);
+      EXPECT_EQ(value->true_mask & 8u, 0u);
+      EXPECT_EQ(value->hr_witness_kind, 0);
+      EXPECT_TRUE(observation.map_frozen && observation.raw_degraded);
+      EXPECT_FALSE(observation.record.map_updated);
+    }
+  }
+  EXPECT_GT(verifying, 0u);
+}
+
+TEST(AnchorLifecycleReference, PreReferenceMapResetExcludesStartupWithoutQualification)
+{
+  auto scenario = withReference(traced(inputScenario("pre_reference_map_reset"), true));
+  scenario.warm_up = false;
+  setPolicy(scenario, 10.0, 1.0);
+  auto reset = slot(Phase::kEvent);
+  reset.reset_before_reference = true;
+  scenario.steps.push_back(reset);
+  append(scenario, 8, slot(Phase::kAfter));
+  const auto result = runScenario(scenario);
+  ASSERT_TRUE(result.ok()) << result.describe();
+  const auto event = result.phase(Phase::kEvent);
+  ASSERT_EQ(event.size(), 1u);
+  EXPECT_TRUE(hasEvent(*event.front(), fast_lio::kAnchorEventMapReset));
+  const auto * negative = referenceFor(result, event.front()->record.scan_seq);
+  ASSERT_NE(negative, nullptr);
+  EXPECT_FALSE(negative->has_pose_binding);
+  EXPECT_EQ(negative->startup_reference, 3);
+  EXPECT_EQ(negative->lifecycle, 0);
+  EXPECT_EQ(negative->trust, 3);
+  EXPECT_NE(negative->cause_mask & 128u, 0u);
+  EXPECT_NE(negative->taint_mask & 128u, 0u);
+  EXPECT_NE(negative->hard_mask & 4u, 0u);
+  std::size_t later_builds = 0;
+  for (const auto & observation : result.observations) {
+    const auto * value = referenceFor(result, observation.record.scan_seq);
+    ASSERT_NE(value, nullptr);
+    expectReferenceProjection(observation, *value);
+    EXPECT_EQ(value->startup_reference, 3);
+    EXPECT_EQ(value->lifecycle, 0);
+    EXPECT_EQ(value->qualified_event_sequence, 0u);
+    EXPECT_EQ(value->true_mask & 12u, 0u);
+    EXPECT_EQ(value->hr_witness_kind, 0);
+    if (observation.step > 0 && observation.record.map_updated && !observation.record.published)
+      ++later_builds;
+  }
+  EXPECT_GT(later_builds, 0u) << "no normal Build after the pre-reference reset";
+}
+
+TEST(AnchorLifecycleReference, LateLostSuppressesWitnessInFinalSnapshot)
+{
+  for (auto scenario : {verificationTimesOut(10.0), pinThenLateHold(true)}) {
+    const auto result = runScenario(withReference(std::move(scenario)));
+    ASSERT_TRUE(result.ok()) << result.describe();
+    std::size_t lost = 0, earlier_witnesses = 0;
+    for (const auto & observation : result.observations) {
+      const auto * value = referenceFor(result, observation.record.scan_seq);
+      ASSERT_NE(value, nullptr);
+      expectReferenceProjection(observation, *value);
+      if ((value->legacy_flags & 4u) == 0) {
+        if (lost == 0 && value->hr_witness_kind != 0)
+          ++earlier_witnesses;
+        continue;
+      }
+      ++lost;
+      EXPECT_TRUE(observation.record.published && observation.typed_seen && observation.odom_seen);
+      EXPECT_EQ(value->legacy_flags, odomFlags(observation));
+      EXPECT_EQ(value->local, 3);
+      EXPECT_EQ(value->true_mask & 12u, 0u);
+      EXPECT_EQ(value->hr_witness_kind, 0);
+      EXPECT_FALSE(value->has_hr_valid_until);
+      EXPECT_NE(value->hard_mask & 9u, 0u);
+    }
+    EXPECT_GT(earlier_witnesses, 0u);
+    EXPECT_GT(lost, 0u);
+  }
+}
+
+TEST(AnchorLifecycleReference, DroppedScansSettleNoPoseNegativeFacts)
+{
+  using Outcome = fast_lio::AnchorScanOutcome;
+  struct DropCase
+  {
+    Scenario scenario;
+    Outcome outcome;
+    std::uint32_t cause;
+  };
+  const DropCase cases[] = {
+    {earlyExitBetweenCandidateScans(Cloud::kEmpty), Outcome::kDroppedInvalidTime, 0},
+    {repeatBeforeAConsumedExit(), Outcome::kDroppedNonadvancing, 0},
+    {lostImu(LostImu::kEmpty), Outcome::kDroppedEmptyImu, 8},
+    {lostImu(LostImu::kTail), Outcome::kImuCoverageGap, 8},
+    {consumedExits("r1_committed_early_exit", 1, Imu::kStatic, kFieldCases[0].old_anchor, 0),
+     Outcome::kBeforeAnchorStep,
+     64},
+  };
+  for (const auto & test : cases) {
+    SCOPED_TRACE(test.scenario.name);
+    const auto result = runScenario(withReference(test.scenario));
+    ASSERT_TRUE(result.ok()) << result.describe();
+    std::size_t matched = 0;
+    for (const auto * observation : result.phase(Phase::kEvent)) {
+      if (observation->record.outcome != test.outcome)
+        continue;
+      ++matched;
+      const auto * value = referenceFor(result, observation->record.scan_seq);
+      ASSERT_NE(value, nullptr);
+      expectReferenceProjection(*observation, *value);
+      EXPECT_FALSE(value->has_pose_binding || value->has_observation_id || value->has_raw_registration_degraded);
+      EXPECT_EQ(value->local, 0);
+      EXPECT_EQ(value->hr_witness_kind, 0);
+      EXPECT_EQ(value->qualified_event_sequence, 0u);
+      EXPECT_EQ(value->true_mask & 12u, 0u);
+      if (test.cause != 0) {
+        EXPECT_EQ(value->cause_mask & test.cause, test.cause);
+        EXPECT_EQ(value->taint_mask & test.cause, test.cause);
+      } else {
+        // Invalid timing and duplicate/old scans are not new effective input.
+        EXPECT_EQ(value->taint_mask, 0u);
+        EXPECT_EQ(value->hard_mask, 0u);
+      }
+    }
+    EXPECT_GT(matched, 0u);
+  }
+}
+
+TEST(AnchorLifecycleReference, StateRepeatOccursAndKeepsOriginalEvidenceAge)
+{
+  auto scenario = withReference(inputScenario("r1_actual_no_input_repeat"));
+  append(scenario, 3, slot(Phase::kBefore));
+  append(scenario, 3, slot(Phase::kAfter, Imu::kStatic, Guard::kHealthy, Cloud::kNone));
+  scenario.wait_for_reference_repeat = true;
+  const auto result = runScenario(scenario);
+  ASSERT_TRUE(result.ok()) << result.describe();
+  std::size_t repeats = 0;
+  for (const auto & value : result.references) {
+    if (value.kind != 4)
+      continue;
+    const auto original = std::find_if(result.references.begin(), result.references.end(), [&](const auto & candidate) {
+      return candidate.kind != 4 && candidate.snapshot_sequence == value.snapshot_sequence;
+    });
+    ASSERT_NE(original, result.references.end());
+    EXPECT_FALSE(value.has_pose_binding || value.has_observation_id || value.has_hr_valid_until);
+    EXPECT_EQ(value.local, 0);
+    auto replayed = value;
+    replayed.kind = original->kind;
+    EXPECT_EQ(replayed, *original) << "repeat changed revision, effective time, lease or qualified sequence";
+    ++repeats;
+  }
+  EXPECT_GT(repeats, 0u);
+  std::printf("[R1-repeat] actual_repeats=%zu original_fields_unchanged=checked\n", repeats);
 }
 
 TEST(AnchorLifecycleReference, EnablingRequiresTheExistingTypedIdentity)

@@ -2775,6 +2775,7 @@ std::function<int(double)> overrideGuardDegraded;
 std::function<void(double, AnchorFixtureState &)> beforeAnchorStep;
 std::function<bool(double)> forceRunawayTrip;
 std::function<bool(double)> initialBuildTakesNoPoint;
+std::function<bool(double)> resetBeforeReference;
 std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 std::function<void(const std::string &)> afterAnchorTraceLine;
 std::function<void(std::uint8_t, std::int64_t, const std::array<std::uint8_t, 32> &)> afterPosePublish;
@@ -3310,8 +3311,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   pubOdomAftMapped->publish(odomAftMapped);
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterPosePublish)
-    fast_lio_test::afterPosePublish(0, rclcpp::Time(odomAftMapped.header.stamp).nanoseconds(),
-                                   final.reference.observationId);
+    fast_lio_test::afterPosePublish(
+      0, rclcpp::Time(odomAftMapped.header.stamp).nanoseconds(), final.reference.observationId);
 #endif
   if (!diag_first_odom_pub_logged) {
     RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
@@ -5379,6 +5380,51 @@ private:
     fout_kalman.flush();
   }
 
+  // The production reset owner, shared verbatim by the late guards and the test-only scheduler.
+  void rebuildLocalMap(const char * tag)
+  {
+    anchorEvidence(fast_lio::AnchorTraceReason::kMapReset,
+                   fast_lio::kAnchorEventMapReset,
+                   &anchor_trace_counters.map_reset,
+                   lidar_end_time,
+                   true);
+    // The rebuilt map is seeded from the very pose in question. The anchors of the old map end with it, and
+    // the reference counts as rebuilt, not recovered: the gate going healthy below says the local map works
+    // again, not where the platform is.
+    changeStationaryReference(fast_lio::AnchorDrop::kMapReset, lidar_end_time);
+    fast_lio::breakRecoveryRun(&recovery_state);
+    noteRecoveryEvent(
+      fast_lio::resetRecoveryReference(&recovery_state, fast_lio::traceNs(lidar_end_time), recovery_params),
+      fast_lio::traceNs(lidar_end_time));
+    int map_before = 0;
+    const bool kept_prior = rebuildLocalMapStorage(map_before);
+    anchorTraceMapUpdated();
+    if (kept_prior) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "[%s] live map dropped and re-seeded from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: "
+                   "map %d -> %d pts, the prior map (%zu voxels) is still there to re-register against",
+                   tag,
+                   feats_down_size,
+                   state_point.pos[0],
+                   state_point.pos[1],
+                   state_point.pos[2],
+                   map_before,
+                   ikdtree.size(),
+                   ikdtree.pinnedVoxels());
+    } else {
+      RCLCPP_ERROR(this->get_logger(),
+                   "[%s] map rebuilt from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: map %d -> %d pts, the "
+                   "estimate is live again but unanchored",
+                   tag,
+                   feats_down_size,
+                   state_point.pos[0],
+                   state_point.pos[1],
+                   state_point.pos[2],
+                   map_before,
+                   ikdtree.size());
+    }
+  }
+
   void timer_callback()
   {
     const bool ready = sync_packages(Measures);
@@ -5394,6 +5440,10 @@ private:
     if (ready) {
       AnchorScanScope anchor_scan_scope(Measures);
       frontend_runaway = false;
+#ifdef FASTLIO_TEST_HOOKS
+      if (fast_lio_test::resetBeforeReference && fast_lio_test::resetBeforeReference(lidar_end_time))
+        rebuildLocalMap("TEST_PRE_REFERENCE");
+#endif
       if (imu_backlog_reanchor_required) {
         markImuCoverageGap(Measures.lidar_end_time);
         imu_backlog_reanchor_required = false;
@@ -6560,49 +6610,6 @@ private:
       // Trade absolute anchoring for a working estimate: rebuild the local map
       // from this scan at the current pose. The jump is real, is logged, and
       // reaches consumers through the health flags.
-      auto rebuild_local_map = [&](const char * tag) {
-        anchorEvidence(fast_lio::AnchorTraceReason::kMapReset,
-                       fast_lio::kAnchorEventMapReset,
-                       &anchor_trace_counters.map_reset,
-                       lidar_end_time,
-                       true);
-        // The rebuilt map is seeded from the very pose in question. The anchors of the old map end with it, and
-        // the reference counts as rebuilt, not recovered: the gate going healthy below says the local map works
-        // again, not where the platform is.
-        changeStationaryReference(fast_lio::AnchorDrop::kMapReset, lidar_end_time);
-        fast_lio::breakRecoveryRun(&recovery_state);
-        noteRecoveryEvent(
-          fast_lio::resetRecoveryReference(&recovery_state, fast_lio::traceNs(lidar_end_time), recovery_params),
-          fast_lio::traceNs(lidar_end_time));
-        int map_before = 0;
-        const bool kept_prior = rebuildLocalMapStorage(map_before);
-        anchorTraceMapUpdated();
-        if (kept_prior) {
-          RCLCPP_ERROR(this->get_logger(),
-                       "[%s] live map dropped and re-seeded from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: "
-                       "map %d -> %d pts, the prior map (%zu voxels) is still there to re-register against",
-                       tag,
-                       feats_down_size,
-                       state_point.pos[0],
-                       state_point.pos[1],
-                       state_point.pos[2],
-                       map_before,
-                       ikdtree.size(),
-                       ikdtree.pinnedVoxels());
-        } else {
-          RCLCPP_ERROR(this->get_logger(),
-                       "[%s] map rebuilt from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: map %d -> %d pts, the "
-                       "estimate is live again but unanchored",
-                       tag,
-                       feats_down_size,
-                       state_point.pos[0],
-                       state_point.pos[1],
-                       state_point.pos[2],
-                       map_before,
-                       ikdtree.size());
-        }
-      };
-
       // The relative tests need what healthy scans look like; only a gate that is verifying asks (the medians
       // are also logged at the release), and an unsupported recovery that runs the same match test. The tests
       // themselves stay off unless their ratios are set.
@@ -6654,7 +6661,7 @@ private:
                      res_mean_last,
                      reanchor_on_fail.c_str());
         if (reanchor_on_fail == "reset_map") {
-          rebuild_local_map("REANCHOR");
+          rebuildLocalMap("REANCHOR");
         }
       }
       // Release the static hold.  The flag leaves this node as "the platform is
@@ -6972,7 +6979,7 @@ private:
             state_point = kf.get_x();
           }
           if (runaway_on_trip == "reset_map") {
-            rebuild_local_map("RUNAWAY");
+            rebuildLocalMap("RUNAWAY");
           } else if (runaway_on_trip == "fault_exit") {
             RCLCPP_FATAL(this->get_logger(),
                          "[RUNAWAY] exiting so the supervisor can restart the pipeline (runaway_on_trip=fault_exit)");

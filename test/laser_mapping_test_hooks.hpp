@@ -39,6 +39,8 @@ extern std::function<bool(double)> forceRunawayTrip;
 /// Scan end time -> true to hand the normal initial map build of that scan only points the map backend skips
 /// (non-finite coordinates): the build runs and leaves the backend empty.
 extern std::function<bool(double)> initialBuildTakesNoPoint;
+/// Schedule the production map-reset owner before the first reference is built.
+extern std::function<bool(double)> resetBeforeReference;
 /// Every scan record, whether or not zupt_anchor_trace_en prints it.
 extern std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 /// Every anchor trace line actually logged.

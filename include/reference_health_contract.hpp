@@ -213,8 +213,12 @@ inline bool referenceHealthEncodingValid(const ReferenceHealthSnapshot & value)
   if (value.kind == 1 && (((value.legacyFlags & 1u) != 0) != (value.rawRegistrationDegraded || value.trust == 3) ||
                           (value.rawRegistrationDegraded && value.local == 1)))
     return false;
-  if ((value.trueMask & 12u) != 0 &&
-      (value.kind != 1 || value.lifecycle != 2 || value.trust != 1 || value.local == 3 || value.hardMask != 0))
+  if ((value.trueMask & 12u) != 0 && (value.kind != 1 || value.lifecycle != 2 || value.trust != 1 || value.local == 3 ||
+                                      value.hardMask != 0 || (value.legacyFlags & 4u) != 0))
+    return false;
+  // Check both witness bits, including when held wins the wire-kind priority.
+  if (((value.trueMask & 8u) != 0 && (value.local != 1 || (value.legacyFlags & 8u) != 0)) ||
+      ((value.trueMask & 4u) != 0 && (value.legacyFlags & 2u) == 0))
     return false;
   return value.hrWitnessKind == ((value.trueMask & 4u) != 0 ? 2 : (value.trueMask & 8u) != 0 ? 1 : 0);
 }

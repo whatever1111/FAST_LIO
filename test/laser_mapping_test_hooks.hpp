@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -42,6 +43,8 @@ extern std::function<bool(double)> initialBuildTakesNoPoint;
 extern std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 /// Every anchor trace line actually logged.
 extern std::function<void(const std::string &)> afterAnchorTraceLine;
+/// Successful publish return: encoding 0 Odometry, 1 pose FrontendObservation.
+extern std::function<void(std::uint8_t, std::int64_t, const std::array<std::uint8_t, 32> &)> afterPosePublish;
 
 struct ImuInputSnapshot
 {

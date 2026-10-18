@@ -234,6 +234,7 @@ struct Observation
   double odom_cov[36] = {};
   double odom_twist_cov[36] = {};
   int typed_seen = 0;  // the typed observation of this scan's pose
+  std::int64_t typed_stamp_ns = 0;
   unsigned typed_state = 0;
   unsigned typed_validity = 0;
   unsigned typed_health = 0;
@@ -264,6 +265,14 @@ struct IdleSample
 };
 static_assert(std::is_trivially_copyable<IdleSample>::value, "idle samples cross the pipe as bytes");
 
+struct PosePublication
+{
+  std::uint8_t encoding = 0;
+  std::int64_t stamp_ns = 0;
+  std::array<std::uint8_t, 32> id{};
+};
+static_assert(std::is_trivially_copyable<PosePublication>::value, "publication receipts cross the pipe as bytes");
+
 struct ChildResult
 {
   int status = -1;
@@ -274,6 +283,8 @@ struct ChildResult
   std::vector<IdleSample> idle;
   std::vector<std::int64_t> odom_ns;  // the stamp of every /Odometry message received, in order
   std::vector<fast_lio_interfaces::msg::ReferenceHealth> references;
+  std::vector<fast_lio_interfaces::msg::FrontendObservation> typed_poses;
+  std::vector<PosePublication> pose_publications;
 
   bool ok() const { return WIFEXITED(status) && WEXITSTATUS(status) == 0 && error.empty(); }
   std::string describe() const
@@ -655,6 +666,14 @@ public:
     writeAll(fd, &references, sizeof(references));
     for (const auto & bytes : reference_cdr_)
       writeString(fd, bytes);
+    const auto typed = static_cast<std::uint32_t>(typed_cdr_.size());
+    writeAll(fd, &typed, sizeof(typed));
+    for (const auto & bytes : typed_cdr_)
+      writeString(fd, bytes);
+    const auto publications = static_cast<std::uint32_t>(pose_publications_.size());
+    writeAll(fd, &publications, sizeof(publications));
+    if (publications > 0)
+      writeAll(fd, pose_publications_.data(), sizeof(PosePublication) * publications);
   }
 
 private:
@@ -728,6 +747,10 @@ private:
       lines_.push_back(line);
       line_input_ns_.push_back(newest_imu_ns_);
     };
+    fast_lio_test::afterPosePublish = [this](std::uint8_t encoding, std::int64_t stamp,
+                                            const std::array<std::uint8_t, 32> & id) {
+      pose_publications_.push_back({encoding, stamp, id});
+    };
   }
 
   struct ImuBatch
@@ -740,6 +763,7 @@ private:
 
   struct TypedSample
   {
+    std::int64_t stamp_ns = 0;
     unsigned state = 0;
     unsigned validity = 0;
     unsigned health = 0;
@@ -753,7 +777,13 @@ private:
   void onTyped(const fast_lio_interfaces::msg::FrontendObservation & message)
   {
     if (message.has_pose && message.has_observation_stamp) {
+      rclcpp::Serialization<fast_lio_interfaces::msg::FrontendObservation> serialization;
+      rclcpp::SerializedMessage wire;
+      serialization.serialize_message(&message, &wire);
+      const auto & data = wire.get_rcl_serialized_message();
+      typed_cdr_.emplace_back(reinterpret_cast<const char *>(data.buffer), data.buffer_length);
       TypedSample sample;
+      sample.stamp_ns = message.observation_stamp_ns;
       sample.state = message.estimator_state;
       sample.validity = message.output_validity;
       sample.health = message.health_flags;
@@ -790,6 +820,7 @@ private:
     fast_lio_test::afterAnchorScanRecord = {};
     fast_lio_test::afterAnchorTraceLine = {};
     fast_lio_test::afterImuConsumption = {};
+    fast_lio_test::afterPosePublish = {};
   }
 
   const Step * stepAt(double end) const
@@ -945,8 +976,8 @@ private:
     const bool done = spinUntil([&] {
       const auto * r = recordAt(end);
       return r != nullptr && (!r->published || odom_by_ms_.count(msKey(end)) > 0) &&
-             (!scenario_.reference ||
-              (reference_scans_.count(r->scan_seq) != 0 && (!r->published || typed_by_ms_.count(msKey(end)) != 0)));
+             (!scenario_.typed || !r->published || typed_by_ms_.count(msKey(end)) != 0) &&
+             (!scenario_.reference || reference_scans_.count(r->scan_seq) != 0);
     });
     if (!done) {
       std::ostringstream out;
@@ -991,6 +1022,7 @@ private:
     const auto typed = typed_by_ms_.find(msKey(static_cast<double>(record.end_ns) * 1e-9));
     if (record.published && typed != typed_by_ms_.end()) {
       o.typed_seen = 1;
+      o.typed_stamp_ns = typed->second.stamp_ns;
       o.typed_state = typed->second.state;
       o.typed_validity = typed->second.validity;
       o.typed_health = typed->second.health;
@@ -1344,6 +1376,8 @@ private:
   rclcpp::Subscription<fast_lio_interfaces::msg::FrontendObservation>::SharedPtr typed_;
   rclcpp::Subscription<fast_lio_interfaces::msg::ReferenceHealth>::SharedPtr reference_;
   std::vector<std::string> reference_cdr_;
+  std::vector<std::string> typed_cdr_;
+  std::vector<PosePublication> pose_publications_;
   std::set<std::uint64_t> reference_scans_;
   std::map<std::int64_t, nav_msgs::msg::Odometry> odom_by_ms_;
   std::map<std::int64_t, TypedSample> typed_by_ms_;
@@ -1525,6 +1559,34 @@ ChildResult runScenario(const Scenario & scenario)
     serialization.deserialize_message(&wire, &message);
     result.references.push_back(std::move(message));
   }
+  std::uint32_t typed = 0;
+  if (!reader.take(&typed, sizeof(typed))) {
+    result.error = "child typed count truncated";
+    return result;
+  }
+  for (std::uint32_t i = 0; i < typed; ++i) {
+    std::string bytes;
+    if (!reader.takeString(&bytes)) {
+      result.error = "child typed CDR truncated";
+      return result;
+    }
+    rclcpp::SerializedMessage wire(bytes.size());
+    auto & data = wire.get_rcl_serialized_message();
+    std::memcpy(data.buffer, bytes.data(), bytes.size());
+    data.buffer_length = bytes.size();
+    fast_lio_interfaces::msg::FrontendObservation message;
+    rclcpp::Serialization<fast_lio_interfaces::msg::FrontendObservation> serialization;
+    serialization.deserialize_message(&wire, &message);
+    result.typed_poses.push_back(std::move(message));
+  }
+  std::uint32_t publications = 0;
+  if (!reader.take(&publications, sizeof(publications))) {
+    result.error = "child publication count truncated";
+    return result;
+  }
+  result.pose_publications.resize(publications);
+  if (publications > 0 && !reader.take(result.pose_publications.data(), sizeof(PosePublication) * publications))
+    result.error = "child publication receipts truncated";
   return result;
 }
 
@@ -5604,6 +5666,71 @@ void expectReferenceProjection(const Observation & observation, const fast_lio_i
     EXPECT_TRUE(sameBits(value.pose_binding[i + 3], observation.odom_q[i + 1]));
   EXPECT_TRUE(sameBits(value.pose_binding[6], observation.odom_q[0]));
 }
+
+void expectCompleteClosedArm(const ChildResult & result, const char * arm)
+{
+  SCOPED_TRACE(arm);
+  // pendingExport: warm-up 2 + Before 1 + Event 3 + After (11+1) + Later 5 + Hold 2.
+  constexpr std::size_t kExpectedPoseCount = 25;
+  const auto sent = [&](std::uint8_t encoding) {
+    return std::count_if(result.pose_publications.begin(), result.pose_publications.end(),
+                         [&](const auto & receipt) { return receipt.encoding == encoding; });
+  };
+  const auto published = std::count_if(result.observations.begin(), result.observations.end(),
+                                        [](const auto & observation) { return observation.record.published; });
+  std::printf("[R1-closed-arm] arm=%s scan_published=%zu odom_sent=%zu odom_received=%zu "
+              "pose_fo_sent=%zu pose_fo_received=%zu idle_fo=%zu\n",
+              arm, static_cast<std::size_t>(published), static_cast<std::size_t>(sent(0)), result.odom_ns.size(),
+              static_cast<std::size_t>(sent(1)), result.typed_poses.size(), result.idle.size());
+  ASSERT_EQ(static_cast<std::size_t>(published), kExpectedPoseCount);
+  ASSERT_EQ(static_cast<std::size_t>(sent(0)), kExpectedPoseCount);
+  ASSERT_EQ(static_cast<std::size_t>(sent(1)), kExpectedPoseCount);
+  ASSERT_EQ(result.odom_ns.size(), kExpectedPoseCount);
+  ASSERT_EQ(result.typed_poses.size(), kExpectedPoseCount);
+  std::set<std::int64_t> stamps;
+  std::set<std::array<std::uint8_t, 32>> ids;
+  for (const auto & message : result.typed_poses) {
+    ASSERT_TRUE(message.has_pose && message.has_observation_stamp && message.has_observation_id &&
+                message.has_source_instance && message.has_completion_sequence && message.has_coordinate_epoch);
+    EXPECT_TRUE(stamps.insert(message.observation_stamp_ns).second) << "duplicate pose stamp";
+    EXPECT_TRUE(ids.insert(message.observation_id).second) << "duplicate observation ID";
+    EXPECT_EQ(message.source_instance, result.typed_poses.front().source_instance);
+    EXPECT_TRUE(std::any_of(message.source_instance.begin(), message.source_instance.end(),
+                            [](auto byte) { return byte != 0; }));
+    std::array<std::uint8_t, 32> expected_id{};
+    ASSERT_TRUE(fast_lio::frontendObservationId(message.source_instance, message.has_source_instance,
+                                               message.completion_sequence, message.observation_stamp_ns,
+                                               message.has_observation_stamp, message.clock_domain, expected_id));
+    EXPECT_EQ(message.observation_id, expected_id);
+    EXPECT_EQ(std::count(result.odom_ns.begin(), result.odom_ns.end(), message.observation_stamp_ns), 1);
+    for (std::uint8_t encoding : {0, 1}) {
+      EXPECT_EQ(std::count_if(result.pose_publications.begin(), result.pose_publications.end(),
+                              [&](const auto & receipt) {
+                                return receipt.encoding == encoding && receipt.stamp_ns == message.observation_stamp_ns &&
+                                       receipt.id == message.observation_id;
+                              }), 1);
+    }
+  }
+  std::size_t warmup = 0;
+  for (const auto & observation : result.observations) {
+    if (!observation.record.published)
+      continue;
+    ASSERT_TRUE(observation.odom_seen && observation.typed_seen) << "step " << observation.step;
+    EXPECT_EQ(observation.typed_stamp_ns, observation.odom_stamp_ns);
+    EXPECT_EQ(stamps.count(observation.odom_stamp_ns), 1u);
+    EXPECT_EQ(ids.count(observation.typed_id), 1u);
+    if (observation.step < 0)
+      ++warmup;
+    if (!result.references.empty()) {
+      const auto * reference = referenceFor(result, observation.record.scan_seq);
+      ASSERT_NE(reference, nullptr);
+      expectReferenceProjection(observation, *reference);
+    }
+  }
+  EXPECT_EQ(warmup, 2u);
+  std::printf("[R1-closed-arm] arm=%s warmup_pose_fo=%zu exact_ns_id=%zu missing=0 duplicate=0\n",
+              arm, warmup, stamps.size());
+}
 }  // namespace
 
 TEST(AnchorLifecycleReference, BuildPublishesEstablishedWithoutPoseAndKeepsEmptyBuildsCold)
@@ -5770,6 +5897,9 @@ TEST(AnchorLifecycleReference, ClosedArmAndTraceSwitchPreserveLegacyFields)
   setParam(enabled, rclcpp::Parameter("zupt_anchor_trace_en", true));
   const auto traced = runScenario(enabled);
   ASSERT_TRUE(off.ok() && on.ok() && traced.ok()) << off.describe() << on.describe() << traced.describe();
+  ASSERT_NO_FATAL_FAILURE(expectCompleteClosedArm(off, "off"));
+  ASSERT_NO_FATAL_FAILURE(expectCompleteClosedArm(on, "on"));
+  ASSERT_NO_FATAL_FAILURE(expectCompleteClosedArm(traced, "traced"));
   EXPECT_TRUE(off.references.empty());
   ASSERT_EQ(off.observations.size(), on.observations.size());
   ASSERT_EQ(off.observations.size(), traced.observations.size());
@@ -5788,6 +5918,18 @@ TEST(AnchorLifecycleReference, ClosedArmAndTraceSwitchPreserveLegacyFields)
       EXPECT_EQ(candidate->typed_health, expected.typed_health);
       EXPECT_EQ(candidate->typed_axes, expected.typed_axes);
       EXPECT_EQ(candidate->typed_substate, expected.typed_substate);
+    }
+  }
+  for (std::size_t i = 0; i < off.typed_poses.size(); ++i) {
+    auto expected = off.typed_poses[i];
+    // UUID and its content ID differ per activation; their exact algorithm was checked above.
+    expected.source_instance.fill(0);
+    expected.observation_id.fill(0);
+    for (const auto * arm : {&on, &traced}) {
+      auto actual = arm->typed_poses[i];
+      actual.source_instance.fill(0);
+      actual.observation_id.fill(0);
+      EXPECT_EQ(actual, expected) << "canonical FrontendObservation " << i;
     }
   }
 }

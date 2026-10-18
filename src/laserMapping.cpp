@@ -2777,6 +2777,7 @@ std::function<bool(double)> forceRunawayTrip;
 std::function<bool(double)> initialBuildTakesNoPoint;
 std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 std::function<void(const std::string &)> afterAnchorTraceLine;
+std::function<void(std::uint8_t, std::int64_t, const std::array<std::uint8_t, 32> &)> afterPosePublish;
 
 ImuInputSnapshot inspectImuInput()
 {
@@ -3307,6 +3308,11 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.twist.covariance[4] = state_point.grav[2];
   }
   pubOdomAftMapped->publish(odomAftMapped);
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::afterPosePublish)
+    fast_lio_test::afterPosePublish(0, rclcpp::Time(odomAftMapped.header.stamp).nanoseconds(),
+                                   final.reference.observationId);
+#endif
   if (!diag_first_odom_pub_logged) {
     RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
                 "[STARTUP][FAST_LIO] first /Odometry publish stamp=%.3f pos=[%.3f %.3f %.3f]",
@@ -3454,6 +3460,10 @@ void buildAndPublishFrontendObservation(bool completed,
       message.queue_count = static_cast<std::uint32_t>(pending);
   }
   frontend_publisher->publish(message);
+#ifdef FASTLIO_TEST_HOOKS
+  if (completed && fast_lio_test::afterPosePublish)
+    fast_lio_test::afterPosePublish(1, message.observation_stamp_ns, message.observation_id);
+#endif
 }
 
 void publishFrontendObservation(bool completed, bool scanEvent, double eventTime) noexcept

@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 #include <limits>
+#include <memory>
 #include <vector>
 
 #include "map_backend_reference.hpp"
@@ -91,14 +92,14 @@ TEST(MapBackendReference, IvoxHoldsPointsOnlyWhenTheBuildPlacedOne)
 
 TEST(MapBackendReference, IkdTreeHoldsPointsOnlyWhenTheBuildHadOne)
 {
-  KdTree map;
-  EXPECT_FALSE(fast_lio::mapBackendHoldsPoints(map)) << "never built";
-  map.Build(Points());
-  EXPECT_FALSE(fast_lio::mapBackendHoldsPoints(map)) << "built from nothing";
-  map.Build(ground());
-  EXPECT_TRUE(fast_lio::mapBackendHoldsPoints(map));
-  EXPECT_GT(map.size(), 0);
+  auto map = std::make_unique<KdTree>();
+  EXPECT_FALSE(fast_lio::mapBackendHoldsPoints(*map)) << "never built";
+  map->Build(Points());
+  EXPECT_FALSE(fast_lio::mapBackendHoldsPoints(*map)) << "built from nothing";
+  map->Build(ground());
+  EXPECT_TRUE(fast_lio::mapBackendHoldsPoints(*map));
+  EXPECT_GT(map->size(), 0);
   // A build deletes the tree first: rebuilt from nothing, nothing is left.
-  map.Build(Points());
-  EXPECT_FALSE(fast_lio::mapBackendHoldsPoints(map));
+  map->Build(Points());
+  EXPECT_FALSE(fast_lio::mapBackendHoldsPoints(*map));
 }

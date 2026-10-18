@@ -14,7 +14,7 @@
 // Pure C++. No ROS, no Eigen.
 //
 // ===========================================================================
-// Trace format, version 4. This comment is the specification; a checker must
+// Trace format, version 5. This comment is the specification; a checker must
 // depend on nothing else.
 // ===========================================================================
 //
@@ -73,6 +73,20 @@
 // using that input's stamp and path. Only the scan hole the idle check finds
 // still means that no scan was queued.
 //
+// Since version 4: one key is appended to the scan record, startup_reference
+// (section 3); every other key keeps its order and meaning, and the other
+// records are unchanged. A fresh process that builds its local map from its
+// own scans (no prior map, nothing restored) starts no unsupported-recovery
+// episode before its first local reference: the first normal map build that
+// left the map backend holding points. Before it, a degraded scan, a scan
+// hole, an IMU coverage gap or lost batch and an IMU bridge write no pending
+// record and are not counted in recovery_started; the anchor records, the
+// input events and their counts are written as before, and a map reset still
+// latches. Every start after that build follows section 2 at once: the build
+// is no supported scan, so the clock starts at the last supported scan after
+// it or, when there was none, at the event. Any other process follows section
+// 2 from its first scan.
+//
 // Sequence rules
 //   event_seq   1, 2, 3, ... over the process lifetime, one per transition record
 //               of either tag (the counter summary included). Never repeats,
@@ -96,7 +110,7 @@
 //
 // 1. Anchor transition records: always on, never throttled, one line per event.
 //
-//   [ZUPT-ANCHOR] v=4 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
+//   [ZUPT-ANCHOR] v=5 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
 //     stamp_ns=<ns> anchor_id=<id> anchor_valid=<0|1> created_ns=<ns>
 //     last_evidence_ns=<ns> anchor_state=<state> stationary_episode=<n>
 //     reference_generation=<n> streak=<n>
@@ -170,7 +184,7 @@
 //    event; event_seq is drawn from the same sequence as the anchor records.
 //    Only with the platform policy on (reanchor_total_timeout_sec > 0).
 //
-//   [FE-RECOVERY] v=4 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
+//   [FE-RECOVERY] v=5 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
 //     stamp_ns=<ns> episode=<n> start_ns=<ns> deadline_ns=<ns> elapsed_ns=<ns>
 //     reset_count=<n> path=<path>
 //
@@ -206,7 +220,7 @@
 //
 // 3. Scan records: one per scan, only with the parameter zupt_anchor_trace_en.
 //
-//   [ZUPT-ANCHOR-SCAN] v=4 scan_seq=<n> outcome=<outcome> beg_ns=<ns>
+//   [ZUPT-ANCHOR-SCAN] v=5 scan_seq=<n> outcome=<outcome> beg_ns=<ns>
 //     end_ns=<ns> gap_ns=<ns> anchor_id=<id> anchor_valid=<0|1>
 //     anchor_created_ns=<ns> body=<body> imu_n=<n> gyr_max=<rad/s>
 //     acc_span=<ratio> wheel_age=<s> wheel_speed=<m/s> guard_degraded=<0|1>
@@ -223,6 +237,7 @@
 //     static_hold=<0|1> act_p=<x,y,z> act_q=<w,x,y,z> act_v=<x,y,z>
 //     p_pose_act=<hash> target_p=<x,y,z> target_q=<w,x,y,z> anchor_p=<x,y,z>
 //     anchor_q=<w,x,y,z> streak=<n> map_updated=<0|1> upd_dp=<m> upd_dq=<rad>
+//     startup_reference=<phase>
 //
 //   outcome     published: went through the whole scan path and published
 //               /Odometry. Otherwise where it stopped: bootstrap (first scan,
@@ -324,11 +339,25 @@
 //               and after this scan's lidar measurement update (the iterated
 //               update alone, before the priors and the anchor step). na when
 //               the scan stopped before it.
+//   startup_reference  how this process judges the start of an episode after
+//               this scan (see "Since version 4"). cold: a fresh start that
+//               builds its local map from its own scans, whose first local
+//               reference is not built yet; every start is deferred. With cold,
+//               map_updated=1 is a first build that left the map backend
+//               without points. established: that reference was built, by this
+//               scan or an earlier one; every start follows section 2 for the
+//               rest of the process, after a map reset too. excluded: any other
+//               start (a prior map, an unknown source), or a cold one that a
+//               map reset, a replaced reference or a clock fault ended before
+//               its first reference; every start follows section 2. cold
+//               changes only to established or excluded, and neither of those
+//               changes again. Every scan record carries it, whatever its
+//               outcome.
 //
 // 4. Counter summary: once, when the node shuts down. An anchor transition
 //    record with its own keys, all saturating unsigned 64-bit counts:
 //
-//   [ZUPT-ANCHOR] v=4 event=counters event_seq=<n> scans=<n> events=<n>
+//   [ZUPT-ANCHOR] v=5 event=counters event_seq=<n> scans=<n> events=<n>
 //     candidates=<n> created=<n> candidates_dropped=<n> invalidated=<n>
 //     invalidated_motion=<n> invalidated_evidence_unknown=<n>
 //     invalidated_scan_hole=<n> invalidated_imu_coverage_gap=<n>
@@ -381,7 +410,7 @@
 namespace fast_lio
 {
 
-constexpr int kAnchorTraceVersion = 4;
+constexpr int kAnchorTraceVersion = 5;
 
 /// Counts that reach the top stay there: a wrapped counter would read as a
 /// small, plausible number.
@@ -764,6 +793,19 @@ inline const char * recoveryTrustName(RecoveryTrust trust)
   return "unknown";
 }
 
+inline const char * startupReferenceName(StartupReference phase)
+{
+  switch (phase) {
+    case StartupReference::kCold:
+      return "cold";
+    case StartupReference::kEstablished:
+      return "established";
+    case StartupReference::kExcluded:
+      return "excluded";
+  }
+  return "unknown";
+}
+
 inline const char * recoveryCauseName(RecoveryCause cause)
 {
   switch (cause) {
@@ -945,6 +987,7 @@ struct AnchorScanRecord
   bool have_update = false;  ///< the lidar measurement update ran
   double upd_dp = std::numeric_limits<double>::quiet_NaN();
   double upd_dq = std::numeric_limits<double>::quiet_NaN();
+  StartupReference startup_reference = StartupReference::kExcluded;  ///< after the scan
 };
 
 /// Indexed by AnchorDrop; only the reasons an anchor can end with are printed.
@@ -1260,6 +1303,7 @@ inline std::string formatAnchorScanRecord(const AnchorScanRecord & r)
       line.text(name, "na");
     }
   }
+  line.text("startup_reference", startupReferenceName(r.startup_reference));
   return line.str();
 }
 

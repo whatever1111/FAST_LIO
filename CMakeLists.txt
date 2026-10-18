@@ -259,7 +259,8 @@ if(BUILD_TESTING)
       "AnchorLifecycleGate:gate:480"
       "AnchorLifecycleRebuild:rebuild:240"
       "AnchorLifecycleHold:hold:240"
-      "AnchorLifecycleExport:export:240")
+      "AnchorLifecycleExport:export:240"
+      "AnchorLifecycleStartup:startup:600")
     ament_add_gtest_executable(test_anchor_lifecycle_node test/test_anchor_lifecycle_node.cpp)
     set(anchor_node_suites "")
     foreach(anchor_node_entry ${anchor_node_entries})
@@ -431,6 +432,14 @@ if(BUILD_TESTING)
     target_include_directories(test_ivox_voxel_occupancy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                                  ${PCL_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR})
     target_link_libraries(test_ivox_voxel_occupancy ${PCL_LIBRARIES})
+  endif()
+  # Both map backends, whatever USE_IVOX is: the front end's first local reference needs the initial
+  # build to have left the backend holding points, not only to have been called.
+  ament_add_gtest(test_map_backend_reference test/test_map_backend_reference.cpp include/ikd-Tree/ikd_Tree.cpp)
+  if(TARGET test_map_backend_reference)
+    target_include_directories(test_map_backend_reference PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                                  ${PCL_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR})
+    target_link_libraries(test_map_backend_reference ${PCL_LIBRARIES})
   endif()
   # Pure header, Eigen only: what a prior map and its initial pose have to prove before
   # either of them reaches the map backend.

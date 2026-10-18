@@ -19,6 +19,7 @@ using fast_lio::RecoveryEvent;
 using fast_lio::RecoveryParams;
 using fast_lio::RecoveryState;
 using fast_lio::RecoveryTrust;
+using fast_lio::StartupReference;
 using fast_lio::StaticEvidence;
 using fast_lio::StaticEvidenceReason;
 using fast_lio::StationaryAnchor;
@@ -120,6 +121,85 @@ RecoveryParams platformPolicy()
   p.total_ns = 10 * kSecond;
   p.stable_ns = kSecond;
   return p;
+}
+
+// A fresh process that builds its local map from its own scans, configured before any input.
+RecoveryState coldStart()
+{
+  RecoveryState recovery;
+  fast_lio::configureRecoveryStartup(&recovery, true);
+  return recovery;
+}
+
+// The fields the recovery rules run on; the first-reference fields are left out.
+bool sameRecovery(const RecoveryState & a, const RecoveryState & b)
+{
+  return a.trust == b.trust && a.cause == b.cause && a.episode == b.episode && a.start_ns == b.start_ns &&
+         a.deadline_ns == b.deadline_ns && a.last_supported_end_ns == b.last_supported_end_ns &&
+         a.stable_begin_ns == b.stable_begin_ns && a.stable_last_scan == b.stable_last_scan &&
+         a.stable_generation == b.stable_generation && a.excluded_scan == b.excluded_scan &&
+         a.map_resets == b.map_resets;
+}
+
+bool sameEvent(const RecoveryEvent & a, const RecoveryEvent & b)
+{
+  return a.pending == b.pending && a.qualified == b.qualified && a.unanchored == b.unanchored && a.cause == b.cause;
+}
+
+// Supported scans, a degraded start, 0.8 s of matching broken by a mismatch, a repeated and a skipped scan number, a
+// new generation, a bridged scan that is excluded while Pending, one unbroken second that re-qualifies, a long hole
+// that expires on the returning scan, and a reset on the latch. Every event, in order.
+std::vector<RecoveryEvent> driveRecovery(RecoveryState * recovery, const RecoveryParams & params)
+{
+  std::vector<RecoveryEvent> events;
+  for (int i = 0; i < 5; ++i)
+    fast_lio::noteSupportedScan(recovery, endOf(i));
+  events.push_back(fast_lio::startRecovery(recovery, RecoveryCause::kDegraded, endOf(5), params));
+  std::uint64_t seq = 6;
+  for (int i = 6; i < 14; ++i)
+    events.push_back(fast_lio::observeRecoveryScan(recovery, seq++, beginOf(i), endOf(i), true, 0, params));
+  events.push_back(fast_lio::observeRecoveryScan(recovery, seq++, beginOf(14), endOf(14), false, 0, params));
+  events.push_back(fast_lio::observeRecoveryScan(recovery, seq - 1, beginOf(15), endOf(15), true, 0, params));
+  ++seq;  // a scan that never reached the test
+  events.push_back(fast_lio::observeRecoveryScan(recovery, seq++, beginOf(16), endOf(16), true, 1, params));
+  fast_lio::excludeRecoveryScan(recovery, seq);
+  events.push_back(fast_lio::startRecovery(recovery, RecoveryCause::kImuBridge, endOf(17), params));
+  events.push_back(fast_lio::observeRecoveryScan(recovery, seq++, beginOf(17), endOf(17), true, 1, params));
+  for (int i = 18; i < 40 && recovery->trust == RecoveryTrust::kPending; ++i) {
+    events.push_back(fast_lio::expireRecovery(recovery, endOf(i)));
+    events.push_back(fast_lio::observeRecoveryScan(recovery, seq++, beginOf(i), endOf(i), true, 1, params));
+  }
+  for (int i = 40; i < 45; ++i)
+    fast_lio::noteSupportedScan(recovery, endOf(i));
+  const std::int64_t back = endOf(44) + 30 * kSecond;
+  events.push_back(fast_lio::startRecovery(recovery, RecoveryCause::kScanHole, back, params));
+  events.push_back(fast_lio::expireRecovery(recovery, back));
+  events.push_back(fast_lio::observeRecoveryScan(recovery, seq++, back - kPeriod, back, true, 1, params));
+  events.push_back(fast_lio::resetRecoveryReference(recovery, back + kPeriod, params));
+  return events;
+}
+
+// What moves the first-reference fields, by number: configure fresh, configure another source, the first build,
+// a revocation (replaced reference, clock fault) and a reset.
+void startupStep(RecoveryState * recovery, int step, const RecoveryParams & params)
+{
+  switch (step) {
+    case 0:
+      fast_lio::configureRecoveryStartup(recovery, true);
+      break;
+    case 1:
+      fast_lio::configureRecoveryStartup(recovery, false);
+      break;
+    case 2:
+      fast_lio::commitInitialReference(recovery);
+      break;
+    case 3:
+      fast_lio::revokeRecoveryStartup(recovery);
+      break;
+    default:
+      fast_lio::resetRecoveryReference(recovery, endOf(step), params);
+      break;
+  }
 }
 }  // namespace
 
@@ -1040,6 +1120,479 @@ TEST(StationaryAnchorPolicy, WithoutAnyTimeAnEpisodeCannotBeMeasuredAndIsNotTrus
   const RecoveryEvent event = fast_lio::startRecovery(&recovery, RecoveryCause::kScanHole, -1, platformPolicy());
   EXPECT_TRUE(event.unanchored);
   EXPECT_EQ(recovery.trust, RecoveryTrust::kUnanchored);
+}
+
+// ── (b1): the first local reference ──────────────────────────────────────────
+
+TEST(StationaryAnchorPolicy, AStateNobodyConfiguredOrAnotherSourceFollowsTheRulesFromTheBeginning)
+{
+  const RecoveryParams params = platformPolicy();
+  RecoveryState unconfigured;
+  EXPECT_FALSE(unconfigured.startup_configured);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(unconfigured), StartupReference::kExcluded);
+  EXPECT_FALSE(fast_lio::recoveryStartDeferred(unconfigured, params));
+  EXPECT_FALSE(fast_lio::commitInitialReference(&unconfigured)) << "only a cold start has a first reference";
+  EXPECT_FALSE(unconfigured.reference_initialized_once);
+  EXPECT_TRUE(fast_lio::startRecovery(&unconfigured, RecoveryCause::kImuCoverageGap, endOf(0), params).pending);
+  EXPECT_EQ(unconfigured.start_ns, endOf(0));
+  EXPECT_EQ(unconfigured.deadline_ns, endOf(0) + params.total_ns);
+
+  // A prior map (as delivered, pinned, relocalizing, or a load that failed and fell back), a restored or an unknown
+  // source: excluded from the beginning. The parameter cleared later, and a build on the fallback, grant nothing.
+  RecoveryState prior;
+  fast_lio::configureRecoveryStartup(&prior, false);
+  EXPECT_TRUE(prior.startup_configured);
+  EXPECT_FALSE(prior.cold_start_eligible);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(prior), StartupReference::kExcluded);
+  fast_lio::configureRecoveryStartup(&prior, true);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(prior), StartupReference::kExcluded);
+  EXPECT_FALSE(fast_lio::commitInitialReference(&prior));
+  EXPECT_EQ(fast_lio::recoveryStartupReference(prior), StartupReference::kExcluded);
+  EXPECT_FALSE(fast_lio::recoveryStartDeferred(prior, params));
+  EXPECT_TRUE(fast_lio::startRecovery(&prior, RecoveryCause::kScanHole, endOf(1), params).pending);
+  EXPECT_EQ(prior.start_ns, endOf(1));
+}
+
+TEST(StationaryAnchorPolicy, OnlyTheFirstConfigurationOfAStateWithoutHistoryGrantsTheColdStart)
+{
+  const RecoveryParams params = platformPolicy();
+  EXPECT_TRUE(fast_lio::recoveryHistoryEmpty(RecoveryState()));
+  RecoveryState fresh = coldStart();
+  EXPECT_TRUE(fresh.startup_configured);
+  EXPECT_TRUE(fresh.cold_start_eligible);
+  EXPECT_FALSE(fresh.reference_initialized_once);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(fresh), StartupReference::kCold);
+  EXPECT_TRUE(fast_lio::recoveryStartDeferred(fresh, params));
+  // Configured again: a start on a state that already exists grants nothing and takes the open cold start away.
+  fast_lio::configureRecoveryStartup(&fresh, true);
+  EXPECT_FALSE(fresh.cold_start_eligible);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(fresh), StartupReference::kExcluded);
+  EXPECT_FALSE(fast_lio::recoveryStartDeferred(fresh, params));
+
+  // Any history at all, one field at a time: the first configuration grants nothing and changes nothing else.
+  for (int what = 0; what < 13; ++what) {
+    RecoveryState used;
+    switch (what) {
+      case 0:
+        used.trust = RecoveryTrust::kPending;
+        break;
+      case 1:
+        used.trust = RecoveryTrust::kUnanchored;
+        break;
+      case 2:
+        used.cause = RecoveryCause::kDegraded;
+        break;
+      case 3:
+        used.episode = 1;
+        break;
+      case 4:
+        used.start_ns = 0;
+        break;
+      case 5:
+        used.deadline_ns = 0;
+        break;
+      case 6:
+        fast_lio::noteSupportedScan(&used, 0);
+        break;
+      case 7:
+        used.stable_begin_ns = 0;
+        break;
+      case 8:
+        used.stable_last_scan = 1;
+        break;
+      case 9:
+        used.stable_generation = 1;
+        break;
+      case 10:
+        fast_lio::excludeRecoveryScan(&used, 1);
+        break;
+      case 11:
+        used.map_resets = 1;
+        break;
+      default:
+        used.reference_initialized_once = true;
+        break;
+    }
+    const RecoveryState before = used;
+    EXPECT_FALSE(fast_lio::recoveryHistoryEmpty(used)) << what;
+    fast_lio::configureRecoveryStartup(&used, true);
+    EXPECT_TRUE(used.startup_configured) << what;
+    EXPECT_FALSE(used.cold_start_eligible) << what;
+    EXPECT_TRUE(sameRecovery(used, before)) << what;
+    EXPECT_EQ(used.reference_initialized_once, before.reference_initialized_once) << what;
+    EXPECT_FALSE(fast_lio::recoveryStartDeferred(used, params)) << what;
+  }
+}
+
+TEST(StationaryAnchorPolicy, BeforeTheFirstReferenceNoCauseStartsAnEpisodeAndAfterItEveryCauseDoes)
+{
+  const RecoveryParams params = platformPolicy();
+  for (const RecoveryCause cause : {RecoveryCause::kDegraded,
+                                    RecoveryCause::kScanHole,
+                                    RecoveryCause::kImuCoverageGap,
+                                    RecoveryCause::kImuBridge}) {
+    RecoveryState recovery = coldStart();
+    // What the node does around a start is not deferred: the scan stays excluded and the run broken.
+    fast_lio::excludeRecoveryScan(&recovery, 1);
+    fast_lio::breakRecoveryRun(&recovery);
+    for (const std::int64_t now : {endOf(1), std::int64_t{-1}}) {
+      const RecoveryEvent deferred = fast_lio::startRecovery(&recovery, cause, now, params);
+      EXPECT_FALSE(deferred.pending) << static_cast<int>(cause) << " at " << now;
+      EXPECT_FALSE(deferred.unanchored) << "not even without a usable time: there is nothing to time yet";
+      EXPECT_EQ(deferred.cause, RecoveryCause::kNone);
+    }
+    EXPECT_EQ(recovery.trust, RecoveryTrust::kLocalQualified);
+    EXPECT_EQ(recovery.cause, RecoveryCause::kNone);
+    EXPECT_EQ(recovery.episode, 0u);
+    EXPECT_EQ(recovery.start_ns, -1);
+    EXPECT_EQ(recovery.deadline_ns, -1);
+    EXPECT_TRUE(fast_lio::recoveryScanExcluded(recovery, 1)) << "the exclusion is kept";
+    EXPECT_FALSE(fast_lio::expireRecovery(&recovery, endOf(1) + 60 * kSecond).unanchored);
+    EXPECT_EQ(fast_lio::recoveryStartupReference(recovery), StartupReference::kCold);
+
+    ASSERT_TRUE(fast_lio::commitInitialReference(&recovery));
+    const RecoveryEvent started = fast_lio::startRecovery(&recovery, cause, endOf(3), params);
+    EXPECT_TRUE(started.pending) << static_cast<int>(cause);
+    EXPECT_EQ(started.cause, cause);
+    EXPECT_EQ(recovery.episode, 1u);
+    EXPECT_EQ(recovery.start_ns, endOf(3)) << "no supported scan yet: timed from the event";
+    EXPECT_EQ(recovery.deadline_ns, endOf(3) + params.total_ns);
+  }
+  // After the reference, an event without any usable time keeps the fail-closed rule.
+  RecoveryState untimed = coldStart();
+  ASSERT_TRUE(fast_lio::commitInitialReference(&untimed));
+  EXPECT_TRUE(fast_lio::startRecovery(&untimed, RecoveryCause::kScanHole, -1, params).unanchored);
+  EXPECT_EQ(untimed.trust, RecoveryTrust::kUnanchored);
+}
+
+TEST(StationaryAnchorPolicy, AColdStartWaitsForItsFirstReferenceHoweverLongThatTakes)
+{
+  // Initialization restarted by motion for 16.4 s or 46.7 s, a wait just over the 10 s budget, and a 90 s still
+  // timeout: the scan count differs every time, and every start before the first reference is deferred.
+  const RecoveryParams params = platformPolicy();
+  const RecoveryCause causes[] = {
+    RecoveryCause::kImuCoverageGap, RecoveryCause::kScanHole, RecoveryCause::kDegraded, RecoveryCause::kImuBridge};
+  for (const std::int64_t wait :
+       {16 * kSecond + 4 * kPeriod, 46 * kSecond + 7 * kPeriod, 10 * kSecond + 1, 90 * kSecond + kPeriod}) {
+    RecoveryState recovery = coldStart();
+    std::uint64_t seq = 1;
+    std::int64_t now = kFirstBegin;
+    for (; now < kFirstBegin + wait; now += kPeriod, ++seq) {
+      EXPECT_FALSE(fast_lio::expireRecovery(&recovery, now).unanchored);
+      fast_lio::excludeRecoveryScan(&recovery, seq);
+      EXPECT_FALSE(fast_lio::startRecovery(&recovery, causes[seq % 4], now, params).pending);
+      EXPECT_FALSE(fast_lio::observeRecoveryScan(&recovery, seq, now - kPeriod, now, true, 0, params).qualified);
+    }
+    EXPECT_EQ(recovery.trust, RecoveryTrust::kLocalQualified) << wait;
+    EXPECT_EQ(recovery.episode, 0u) << wait;
+    EXPECT_EQ(recovery.deadline_ns, -1) << wait;
+    EXPECT_EQ(recovery.last_supported_end_ns, -1) << wait;
+    ASSERT_TRUE(fast_lio::commitInitialReference(&recovery));
+    // The first event after the reference has the whole budget from that event, and no more.
+    ASSERT_TRUE(fast_lio::startRecovery(&recovery, RecoveryCause::kDegraded, now, params).pending);
+    EXPECT_EQ(recovery.start_ns, now) << wait;
+    EXPECT_FALSE(fast_lio::expireRecovery(&recovery, now + params.total_ns - 1).unanchored) << wait;
+    EXPECT_TRUE(fast_lio::expireRecovery(&recovery, now + params.total_ns).unanchored) << wait;
+  }
+}
+
+TEST(StationaryAnchorPolicy, TheFirstReferenceIsRecordedOnceAndIsNoSupportedScan)
+{
+  const RecoveryParams params = platformPolicy();
+  RecoveryState recovery = coldStart();
+  fast_lio::excludeRecoveryScan(&recovery, 4);
+  // A build that left the map backend empty records nothing (the node does not commit it): starts stay deferred.
+  EXPECT_FALSE(fast_lio::startRecovery(&recovery, RecoveryCause::kImuCoverageGap, endOf(4), params).pending);
+  EXPECT_TRUE(fast_lio::recoveryStartDeferred(recovery, params));
+  const RecoveryState before = recovery;
+  EXPECT_TRUE(fast_lio::commitInitialReference(&recovery));
+  EXPECT_TRUE(recovery.reference_initialized_once);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(recovery), StartupReference::kEstablished);
+  EXPECT_TRUE(sameRecovery(recovery, before)) << "trust, clock, run, exclusion and last supported scan untouched";
+  EXPECT_EQ(recovery.last_supported_end_ns, -1);
+  EXPECT_EQ(recovery.stable_begin_ns, -1);
+  EXPECT_FALSE(fast_lio::commitInitialReference(&recovery)) << "recorded once";
+  EXPECT_TRUE(recovery.reference_initialized_once);
+  EXPECT_FALSE(fast_lio::recoveryStartDeferred(recovery, params));
+
+  // The build starts no run: one second of matching from the first scan observed after it.
+  ASSERT_TRUE(fast_lio::startRecovery(&recovery, RecoveryCause::kDegraded, endOf(5), params).pending);
+  int last = 0;
+  for (int i = 5; i < 30 && recovery.trust == RecoveryTrust::kPending; ++i) {
+    last = i;
+    fast_lio::expireRecovery(&recovery, endOf(i));
+    fast_lio::observeRecoveryScan(&recovery, static_cast<std::uint64_t>(i), beginOf(i), endOf(i), true, 0, params);
+  }
+  EXPECT_EQ(recovery.trust, RecoveryTrust::kLocalQualified);
+  EXPECT_EQ(last, 14) << "ten 0.1 s scans from the first one observed";
+}
+
+TEST(StationaryAnchorPolicy, AfterTheFirstReferenceEveryStartFollowsTheRulesAtOnce)
+{
+  const RecoveryParams params = platformPolicy();
+  RecoveryState legacy;
+  const std::vector<RecoveryEvent> want = driveRecovery(&legacy, params);
+  int pending = 0;
+  int qualified = 0;
+  int unanchored = 0;
+  for (const RecoveryEvent & event : want) {
+    pending += event.pending ? 1 : 0;
+    qualified += event.qualified ? 1 : 0;
+    unanchored += event.unanchored ? 1 : 0;
+  }
+  ASSERT_EQ(pending, 2) << "the degraded start and the long hole";
+  ASSERT_EQ(qualified, 1);
+  ASSERT_EQ(unanchored, 1) << "the hole's deadline; the reset finds the latch";
+  ASSERT_EQ(legacy.cause, RecoveryCause::kDeadline);
+
+  RecoveryState established = coldStart();
+  ASSERT_TRUE(fast_lio::commitInitialReference(&established));
+  RecoveryState excluded;
+  fast_lio::configureRecoveryStartup(&excluded, false);
+  for (RecoveryState * other : {&established, &excluded}) {
+    const std::vector<RecoveryEvent> got = driveRecovery(other, params);
+    ASSERT_EQ(got.size(), want.size());
+    for (std::size_t i = 0; i < want.size(); ++i)
+      EXPECT_TRUE(sameEvent(got[i], want[i])) << "event " << i;
+    EXPECT_TRUE(sameRecovery(*other, legacy));
+  }
+  EXPECT_EQ(fast_lio::recoveryStartupReference(established), StartupReference::kEstablished);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(excluded), StartupReference::kExcluded);
+}
+
+TEST(StationaryAnchorPolicy, AResetIsNeverAColdStart)
+{
+  const RecoveryParams params = platformPolicy();
+  // Before the first reference: the reset latches as it always did, and the cold start is gone for good.
+  RecoveryState early = coldStart();
+  const RecoveryEvent reset = fast_lio::resetRecoveryReference(&early, endOf(2), params);
+  EXPECT_TRUE(reset.unanchored);
+  EXPECT_EQ(reset.cause, RecoveryCause::kMapReset);
+  EXPECT_EQ(early.episode, 1u);
+  EXPECT_EQ(early.start_ns, endOf(2));
+  EXPECT_EQ(early.map_resets, 1u);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(early), StartupReference::kExcluded);
+  EXPECT_FALSE(fast_lio::commitInitialReference(&early)) << "a map built after a reset is no first reference";
+  fast_lio::configureRecoveryStartup(&early, true);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(early), StartupReference::kExcluded);
+  for (int i = 3; i < 40; ++i) {
+    fast_lio::noteSupportedScan(&early, endOf(i));
+    fast_lio::observeRecoveryScan(&early, static_cast<std::uint64_t>(i), beginOf(i), endOf(i), true, 1, params);
+    fast_lio::expireRecovery(&early, endOf(i));
+    EXPECT_FALSE(fast_lio::startRecovery(&early, RecoveryCause::kDegraded, endOf(i), params).pending);
+  }
+  EXPECT_EQ(early.trust, RecoveryTrust::kUnanchored);
+  EXPECT_EQ(early.cause, RecoveryCause::kMapReset);
+
+  // After it: the reset latches, the reference stays established, and a later build (an empty rebuild that sends
+  // the next scan through the initial build again, then one that holds points) records nothing.
+  RecoveryState late = coldStart();
+  ASSERT_TRUE(fast_lio::commitInitialReference(&late));
+  fast_lio::noteSupportedScan(&late, endOf(3));
+  EXPECT_TRUE(fast_lio::resetRecoveryReference(&late, endOf(4), params).unanchored);
+  EXPECT_EQ(late.start_ns, endOf(3));
+  EXPECT_FALSE(fast_lio::commitInitialReference(&late));
+  EXPECT_FALSE(fast_lio::commitInitialReference(&late));
+  EXPECT_TRUE(late.reference_initialized_once);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(late), StartupReference::kEstablished);
+  EXPECT_EQ(late.trust, RecoveryTrust::kUnanchored);
+  EXPECT_EQ(late.cause, RecoveryCause::kMapReset);
+  // A second reset finds the latch and keeps its cause.
+  EXPECT_FALSE(fast_lio::resetRecoveryReference(&late, endOf(9), params).unanchored);
+  EXPECT_EQ(late.cause, RecoveryCause::kMapReset);
+  EXPECT_EQ(late.map_resets, 2u);
+}
+
+TEST(StationaryAnchorPolicy, AReplacedReferenceOrAClockFaultEndsTheColdStartAndNothingElse)
+{
+  const RecoveryParams params = platformPolicy();
+  RecoveryState cold = coldStart();
+  fast_lio::excludeRecoveryScan(&cold, 2);
+  const RecoveryState before = cold;
+  fast_lio::revokeRecoveryStartup(&cold);
+  EXPECT_TRUE(sameRecovery(cold, before));
+  EXPECT_EQ(fast_lio::recoveryStartupReference(cold), StartupReference::kExcluded);
+  EXPECT_FALSE(fast_lio::recoveryStartDeferred(cold, params));
+  EXPECT_TRUE(fast_lio::startRecovery(&cold, RecoveryCause::kImuCoverageGap, endOf(3), params).pending);
+  EXPECT_EQ(cold.start_ns, endOf(3));
+  EXPECT_FALSE(fast_lio::commitInitialReference(&cold));
+  fast_lio::configureRecoveryStartup(&cold, true);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(cold), StartupReference::kExcluded);
+
+  // Once the first reference was built, a revocation leaves it built and a running episode as it was.
+  RecoveryState established = coldStart();
+  ASSERT_TRUE(fast_lio::commitInitialReference(&established));
+  fast_lio::noteSupportedScan(&established, endOf(1));
+  ASSERT_TRUE(fast_lio::startRecovery(&established, RecoveryCause::kDegraded, endOf(2), params).pending);
+  const RecoveryState running = established;
+  fast_lio::revokeRecoveryStartup(&established);
+  EXPECT_TRUE(sameRecovery(established, running));
+  EXPECT_TRUE(established.reference_initialized_once);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(established), StartupReference::kEstablished);
+}
+
+TEST(StationaryAnchorPolicy, TheDeferralHoldsNoEpisodeThatIsRunningOrLatched)
+{
+  const RecoveryParams params = platformPolicy();
+  // Deliberately combined, no product path leads here: a cold start already Pending. Its episode runs on.
+  RecoveryState pending = coldStart();
+  pending.trust = RecoveryTrust::kPending;
+  pending.cause = RecoveryCause::kScanHole;
+  pending.episode = 1;
+  pending.start_ns = endOf(0);
+  pending.deadline_ns = endOf(0) + params.total_ns;
+  EXPECT_FALSE(fast_lio::recoveryStartDeferred(pending, params));
+  EXPECT_FALSE(fast_lio::startRecovery(&pending, RecoveryCause::kDegraded, endOf(3), params).pending);
+  EXPECT_EQ(pending.episode, 1u);
+  EXPECT_EQ(pending.start_ns, endOf(0));
+  EXPECT_EQ(pending.cause, RecoveryCause::kScanHole);
+  RecoveryState requalified = pending;
+  int last = 0;
+  for (int i = 3; i < 30 && requalified.trust == RecoveryTrust::kPending; ++i) {
+    last = i;
+    fast_lio::observeRecoveryScan(&requalified, static_cast<std::uint64_t>(i), beginOf(i), endOf(i), true, 0, params);
+  }
+  EXPECT_EQ(requalified.trust, RecoveryTrust::kLocalQualified);
+  EXPECT_EQ(last, 12);
+  EXPECT_TRUE(fast_lio::expireRecovery(&pending, pending.deadline_ns).unanchored) << "the deadline is not deferred";
+
+  // Deliberately combined: cold and latched. The first reference is recorded and unlatches nothing.
+  RecoveryState latched = coldStart();
+  latched.trust = RecoveryTrust::kUnanchored;
+  latched.cause = RecoveryCause::kDeadline;
+  latched.episode = 1;
+  EXPECT_FALSE(fast_lio::recoveryStartDeferred(latched, params));
+  EXPECT_TRUE(fast_lio::commitInitialReference(&latched));
+  for (int i = 0; i < 40; ++i) {
+    fast_lio::noteSupportedScan(&latched, endOf(i));
+    fast_lio::observeRecoveryScan(&latched, static_cast<std::uint64_t>(i + 1), beginOf(i), endOf(i), true, 0, params);
+    fast_lio::expireRecovery(&latched, endOf(i));
+    EXPECT_FALSE(fast_lio::startRecovery(&latched, RecoveryCause::kDegraded, endOf(i), params).pending);
+  }
+  fast_lio::configureRecoveryStartup(&latched, true);
+  EXPECT_EQ(latched.trust, RecoveryTrust::kUnanchored);
+  EXPECT_EQ(latched.cause, RecoveryCause::kDeadline);
+  EXPECT_EQ(latched.episode, 1u);
+
+  // Reached the ordinary way: a deadline latch, then a build, healthy matching scans and a new configuration.
+  RecoveryState expired;
+  fast_lio::noteSupportedScan(&expired, endOf(0));
+  ASSERT_TRUE(fast_lio::startRecovery(&expired, RecoveryCause::kImuCoverageGap, endOf(1), params).pending);
+  ASSERT_TRUE(fast_lio::expireRecovery(&expired, endOf(0) + params.total_ns).unanchored);
+  fast_lio::configureRecoveryStartup(&expired, true);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(expired), StartupReference::kExcluded);
+  EXPECT_FALSE(fast_lio::commitInitialReference(&expired));
+  for (int i = 200; i < 240; ++i) {
+    fast_lio::noteSupportedScan(&expired, endOf(i));
+    fast_lio::observeRecoveryScan(&expired, static_cast<std::uint64_t>(i), beginOf(i), endOf(i), true, 0, params);
+  }
+  EXPECT_EQ(expired.trust, RecoveryTrust::kUnanchored);
+  EXPECT_EQ(expired.cause, RecoveryCause::kDeadline);
+  EXPECT_EQ(expired.episode, 1u);
+}
+
+TEST(StationaryAnchorPolicy, WithThePolicyOffTheColdStartChangesNothing)
+{
+  const RecoveryParams off;  // generic: total 0
+  RecoveryState recovery = coldStart();
+  EXPECT_FALSE(fast_lio::recoveryStartDeferred(recovery, off));
+  EXPECT_FALSE(fast_lio::startRecovery(&recovery, RecoveryCause::kImuCoverageGap, endOf(1), off).pending);
+  EXPECT_EQ(recovery.episode, 0u);
+  EXPECT_TRUE(fast_lio::commitInitialReference(&recovery));
+  EXPECT_FALSE(fast_lio::startRecovery(&recovery, RecoveryCause::kImuCoverageGap, endOf(2), off).pending);
+  EXPECT_FALSE(fast_lio::resetRecoveryReference(&recovery, endOf(3), off).unanchored);
+  EXPECT_EQ(recovery.trust, RecoveryTrust::kLocalQualified);
+  EXPECT_EQ(recovery.episode, 0u);
+  EXPECT_EQ(recovery.map_resets, 1u);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(recovery), StartupReference::kEstablished);
+
+  RecoveryState early = coldStart();
+  EXPECT_FALSE(fast_lio::resetRecoveryReference(&early, endOf(3), off).unanchored);
+  EXPECT_EQ(early.trust, RecoveryTrust::kLocalQualified);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(early), StartupReference::kExcluded) << "a reset is no cold start";
+}
+
+TEST(StationaryAnchorPolicy, AfterTheFirstReferenceTheCountersAndTheDeadlineStillSaturate)
+{
+  const RecoveryParams params = platformPolicy();
+  const std::uint64_t max_count = std::numeric_limits<std::uint64_t>::max();
+  const std::int64_t max_time = std::numeric_limits<std::int64_t>::max();
+  RecoveryState recovery = coldStart();
+  ASSERT_TRUE(fast_lio::commitInitialReference(&recovery));
+  recovery.episode = max_count;
+  fast_lio::noteSupportedScan(&recovery, max_time - 1);
+  ASSERT_TRUE(fast_lio::startRecovery(&recovery, RecoveryCause::kDegraded, max_time, params).pending);
+  EXPECT_EQ(recovery.episode, max_count) << "no wrap";
+  EXPECT_EQ(recovery.start_ns, max_time - 1);
+  EXPECT_EQ(recovery.deadline_ns, max_time) << "the deadline saturates";
+  recovery.map_resets = max_count;
+  EXPECT_TRUE(fast_lio::resetRecoveryReference(&recovery, max_time, params).unanchored);
+  EXPECT_EQ(recovery.map_resets, max_count);
+  EXPECT_EQ(recovery.episode, max_count);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(recovery), StartupReference::kEstablished);
+
+  RecoveryState exhausted;
+  exhausted.map_resets = max_count;
+  fast_lio::configureRecoveryStartup(&exhausted, true);
+  EXPECT_EQ(fast_lio::recoveryStartupReference(exhausted), StartupReference::kExcluded);
+}
+
+TEST(StationaryAnchorPolicy, TheStartupPhaseOnlyMovesForward)
+{
+  // Every sequence of three steps after the first configuration: cold may become established or excluded, and
+  // either of those is final. Established needs the first build while cold.
+  const RecoveryParams params = platformPolicy();
+  for (const bool fresh : {true, false}) {
+    for (int a = 0; a < 5; ++a) {
+      for (int b = 0; b < 5; ++b) {
+        for (int c = 0; c < 5; ++c) {
+          RecoveryState recovery;
+          fast_lio::configureRecoveryStartup(&recovery, fresh);
+          StartupReference phase = fast_lio::recoveryStartupReference(recovery);
+          EXPECT_EQ(phase, fresh ? StartupReference::kCold : StartupReference::kExcluded);
+          for (const int step : {a, b, c}) {
+            const bool was_cold = phase == StartupReference::kCold;
+            startupStep(&recovery, step, params);
+            const StartupReference next = fast_lio::recoveryStartupReference(recovery);
+            EXPECT_TRUE(next == phase || was_cold) << fresh << a << b << c;
+            if (next == StartupReference::kEstablished && phase != StartupReference::kEstablished) {
+              EXPECT_EQ(step, 2) << "only the first build establishes it";
+            }
+            if (was_cold && step == 2) {
+              EXPECT_EQ(next, StartupReference::kEstablished);
+            }
+            if (was_cold && step != 2) {
+              EXPECT_EQ(next, StartupReference::kExcluded) << "anything but the build ends the cold start";
+            }
+            phase = next;
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(StationaryAnchorPolicy, BeforeTheFirstReferenceAScanReportsItsOwnVerdict)
+{
+  // A deferred start leaves the trust LocalQualified: the health of a scan before the first reference is its own
+  // verdict (no Pending, no latch), and a hold is claimed only on a usable anchor, as on any trusted reference.
+  const RecoveryParams params = platformPolicy();
+  RecoveryState recovery = coldStart();
+  fast_lio::startRecovery(&recovery, RecoveryCause::kImuCoverageGap, endOf(0), params);
+  ASSERT_TRUE(fast_lio::recoveryTrusted(recovery));
+  for (const bool degraded : {false, true}) {
+    for (const bool usable : {false, true}) {
+      AnchorHealthInputs in;
+      in.degraded = degraded;
+      in.hold_active = true;
+      in.anchor_usable = usable;
+      in.trust = recovery.trust;
+      const AnchorHealth health = fast_lio::anchorHealth(in);
+      EXPECT_EQ(health.effective_degraded, degraded);
+      EXPECT_EQ(health.reported_static_hold, usable);
+      EXPECT_FALSE(health.lost);
+    }
+  }
 }
 
 // ── P2-9: what counts as static evidence ─────────────────────────────────────

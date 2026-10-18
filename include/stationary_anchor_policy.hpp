@@ -40,6 +40,19 @@
 // the re-anchor gate: a latched Unanchored must not freeze a rebuilt map for
 // good, and this decides only what the outputs may claim.
 //
+// The first local reference. An episode times how long the front end runs on a
+// reference it can no longer vouch for, so it starts only once there is one. A
+// fresh process that builds its local map from its own scans (no prior map,
+// nothing restored) has none until its first map build leaves the map backend
+// holding points: until then a start is deferred, not queued, and nothing is
+// timed from it. The events themselves are not deferred: what ends the anchor,
+// excludes a scan, blinds the re-anchor gate or freezes the map acts as before.
+// From that build on, every start follows the rules above at once; the build is
+// not a supported scan and gives the clock no start of its own. Any other
+// process (a prior map, an unknown source), and a fresh one whose reference was
+// reset or replaced, or whose clock faulted, before that build, starts episodes
+// as above from the beginning; a reset latches Unanchored either way.
+//
 // Pure C++. No ROS, no estimator types.
 
 #pragma once
@@ -461,6 +474,14 @@ enum class RecoveryCause : std::uint8_t
   kStable,          ///< the scans re-registered for the stable time
 };
 
+/// Where the episode starts are judged, as the scan records report it. Nothing decides on this value.
+enum class StartupReference : std::uint8_t
+{
+  kCold,         ///< a fresh normal-local start whose first local reference is not built yet: starts are deferred
+  kEstablished,  ///< that first reference was built; for the rest of the process every start follows the rules
+  kExcluded,     ///< any other start, or a cold one revoked before its first reference: every start follows the rules
+};
+
 struct RecoveryState
 {
   RecoveryTrust trust = RecoveryTrust::kLocalQualified;
@@ -474,6 +495,11 @@ struct RecoveryState
   std::uint64_t stable_generation = 0;      ///< reference generation the run is on
   std::uint64_t excluded_scan = 0;          ///< scan sequence number that may not count toward a run; 0 = none
   std::uint64_t map_resets = 0;
+  // The first local reference (configureRecoveryStartup() and what follows it). Nothing is deferred until a first
+  // configuration grants the cold start: a state nobody configured follows the rules from the beginning.
+  bool startup_configured = false;          ///< the start was decided; a later decision only takes the cold start away
+  bool cold_start_eligible = false;         ///< granted by the first decision alone, revoked by what came after it
+  bool reference_initialized_once = false;  ///< the first local reference of a cold start was built; never undone
 };
 
 struct RecoveryEvent
@@ -518,14 +544,87 @@ inline bool recoveryScanExcluded(const RecoveryState & recovery, std::uint64_t s
   return scan_seq != 0 && recovery.excluded_scan == scan_seq;
 }
 
+// ── The first local reference ────────────────────────────────────────────────
+
+/// Nothing has happened to the state: no episode, latch, supported scan, run, excluded scan or reset, and no first
+/// reference.
+inline bool recoveryHistoryEmpty(const RecoveryState & recovery)
+{
+  return recovery.trust == RecoveryTrust::kLocalQualified && recovery.cause == RecoveryCause::kNone &&
+         recovery.episode == 0 && recovery.start_ns < 0 && recovery.deadline_ns < 0 &&
+         recovery.last_supported_end_ns < 0 && recovery.stable_begin_ns < 0 && recovery.stable_last_scan == 0 &&
+         recovery.stable_generation == 0 && recovery.excluded_scan == 0 && recovery.map_resets == 0 &&
+         !recovery.reference_initialized_once;
+}
+
+/// Decides, before any input, whether the process starts cold. `fresh_normal_local` is the configured source: the
+/// local map is built from the process's own scans, with no prior map and nothing restored; anything else, an
+/// unknown source included, is not. Only the first call decides, and it grants the cold start only to a state
+/// without any history. A later call is a start on a state that already exists: it grants nothing, takes a cold
+/// start that is still open away, and leaves everything else as it is.
+inline void configureRecoveryStartup(RecoveryState * recovery, bool fresh_normal_local)
+{
+  if (recovery->startup_configured) {
+    recovery->cold_start_eligible = false;
+    return;
+  }
+  recovery->startup_configured = true;
+  recovery->cold_start_eligible = fresh_normal_local && recoveryHistoryEmpty(*recovery);
+}
+
+/// The reference was reset or replaced, or the input clock faulted: whatever comes next is not the fresh start the
+/// process was configured as. A cold start loses the deferral for good, and no later configuration grants it again.
+/// Nothing else changes: a first reference already built stays built, and an episode runs on as it was.
+inline void revokeRecoveryStartup(RecoveryState * recovery)
+{
+  recovery->startup_configured = true;
+  recovery->cold_start_eligible = false;
+}
+
+/// The normal initial map build of a cold start returned with the map backend holding points: the first local
+/// reference exists. Recorded once, for the rest of the process; a revoked or never granted cold start records
+/// nothing. The trust, the episode and its clock, the run and the last supported scan stay as they are: the build is
+/// not a supported scan, and it neither ends nor restarts an episode. Returns whether this call recorded it.
+inline bool commitInitialReference(RecoveryState * recovery)
+{
+  if (!recovery->cold_start_eligible || recovery->reference_initialized_once) {
+    return false;
+  }
+  recovery->reference_initialized_once = true;
+  return true;
+}
+
+/// Whether startRecovery() defers the start now: the policy on, the reference trusted as far as the local checks
+/// go, a cold start, and its first reference not built yet. An episode that is already running or latched is never
+/// deferred. Changes nothing.
+inline bool recoveryStartDeferred(const RecoveryState & recovery, const RecoveryParams & params)
+{
+  return params.enabled() && recovery.trust == RecoveryTrust::kLocalQualified && recovery.cold_start_eligible &&
+         !recovery.reference_initialized_once;
+}
+
+/// What the scan records report: established once the first reference was built, whatever happened after it;
+/// otherwise cold while the cold start stands, excluded when it never did or was revoked. Changes nothing.
+inline StartupReference recoveryStartupReference(const RecoveryState & recovery)
+{
+  if (recovery.reference_initialized_once) {
+    return StartupReference::kEstablished;
+  }
+  return recovery.cold_start_eligible ? StartupReference::kCold : StartupReference::kExcluded;
+}
+
 /// The evidence for the reference broke. With the policy on and the reference trusted, Pending starts with its
 /// clock at the last supported scan (or at `now_ns` when there was none). Without any usable time there is nothing
-/// to measure the episode by, and the reference is not trusted again.
+/// to measure the episode by, and the reference is not trusted again. Before the first local reference of a cold
+/// start nothing starts (recoveryStartDeferred()), and nothing is kept to start from later.
 inline RecoveryEvent
 startRecovery(RecoveryState * recovery, RecoveryCause cause, std::int64_t now_ns, const RecoveryParams & params)
 {
   RecoveryEvent event;
   if (!params.enabled() || recovery->trust != RecoveryTrust::kLocalQualified) {
+    return event;
+  }
+  if (recoveryStartDeferred(*recovery, params)) {
     return event;
   }
   if (recovery->episode != std::numeric_limits<std::uint64_t>::max()) {
@@ -606,11 +705,13 @@ inline RecoveryEvent observeRecoveryScan(RecoveryState * recovery,
   return event;
 }
 
-/// A map reset. With the policy on, the reference is not trusted again in this process.
+/// A map reset. With the policy on, the reference is not trusted again in this process. A reset is never a cold
+/// start: it revokes one that is still open, and latches whether or not the first reference was built.
 inline RecoveryEvent
 resetRecoveryReference(RecoveryState * recovery, std::int64_t now_ns, const RecoveryParams & params)
 {
   RecoveryEvent event;
+  revokeRecoveryStartup(recovery);
   if (recovery->map_resets != std::numeric_limits<std::uint64_t>::max()) {
     ++recovery->map_resets;
   }

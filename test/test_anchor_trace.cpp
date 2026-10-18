@@ -61,9 +61,9 @@ bool sameBits(double a, double b)
 
 // `v` names the specification a record follows: the header comment of anchor_trace.hpp. A reader rejects a version
 // it does not know, so the number moves with any change to what a record says, here as well as there.
-TEST(AnchorTrace, TheFormatVersionIsFour)
+TEST(AnchorTrace, TheFormatVersionIsFive)
 {
-  EXPECT_EQ(fast_lio::kAnchorTraceVersion, 4);
+  EXPECT_EQ(fast_lio::kAnchorTraceVersion, 5);
 }
 
 TEST(AnchorTrace, TransitionRecordHasTheSpecifiedKeysInOrder)
@@ -82,7 +82,7 @@ TEST(AnchorTrace, TransitionRecordHasTheSpecifiedKeysInOrder)
   t.ref_gen = 2;
   t.streak = 5;
   EXPECT_EQ(fast_lio::formatAnchorTransition(t),
-            "[ZUPT-ANCHOR] v=4 event=pin_engaged reason=- event_seq=7 scan_seq=42 stamp_ns=1700000000123456789 "
+            "[ZUPT-ANCHOR] v=5 event=pin_engaged reason=- event_seq=7 scan_seq=42 stamp_ns=1700000000123456789 "
             "anchor_id=3 anchor_valid=1 created_ns=1700000000000000000 last_evidence_ns=1700000000100000000 "
             "anchor_state=valid stationary_episode=4 reference_generation=2 streak=5");
 }
@@ -295,7 +295,7 @@ TEST(AnchorTrace, RecoveryRecordHasTheSpecifiedKeysInOrder)
   t.elapsed_ns = 10000000000LL;
   t.reset_count = 1;
   EXPECT_EQ(fast_lio::formatRecoveryTransition(t),
-            "[FE-RECOVERY] v=4 event=unanchored reason=deadline event_seq=12 scan_seq=300 "
+            "[FE-RECOVERY] v=5 event=unanchored reason=deadline event_seq=12 scan_seq=300 "
             "stamp_ns=1700000010100000000 episode=2 start_ns=1700000000100000000 "
             "deadline_ns=1700000010100000000 elapsed_ns=10000000000 reset_count=1 path=scan");
   t.path = fast_lio::RecoveryTracePath::kIdle;
@@ -389,9 +389,10 @@ TEST(AnchorTrace, ScanRecordPrintsEveryKeyEvenWhenTheAnchorStepDidNotRun)
                                              "streak",
                                              "map_updated",
                                              "upd_dp",
-                                             "upd_dq"};
+                                             "upd_dq",
+                                             "startup_reference"};
   EXPECT_EQ(keysOf(line), expected);
-  EXPECT_EQ(line.rfind("[ZUPT-ANCHOR-SCAN] v=4 ", 0), 0u);
+  EXPECT_EQ(line.rfind("[ZUPT-ANCHOR-SCAN] v=5 ", 0), 0u);
   for (const char * key :
        {"act_p", "act_q", "act_v", "p_pose_act", "target_p", "target_q", "anchor_p", "anchor_q", "upd_dp", "upd_dq"}) {
     EXPECT_EQ(valueOf(line, key), "na") << key;
@@ -489,7 +490,7 @@ TEST(AnchorTrace, ScanRecordAppendsTheAnchorWriteItsTargetAndTheUpdate)
                              "p_pose_act=") +
                            hash +
                            " target_p=3,0,0 target_q=1,0,0,0.25 anchor_p=0,4,0 anchor_q=1,-0.75,0,0 streak=7 "
-                           "map_updated=1 upd_dp=0.0625 upd_dq=0.001953125";
+                           "map_updated=1 upd_dp=0.0625 upd_dq=0.001953125 startup_reference=excluded";
   ASSERT_GE(line.size(), tail.size());
   EXPECT_EQ(line.substr(line.size() - tail.size()), tail);
 
@@ -518,6 +519,42 @@ TEST(AnchorTrace, ScanRecordAppendsTheAnchorWriteItsTargetAndTheUpdate)
   EXPECT_EQ(valueOf(zeroed, "target_p"), "na");
   EXPECT_EQ(valueOf(zeroed, "anchor_q"), "na");
   EXPECT_EQ(valueOf(zeroed, "upd_dp"), "0");
+}
+
+// Version 5: every scan record ends with the startup phase the scan left; the other records do not carry it.
+TEST(AnchorTrace, ScanRecordEndsWithTheStartupReference)
+{
+  const struct
+  {
+    fast_lio::StartupReference phase;
+    const char * token;
+  } phases[] = {
+    {fast_lio::StartupReference::kCold, "cold"},
+    {fast_lio::StartupReference::kEstablished, "established"},
+    {fast_lio::StartupReference::kExcluded, "excluded"},
+  };
+  for (const auto & phase : phases) {
+    fast_lio::AnchorScanRecord r;
+    r.startup_reference = phase.phase;
+    const std::string line = fast_lio::formatAnchorScanRecord(r);
+    EXPECT_EQ(keysOf(line).back(), "startup_reference") << phase.token;
+    EXPECT_EQ(valueOf(line, "startup_reference"), phase.token);
+  }
+  EXPECT_EQ(valueOf(fast_lio::formatAnchorScanRecord(fast_lio::AnchorScanRecord()), "startup_reference"), "excluded")
+    << "a record nobody filled claims no cold start";
+
+  fast_lio::RecoveryState recovery;
+  EXPECT_STREQ(fast_lio::startupReferenceName(fast_lio::recoveryStartupReference(recovery)), "excluded");
+  fast_lio::configureRecoveryStartup(&recovery, true);
+  EXPECT_STREQ(fast_lio::startupReferenceName(fast_lio::recoveryStartupReference(recovery)), "cold");
+  fast_lio::commitInitialReference(&recovery);
+  EXPECT_STREQ(fast_lio::startupReferenceName(fast_lio::recoveryStartupReference(recovery)), "established");
+
+  EXPECT_EQ(valueOf(fast_lio::formatAnchorTransition(fast_lio::AnchorTransition()), "startup_reference"), "<missing>");
+  EXPECT_EQ(valueOf(fast_lio::formatRecoveryTransition(fast_lio::RecoveryTransition()), "startup_reference"),
+            "<missing>");
+  EXPECT_EQ(valueOf(fast_lio::formatAnchorCounters(fast_lio::AnchorTraceCounters(), 1, false), "startup_reference"),
+            "<missing>");
 }
 
 // p_pose_act is the same fingerprint as p_pose_pre: an anchor write that leaves the pose covariance block alone
@@ -638,6 +675,9 @@ TEST(AnchorTrace, EveryEnumValueHasASpaceFreeToken)
   }
   for (int i = 0; i <= static_cast<int>(fast_lio::RecoveryTrust::kUnanchored); ++i) {
     check(fast_lio::recoveryTrustName(static_cast<fast_lio::RecoveryTrust>(i)));
+  }
+  for (int i = 0; i <= static_cast<int>(fast_lio::StartupReference::kExcluded); ++i) {
+    check(fast_lio::startupReferenceName(static_cast<fast_lio::StartupReference>(i)));
   }
   for (int i = 0; i <= static_cast<int>(fast_lio::RecoveryCause::kStable); ++i) {
     check(fast_lio::recoveryCauseName(static_cast<fast_lio::RecoveryCause>(i)));
@@ -775,7 +815,7 @@ TEST(AnchorTrace, CounterSummaryCarriesEveryCounter)
                                              "map_reset_unanchored",
                                              "sequence_exhausted"};
   EXPECT_EQ(keysOf(line), expected);
-  EXPECT_EQ(line.rfind("[ZUPT-ANCHOR] v=4 ", 0), 0u);
+  EXPECT_EQ(line.rfind("[ZUPT-ANCHOR] v=5 ", 0), 0u);
   EXPECT_EQ(valueOf(line, "event"), "counters");
   EXPECT_EQ(valueOf(line, "event_seq"), "99");
   EXPECT_EQ(valueOf(line, "invalidated_motion"), "21");

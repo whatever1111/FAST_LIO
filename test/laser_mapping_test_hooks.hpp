@@ -35,6 +35,9 @@ extern std::function<int(double)> overrideGuardDegraded;
 extern std::function<void(double, AnchorFixtureState &)> beforeAnchorStep;
 /// Scan end time -> true to trip the runaway watchdog this scan (reason: wheel).
 extern std::function<bool(double)> forceRunawayTrip;
+/// Scan end time -> true to hand the normal initial map build of that scan only points the map backend skips
+/// (non-finite coordinates): the build runs and leaves the backend empty.
+extern std::function<bool(double)> initialBuildTakesNoPoint;
 /// Every scan record, whether or not zupt_anchor_trace_en prints it.
 extern std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 /// Every anchor trace line actually logged.

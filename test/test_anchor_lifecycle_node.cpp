@@ -216,6 +216,7 @@ struct Scenario
   std::vector<Relocalization> relocalizations;
   double scan_length = kScanLength;  // s, last point time within each scan; kScanPeriod: scans that abut
   bool warm_up = true;               // false: the steps are the process's first input, its start included
+  bool capture_raw_state = false;    // startup-only: snapshot at scope exit or an unlocked empty-IMU drop
 };
 
 struct Observation
@@ -239,6 +240,9 @@ struct Observation
   int imu_reason = -1;
   std::uint64_t imu_samples = 0;
   double filter_end = 0.0;  // the end of the input the filter had processed once that batch was settled
+  bool raw_state_seen = false;
+  bool map_frozen = false;
+  bool raw_degraded = false;
 };
 static_assert(std::is_trivially_copyable<Observation>::value, "observations cross the pipe as bytes");
 
@@ -686,6 +690,8 @@ private:
       };
     fast_lio_test::afterAnchorScanRecord = [this](const fast_lio::AnchorScanRecord & record) {
       records_.push_back(record);
+      if (scenario_.capture_raw_state)
+        raw_by_seq_[record.scan_seq] = fast_lio_test::inspectImuInput();
       if (batch_pending_)
         batch_by_seq_[record.scan_seq] = batch_;
       batch_pending_ = false;
@@ -916,6 +922,12 @@ private:
     o.phase = index < 0 ? static_cast<int>(Phase::kWarmup)
                         : static_cast<int>(scenario_.steps[static_cast<std::size_t>(index)].phase);
     o.record = record;
+    const auto raw = raw_by_seq_.find(record.scan_seq);
+    if (raw != raw_by_seq_.end()) {
+      o.raw_state_seen = true;
+      o.map_frozen = raw->second.mapFrozen;
+      o.raw_degraded = raw->second.degradedOdom;
+    }
     const auto odom = odom_by_ms_.find(msKey(static_cast<double>(record.end_ns) * 1e-9));
     if (record.published && odom != odom_by_ms_.end()) {
       const auto & m = odom->second;
@@ -1293,6 +1305,7 @@ private:
   std::map<std::int64_t, int> step_by_end_ms_;
   std::map<int, int> step_by_scan_;
   std::vector<fast_lio::AnchorScanRecord> records_;
+  std::map<std::uint64_t, fast_lio_test::ImuInputSnapshot> raw_by_seq_;
   ImuBatch batch_;
   bool batch_pending_ = false;
   std::map<std::uint64_t, ImuBatch> batch_by_seq_;  // by scan_seq of the record that settled it
@@ -5149,6 +5162,88 @@ TEST(AnchorLifecycleStartup, AColdStartStartsNoRecoveryBeforeItsFirstReference)
     expectOdometryOnlyForPublishedScans(r);
     expectTraceAccountsForEveryScan(r, true, scenario.name);
   }
+}
+
+// An enabled raw re-anchor gate still blinds and freezes the map on the first empty-IMU drop. Initialization and
+// the initial Build leave that state alone; the first registered healthy scan starts verification, still frozen.
+// An unreachable match count keeps verification open within its original 5 s budget. Turning the unsupported
+// recovery policy off gives the same raw gate and map-freeze timeline, including the gap after the first reference.
+TEST(AnchorLifecycleStartup, AColdStartStillBlindsTheRawGateAndFreezesTheMap)
+{
+  Scenario on = coldStart(kMovingScans, true);
+  on.name = "cold_start_reanchor_policy_on";
+  on.capture_raw_state = true;
+  setParam(on, rclcpp::Parameter("reanchor_en", true));
+  setParam(on, rclcpp::Parameter("reanchor_min_eff", 100000000));
+  Scenario off = on;
+  off.name = "cold_start_reanchor_policy_off";
+  setPolicy(off, 0.0, 1.0);
+  const ChildResult a = runScenario(on);
+  const ChildResult b = runScenario(off);
+  SCOPED_TRACE(on.name + "\n" + describeStart(a) + "\n" + off.name + "\n" + describeStart(b));
+  ASSERT_TRUE(a.ok());
+  ASSERT_TRUE(b.ok());
+  const Observation * build = firstEstablished(a);
+  const Observation * control_build = firstEstablished(b);
+  ASSERT_NE(build, nullptr);
+  ASSERT_NE(control_build, nullptr);
+  EXPECT_EQ(build->record.scan_seq, control_build->record.scan_seq);
+  expectColdUntil(a, *build);
+  expectNothingStartedBefore(a, *build);
+  expectTheBuildScan(*build);
+
+  ASSERT_EQ(a.observations.size(), b.observations.size());
+  const std::size_t at = indexOf(a, *build);
+  ASSERT_LT(at + 1, a.observations.size());
+  for (std::size_t i = 0; i < a.observations.size(); ++i) {
+    const Observation & o = a.observations[i];
+    const Observation & control = b.observations[i];
+    SCOPED_TRACE("scan " + std::to_string(o.record.scan_seq));
+    ASSERT_TRUE(o.raw_state_seen && control.raw_state_seen);
+    EXPECT_EQ(o.record.scan_seq, control.record.scan_seq);
+    EXPECT_EQ(o.record.outcome, control.record.outcome);
+    EXPECT_EQ(o.record.gate_pre, control.record.gate_pre);
+    EXPECT_EQ(o.record.gate_post, control.record.gate_post);
+    EXPECT_EQ(o.map_frozen, control.map_frozen);
+    EXPECT_EQ(o.raw_degraded, control.raw_degraded);
+    EXPECT_EQ(o.record.map_updated, control.record.map_updated);
+    EXPECT_TRUE(o.map_frozen);
+    EXPECT_TRUE(o.raw_degraded);
+    if (i <= at) {
+      EXPECT_EQ(o.record.gate_pre, i == 0 ? fast_lio::AnchorTraceGate::kHealthy : fast_lio::AnchorTraceGate::kBlind);
+      EXPECT_EQ(o.record.gate_post, fast_lio::AnchorTraceGate::kBlind);
+    }
+  }
+
+  const auto gap = a.phase(Phase::kGap);
+  ASSERT_EQ(gap.size(), static_cast<std::size_t>(kStartupGapScans));
+  for (const auto * o : gap) {
+    EXPECT_EQ(o->record.outcome, fast_lio::AnchorScanOutcome::kDroppedEmptyImu);
+    EXPECT_TRUE(hasEvent(*o, fast_lio::kAnchorEventImuCoverageGap));
+  }
+  const Observation & registered = a.observations[at + 1];
+  EXPECT_TRUE(registered.record.published);
+  EXPECT_FALSE(registered.record.guard_degraded);
+  EXPECT_EQ(registered.record.gate_pre, fast_lio::AnchorTraceGate::kBlind);
+  EXPECT_EQ(registered.record.gate_post, fast_lio::AnchorTraceGate::kVerifying);
+  EXPECT_EQ(registered.record.trust_post, fast_lio::RecoveryTrust::kPending);
+  EXPECT_FALSE(registered.record.map_updated);
+  EXPECT_EQ(odomFlags(registered) & kFlagDegraded, kFlagDegraded);
+
+  const auto event = a.phase(Phase::kEvent);
+  ASSERT_EQ(event.size(), 2u);
+  const Observation & dropped = *event.back();
+  EXPECT_EQ(dropped.record.outcome, fast_lio::AnchorScanOutcome::kDroppedEmptyImu);
+  EXPECT_TRUE(hasEvent(dropped, fast_lio::kAnchorEventImuCoverageGap));
+  EXPECT_EQ(dropped.record.gate_post, fast_lio::AnchorTraceGate::kBlind);
+  const auto after = a.phase(Phase::kAfter);
+  ASSERT_FALSE(after.empty());
+  EXPECT_EQ(after.front()->record.gate_pre, fast_lio::AnchorTraceGate::kBlind);
+  EXPECT_EQ(after.front()->record.gate_post, fast_lio::AnchorTraceGate::kVerifying);
+  EXPECT_TRUE(after.front()->map_frozen);
+  EXPECT_EQ(counterValue(a, "imu_coverage_gap"), std::to_string(kStartupGapScans + 1));
+  expectOdometryOnlyForPublishedScans(a);
+  expectTraceAccountsForEveryScan(a, true, on.name);
 }
 
 // The per-scan trace changes nothing of a cold start: the same states, flags, phases and transition records with it

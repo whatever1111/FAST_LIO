@@ -508,16 +508,44 @@ TEST(AnchorTrace, ScanRecordAppendsTheAnchorWriteItsTargetAndTheUpdate)
   r.upd_dp = 0.0625;
   r.upd_dq = 0.001953125;
   const std::string line = fast_lio::formatAnchorScanRecord(r);
-  char hash[24];
-  std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(fast_lio::fnv1a64(r.p_pose_act, 36)));
-  const std::string tail = std::string(
-                             " static_hold=0 act_p=1.5,-2,0.25 act_q=0.5,0.5,-0.5,0.5 act_v=0,0,0.125 "
-                             "p_pose_act=") +
-                           hash +
-                           " target_p=3,0,0 target_q=1,0,0,0.25 anchor_p=0,4,0 anchor_q=1,-0.75,0,0 streak=7 "
-                           "map_updated=1 upd_dp=0.0625 upd_dq=0.001953125 startup_reference=excluded";
+  const std::string legacy_tail =
+    " static_hold=0 act_p=1.5,-2,0.25 act_q=0.5,0.5,-0.5,0.5 act_v=0,0,0.125 p_pose_act=d4ff6d6afe1b9205"
+    " target_p=3,0,0 target_q=1,0,0,0.25 anchor_p=0,4,0 anchor_q=1,-0.75,0,0 streak=7"
+    " map_updated=1 upd_dp=0.0625 upd_dq=0.001953125 startup_reference=excluded";
+  const std::string tail =
+    legacy_tail +
+    " r1_present=0 r1_schema=1 r1_snapshot_sequence=0 r1_state_revision=0 r1_scan_sequence=0 r1_kind=0"
+    " r1_lifecycle=0 r1_startup_reference=0 r1_trust=0 r1_local=0 r1_legacy_flags=0 r1_qualified_sequence=0"
+    " r1_present_mask=0 r1_true_mask=0 r1_cause_mask=0 r1_taint_mask=0 r1_hard_mask=0 r1_has_pose=0"
+    " r1_evaluated_input_ns=0 r1_effective_ns=0 r1_state_valid_until_ns=0 r1_hr_kind=0 r1_hr_valid_until_ns=0"
+    " rw_present=0 gprime_present=0";
   ASSERT_GE(line.size(), tail.size());
   EXPECT_EQ(line.substr(line.size() - tail.size()), tail);
+  r.reference_health.present = true;
+  r.reference_health.snapshotSequence = 17;
+  r.reference_health.stateRevision = 9;
+  r.reference_health.scanSequence = 12;
+  r.reference_health.kind = 1;
+  r.reference_health.lifecycle = r.reference_health.startup = 2;
+  r.reference_health.trust = r.reference_health.local = r.reference_health.hrKind = 1;
+  r.reference_health.presentMask = 143;
+  r.reference_health.trueMask = 139;
+  r.reference_health.hasPose = true;
+  r.reference_health.evaluatedNs = r.reference_health.effectiveNs = 1100000000;
+  r.reference_health.stateUntilNs = r.reference_health.hrUntilNs = 1300000000;
+  r.startup_reference = fast_lio::StartupReference::kEstablished;
+  const std::string enabled_tail =
+    " static_hold=0 act_p=1.5,-2,0.25 act_q=0.5,0.5,-0.5,0.5 act_v=0,0,0.125 p_pose_act=d4ff6d6afe1b9205"
+    " target_p=3,0,0 target_q=1,0,0,0.25 anchor_p=0,4,0 anchor_q=1,-0.75,0,0 streak=7"
+    " map_updated=1 upd_dp=0.0625 upd_dq=0.001953125 startup_reference=established"
+    " r1_present=1 r1_schema=1 r1_snapshot_sequence=17 r1_state_revision=9 r1_scan_sequence=12 r1_kind=1"
+    " r1_lifecycle=2 r1_startup_reference=2 r1_trust=1 r1_local=1 r1_legacy_flags=0 r1_qualified_sequence=0"
+    " r1_present_mask=143 r1_true_mask=139 r1_cause_mask=0 r1_taint_mask=0 r1_hard_mask=0 r1_has_pose=1"
+    " r1_evaluated_input_ns=1100000000 r1_effective_ns=1100000000 r1_state_valid_until_ns=1300000000"
+    " r1_hr_kind=1 r1_hr_valid_until_ns=1300000000 rw_present=0 gprime_present=0";
+  const auto enabled = fast_lio::formatAnchorScanRecord(r);
+  ASSERT_GE(enabled.size(), enabled_tail.size());
+  EXPECT_EQ(enabled.substr(enabled.size() - enabled_tail.size()), enabled_tail);
 
   // Each group is na by itself.
   fast_lio::AnchorScanRecord only_anchor;

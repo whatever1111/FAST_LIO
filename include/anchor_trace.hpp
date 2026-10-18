@@ -14,7 +14,7 @@
 // Pure C++. No ROS, no Eigen.
 //
 // ===========================================================================
-// Trace format, version 5. This comment is the specification; a checker must
+// Trace format, version 6. This comment is the specification; a checker must
 // depend on nothing else.
 // ===========================================================================
 //
@@ -87,6 +87,21 @@
 // it or, when there was none, at the event. Any other process follows section
 // 2 from its first scan.
 //
+// Version 6 inherits the entire b1-v5 prefix (including startup_reference), with
+// the R1-OBS-1 numeric projection appended to scan records only, in this order:
+// r1_present, r1_schema, r1_snapshot_sequence, r1_state_revision,
+// r1_scan_sequence, r1_kind, r1_lifecycle, r1_startup_reference, r1_trust,
+// r1_local, r1_legacy_flags, r1_qualified_sequence, r1_present_mask, r1_true_mask,
+// r1_cause_mask, r1_taint_mask, r1_hard_mask, r1_has_pose,
+// r1_evaluated_input_ns, r1_effective_ns, r1_state_valid_until_ns, r1_hr_kind,
+// r1_hr_valid_until_ns, rw_present, gprime_present. Every record now has v=6.
+// r1_present=0 means no R1 claim; rw_present and gprime_present are always 0 in
+// PR1. R1 enums/masks/times are the typed ReferenceHealth schema-1 encodings.
+// A successful Build is a no-pose StateChange (local=Unknown), not a scan witness.
+// Final health/pose/reference fields come from the same immutable snapshot as
+// the publishers; map_updated/published/outcome keep their original later bookkeeping.
+// The old v5 producer/checker binding does not authorize this v6 producer.
+//
 // Sequence rules
 //   event_seq   1, 2, 3, ... over the process lifetime, one per transition record
 //               of either tag (the counter summary included). Never repeats,
@@ -110,7 +125,7 @@
 //
 // 1. Anchor transition records: always on, never throttled, one line per event.
 //
-//   [ZUPT-ANCHOR] v=5 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
+//   [ZUPT-ANCHOR] v=6 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
 //     stamp_ns=<ns> anchor_id=<id> anchor_valid=<0|1> created_ns=<ns>
 //     last_evidence_ns=<ns> anchor_state=<state> stationary_episode=<n>
 //     reference_generation=<n> streak=<n>
@@ -184,7 +199,7 @@
 //    event; event_seq is drawn from the same sequence as the anchor records.
 //    Only with the platform policy on (reanchor_total_timeout_sec > 0).
 //
-//   [FE-RECOVERY] v=5 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
+//   [FE-RECOVERY] v=6 event=<event> reason=<reason> event_seq=<n> scan_seq=<n>
 //     stamp_ns=<ns> episode=<n> start_ns=<ns> deadline_ns=<ns> elapsed_ns=<ns>
 //     reset_count=<n> path=<path>
 //
@@ -220,7 +235,7 @@
 //
 // 3. Scan records: one per scan, only with the parameter zupt_anchor_trace_en.
 //
-//   [ZUPT-ANCHOR-SCAN] v=5 scan_seq=<n> outcome=<outcome> beg_ns=<ns>
+//   [ZUPT-ANCHOR-SCAN] v=6 scan_seq=<n> outcome=<outcome> beg_ns=<ns>
 //     end_ns=<ns> gap_ns=<ns> anchor_id=<id> anchor_valid=<0|1>
 //     anchor_created_ns=<ns> body=<body> imu_n=<n> gyr_max=<rad/s>
 //     acc_span=<ratio> wheel_age=<s> wheel_speed=<m/s> guard_degraded=<0|1>
@@ -357,7 +372,7 @@
 // 4. Counter summary: once, when the node shuts down. An anchor transition
 //    record with its own keys, all saturating unsigned 64-bit counts:
 //
-//   [ZUPT-ANCHOR] v=5 event=counters event_seq=<n> scans=<n> events=<n>
+//   [ZUPT-ANCHOR] v=6 event=counters event_seq=<n> scans=<n> events=<n>
 //     candidates=<n> created=<n> candidates_dropped=<n> invalidated=<n>
 //     invalidated_motion=<n> invalidated_evidence_unknown=<n>
 //     invalidated_scan_hole=<n> invalidated_imu_coverage_gap=<n>
@@ -405,12 +420,13 @@
 #include <limits>
 #include <string>
 
+#include "reference_health_contract.hpp"
 #include "stationary_anchor_policy.hpp"
 
 namespace fast_lio
 {
 
-constexpr int kAnchorTraceVersion = 5;
+constexpr int kAnchorTraceVersion = 6;
 
 /// Counts that reach the top stay there: a wrapped counter would read as a
 /// small, plausible number.
@@ -988,6 +1004,7 @@ struct AnchorScanRecord
   double upd_dp = std::numeric_limits<double>::quiet_NaN();
   double upd_dq = std::numeric_limits<double>::quiet_NaN();
   StartupReference startup_reference = StartupReference::kExcluded;  ///< after the scan
+  ReferenceHealthTrace reference_health;  ///< R1 projection; no RW or g-prime evidence in PR1
 };
 
 /// Indexed by AnchorDrop; only the reasons an anchor can end with are printed.
@@ -1304,6 +1321,32 @@ inline std::string formatAnchorScanRecord(const AnchorScanRecord & r)
     }
   }
   line.text("startup_reference", startupReferenceName(r.startup_reference));
+  const auto & r1 = r.reference_health;
+  line.boolean("r1_present", r1.present);
+  line.u64("r1_schema", 1);
+  line.u64("r1_snapshot_sequence", r1.snapshotSequence);
+  line.u64("r1_state_revision", r1.stateRevision);
+  line.u64("r1_scan_sequence", r1.scanSequence);
+  line.u64("r1_kind", r1.kind);
+  line.u64("r1_lifecycle", r1.lifecycle);
+  line.u64("r1_startup_reference", r1.startup);
+  line.u64("r1_trust", r1.trust);
+  line.u64("r1_local", r1.local);
+  line.u64("r1_legacy_flags", r1.legacyFlags);
+  line.u64("r1_qualified_sequence", r1.qualifiedSequence);
+  line.u64("r1_present_mask", r1.presentMask);
+  line.u64("r1_true_mask", r1.trueMask);
+  line.u64("r1_cause_mask", r1.cause);
+  line.u64("r1_taint_mask", r1.taint);
+  line.u64("r1_hard_mask", r1.hard);
+  line.boolean("r1_has_pose", r1.hasPose);
+  line.i64("r1_evaluated_input_ns", r1.evaluatedNs);
+  line.i64("r1_effective_ns", r1.effectiveNs);
+  line.i64("r1_state_valid_until_ns", r1.stateUntilNs);
+  line.u64("r1_hr_kind", r1.hrKind);
+  line.i64("r1_hr_valid_until_ns", r1.hrUntilNs);
+  line.boolean("rw_present", false);
+  line.boolean("gprime_present", false);
   return line.str();
 }
 

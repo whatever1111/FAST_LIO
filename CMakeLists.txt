@@ -260,7 +260,8 @@ if(BUILD_TESTING)
       "AnchorLifecycleRebuild:rebuild:240"
       "AnchorLifecycleHold:hold:240"
       "AnchorLifecycleExport:export:240"
-      "AnchorLifecycleStartup:startup:600")
+      "AnchorLifecycleStartup:startup:600"
+      "AnchorLifecycleReference:reference:600")
     ament_add_gtest_executable(test_anchor_lifecycle_node test/test_anchor_lifecycle_node.cpp)
     set(anchor_node_suites "")
     foreach(anchor_node_entry ${anchor_node_entries})
@@ -329,6 +330,8 @@ if(BUILD_TESTING)
     TIMEOUT 120
     ENV FASTLIO_SCAN_CONTRACT_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/test_results/fast_lio/scan_contract)
   ament_add_gtest(test_frontend_observation test/test_frontend_observation.cpp)
+  ament_add_gtest(test_reference_health_contract test/test_reference_health_contract.cpp)
+  target_include_directories(test_reference_health_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_include_directories(test_frontend_observation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(test_frontend_observation OpenSSL::Crypto)
   ament_add_gtest(test_imu_coverage_policy test/test_imu_coverage_policy.cpp)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -38,10 +39,14 @@ extern std::function<bool(double)> forceRunawayTrip;
 /// Scan end time -> true to hand the normal initial map build of that scan only points the map backend skips
 /// (non-finite coordinates): the build runs and leaves the backend empty.
 extern std::function<bool(double)> initialBuildTakesNoPoint;
+/// Schedule the production map-reset owner before the first reference is built.
+extern std::function<bool(double)> resetBeforeReference;
 /// Every scan record, whether or not zupt_anchor_trace_en prints it.
 extern std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 /// Every anchor trace line actually logged.
 extern std::function<void(const std::string &)> afterAnchorTraceLine;
+/// Successful publish return: encoding 0 Odometry, 1 pose FrontendObservation.
+extern std::function<void(std::uint8_t, std::int64_t, const std::array<std::uint8_t, 32> &)> afterPosePublish;
 
 struct ImuInputSnapshot
 {

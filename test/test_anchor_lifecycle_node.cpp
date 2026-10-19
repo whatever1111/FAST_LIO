@@ -5796,14 +5796,12 @@ void expectCompleteClosedArm(const ChildResult & result, const char * arm)
     EXPECT_EQ(message.observation_id, expected_id);
     EXPECT_EQ(std::count(result.odom_ns.begin(), result.odom_ns.end(), message.observation_stamp_ns), 1);
     for (std::uint8_t encoding : {0, 1}) {
-      EXPECT_EQ(std::count_if(result.pose_publications.begin(),
-                              result.pose_publications.end(),
-                              [&](const auto & receipt) {
-                                return receipt.encoding == encoding &&
-                                       receipt.stamp_ns == message.observation_stamp_ns &&
-                                       receipt.id == message.observation_id;
-                              }),
-                1);
+      const auto matchingPublicationCount =
+        std::count_if(result.pose_publications.begin(), result.pose_publications.end(), [&](const auto & receipt) {
+          return receipt.encoding == encoding && receipt.stamp_ns == message.observation_stamp_ns &&
+                 receipt.id == message.observation_id;
+        });
+      EXPECT_EQ(matchingPublicationCount, 1);
     }
   }
   std::size_t warmup = 0, exact = 0;

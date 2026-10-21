@@ -39,4 +39,40 @@ inline constexpr Vector kVectors[] = {
   {"pending-cannot-hold", 1, 2, 2, 2, 2, 0, 3, 143, 1, true, false},
   {"pending-cannot-normal", 1, 2, 2, 2, 1, 1, 0, 143, 137, true, false},
 };
+
+// RW carry contract 3 on an RW-enabled Established scan [20.0 s, 20.1 s]: enabled 7, present 191. A zero time
+// means the optional field is absent; a nonzero `lower` means the fallback epochs are present.
+inline constexpr std::int64_t kRwScanBeginNs = 20000000000;
+inline constexpr std::int64_t kRwScanEndNs = 20100000000;
+struct RwVector
+{
+  const char * name;
+  std::uint8_t trust, local, hr, witness;
+  std::uint32_t flags, truth, taint, hard;
+  std::int64_t rawStart, until, deadline;
+  std::uint64_t lower, upper;
+  bool valid;
+};
+inline constexpr RwVector kRwVectors[] = {
+  {"rw-quiet-origin", 1, 1, 1, 0, 0, 155, 0, 0, 0, 0, 0, 0, 0, true},
+  {"rw-latched-no-origin", 1, 1, 0, 0, 0, 131, 8, 0, 0, 0, 0, 0, 0, true},
+  {"rw-origin-on-taint", 1, 1, 0, 0, 0, 147, 8, 0, 0, 0, 0, 0, 0, false},
+  {"rw-origin-on-hard", 1, 3, 0, 0, 0, 19, 0, 1, 0, 0, 0, 0, 0, false},
+  {"rw-current-window", 1, 2, 0, 1, 1, 51, 0, 0, 13000000000, 20300000000, 0, 0, 0, true},
+  {"rw-pending-raw-clear-tail", 2, 1, 0, 1, 0, 177, 0, 0, 13000000000, 20249999999, 20250000000, 0, 0, true},
+  {"rw-pending-at-deadline", 2, 1, 0, 1, 0, 177, 0, 0, 13000000000, 20250000000, 20250000000, 0, 0, false},
+  {"rw-fallback", 1, 2, 0, 2, 1, 51, 0, 0, 13000000000, 20250000000, 0, 19250000000, 19900000000, true},
+  {"rw-fallback-past-witness", 1, 2, 0, 2, 1, 51, 0, 0, 13000000000, 20250000001, 0, 19250000000, 19900000000, false},
+  {"rw-past-lease", 1, 2, 0, 1, 1, 51, 0, 0, 13000000000, 20300000001, 0, 0, 0, false},
+  {"rw-at-raw-budget", 1, 2, 0, 1, 1, 51, 0, 0, 12200000000, 20200000000, 0, 0, 0, true},
+  {"rw-past-raw-budget", 1, 2, 0, 1, 1, 51, 0, 0, 12200000000, 20200000001, 0, 0, 0, false},
+  {"rw-before-scan-end", 1, 2, 0, 1, 1, 51, 0, 0, 13000000000, 20099999999, 0, 0, 0, false},
+  {"rw-carry-on-clear-local-qualified", 1, 1, 1, 1, 0, 187, 0, 0, 13000000000, 20300000000, 0, 0, 0, false},
+  {"rw-carry-with-lost", 1, 2, 0, 1, 5, 51, 0, 0, 13000000000, 20300000000, 0, 0, 0, false},
+  {"rw-carry-with-hold", 1, 2, 0, 1, 3, 51, 0, 0, 13000000000, 20300000000, 0, 0, 0, false},
+  {"rw-carry-without-origin", 1, 2, 0, 1, 1, 35, 0, 0, 13000000000, 20300000000, 0, 0, 0, false},
+  {"rw-witness-without-carry", 1, 2, 0, 1, 1, 19, 0, 0, 13000000000, 0, 0, 0, 0, false},
+  {"rw-current-with-epochs", 1, 2, 0, 1, 1, 51, 0, 0, 13000000000, 20300000000, 0, 19250000000, 19900000000, false},
+  {"rw-carry-without-raw-start", 1, 2, 0, 1, 1, 51, 0, 0, 0, 20300000000, 0, 0, 0, false},
+};
 }  // namespace reference_health_literals

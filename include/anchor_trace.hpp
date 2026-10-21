@@ -95,8 +95,11 @@
 // r1_cause_mask, r1_taint_mask, r1_hard_mask, r1_has_pose,
 // r1_evaluated_input_ns, r1_effective_ns, r1_state_valid_until_ns, r1_hr_kind,
 // r1_hr_valid_until_ns, rw_present, gprime_present. Every record now has v=6.
-// r1_present=0 means no R1 claim; rw_present and gprime_present are always 0 in
-// PR1. R1 enums/masks/times are the typed ReferenceHealth schema-1 encodings.
+// r1_present=0 means no R1 claim. rw_present=1 when that snapshot carries the RW
+// block (carry contract 3, guard_engulf_carry_en); its positive bits 4/5 and the
+// RW latch are then in r1_true_mask and the r1_cause/taint/hard masks, which RW
+// and R1 share. gprime_present is always 0. R1 enums/masks/times are the typed
+// ReferenceHealth schema-1 encodings.
 // A successful Build is a no-pose StateChange (local=Unknown), not a scan witness.
 // Final health/pose/reference fields come from the same immutable snapshot as
 // the publishers; map_updated/published/outcome keep their original later bookkeeping.
@@ -1004,7 +1007,7 @@ struct AnchorScanRecord
   double upd_dp = std::numeric_limits<double>::quiet_NaN();
   double upd_dq = std::numeric_limits<double>::quiet_NaN();
   StartupReference startup_reference = StartupReference::kExcluded;  ///< after the scan
-  ReferenceHealthTrace reference_health;  ///< R1 projection; no RW or g-prime evidence in PR1
+  ReferenceHealthTrace reference_health;  ///< R1 projection with RW presence; no g-prime evidence
 };
 
 /// Indexed by AnchorDrop; only the reasons an anchor can end with are printed.
@@ -1345,7 +1348,7 @@ inline std::string formatAnchorScanRecord(const AnchorScanRecord & r)
   line.i64("r1_state_valid_until_ns", r1.stateUntilNs);
   line.u64("r1_hr_kind", r1.hrKind);
   line.i64("r1_hr_valid_until_ns", r1.hrUntilNs);
-  line.boolean("rw_present", false);
+  line.boolean("rw_present", r1.rwPresent);
   line.boolean("gprime_present", false);
   return line.str();
 }

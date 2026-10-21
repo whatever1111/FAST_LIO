@@ -134,11 +134,13 @@ enum class Imu : std::uint8_t
 // What a scan slot puts on the point-cloud topic.
 enum class Cloud : std::uint8_t
 {
-  kDense,   // the fixture's 2000-point scan
-  kSparse,  // three points: the scan path leaves before the anchor step
-  kEmpty,   // no point: dropped when taken, for having no usable timing
-  kNone,    // nothing is sent: the slot is a hole in the scan stream
+  kDense,    // the fixture's 2000-point scan
+  kSparse,   // three points: the scan path leaves before the anchor step
+  kEmpty,    // no point: dropped when taken, for having no usable timing
+  kNone,     // nothing is sent: the slot is a hole in the scan stream
+  kNearMix,  // 2000 points, 280 of them on the dense patch's first row and the rest within 2 m: an engulfment
 };
+constexpr std::size_t kNearMixFarPoints = 280;  // far-field fraction 0.14, below guard_engulf_far_frac_min
 
 enum class Guard : std::int8_t
 {
@@ -952,7 +954,9 @@ private:
 
   void sendLidar(double start, Cloud kind = Cloud::kDense)
   {
-    const std::size_t points = kind == Cloud::kDense ? kScanPoints : kind == Cloud::kSparse ? 3u : 0u;
+    const std::size_t points = kind == Cloud::kDense || kind == Cloud::kNearMix ? kScanPoints
+                               : kind == Cloud::kSparse                         ? 3u
+                                                                                : 0u;
     const auto length_ns = static_cast<std::uint64_t>(std::llround(scenario_.scan_length * 1e9));
     pcl::PointCloud<ouster_ros::Point> cloud;
     cloud.resize(points);
@@ -961,6 +965,11 @@ private:
       point = ouster_ros::Point{};
       point.x = 10.0f + static_cast<float>(i % 317) * 0.01f;
       point.y = -1.6f + static_cast<float>(i / 317) * 0.01f;
+      if (kind == Cloud::kNearMix && i >= kNearMixFarPoints) {
+        const std::size_t nearPoint = i - kNearMixFarPoints;
+        point.x = 0.5f + static_cast<float>(nearPoint % 100) * 0.01f;
+        point.y = -0.5f + static_cast<float>(nearPoint / 100) * 0.01f;
+      }
       point.z = 1.0f;
       point.intensity = 1.0f;
       point.t = static_cast<std::uint32_t>(i * length_ns / (points - 1));
@@ -5693,7 +5702,10 @@ const fast_lio_interfaces::msg::ReferenceHealth * referenceFor(const ChildResult
   return nullptr;
 }
 
-void expectReferenceProjection(const Observation & observation, const fast_lio_interfaces::msg::ReferenceHealth & value)
+// `rw`: the scenario enabled guard_engulf_carry_en, so every snapshot carries the RW block.
+void expectReferenceProjection(const Observation & observation,
+                               const fast_lio_interfaces::msg::ReferenceHealth & value,
+                               bool rw = false)
 {
   const auto & trace = observation.record.reference_health;
   EXPECT_EQ(value.schema_version, 1);
@@ -5701,9 +5713,10 @@ void expectReferenceProjection(const Observation & observation, const fast_lio_i
   EXPECT_TRUE(value.has_source_instance && value.has_coordinate_epoch && value.has_snapshot_sequence &&
               value.has_state_revision && value.has_qualified_event_sequence);
   EXPECT_EQ(value.clock_domain, "fixture");
-  EXPECT_EQ(value.implemented_mask, 5u);
-  EXPECT_EQ(value.enabled_policy_mask, 5u);
+  EXPECT_EQ(value.implemented_mask, 7u);
+  EXPECT_EQ(value.enabled_policy_mask, rw ? 7u : 5u);
   EXPECT_TRUE(trace.present);
+  EXPECT_EQ(trace.rwPresent, rw);
   EXPECT_EQ(value.snapshot_sequence, trace.snapshotSequence);
   EXPECT_EQ(value.state_revision, trace.stateRevision);
   EXPECT_EQ(value.scan_sequence, trace.scanSequence);
@@ -5715,17 +5728,20 @@ void expectReferenceProjection(const Observation & observation, const fast_lio_i
   EXPECT_EQ(value.local, trace.local);
   EXPECT_EQ(value.legacy_flags, trace.legacyFlags);
   EXPECT_EQ(value.true_mask, trace.trueMask);
-  EXPECT_EQ(value.present_mask, 143u);
+  EXPECT_EQ(value.present_mask, rw ? 191u : 143u);
   EXPECT_EQ(value.cause_mask, trace.cause);
   EXPECT_EQ(value.taint_mask, trace.taint);
   EXPECT_EQ(value.hard_mask, trace.hard);
   EXPECT_EQ(value.has_pose_binding, observation.record.published);
-  EXPECT_FALSE(value.has_rw || value.has_raw_episode || value.has_raw_start || value.has_rw_origin ||
-               value.has_frozen_residual || value.has_withdrawal_rearm || value.has_rw_valid_until ||
-               value.has_wheel_witness_epochs || value.has_support || value.has_support_seed ||
-               value.has_supported_through || value.has_first_loss || value.has_support_deadline ||
-               value.has_proof_id || value.has_trajectory_id);
-  EXPECT_EQ(value.present_mask & 112u, 0u);
+  EXPECT_EQ(value.has_rw && value.has_withdrawal_rearm && value.rw_contract == 3, rw);
+  if (!rw) {
+    EXPECT_FALSE(value.has_rw || value.has_raw_episode || value.has_raw_start || value.has_rw_origin ||
+                 value.has_frozen_residual || value.has_withdrawal_rearm || value.has_rw_valid_until ||
+                 value.has_wheel_witness_epochs);
+  }
+  EXPECT_FALSE(value.has_support || value.has_support_seed || value.has_supported_through || value.has_first_loss ||
+               value.has_support_deadline || value.has_proof_id || value.has_trajectory_id);
+  EXPECT_EQ(value.present_mask & 64u, 0u);
   if (!value.has_pose_binding) {
     EXPECT_EQ(value.local, 0);
     EXPECT_EQ(value.hr_witness_kind, 0);
@@ -5735,8 +5751,11 @@ void expectReferenceProjection(const Observation & observation, const fast_lio_i
   ASSERT_TRUE(observation.odom_seen && observation.typed_seen);
   EXPECT_EQ(value.kind, 1);
   EXPECT_EQ(value.scan_end_ns, observation.odom_stamp_ns);
-  EXPECT_EQ(value.legacy_flags, odomFlags(observation));
+  EXPECT_EQ(value.legacy_flags, odomFlags(observation) & 15u);
   EXPECT_EQ(value.legacy_flags, observation.typed_health);
+  if (!rw) {
+    EXPECT_EQ(odomFlags(observation) & ~15u, 0u);
+  }
   EXPECT_EQ(value.source_instance, observation.typed_instance);
   EXPECT_EQ(value.observation_id, observation.typed_id);
   EXPECT_EQ(value.pose_binding, observation.typed_pose);
@@ -5850,6 +5869,91 @@ void expectCompleteClosedArm(const ChildResult & result, const char * arm)
     result.transforms.size(),
     static_cast<unsigned long long>(result.reference_publishers_before),
     static_cast<unsigned long long>(result.reference_publishers_after));
+}
+
+// ---- RW: the bounded near-field carry (carry contract 3) --------------------------------------------------------
+
+constexpr int kCarryOriginScans = 45;    // a 20-scan legal recovery from the start-up taint, then a 20-sample origin
+constexpr int kCarryEngulfScans = 6;     // the engulfment latch closes on the second
+constexpr int kCarryRecoveryScans = 26;  // the release takes 5 scans, the legal recovery 20 more
+constexpr int kCarryHoleScans = 3;       // 0.35 s after the last evidence: past zupt_anchor_max_scan_gap_s
+
+// The guard's own verdict, and legs that report standstill just before every scan end.
+Step carrySlot(Phase phase, Cloud cloud = Cloud::kDense)
+{
+  Step s = wheelSlot(phase, 0.0, 0.01);
+  s.guard = Guard::kNatural;
+  s.cloud = cloud;
+  return s;
+}
+
+// Healthy dense scans, then a far field that collapses for kCarryEngulfScans scans and comes back. `hole` drops
+// kCarryHoleScans scans in the middle of the engulfment: a scan-hole taint.
+Scenario nearFieldCarry(bool hole)
+{
+  Scenario s = withReference(inputScenario(hole ? "near_field_carry_hole" : "near_field_carry"));
+  setParam(s, rclcpp::Parameter("guard_engulf_carry_en", true));
+  setParam(s, rclcpp::Parameter("zupt_en", false));  // a StaticHold certifies no carry
+  setParam(s, rclcpp::Parameter("wheel_topic", kWheelTopic));
+  append(s, kCarryOriginScans, carrySlot(Phase::kBefore));
+  append(s, kCarryEngulfScans / 2, carrySlot(Phase::kEvent, Cloud::kNearMix));
+  if (hole)
+    append(s, kCarryHoleScans, carrySlot(Phase::kEvent, Cloud::kNone));
+  append(s, kCarryEngulfScans - kCarryEngulfScans / 2, carrySlot(Phase::kEvent, Cloud::kNearMix));
+  append(s, kCarryRecoveryScans, carrySlot(Phase::kAfter));
+  return s;
+}
+
+// Checks every scan of a carry run and returns the snapshots of the scans that carried. The odometry's bit 4 and
+// cells 6/8/9, the typed RW block and the trace of one scan say the same; a carry stands on a qualified, untainted
+// origin; the run starts with that origin and ends legally recovered with one more rearm and the origin back.
+std::vector<const fast_lio_interfaces::msg::ReferenceHealth *> expectCarryRun(const ChildResult & result)
+{
+  std::vector<const fast_lio_interfaces::msg::ReferenceHealth *> carried;
+  const fast_lio_interfaces::msg::ReferenceHealth * before = nullptr;
+  const fast_lio_interfaces::msg::ReferenceHealth * last = nullptr;
+  for (const auto & o : result.observations) {
+    const auto * value = referenceFor(result, o.record.scan_seq);
+    if (value == nullptr) {
+      ADD_FAILURE() << "no reference for scan " << o.record.scan_seq;
+      continue;
+    }
+    expectReferenceProjection(o, *value, true);
+    last = value;
+    if (o.phase == static_cast<int>(Phase::kBefore))
+      before = value;
+    if (!value->has_pose_binding)
+      continue;
+    const unsigned flags = odomFlags(o);
+    const bool carry = (value->true_mask & 32u) != 0;
+    const bool constrained = (flags & 16u) != 0;
+    EXPECT_EQ(constrained, carry && value->raw_registration_degraded) << "step " << o.step;
+    EXPECT_EQ(flags & 32u, 0u) << "step " << o.step;
+    EXPECT_EQ(o.odom_twist_cov[9], 3.0) << "step " << o.step;
+    EXPECT_EQ(o.odom_twist_cov[6], constrained ? fast_lio::carryCellSeconds(value->rw_valid_until_ns) : 0.0)
+      << "step " << o.step;
+    EXPECT_EQ(o.odom_twist_cov[8], value->has_raw_start ? fast_lio::carryCellSeconds(value->raw_start_ns) : 0.0)
+      << "step " << o.step;
+    EXPECT_EQ(value->has_rw_valid_until, carry) << "step " << o.step;
+    if (!carry)
+      continue;
+    EXPECT_NE(o.phase, static_cast<int>(Phase::kBefore));
+    EXPECT_TRUE(value->has_rw_origin && value->has_raw_episode && value->has_raw_start && value->has_frozen_residual)
+      << "step " << o.step;
+    EXPECT_EQ(value->taint_mask | value->hard_mask, 0u) << "step " << o.step;
+    carried.push_back(value);
+  }
+  if (before == nullptr || last == nullptr) {
+    ADD_FAILURE() << "the run has no scan before the engulfment";
+    return carried;
+  }
+  EXPECT_FALSE(before->has_raw_start);
+  EXPECT_EQ(before->true_mask & 16u, 16u) << "no qualified origin before the engulfment";
+  EXPECT_FALSE(last->has_raw_start) << "no legal recovery";
+  EXPECT_EQ(last->true_mask & 48u, 16u);
+  EXPECT_EQ(last->taint_mask, 0u);
+  EXPECT_EQ(last->withdrawal_rearm_event, before->withdrawal_rearm_event + 1);
+  return carried;
 }
 }  // namespace
 
@@ -6295,4 +6399,56 @@ TEST(AnchorLifecycleReference, EnablingRequiresTheExistingTypedIdentity)
   result = runScenario(scenario);
   EXPECT_FALSE(result.ok());
   EXPECT_NE(result.error.find("explicit clock domain"), std::string::npos);
+  auto carry = baseParams("carry_without_reference", false);
+  setParam(carry, rclcpp::Parameter("guard_engulf_carry_en", true));
+  result = runScenario(carry);
+  EXPECT_FALSE(result.ok());
+  EXPECT_NE(result.error.find("guard_engulf_carry_en requires publish.reference_health=true"), std::string::npos);
+}
+
+TEST(AnchorLifecycleReference, PureEngulfCarriesBoundedEvidenceOnOdometryTypedAndTrace)
+{
+  const auto result = runScenario(nearFieldCarry(false));
+  ASSERT_TRUE(result.ok()) << result.describe();
+  const auto carried = expectCarryRun(result);
+  ASSERT_FALSE(carried.empty()) << describeRun(result);
+  // Every raw degraded scan of the engulfment carries, on the legs' current window and the scan's own lease.
+  std::size_t degraded = 0;
+  for (const auto & value : result.references)
+    degraded += value.kind == 1 && value.raw_registration_degraded ? 1u : 0u;
+  EXPECT_EQ(carried.size(), degraded);
+  for (const auto * value : carried) {
+    EXPECT_TRUE(value->raw_registration_degraded);
+    EXPECT_EQ(value->wheel_witness_kind, 1);
+    EXPECT_FALSE(value->has_wheel_witness_epochs);
+    EXPECT_EQ(value->rw_valid_until_ns, value->scan_end_ns + 200000000);
+    EXPECT_EQ(value->raw_start_ns, carried.front()->scan_end_ns);
+    EXPECT_EQ(value->raw_episode_id, carried.front()->raw_episode_id);
+  }
+}
+
+TEST(AnchorLifecycleReference, ScanHoleInsideEngulfLatchesCarryUntilTheLegalRecovery)
+{
+  const auto result = runScenario(nearFieldCarry(true));
+  ASSERT_TRUE(result.ok()) << result.describe();
+  const auto carried = expectCarryRun(result);
+  ASSERT_FALSE(carried.empty()) << describeRun(result);
+  const auto hole = std::find_if(result.observations.begin(), result.observations.end(), [](const auto & o) {
+    return hasEvent(o, fast_lio::kAnchorEventScanHole);
+  });
+  ASSERT_NE(hole, result.observations.end()) << describeRun(result);
+  for (const auto * value : carried)
+    EXPECT_LT(value->scan_sequence, hole->record.scan_seq);
+  // Engulfed scans after the hole, whose windows the positive run certifies, stay latched until the legal recovery.
+  std::size_t latched = 0;
+  for (auto o = hole; o != result.observations.end(); ++o) {
+    const auto * value = referenceFor(result, o->record.scan_seq);
+    ASSERT_NE(value, nullptr);
+    if (!value->has_raw_start)
+      break;  // the legal recovery
+    EXPECT_NE(value->taint_mask & 4u, 0u) << "step " << o->step;
+    EXPECT_EQ(value->true_mask & 48u, 0u) << "step " << o->step;
+    latched += value->raw_registration_degraded ? 1u : 0u;
+  }
+  EXPECT_GE(latched, 4u);
 }

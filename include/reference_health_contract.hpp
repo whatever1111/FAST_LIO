@@ -12,14 +12,18 @@
 
 namespace fast_lio
 {
-inline constexpr std::uint32_t kReferenceImplemented = 5u;  // R1 and the read-only HR witness
+inline constexpr std::uint32_t kReferenceImplemented = 7u;  // R1, RW and the read-only HR witness
+inline constexpr std::uint32_t kReferenceR1Enabled = 5u;    // R1 and the HR witness projection, without RW
 inline constexpr std::uint32_t kReferencePositiveKnown = 255u;
-inline constexpr std::uint32_t kReferenceR1Present = 143u;  // bits 0, 1, 2, 3, 7; no RW/g-prime evidence
+inline constexpr std::uint32_t kReferenceR1Present = 143u;  // bits 0, 1, 2, 3, 7
+inline constexpr std::uint32_t kReferenceRwPresent = 48u;   // bit 4 qualified RW origin, bit 5 current carry
 inline constexpr std::uint32_t kReferenceCauseKnown = 8191u;
+inline constexpr std::uint32_t kReferenceTaintBits = 8188u;  // raw degraded and pure engulf alone are no taint
 inline constexpr std::uint32_t kReferenceHardKnown = 255u;
 inline constexpr std::int64_t kReferenceLeaseNs = 200000000;
 inline constexpr std::int64_t kReferenceInputPeriodNs = 100000000;
 inline constexpr std::uint32_t kReferenceRawDegraded = 1u;
+inline constexpr std::uint32_t kReferencePureEngulf = 2u;
 inline constexpr std::uint32_t kReferenceScanHole = 4u;
 inline constexpr std::uint32_t kReferenceImuCoverage = 8u;
 inline constexpr std::uint32_t kReferenceImuBridge = 16u;
@@ -28,11 +32,37 @@ inline constexpr std::uint32_t kReferenceUnassessed = 64u;
 inline constexpr std::uint32_t kReferenceMapReset = 128u;
 inline constexpr std::uint32_t kReferenceSourceFault = 256u;
 inline constexpr std::uint32_t kReferenceRunaway = 512u;
+inline constexpr std::uint32_t kReferenceUnknownRewrite = 4096u;
+
+// RW carry contract 3: odom flag bits 4/5 and twist-covariance cells 6/8/9, and the RW block of R1.
+inline constexpr std::uint16_t kCarryContract = 3;
+inline constexpr unsigned kCarryFlagConstrained = 16u;  // bit 4 NearFieldConstrained
+inline constexpr unsigned kCarryFlagHardFailure = 32u;  // bit 5 HardFailure
+inline constexpr std::int64_t kCarryRawBudgetNs = 8000000000;
+inline constexpr std::int64_t kCarryWitnessNs = 1000000000;
+
+inline std::int64_t referenceAdd(std::int64_t stamp, std::int64_t span)
+{
+  return stamp > std::numeric_limits<std::int64_t>::max() - span ? std::numeric_limits<std::int64_t>::max()
+                                                                 : stamp + span;
+}
 
 inline std::int64_t referenceUntil(std::int64_t stamp)
 {
-  return stamp > std::numeric_limits<std::int64_t>::max() - kReferenceLeaseNs ? std::numeric_limits<std::int64_t>::max()
-                                                                              : stamp + kReferenceLeaseNs;
+  return referenceAdd(stamp, kReferenceLeaseNs);
+}
+
+// Cells 6 and 8 carry sensor-epoch seconds in a double, which cannot hold every nanosecond. The instant is floored
+// to the microsecond and one more microsecond is taken off, so the decoded value is never later than the exact one
+// R1 carries. Zero means none.
+inline double carryCellSeconds(std::int64_t ns)
+{
+  return ns <= 1000 ? 0.0 : static_cast<double>(ns / 1000 - 1) * 1e-6;
+}
+
+inline std::int64_t carryCellNs(double seconds)
+{
+  return std::isfinite(seconds) && seconds > 0.0 && seconds < 9.2e9 ? std::llround(seconds * 1e6) * 1000 : 0;
 }
 
 // These are explicit wire encodings, not casts of the zero-based policy enums.
@@ -124,8 +154,27 @@ struct ReferenceHealthSnapshot
   std::uint8_t hrWitnessKind = 0;  // None, Normal, TrustedStaticHold, Constrained
   bool hasHrValidUntil = false;
   std::int64_t hrValidUntilNs = 0;
-  bool hasRw = false;       // contract 3 is reserved, never asserted by PR1
-  bool hasSupport = false;  // support contract 1 is reserved, never asserted by PR1
+  // RW contract 3, present exactly when RW is enabled.
+  bool hasRw = false;
+  std::uint16_t rwContract = 0;
+  bool hasRawEpisode = false;
+  std::uint64_t rawEpisodeId = 0;
+  bool hasRawStart = false;
+  std::int64_t rawStartNs = 0;
+  bool hasRwOrigin = false;
+  std::uint64_t originScan = 0;
+  std::uint64_t originReferenceGeneration = 0;
+  bool hasFrozenResidual = false;
+  double frozenResidualMedian = 0.0;
+  bool hasWithdrawalRearm = false;
+  std::uint64_t withdrawalRearmEvent = 0;
+  bool hasRwValidUntil = false;
+  std::int64_t rwValidUntilNs = 0;
+  bool hasWheelWitnessEpochs = false;
+  std::uint64_t lowerWheelWitnessEpoch = 0;  // sensor ns of the supporting leg sample
+  std::uint64_t upperWheelWitnessEpoch = 0;
+  std::uint8_t wheelWitnessKind = 0;  // None, CurrentWindow, Fallback
+  bool hasSupport = false;            // support contract 1 is reserved, never asserted
 };
 
 struct ReferenceScanFacts
@@ -189,15 +238,48 @@ projectReferenceHealth(ReferenceHealthSnapshot value, const RecoveryState & reco
   return value;
 }
 
+// The RW block of an RW-enabled snapshot. Bit 4 is a qualified origin on an untainted reference; bit 5 is the
+// strict carry permission of one scan, bounded by the scan lease, the raw budget, the recovery deadline and, for
+// the fallback, its two leg witnesses. Without bit 5 no certificate field is set.
+inline bool referenceCarryValid(const ReferenceHealthSnapshot & value)
+{
+  const bool origin = (value.trueMask & 16u) != 0;
+  const bool carry = (value.trueMask & 32u) != 0;
+  if (value.rwContract != kCarryContract || (value.presentMask & kReferenceRwPresent) != kReferenceRwPresent ||
+      !value.hasWithdrawalRearm || value.hasRawEpisode != value.hasRawStart ||
+      (value.hasFrozenResidual && !(std::isfinite(value.frozenResidualMedian) && value.frozenResidualMedian >= 0.0)) ||
+      (origin && (!value.hasRwOrigin || value.lifecycle != 2 || value.taintMask != 0 || value.hardMask != 0)))
+    return false;
+  if (!carry)
+    return !value.hasRwValidUntil && value.wheelWitnessKind == 0 && !value.hasWheelWitnessEpochs;
+  const auto until = value.rwValidUntilNs;
+  const bool witnesses =
+    value.wheelWitnessKind == 1
+      ? !value.hasWheelWitnessEpochs
+      : value.wheelWitnessKind == 2 && value.hasWheelWitnessEpochs &&
+          value.lowerWheelWitnessEpoch <= static_cast<std::uint64_t>(value.scanEndNs) &&
+          value.upperWheelWitnessEpoch <= static_cast<std::uint64_t>(value.scanEndNs) &&
+          until <= referenceAdd(static_cast<std::int64_t>(value.lowerWheelWitnessEpoch), kCarryWitnessNs) &&
+          until <= referenceAdd(static_cast<std::int64_t>(value.upperWheelWitnessEpoch), kCarryWitnessNs);
+  return witnesses && value.kind == 1 && origin && value.hasRawStart && value.hasFrozenResidual &&
+         value.hasRwValidUntil && value.hasScanEnd && (value.trust == 1 || value.trust == 2) &&
+         (value.rawRegistrationDegraded || value.trust == 2) && (value.legacyFlags & 6u) == 0 &&
+         value.rawStartNs <= value.scanEndNs && until >= value.scanEndNs && until <= referenceUntil(value.scanEndNs) &&
+         until <= referenceAdd(value.rawStartNs, kCarryRawBudgetNs) &&
+         (value.trust != 2 || !value.hasOriginalDeadline || until < value.originalDeadlineNs);
+}
+
 inline bool referenceHealthEncodingValid(const ReferenceHealthSnapshot & value)
 {
+  const bool rw = (value.enabledPolicyMask & 2u) != 0;
   if (value.schemaVersion != 1 || value.identityVersion != 1 || value.kind < 1 || value.kind > 4 ||
       value.lifecycle > 2 || value.startupReference > 3 || value.trust > 3 || value.local > 3 ||
       value.hrWitnessKind > 3 || (value.legacyFlags & ~15u) != 0 || (value.implementedMask & ~15u) != 0 ||
-      (value.enabledPolicyMask & ~value.implementedMask) != 0 || (value.presentMask & ~kReferenceR1Present) != 0 ||
+      (value.enabledPolicyMask & ~value.implementedMask) != 0 ||
+      (value.presentMask & ~(kReferenceR1Present | (rw ? kReferenceRwPresent : 0u))) != 0 ||
       (value.trueMask & ~value.presentMask) != 0 || (value.causeMask & ~kReferenceCauseKnown) != 0 ||
-      (value.taintMask & ~value.causeMask) != 0 || (value.hardMask & ~kReferenceHardKnown) != 0 || value.hasRw ||
-      value.hasSupport)
+      (value.taintMask & ~value.causeMask) != 0 || (value.hardMask & ~kReferenceHardKnown) != 0 || value.hasRw != rw ||
+      value.hasSupport || (rw && !referenceCarryValid(value)))
     return false;
   const auto lifecycle = value.startupReference == 1 ? 1 : value.startupReference == 2 ? 2 : 0;
   if (value.lifecycle != lifecycle || ((value.trueMask & 1u) != 0) != (value.lifecycle == 2) ||
@@ -228,26 +310,31 @@ inline bool referenceHealthEncodingValid(const ReferenceHealthSnapshot & value)
 class ReferenceHealthProgress
 {
 public:
-  void beginScan(const RecoveryState & recovery)
+  // `keep` holds the masks while RW has not seen a legal recovery: its latch outlives the unsupported episode,
+  // and R1 reports the same OR until rearm().
+  void beginScan(const RecoveryState & recovery, bool keep = false)
   {
     // OR is scoped to an actual unsupported episode. Outside one, the next scan
     // supplies its own current evidence; initialization has no pose certificate to carry.
-    if (recovery.trust == RecoveryTrust::kLocalQualified)
+    if (recovery.trust == RecoveryTrust::kLocalQualified && !keep)
       causeMask_ = taintMask_ = hardMask_ = 0;
   }
   void negative(std::uint32_t cause, std::uint32_t hard = 0)
   {
     causeMask_ |= cause;
-    taintMask_ |= cause & 8188u;  // raw degraded / pure engulf alone are not taint
+    taintMask_ |= cause & kReferenceTaintBits;
     hardMask_ |= hard;
     advance(negativeSequence_);
   }
 
-  void qualified()
+  void qualified(bool keep = false)
   {
     advance(qualifiedSequence_);
-    causeMask_ = taintMask_ = hardMask_ = 0;
+    if (!keep)
+      causeMask_ = taintMask_ = hardMask_ = 0;
   }
+
+  void rearm() { causeMask_ = taintMask_ = hardMask_ = 0; }
 
   bool stateChanged(const ReferenceHealthSnapshot & value) const
   {
@@ -349,6 +436,7 @@ struct ReferenceHealthTrace
   std::uint32_t legacyFlags = 0, presentMask = 0, trueMask = 0, cause = 0, taint = 0, hard = 0;
   bool hasPose = false;
   std::int64_t evaluatedNs = 0, effectiveNs = 0, stateUntilNs = 0, hrUntilNs = 0;
+  bool rwPresent = false;
 };
 
 inline ReferenceHealthTrace referenceHealthTrace(const ReferenceHealthSnapshot & value)
@@ -374,6 +462,7 @@ inline ReferenceHealthTrace referenceHealthTrace(const ReferenceHealthSnapshot &
           value.evaluatedInputNs,
           value.effectiveNs,
           value.stateValidUntilNs,
-          value.hrValidUntilNs};
+          value.hrValidUntilNs,
+          value.enabledPolicyMask != 0 && value.hasSnapshotSequence && value.hasRw};
 }
 }  // namespace fast_lio

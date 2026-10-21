@@ -512,6 +512,12 @@ if(BUILD_TESTING)
     target_include_directories(test_engulf_release PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
 
+  # Pure header, Eigen only: the bounded near-field carry certificate (carry contract 3) and its latch.
+  ament_add_gtest(test_constrained_carry test/test_constrained_carry.cpp)
+  if(TARGET test_constrained_carry)
+    target_include_directories(test_constrained_carry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
+
   # Pure header, Eigen only: the lidar update as a consider (Schmidt) update for roll/pitch — policy, projector and
   # the Joseph-form covariance checked against the explicit form (docs/PGO_LOOP_TUNING.md section 7.8).
   ament_add_gtest(test_rp_consider test/test_rp_consider.cpp)

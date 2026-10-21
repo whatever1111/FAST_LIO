@@ -104,6 +104,7 @@
 #include "anchor_trace.hpp"
 #include "attitude_hold.hpp"
 #include "cached_plane.hpp"
+#include "constrained_carry.hpp"
 #include "correspondence_compaction.hpp"
 #include "correspondence_gate.hpp"
 #include "covariance_reset.hpp"
@@ -444,7 +445,14 @@ double guard_engulf_far_frac_release = 0.35;  // release needs far field this he
 int guard_engulf_release_scans = 5;           // ...for this many consecutive scans
 int consec_engulf_clear = 0;                  // running healthy-scan streak while latched
 bool engulf_latched = false;                  // sticky engulfed state (entered, not yet released)
-double engulf_latch_time = -1.0;              // lidar_end_time of the scan that latched (blind duration at release)
+// RW near-field carry (constrained_carry.hpp), carry contract 3: read-only evidence that a pure engulfment still
+// moves as the legs and the gyro say, published in R1 and as odometry flag bits 4/5 and cells 6/8/9. It never
+// changes the reference, the map or the estimate. Off by default; requires publish.reference_health.
+bool carry_en = false;
+fast_lio::ConstrainedCarry near_carry;
+bool carry_scan_pure_engulf = false;                 // this scan's degraded verdict came from the engulf latch alone
+std::deque<fast_lio::CarryWheelSample> carry_wheel;  // ascending leg speeds at their own epochs, under mtx_twist
+double engulf_latch_time = -1.0;  // lidar_end_time of the scan that latched (blind duration at release)
 // Release policy (engulf_release.hpp): what velocity leaves the blind stretch and how much the pose's
 // covariance grows for it. Defaults reproduce the legacy "zero velocity, P untouched".
 fast_lio::ReleaseVelocityParams release_vel_params;
@@ -962,6 +970,16 @@ std::array<std::uint8_t, 32> reference_contract_id{}, reference_config_id{};
 void publishFrontendObservation(bool completed, bool scanEvent = false, double eventTime = 0.0) noexcept;
 void publishPendingReference() noexcept;
 
+// Every negative entry point: R1 and the RW latch see the same events, so their masks stay one value.
+void referenceNegative(std::uint32_t cause, std::uint32_t hard = 0)
+{
+  if (!reference_health_en)
+    return;
+  reference_progress.negative(cause, hard);
+  if (carry_en)
+    near_carry.negative(cause, hard);
+}
+
 void frontendAdmit(const builtin_interfaces::msg::Time & stamp)
 {
   if (!frontend_observation_en)
@@ -1080,8 +1098,7 @@ void logImuBacklogLoss(const ImuBacklogLoss & loss)
 {
   if (loss.samples == 0)
     return;
-  if (reference_health_en)
-    reference_progress.negative(fast_lio::kReferenceLostBatch);
+  referenceNegative(fast_lio::kReferenceLostBatch);
   RCLCPP_DEBUG(
     rclcpp::get_logger("laser_mapping.imu_transactions"),
     "[IMU-CONSUMPTION-LOSS] reason=backlog samples=%zu oldest=%.9f newest=%.9f valid_total=%lu retained_total=%lu",
@@ -1456,6 +1473,15 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
   if (v.allFinite()) {
     last_twist_v_body = v;
   }
+  // RW leg evidence keeps every sample at its own epoch, NaN included; a non-increasing epoch is not appended.
+  std::int64_t carry_ns = 0;
+  if (carry_en && fast_lio::frontendStamp(msg_in->header.stamp.sec, msg_in->header.stamp.nanosec, carry_ns) &&
+      (carry_wheel.empty() || carry_ns > carry_wheel.back().ns)) {
+    carry_wheel.push_back({carry_ns, fast_lio::carryWheelSpeed(v(0), v(1), v(2))});
+    while (carry_wheel.size() > fast_lio::kCarryWheelCapacity ||
+           carry_ns - carry_wheel.front().ns > 2 * fast_lio::kCarryWitnessNs)
+      carry_wheel.pop_front();
+  }
   // [v6] stamped forward-speed history for the levelling prior's leg-velocity edges
   if (std::isfinite(v(0))) {
     gravity_align_leg_hist.emplace_back(last_twist_stamp, v(0));
@@ -1571,6 +1597,10 @@ struct FinalFrontendSnapshot
   fast_lio::FrontendFacts frontend;
   fast_lio::ReferenceHealthSnapshot reference;
   std::int64_t poseStamp = 0;
+  // Carry contract 3 projection of the same snapshot; false when RW or R1 is off for this activation.
+  bool carryContract = false;
+  bool carryHard = false;
+  fast_lio::CarryVerdict carry;
 };
 FinalFrontendSnapshot anchor_final_snapshot;
 bool anchor_final_frozen = false;
@@ -1582,6 +1612,34 @@ void disableReferencePublication(const char * reason)
   reference_health_en = false;
   reference_pending = false;
   RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"), "Reference health disabled for this activation: %s", reason);
+}
+
+// The completed scan's final facts for the RW carry, read after every late guard. The base point is the legs'
+// reference point, gravity_align_leg_lever_arm behind the IMU.
+fast_lio::CarryScan carryScanFacts(const fast_lio::ReferenceHealthSnapshot & value,
+                                   const fast_lio::FrontendFacts & facts)
+{
+  fast_lio::CarryScan in;
+  in.sequence = anchor_scan_record.scan_seq;
+  in.beginNs = anchor_scan_record.beg_ns;
+  in.endNs = value.scanEndNs;
+  in.generation = stationary_anchor.reference_generation;
+  in.established = value.lifecycle == 2;
+  in.trust = recovery_state.trust;
+  in.deadlineNs = recovery_state.deadline_ns;
+  in.degraded = flio_degraded_odom;
+  in.pureEngulf = carry_scan_pure_engulf;
+  in.staticHold = facts.staticHold;
+  in.lost = facts.lost;
+  in.iterations = ekf_iters;
+  in.effective = effct_feat_num;
+  in.residual = res_mean_last;
+  const Eigen::Matrix3d rotation = state_point.rot.toRotationMatrix();
+  in.base = state_point.pos - rotation * gravity_align_leg_lever_arm;
+  in.rotation = Eigen::Quaterniond(rotation);
+  in.up = -V3D(state_point.grav[0], state_point.grav[1], state_point.grav[2]).normalized();
+  in.gyroBias = state_point.bg;
+  return in;
 }
 
 FinalFrontendSnapshot captureFinalFrontend(bool completed, bool scanEvent, double eventTime) noexcept
@@ -1667,14 +1725,16 @@ FinalFrontendSnapshot captureFinalFrontend(bool completed, bool scanEvent, doubl
   if (reference_health_en) {
     reference_publication_guard.run(
       [&] {
+        const bool pureEngulf = carry_en && flio_degraded_odom && carry_scan_pure_engulf;
         if (completed && (flio_degraded_odom || facts.runaway))
-          reference_progress.negative((flio_degraded_odom ? fast_lio::kReferenceRawDegraded : 0u) |
-                                        (facts.runaway ? fast_lio::kReferenceRunaway : 0u),
-                                      facts.runaway ? 8u : 0u);
+          referenceNegative((flio_degraded_odom ? fast_lio::kReferenceRawDegraded : 0u) |
+                              (pureEngulf ? fast_lio::kReferencePureEngulf : 0u) |
+                              (facts.runaway ? fast_lio::kReferenceRunaway : 0u),
+                            facts.runaway ? 8u : 0u);
         if (completed && facts.lost)
-          reference_progress.negative(0, 1);
+          referenceNegative(0, 1);
         if (completed && !fast_lio::referencePoseFinite(facts.pose))
-          reference_progress.negative(0, 32);
+          referenceNegative(0, 32);
         value.hasSourceInstance = frontend_has_instance;
         value.sourceInstance = frontend_instance;
         value.clockDomain = frontend_clock_domain;
@@ -1684,8 +1744,28 @@ FinalFrontendSnapshot captureFinalFrontend(bool completed, bool scanEvent, doubl
         value.coordinateEpoch = facts.contextKnown ? 1 : 0;
         value.producerContractId = reference_contract_id;
         value.configId = reference_config_id;
-        value.enabledPolicyMask = fast_lio::kReferenceImplemented;
+        value.enabledPolicyMask = fast_lio::kReferenceR1Enabled | (carry_en ? 2u : 0u);
         value = fast_lio::projectReferenceHealth(std::move(value), recovery_state, scan);
+        if (carry_en) {
+          if (completed) {
+            for (const auto & imu : Measures.imu) {
+              std::int64_t ns = 0;
+              if (fast_lio::frontendStamp(imu->header.stamp.sec, imu->header.stamp.nanosec, ns))
+                near_carry.noteImu(ns, V3D(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z));
+            }
+            std::deque<fast_lio::CarryWheelSample> wheel;
+            {
+              std::lock_guard<std::mutex> lk(mtx_twist);
+              wheel = carry_wheel;
+            }
+            final.carry = near_carry.scan(carryScanFacts(value, facts), wheel, recovery_params.stable_ns);
+            if (final.carry.rearmed)
+              reference_progress.rearm();
+          }
+          value = fast_lio::projectCarry(std::move(value), near_carry, final.carry);
+          final.carryContract = true;
+          final.carryHard = near_carry.hard() != 0;
+        }
         if (!scanEvent && !reference_progress.inputDue(value))
           return;
         value = reference_progress.settle(std::move(value));
@@ -1762,7 +1842,26 @@ void buildAndPublishReference(const fast_lio::ReferenceHealthSnapshot & value)
   message.hr_witness_kind = value.hrWitnessKind;
   message.has_hr_valid_until = value.hasHrValidUntil;
   message.hr_valid_until_ns = value.hrValidUntilNs;
-  // All RW / g-prime presence fields retain their false value-initialization.
+  message.has_rw = value.hasRw;
+  message.rw_contract = value.rwContract;
+  message.has_raw_episode = value.hasRawEpisode;
+  message.raw_episode_id = value.rawEpisodeId;
+  message.has_raw_start = value.hasRawStart;
+  message.raw_start_ns = value.rawStartNs;
+  message.has_rw_origin = value.hasRwOrigin;
+  message.origin_scan = value.originScan;
+  message.origin_reference_generation = value.originReferenceGeneration;
+  message.has_frozen_residual = value.hasFrozenResidual;
+  message.frozen_residual_median = value.frozenResidualMedian;
+  message.has_withdrawal_rearm = value.hasWithdrawalRearm;
+  message.withdrawal_rearm_event = value.withdrawalRearmEvent;
+  message.has_rw_valid_until = value.hasRwValidUntil;
+  message.rw_valid_until_ns = value.rwValidUntilNs;
+  message.has_wheel_witness_epochs = value.hasWheelWitnessEpochs;
+  message.lower_wheel_witness_epoch = value.lowerWheelWitnessEpoch;
+  message.upper_wheel_witness_epoch = value.upperWheelWitnessEpoch;
+  message.wheel_witness_kind = value.wheelWitnessKind;
+  // The g-prime support fields retain their false value-initialization.
   reference_publisher->publish(message);
 }
 
@@ -1895,7 +1994,7 @@ void anchorEvidence(
         break;
     }
     if (cause != 0 || hard != 0)
-      reference_progress.negative(cause, hard);
+      referenceNegative(cause, hard);
   }
   fast_lio::saturatingIncrement(counter);
   endParkedStreak();
@@ -1908,7 +2007,7 @@ void anchorEvidence(
 void beginAnchorScanRecord(double beg, double end)
 {
   if (reference_health_en)
-    reference_progress.beginScan(recovery_state);
+    reference_progress.beginScan(recovery_state, carry_en && near_carry.unresolved());
   anchor_final_frozen = false;
   anchor_pending_legacy_observation = false;
   anchor_scan_record = fast_lio::AnchorScanRecord{};
@@ -2199,8 +2298,12 @@ void noteRecoveryEvent(const fast_lio::RecoveryEvent & event, std::int64_t stamp
     recoveryTransition(fast_lio::RecoveryTraceEvent::kPending, event.cause, stamp_ns);
   }
   if (event.qualified) {
-    if (reference_health_en)
-      reference_progress.qualified();
+    if (reference_health_en) {
+      // With RW on, only its legal recovery clears the shared masks (rearm).
+      reference_progress.qualified(carry_en);
+      if (carry_en)
+        near_carry.qualified();
+    }
     fast_lio::saturatingIncrement(&anchor_trace_counters.recovery_qualified);
     RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
                 "[FE-RECOVERY] recovery #%llu qualified: %.1fs of unbroken matching on the same reference",
@@ -2319,6 +2422,7 @@ void beginAnchorLifecycleScan(double beg, double end)
   if (lifecycle_scan_seq != std::numeric_limits<std::uint64_t>::max())
     ++lifecycle_scan_seq;
   anchor_usable = false;
+  carry_scan_pure_engulf = false;
   anchor_scan_evaluated = false;
   reanchor_lost_this_scan = false;
   anchor_write.writer = AnchorWrite::Writer::kNone;
@@ -2372,8 +2476,8 @@ struct AnchorScanScope
           dropStationaryAnchor(drop, end_);
       }
       dropUnevaluatedAnchorCandidate(end_);
-      if (reference_health_en && imu_committed_)
-        reference_progress.negative(fast_lio::kReferenceUnassessed);
+      if (imu_committed_)
+        referenceNegative(fast_lio::kReferenceUnassessed);
     }
     finishAnchorScanRecord();
     if (anchor_pending_legacy_observation && frontend_observation_en)
@@ -3292,7 +3396,20 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     // consumer must act on: a degraded pose is fresh and self-consistent, so
     // staleness gates downstream pass it through unchanged (dog 2, 2026-09-04).
     const unsigned health_flags = final.reference.legacyFlags;
-    odomAftMapped.twist.covariance[1] = static_cast<double>(health_flags);
+    // Carry contract 3 (reference_health_contract.hpp): bit 4 NearFieldConstrained, bit 5 HardFailure on top of the
+    // unchanged low four; cell 6 the certificate's end and cell 8 the raw episode's start, both sensor-epoch seconds
+    // rounded down, 0 = none; cell 9 the contract version, 0 = no carry evidence.
+    // Bit 4 and cell 6 come from the settled R1 carry bit, so the two encodings of this scan cannot disagree.
+    const bool carry = final.carryContract && final.reference.hasRw;
+    const bool constrained = carry && (final.reference.trueMask & 32u) != 0 && final.carry.constrained;
+    const unsigned carry_flags = carry ? (constrained ? fast_lio::kCarryFlagConstrained : 0u) |
+                                           (final.carryHard ? fast_lio::kCarryFlagHardFailure : 0u)
+                                       : 0u;
+    odomAftMapped.twist.covariance[1] = static_cast<double>(health_flags | carry_flags);
+    odomAftMapped.twist.covariance[6] = constrained ? fast_lio::carryCellSeconds(final.reference.rwValidUntilNs) : 0.0;
+    odomAftMapped.twist.covariance[8] =
+      carry && final.reference.hasRawStart ? fast_lio::carryCellSeconds(final.reference.rawStartNs) : 0.0;
+    odomAftMapped.twist.covariance[9] = carry ? static_cast<double>(fast_lio::kCarryContract) : 0.0;
     if (anchor_scan_record_open)
       anchor_scan_record.flags = static_cast<int>(health_flags);
     odomAftMapped.twist.covariance[7] = scan_obs_along;
@@ -4320,10 +4437,13 @@ public:
     rcl_interfaces::msg::ParameterDescriptor referenceDescriptor;
     referenceDescriptor.read_only = true;
     reference_health_en = this->declare_parameter<bool>("publish.reference_health", false, referenceDescriptor);
+    carry_en = this->declare_parameter<bool>("guard_engulf_carry_en", false, referenceDescriptor);
     frontend_clock_domain = this->declare_parameter<std::string>("publish.frontend_clock_domain", "");
     const double frontendIdlePeriod = this->declare_parameter<double>("publish.frontend_idle_period_sec", 0.5);
     if (reference_health_en && !frontend_observation_en)
       throw std::invalid_argument("reference health requires publish.frontend_observation=true and its clock domain");
+    if (carry_en && !reference_health_en)
+      throw std::invalid_argument("guard_engulf_carry_en requires publish.reference_health=true");
     if (frontend_observation_en) {
       if (!fast_lio::frontendIdentifier(frontend_clock_domain, 48) || !std::isfinite(frontendIdlePeriod) ||
           frontendIdlePeriod < 1e-9 || frontendIdlePeriod > 3600.0) {
@@ -4354,6 +4474,7 @@ public:
       if (reference_health_en) {
         reference_progress = fast_lio::ReferenceHealthProgress{};
         reference_publication_guard = fast_lio::FrontendPublicationGuard{};
+        near_carry = fast_lio::ConstrainedCarry{};
         reference_publisher =
           this->create_publisher<fast_lio_interfaces::msg::ReferenceHealth>("/lio_slam/reference_health", frontendQos);
       }
@@ -5081,7 +5202,7 @@ public:
       sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
       RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", imu_topic.c_str());
     }
-    if (wheel_odom_en || zupt_en || parked_hold_params.enabled) {
+    if (wheel_odom_en || zupt_en || parked_hold_params.enabled || carry_en) {
       sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(wheel_topic, 2000, twist_cbk);
       RCLCPP_INFO(this->get_logger(),
                   "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s, parked hold %s)",
@@ -6192,10 +6313,10 @@ private:
         else
           consec_low_eff = 0;
         flio_vel_runaway = (state_point.vel.norm() > divergence_guard_max_speed);
-        if (reference_health_en && flio_vel_runaway)
-          reference_progress.negative(1u << 10, 1u << 4);  // the actual pre-clamp fact
-        if (reference_health_en && consec_low_eff >= divergence_guard_streak)
-          reference_progress.negative(1u << 11, 1u << 7);
+        if (flio_vel_runaway)
+          referenceNegative(1u << 10, 1u << 4);  // the actual pre-clamp fact
+        if (consec_low_eff >= divergence_guard_streak)
+          referenceNegative(1u << 11, 1u << 7);
         // (3) engulfment: far field collapsed in the raw scan — leading indicator
         //     (fires before effct starves; see guard_engulf_en block comment).
         if (guard_engulf_en) {
@@ -6272,6 +6393,7 @@ private:
       }
       const bool flio_in_degraded = guardVerdictForTest(
         divergence_guard_en && (consec_low_eff >= divergence_guard_streak || flio_vel_runaway || flio_engulfed));
+      carry_scan_pure_engulf = flio_engulfed && consec_low_eff < divergence_guard_streak && !flio_vel_runaway;
 
       /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
        *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll
@@ -6553,6 +6675,9 @@ private:
                 kf.update_simple(H, residual, R_diag, kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
                 state_point = kf.get_x();
               }
+              // A degraded-sigma levelling rewrite is the estimator moving its own attitude, not motion evidence.
+              if (carry_en && gravity_align_degraded_active)
+                referenceNegative(fast_lio::kReferenceUnknownRewrite);
               if (kalman_channel_diag_en) {
                 writeKalmanChannel(
                   "gravity", st, state_point, gravityCovarianceBefore, gravityDiagnostics, m_body, g_body);

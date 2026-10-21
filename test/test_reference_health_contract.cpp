@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <initializer_list>
 #include <limits>
 
 #include "reference_health_contract.hpp"
@@ -33,6 +34,43 @@ fast_lio::ReferenceScanFacts healthy()
   fast_lio::ReferenceScanFacts facts;
   facts.completed = facts.initialized = facts.assessed = true;
   return facts;
+}
+fast_lio::ReferenceHealthSnapshot rwValue(const reference_health_literals::RwVector & literal)
+{
+  auto value = scanValue();
+  value.enabledPolicyMask = 7;
+  value.scanBeginNs = reference_health_literals::kRwScanBeginNs;
+  value.scanEndNs = value.evaluatedInputNs = value.effectiveNs = reference_health_literals::kRwScanEndNs;
+  value.startupReference = value.lifecycle = 2;
+  value.trust = literal.trust;
+  value.local = literal.local;
+  value.hrWitnessKind = literal.hr;
+  value.legacyFlags = literal.flags;
+  value.presentMask = 191;
+  value.trueMask = literal.truth;
+  value.hasRawRegistrationDegraded = true;
+  value.rawRegistrationDegraded = (literal.flags & 1u) != 0 && literal.trust != 3;
+  value.hasNegativeMasks = true;
+  value.causeMask = value.taintMask = literal.taint;
+  value.hardMask = literal.hard;
+  value.hasOriginalDeadline = literal.deadline != 0;
+  value.originalDeadlineNs = literal.deadline;
+  value.hasRw = value.hasWithdrawalRearm = true;
+  value.rwContract = 3;
+  value.hasRwOrigin = (literal.truth & 16u) != 0;
+  value.originScan = 7;
+  value.originReferenceGeneration = 1;
+  value.hasRawEpisode = value.hasRawStart = value.hasFrozenResidual = literal.rawStart != 0;
+  value.rawEpisodeId = 1;
+  value.rawStartNs = literal.rawStart;
+  value.frozenResidualMedian = 0.03;
+  value.hasRwValidUntil = literal.until != 0;
+  value.rwValidUntilNs = literal.until;
+  value.wheelWitnessKind = literal.witness;
+  value.hasWheelWitnessEpochs = literal.lower != 0;
+  value.lowerWheelWitnessEpoch = literal.lower;
+  value.upperWheelWitnessEpoch = literal.upper;
+  return value;
 }
 }  // namespace
 
@@ -193,4 +231,63 @@ TEST(ReferenceHealthContract, IntegerAndMaskBoundsFailClosed)
   value.enabledPolicyMask = 5;
   value.causeMask = 8192;
   EXPECT_FALSE(fast_lio::referenceHealthEncodingValid(value));
+}
+
+TEST(ReferenceHealthContract, RwWireLiterals)
+{
+  for (const auto & literal : reference_health_literals::kRwVectors) {
+    SCOPED_TRACE(literal.name);
+    EXPECT_EQ(fast_lio::referenceHealthEncodingValid(rwValue(literal)), literal.valid);
+  }
+}
+
+TEST(ReferenceHealthContract, RwBlockExistsExactlyWhenEnabledAndCellsNeverRunLate)
+{
+  const auto carry = rwValue(reference_health_literals::kRwVectors[4]);
+  ASSERT_TRUE(fast_lio::referenceHealthEncodingValid(carry));
+  using Tamper = void (*)(fast_lio::ReferenceHealthSnapshot &);
+  for (Tamper tamper : std::initializer_list<Tamper>{
+         [](fast_lio::ReferenceHealthSnapshot & v) { v.enabledPolicyMask = 5; },
+         [](fast_lio::ReferenceHealthSnapshot & v) { v.hasRw = false; },
+         [](fast_lio::ReferenceHealthSnapshot & v) { v.rwContract = 2; },
+         [](fast_lio::ReferenceHealthSnapshot & v) { v.presentMask = 175; },
+         [](fast_lio::ReferenceHealthSnapshot & v) { v.hasWithdrawalRearm = false; },
+         [](fast_lio::ReferenceHealthSnapshot & v) { v.hasRawEpisode = false; },
+         [](fast_lio::ReferenceHealthSnapshot & v) { v.hasRwOrigin = false; },
+         [](fast_lio::ReferenceHealthSnapshot & v) { v.frozenResidualMedian = -0.01; },
+         [](fast_lio::ReferenceHealthSnapshot & v) { v.hasSupport = true; },
+       }) {
+    auto value = carry;
+    tamper(value);
+    EXPECT_FALSE(fast_lio::referenceHealthEncodingValid(value));
+  }
+  auto r1 = fast_lio::projectReferenceHealth(scanValue(), established(), healthy());
+  r1.presentMask = 191;
+  EXPECT_FALSE(fast_lio::referenceHealthEncodingValid(r1));
+
+  EXPECT_DOUBLE_EQ(fast_lio::carryCellSeconds(1760000000123456789), 1760000000.123455);
+  EXPECT_EQ(fast_lio::carryCellNs(fast_lio::carryCellSeconds(1760000000123456789)), 1760000000123455000);
+  EXPECT_EQ(fast_lio::carryCellSeconds(1000), 0.0);
+  EXPECT_EQ(fast_lio::carryCellNs(0.0), 0);
+  EXPECT_EQ(fast_lio::carryCellNs(std::numeric_limits<double>::quiet_NaN()), 0);
+}
+
+TEST(ReferenceHealthContract, RwLatchKeepsTheSharedMasksUntilRearm)
+{
+  fast_lio::ReferenceHealthProgress progress;
+  const auto recovery = established();
+  const auto value = fast_lio::projectReferenceHealth(scanValue(), recovery, healthy());
+  progress.negative(fast_lio::kReferenceImuCoverage);
+  progress.beginScan(recovery, true);
+  progress.qualified(true);
+  const auto kept = progress.settle(value);
+  EXPECT_EQ(kept.taintMask, 8u);
+  EXPECT_EQ(kept.qualifiedEventSequence, 1u);
+  EXPECT_EQ(kept.trueMask & 12u, 0u);
+  progress.rearm();
+  EXPECT_EQ(progress.settle(value).causeMask, 0u);
+  progress.negative(fast_lio::kReferenceRawDegraded | fast_lio::kReferencePureEngulf);
+  EXPECT_EQ(progress.settle(value).taintMask, 0u);  // raw degraded and pure engulf alone are no taint
+  progress.beginScan(recovery);
+  EXPECT_EQ(progress.settle(value).causeMask, 0u);
 }

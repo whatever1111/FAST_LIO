@@ -1748,11 +1748,6 @@ FinalFrontendSnapshot captureFinalFrontend(bool completed, bool scanEvent, doubl
         value = fast_lio::projectReferenceHealth(std::move(value), recovery_state, scan);
         if (carry_en) {
           if (completed) {
-            for (const auto & imu : Measures.imu) {
-              std::int64_t ns = 0;
-              if (fast_lio::frontendStamp(imu->header.stamp.sec, imu->header.stamp.nanosec, ns))
-                near_carry.noteImu(ns, V3D(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z));
-            }
             std::deque<fast_lio::CarryWheelSample> wheel;
             {
               std::lock_guard<std::mutex> lk(mtx_twist);
@@ -1775,6 +1770,30 @@ FinalFrontendSnapshot captureFinalFrontend(bool completed, bool scanEvent, doubl
       disableReferencePublication);
   }
   return final;
+}
+
+// The RW window of the scan in processing, before its #273 step: its IMU joins the carry history, and a structural
+// gap found in the window is reported once, through the shared negative entry.
+void prepareCarryWindow()
+{
+  if (!reference_health_en || !carry_en)
+    return;
+  reference_publication_guard.run(
+    [&] {
+      for (const auto & imu : Measures.imu) {
+        std::int64_t ns = 0;
+        if (fast_lio::frontendStamp(imu->header.stamp.sec, imu->header.stamp.nanosec, ns))
+          near_carry.noteImu(ns, V3D(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z));
+      }
+      std::int64_t end = 0;
+      if (fast_lio::frontendSecondsStamp(lidar_end_time, end) &&
+          near_carry
+            .prepareScanWindow(
+              anchor_scan_record.scan_seq, end, stationary_anchor.reference_generation, recovery_state.trust)
+            .newGap)
+        referenceNegative(fast_lio::kReferenceImuCoverage);
+    },
+    disableReferencePublication);
 }
 
 void buildAndPublishReference(const fast_lio::ReferenceHealthSnapshot & value)
@@ -7124,6 +7143,7 @@ private:
         }
       }
       countAnchorWrite();
+      prepareCarryWindow();
 
       /*** Recovery trust (stationary_anchor_policy.hpp, on with
        *   reanchor_total_timeout_sec > 0). A degraded scan held on a usable

@@ -16,6 +16,7 @@ namespace
 constexpr std::int64_t kMs = 1000000;
 constexpr std::int64_t kScanNs = 100 * kMs;
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+constexpr std::int64_t kLateDeadline = std::numeric_limits<std::int64_t>::max();
 
 struct Facts
 {
@@ -25,7 +26,7 @@ struct Facts
   double residual = 0.03;
 };
 
-Facts engulfed(std::int64_t deadlineNs = -1)
+Facts engulfed(std::int64_t deadlineNs = kLateDeadline)
 {
   return {true, true, false, fast_lio::RecoveryTrust::kPending, deadlineNs};
 }
@@ -40,10 +41,13 @@ public:
   double climb = 0.0;      // FE vertical speed, m/s
   double legs = 1.0;       // reported leg speed; NaN is "cannot measure"
   bool imu = true;
+  std::uint64_t prepareShift = 0;  // nonzero prepares another scan sequence than the final one
   std::int64_t stableNs = 1000 * kMs;
+  int gapNegatives = 0;
   fast_lio::ConstrainedCarry carry;
   std::deque<fast_lio::CarryWheelSample> wheel;
 
+  // As the node: the IMU and the window before the #273 step, a new structural gap reported once as a negative.
   fast_lio::CarryVerdict scan(const Facts & facts = {}, std::uint64_t skip = 0)
   {
     const std::int64_t begin = end_;
@@ -56,6 +60,10 @@ public:
     z_ += climb * 0.1;
     yaw_ += yawRate * 0.1;
     sequence_ += 1 + skip;
+    if (carry.prepareScanWindow(sequence_ + prepareShift, end_, 1, facts.trust).newGap) {
+      carry.negative(fast_lio::kReferenceImuCoverage, 0);
+      ++gapNegatives;
+    }
     fast_lio::CarryScan in;
     in.sequence = sequence_;
     in.beginNs = begin;
@@ -104,7 +112,7 @@ TEST(ConstrainedCarry, PureEngulfOnTwentySampleOriginCertifiesPendingAndItsRawCl
   const auto rawStart = drive.end();
 
   // Released but #273 still Pending: the same origin may vouch, without a raw-degraded odometry claim.
-  const auto tail = drive.scan({false, false, false, fast_lio::RecoveryTrust::kPending});
+  const auto tail = drive.scan({false, false, false, fast_lio::RecoveryTrust::kPending, kLateDeadline});
   EXPECT_TRUE(tail.permitted);
   EXPECT_FALSE(tail.constrained);
   EXPECT_EQ(drive.carry.rawStartNs(), rawStart);
@@ -198,6 +206,8 @@ TEST(ConstrainedCarry, CertificateStopsAtRawBudgetAndRecoveryDeadline)
   const auto deadline = pending.end() + kScanNs + 50 * kMs;
   EXPECT_EQ(pending.scan(engulfed(deadline)).validUntilNs, deadline - 1);
   EXPECT_FALSE(pending.scan(engulfed(pending.end() + kScanNs)).permitted);  // deadline at the scan end: expired
+  EXPECT_FALSE(pending.scan(engulfed(-1)).permitted);                       // a Pending without its deadline
+  EXPECT_TRUE(pending.scan(engulfed()).permitted);
 }
 
 TEST(ConstrainedCarry, StaticHoldNeitherCertifiesNorRestartsTheRawBudget)
@@ -288,15 +298,67 @@ TEST(ConstrainedCarry, KinematicAndMeasurementGatesReject)
   loose.residual = 0.061;  // above min(.10, 2 * max(frozen .03, .03))
   EXPECT_FALSE(certified([](Drive &) {}, loose));
 
+  // A scan without gyro is one structural gap: one negative, a taint that outlives the window, and only a qualified
+  // event after it, or a 20-scan stable run after it, rearms.
   Drive gap;
   gap.origin();
-  gap.scan(engulfed());
-  gap.imu = false;
-  gap.scan(engulfed());
-  gap.imu = true;
-  for (int i = 0; i < 2; ++i)
-    EXPECT_FALSE(gap.scan(engulfed()).permitted);  // a window holding the missing 100 ms of gyro
   EXPECT_TRUE(gap.scan(engulfed()).permitted);
+  gap.carry.qualified();  // a receipt before the gap does not count
+  gap.imu = false;
+  EXPECT_FALSE(gap.scan(engulfed()).permitted);
+  gap.imu = true;
+  for (int i = 0; i < 6; ++i)
+    EXPECT_FALSE(gap.scan(engulfed()).permitted);  // the window rolled past the gap
+  EXPECT_EQ(gap.gapNegatives, 1);
+  EXPECT_EQ(gap.carry.taint(), fast_lio::kReferenceImuCoverage);
+  EXPECT_FALSE(gap.scan().rearmed);
+  gap.carry.qualified();
+  EXPECT_TRUE(gap.scan().rearmed);
+
+  Drive local;
+  local.origin();
+  local.imu = false;
+  local.scan();
+  local.imu = true;
+  for (int i = 0; i < 21; ++i)
+    EXPECT_FALSE(local.scan().rearmed);  // two more windows hold the gap; 19 covered scans are not 20
+  EXPECT_TRUE(local.scan().rearmed);
+  EXPECT_EQ(local.gapNegatives, 1);
+
+  // The window a scan was prepared with certifies that scan only.
+  Drive other;
+  other.origin();
+  other.prepareShift = 1;
+  EXPECT_FALSE(other.scan(engulfed()).permitted);
+  other.prepareShift = 0;
+  EXPECT_TRUE(other.scan(engulfed()).permitted);
+}
+
+TEST(ConstrainedCarry, ImuCoverageHoldsEachRealSampleAtMostFiftyMilliseconds)
+{
+  const std::int64_t start = 1000 * kMs;
+  const std::int64_t end = start + 100 * kMs;
+  std::int64_t left = -1;
+  std::deque<fast_lio::CarryImu> imu;
+  EXPECT_EQ(fast_lio::carryImuCoverage(imu, start, end, left), fast_lio::CarryImuCoverage::kInsufficientHistory);
+  imu = {{start + 1}, {start + 50 * kMs}};  // no sample at or before the start: start-up, not a gap
+  EXPECT_EQ(fast_lio::carryImuCoverage(imu, start, end, left), fast_lio::CarryImuCoverage::kInsufficientHistory);
+  imu = {{start}, {start + 50 * kMs}};
+  EXPECT_EQ(fast_lio::carryImuCoverage(imu, start, end, left), fast_lio::CarryImuCoverage::kCovered);
+  imu.back().ns += 1;
+  EXPECT_EQ(fast_lio::carryImuCoverage(imu, start, end, left), fast_lio::CarryImuCoverage::kStructuralGap);
+  EXPECT_EQ(left, start);
+  imu = {{start}, {start + 50 * kMs - 1}};  // the end is 50 ms + 1 ns past the last sample
+  EXPECT_EQ(fast_lio::carryImuCoverage(imu, start, end, left), fast_lio::CarryImuCoverage::kStructuralGap);
+  EXPECT_EQ(left, start + 50 * kMs - 1);
+
+  // A fresh end does not hide a 60 ms hole inside the window.
+  imu.clear();
+  for (std::int64_t t = start; t < end; t += 5 * kMs)
+    if (t <= start + 20 * kMs || t >= start + 80 * kMs)
+      imu.push_back({t});
+  EXPECT_EQ(fast_lio::carryImuCoverage(imu, start, end, left), fast_lio::CarryImuCoverage::kStructuralGap);
+  EXPECT_EQ(left, start + 20 * kMs);
 }
 
 TEST(ConstrainedCarry, TaintInsideAPendingEpisodeIsNeverWashedOut)

@@ -240,7 +240,8 @@ projectReferenceHealth(ReferenceHealthSnapshot value, const RecoveryState & reco
 
 // The RW block of an RW-enabled snapshot. Bit 4 is a qualified origin on an untainted reference; bit 5 is the
 // strict carry permission of one scan, bounded by the scan lease, the raw budget, the recovery deadline and, for
-// the fallback, its two leg witnesses. Without bit 5 no certificate field is set.
+// the fallback, its two leg witnesses. A Pending carry needs that deadline known and strictly after it. Without
+// bit 5 no certificate field is set.
 inline bool referenceCarryValid(const ReferenceHealthSnapshot & value)
 {
   const bool origin = (value.trueMask & 16u) != 0;
@@ -266,7 +267,8 @@ inline bool referenceCarryValid(const ReferenceHealthSnapshot & value)
          (value.rawRegistrationDegraded || value.trust == 2) && (value.legacyFlags & 6u) == 0 &&
          value.rawStartNs <= value.scanEndNs && until >= value.scanEndNs && until <= referenceUntil(value.scanEndNs) &&
          until <= referenceAdd(value.rawStartNs, kCarryRawBudgetNs) &&
-         (value.trust != 2 || !value.hasOriginalDeadline || until < value.originalDeadlineNs);
+         (value.trust != 2 ||
+          (value.hasOriginalDeadline && value.originalDeadlineNs >= 0 && until < value.originalDeadlineNs));
 }
 
 inline bool referenceHealthEncodingValid(const ReferenceHealthSnapshot & value)

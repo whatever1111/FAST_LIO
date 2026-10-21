@@ -293,6 +293,7 @@ struct ChildResult
   std::vector<PosePublication> pose_publications;
   std::vector<geometry_msgs::msg::TransformStamped> transforms;
   std::uint64_t reference_publishers_before = 0, reference_publishers_after = 0;
+  std::vector<std::int64_t> imu_skipped_ns;  // grid IMU samples a step's hole kept from the node, in order
 
   bool ok() const { return WIFEXITED(status) && WEXITSTATUS(status) == 0 && error.empty(); }
   std::string describe() const
@@ -716,6 +717,10 @@ public:
       writeString(fd, bytes);
     writeAll(fd, &reference_publishers_before_, sizeof(reference_publishers_before_));
     writeAll(fd, &reference_publishers_after_, sizeof(reference_publishers_after_));
+    const auto skipped = static_cast<std::uint32_t>(imu_skipped_ns_.size());
+    writeAll(fd, &skipped, sizeof(skipped));
+    if (skipped > 0)
+      writeAll(fd, imu_skipped_ns_.data(), sizeof(std::int64_t) * skipped);
   }
 
 private:
@@ -944,8 +949,10 @@ private:
     const Imu pattern = imuForScan(scan);
     if (pattern == Imu::kGap && t > scanEnd(scan - 1) + kGapMargin && t < scanEnd(scan) - kGapMargin)
       return;
-    if (inImuHole(t))
+    if (inImuHole(t)) {
+      imu_skipped_ns_.push_back(stamp_ns);
       return;
+    }
     double yaw_rate = pattern == Imu::kMoving ? kMovingYawRate : 0.0;
     if (bad_imu_scan_ == scan && t > scanEnd(scan) - 0.004 && t <= scanEnd(scan))
       yaw_rate = std::numeric_limits<double>::quiet_NaN();
@@ -1442,6 +1449,7 @@ private:
   std::vector<std::string> tf_cdr_;
   std::set<std::int64_t> tf_stamps_;
   std::uint64_t reference_publishers_before_ = 0, reference_publishers_after_ = 0;
+  std::vector<std::int64_t> imu_skipped_ns_;
   std::uint64_t last_reference_state_ = 0;
   std::set<std::uint64_t> repeated_reference_states_;
   std::set<std::uint64_t> reference_scans_;
@@ -1674,8 +1682,18 @@ ChildResult runScenario(const Scenario & scenario)
     result.transforms.push_back(std::move(message));
   }
   if (!reader.take(&result.reference_publishers_before, sizeof(result.reference_publishers_before)) ||
-      !reader.take(&result.reference_publishers_after, sizeof(result.reference_publishers_after)))
+      !reader.take(&result.reference_publishers_after, sizeof(result.reference_publishers_after))) {
     result.error = "child publisher graph counts truncated";
+    return result;
+  }
+  std::uint32_t skipped = 0;
+  if (!reader.take(&skipped, sizeof(skipped))) {
+    result.error = "child skipped IMU count truncated";
+    return result;
+  }
+  result.imu_skipped_ns.resize(skipped);
+  if (skipped > 0 && !reader.take(result.imu_skipped_ns.data(), sizeof(std::int64_t) * skipped))
+    result.error = "child skipped IMU stamps truncated";
   return result;
 }
 
@@ -5875,8 +5893,9 @@ void expectCompleteClosedArm(const ChildResult & result, const char * arm)
 
 constexpr int kCarryOriginScans = 45;    // a 20-scan legal recovery from the start-up taint, then a 20-sample origin
 constexpr int kCarryEngulfScans = 6;     // the engulfment latch closes on the second
-constexpr int kCarryRecoveryScans = 26;  // the release takes 5 scans, the legal recovery 20 more
+constexpr int kCarryRecoveryScans = 26;  // the release takes 5 scans, the #273 qualification 1 s more
 constexpr int kCarryHoleScans = 3;       // 0.35 s after the last evidence: past zupt_anchor_max_scan_gap_s
+constexpr std::int64_t kCarryPendingNs = 10000000000;  // reanchor_total_timeout_sec of the carry runs
 
 // The guard's own verdict, and legs that report standstill just before every scan end.
 Step carrySlot(Phase phase, Cloud cloud = Cloud::kDense)
@@ -5887,31 +5906,56 @@ Step carrySlot(Phase phase, Cloud cloud = Cloud::kDense)
   return s;
 }
 
-// Healthy dense scans, then a far field that collapses for kCarryEngulfScans scans and comes back. `hole` drops
-// kCarryHoleScans scans in the middle of the engulfment: a scan-hole taint.
-Scenario nearFieldCarry(bool hole)
+enum class CarryRun
 {
-  Scenario s = withReference(inputScenario(hole ? "near_field_carry_hole" : "near_field_carry"));
+  kClean,
+  kScanHole,  // kCarryHoleScans scans dropped in the middle of the engulfment: a scan-hole taint
+  kImuGap,    // 60 ms of IMU missing inside the fourth engulfed scan: an RW structural gap
+};
+
+// Healthy dense scans, then a far field that collapses for kCarryEngulfScans scans and comes back, under the #273
+// policy: the engulfment is a Pending episode, recovered by its real qualification.
+Scenario nearFieldCarry(CarryRun run)
+{
+  Scenario s = withReference(inputScenario(run == CarryRun::kScanHole ? "near_field_carry_hole"
+                                           : run == CarryRun::kImuGap ? "near_field_carry_imu_gap"
+                                                                      : "near_field_carry"));
+  setPolicy(s, 10.0, 1.0);
   setParam(s, rclcpp::Parameter("guard_engulf_carry_en", true));
   setParam(s, rclcpp::Parameter("zupt_en", false));  // a StaticHold certifies no carry
   setParam(s, rclcpp::Parameter("wheel_topic", kWheelTopic));
+  if (run == CarryRun::kImuGap) {
+    // Only the RW window sees the gap: the generic coverage gate and levelling stay off.
+    setParam(s, rclcpp::Parameter("imu_coverage.max_gap_s", 0.0));
+    setParam(s, rclcpp::Parameter("gravity_align_en", false));
+  }
   append(s, kCarryOriginScans, carrySlot(Phase::kBefore));
   append(s, kCarryEngulfScans / 2, carrySlot(Phase::kEvent, Cloud::kNearMix));
-  if (hole)
+  if (run == CarryRun::kScanHole)
     append(s, kCarryHoleScans, carrySlot(Phase::kEvent, Cloud::kNone));
-  append(s, kCarryEngulfScans - kCarryEngulfScans / 2, carrySlot(Phase::kEvent, Cloud::kNearMix));
+  Step fourth = carrySlot(Phase::kEvent, Cloud::kNearMix);
+  if (run == CarryRun::kImuGap) {
+    // Between grid samples (5 ms, 2.5 ms off the scan ends): end - 82.5 ms and end - 22.5 ms stay, 11 go.
+    fourth.hole_from = -0.081;
+    fourth.hole_to = -0.024;
+  }
+  s.steps.push_back(fourth);
+  append(s, kCarryEngulfScans - kCarryEngulfScans / 2 - 1, carrySlot(Phase::kEvent, Cloud::kNearMix));
   append(s, kCarryRecoveryScans, carrySlot(Phase::kAfter));
   return s;
 }
 
-// Checks every scan of a carry run and returns the snapshots of the scans that carried. The odometry's bit 4 and
-// cells 6/8/9, the typed RW block and the trace of one scan say the same; a carry stands on a qualified, untainted
-// origin; the run starts with that origin and ends legally recovered with one more rearm and the origin back.
+// Checks every scan of a carry run and returns the snapshots of the scans that carried. The odometry's low four bits,
+// bits 4/5 and cells 6/8/9, the typed RW block and the trace of one scan say the same; a carry stands on a qualified,
+// untainted origin of one raw episode and, while Pending, inside its known recovery deadline. The run starts
+// Established and LocalQualified with that origin and ends recovered by exactly one real qualification and one
+// rearm, the origin back.
 std::vector<const fast_lio_interfaces::msg::ReferenceHealth *> expectCarryRun(const ChildResult & result)
 {
   std::vector<const fast_lio_interfaces::msg::ReferenceHealth *> carried;
   const fast_lio_interfaces::msg::ReferenceHealth * before = nullptr;
   const fast_lio_interfaces::msg::ReferenceHealth * last = nullptr;
+  const fast_lio_interfaces::msg::ReferenceHealth * pending = nullptr;
   for (const auto & o : result.observations) {
     const auto * value = referenceFor(result, o.record.scan_seq);
     if (value == nullptr) {
@@ -5928,7 +5972,7 @@ std::vector<const fast_lio_interfaces::msg::ReferenceHealth *> expectCarryRun(co
     const bool carry = (value->true_mask & 32u) != 0;
     const bool constrained = (flags & 16u) != 0;
     EXPECT_EQ(constrained, carry && value->raw_registration_degraded) << "step " << o.step;
-    EXPECT_EQ(flags & 32u, 0u) << "step " << o.step;
+    EXPECT_EQ((flags & 32u) != 0, value->hard_mask != 0) << "step " << o.step;
     EXPECT_EQ(o.odom_twist_cov[9], 3.0) << "step " << o.step;
     EXPECT_EQ(o.odom_twist_cov[6], constrained ? fast_lio::carryCellSeconds(value->rw_valid_until_ns) : 0.0)
       << "step " << o.step;
@@ -5941,19 +5985,73 @@ std::vector<const fast_lio_interfaces::msg::ReferenceHealth *> expectCarryRun(co
     EXPECT_TRUE(value->has_rw_origin && value->has_raw_episode && value->has_raw_start && value->has_frozen_residual)
       << "step " << o.step;
     EXPECT_EQ(value->taint_mask | value->hard_mask, 0u) << "step " << o.step;
+    if (!carried.empty()) {
+      EXPECT_EQ(value->raw_episode_id, carried.front()->raw_episode_id) << "step " << o.step;
+      EXPECT_EQ(value->raw_start_ns, carried.front()->raw_start_ns) << "step " << o.step;
+      EXPECT_EQ(value->reference_generation, carried.front()->reference_generation) << "step " << o.step;
+    }
+    if (value->trust == 2) {
+      EXPECT_TRUE(value->has_original_start && value->has_original_deadline) << "step " << o.step;
+      EXPECT_EQ(value->original_deadline_ns - value->original_start_ns, kCarryPendingNs) << "step " << o.step;
+      EXPECT_LT(value->rw_valid_until_ns, value->original_deadline_ns) << "step " << o.step;
+      if (pending != nullptr) {
+        EXPECT_EQ(value->recovery_episode, pending->recovery_episode) << "step " << o.step;
+        EXPECT_EQ(value->original_start_ns, pending->original_start_ns) << "step " << o.step;
+        EXPECT_EQ(value->original_deadline_ns, pending->original_deadline_ns) << "step " << o.step;
+      }
+      pending = value;
+    }
     carried.push_back(value);
   }
   if (before == nullptr || last == nullptr) {
     ADD_FAILURE() << "the run has no scan before the engulfment";
     return carried;
   }
+  EXPECT_EQ(before->lifecycle, 2) << "not Established before the engulfment";
+  EXPECT_EQ(before->trust, 1) << "not LocalQualified before the engulfment";
   EXPECT_FALSE(before->has_raw_start);
   EXPECT_EQ(before->true_mask & 16u, 16u) << "no qualified origin before the engulfment";
+  for (const auto * value : carried)
+    EXPECT_EQ(value->qualified_event_sequence, before->qualified_event_sequence) << "scan " << value->scan_sequence;
   EXPECT_FALSE(last->has_raw_start) << "no legal recovery";
+  EXPECT_EQ(last->trust, 1);
   EXPECT_EQ(last->true_mask & 48u, 16u);
   EXPECT_EQ(last->taint_mask, 0u);
+  EXPECT_EQ(last->qualified_event_sequence, before->qualified_event_sequence + 1);
   EXPECT_EQ(last->withdrawal_rearm_event, before->withdrawal_rearm_event + 1);
   return carried;
+}
+
+// From `first` on, until the rearm: the taint `bit` and no origin or carry. The rearm comes with the one real
+// qualification. Returns the scans that were Pending in between.
+std::size_t expectLatchedUntilRearm(const ChildResult & result,
+                                    std::vector<Observation>::const_iterator first,
+                                    const fast_lio_interfaces::msg::ReferenceHealth & carried,
+                                    std::uint32_t bit)
+{
+  std::size_t pending = 0;
+  for (auto o = first; o != result.observations.end(); ++o) {
+    const auto * value = referenceFor(result, o->record.scan_seq);
+    if (value == nullptr) {
+      ADD_FAILURE() << "no reference for scan " << o->record.scan_seq;
+      return pending;
+    }
+    if (value->withdrawal_rearm_event != carried.withdrawal_rearm_event) {
+      EXPECT_EQ(value->withdrawal_rearm_event, carried.withdrawal_rearm_event + 1) << "step " << o->step;
+      EXPECT_EQ(value->qualified_event_sequence, carried.qualified_event_sequence + 1) << "step " << o->step;
+      EXPECT_EQ(value->taint_mask, 0u) << "step " << o->step;
+      return pending;
+    }
+    EXPECT_NE(value->taint_mask & bit, 0u) << "step " << o->step;
+    EXPECT_EQ(value->true_mask & 48u, 0u) << "step " << o->step;
+    if (value->trust == 2) {
+      ++pending;
+      EXPECT_EQ(value->recovery_episode, carried.recovery_episode) << "step " << o->step;
+      EXPECT_EQ(value->original_deadline_ns, carried.original_deadline_ns) << "step " << o->step;
+    }
+  }
+  ADD_FAILURE() << "no rearm after the latch";
+  return pending;
 }
 }  // namespace
 
@@ -6408,28 +6506,28 @@ TEST(AnchorLifecycleReference, EnablingRequiresTheExistingTypedIdentity)
 
 TEST(AnchorLifecycleReference, PureEngulfCarriesBoundedEvidenceOnOdometryTypedAndTrace)
 {
-  const auto result = runScenario(nearFieldCarry(false));
+  const auto result = runScenario(nearFieldCarry(CarryRun::kClean));
   ASSERT_TRUE(result.ok()) << result.describe();
   const auto carried = expectCarryRun(result);
   ASSERT_FALSE(carried.empty()) << describeRun(result);
-  // Every raw degraded scan of the engulfment carries, on the legs' current window and the scan's own lease.
-  std::size_t degraded = 0;
-  for (const auto & value : result.references)
-    degraded += value.kind == 1 && value.raw_registration_degraded ? 1u : 0u;
-  EXPECT_EQ(carried.size(), degraded);
+  // Pending carries the raw degraded scans and, released but not yet qualified, the raw-clear tail: R1 bit 5 without
+  // odometry bit 4 or cell 6. Each on the legs' current window and the scan's own lease.
+  std::size_t degraded = 0, tail = 0;
   for (const auto * value : carried) {
-    EXPECT_TRUE(value->raw_registration_degraded);
+    if (value->trust == 2)
+      ++(value->raw_registration_degraded ? degraded : tail);
     EXPECT_EQ(value->wheel_witness_kind, 1);
     EXPECT_FALSE(value->has_wheel_witness_epochs);
     EXPECT_EQ(value->rw_valid_until_ns, value->scan_end_ns + 200000000);
     EXPECT_EQ(value->raw_start_ns, carried.front()->scan_end_ns);
-    EXPECT_EQ(value->raw_episode_id, carried.front()->raw_episode_id);
   }
+  EXPECT_GT(degraded, 0u) << describeRun(result);
+  EXPECT_GT(tail, 0u) << describeRun(result);
 }
 
 TEST(AnchorLifecycleReference, ScanHoleInsideEngulfLatchesCarryUntilTheLegalRecovery)
 {
-  const auto result = runScenario(nearFieldCarry(true));
+  const auto result = runScenario(nearFieldCarry(CarryRun::kScanHole));
   ASSERT_TRUE(result.ok()) << result.describe();
   const auto carried = expectCarryRun(result);
   ASSERT_FALSE(carried.empty()) << describeRun(result);
@@ -6439,16 +6537,41 @@ TEST(AnchorLifecycleReference, ScanHoleInsideEngulfLatchesCarryUntilTheLegalReco
   ASSERT_NE(hole, result.observations.end()) << describeRun(result);
   for (const auto * value : carried)
     EXPECT_LT(value->scan_sequence, hole->record.scan_seq);
-  // Engulfed scans after the hole, whose windows the positive run certifies, stay latched until the legal recovery.
+  EXPECT_EQ(carried.back()->trust, 2) << "not Pending before the hole";
+  // The engulfed scans after the hole stay latched in the same episode and deadline until the qualified rearm.
   std::size_t latched = 0;
   for (auto o = hole; o != result.observations.end(); ++o) {
     const auto * value = referenceFor(result, o->record.scan_seq);
-    ASSERT_NE(value, nullptr);
-    if (!value->has_raw_start)
-      break;  // the legal recovery
-    EXPECT_NE(value->taint_mask & 4u, 0u) << "step " << o->step;
-    EXPECT_EQ(value->true_mask & 48u, 0u) << "step " << o->step;
-    latched += value->raw_registration_degraded ? 1u : 0u;
+    if (value != nullptr && value->withdrawal_rearm_event == carried.back()->withdrawal_rearm_event)
+      latched += value->raw_registration_degraded ? 1u : 0u;
   }
+  EXPECT_GT(expectLatchedUntilRearm(result, hole, *carried.back(), fast_lio::kReferenceScanHole), 0u);
   EXPECT_GE(latched, 4u);
+}
+
+TEST(AnchorLifecycleReference, RwImuGapTaintsTheCarryUntilTheLegalRecovery)
+{
+  const auto result = runScenario(nearFieldCarry(CarryRun::kImuGap));
+  ASSERT_TRUE(result.ok()) << result.describe();
+  // The fixture kept back exactly 11 consecutive grid samples: the samples around them are 60 ms apart.
+  ASSERT_EQ(result.imu_skipped_ns.size(), 11u);
+  for (std::size_t i = 1; i < result.imu_skipped_ns.size(); ++i)
+    EXPECT_EQ(result.imu_skipped_ns[i] - result.imu_skipped_ns[i - 1], kImuPeriodNs);
+  EXPECT_EQ(result.imu_skipped_ns.back() - result.imu_skipped_ns.front() + 2 * kImuPeriodNs, 60000000);
+  const auto carried = expectCarryRun(result);
+  ASSERT_FALSE(carried.empty()) << describeRun(result);
+  constexpr int kGapStep = kCarryOriginScans + kCarryEngulfScans / 2;
+  const auto gap = std::find_if(
+    result.observations.begin(), result.observations.end(), [](const auto & o) { return o.step == kGapStep; });
+  ASSERT_NE(gap, result.observations.end()) << describeRun(result);
+  EXPECT_LT(result.imu_skipped_ns.back(), gap->record.end_ns);
+  const auto * first = referenceFor(result, gap->record.scan_seq);
+  ASSERT_NE(first, nullptr);
+  ASSERT_TRUE(first->has_pose_binding) << "the gap's scan was not published";
+  EXPECT_NE(first->cause_mask & fast_lio::kReferenceImuCoverage, 0u);
+  for (const auto * value : carried)
+    EXPECT_LT(value->scan_sequence, gap->record.scan_seq);
+  EXPECT_EQ(carried.back()->trust, 2) << "not Pending before the gap";
+  // Still Pending and uncertified after the window rolled past the gap, three scans on.
+  EXPECT_GT(expectLatchedUntilRearm(result, gap, *carried.back(), fast_lio::kReferenceImuCoverage), 3u);
 }

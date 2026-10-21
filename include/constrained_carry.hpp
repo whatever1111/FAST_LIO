@@ -150,6 +150,44 @@ struct CarryImu
   Eigen::Vector3d gyro = Eigen::Vector3d::Zero();  // rad/s, IMU (= FE body) frame
 };
 
+// Time coverage of an FE window by real IMU samples, each held until the next one.
+enum class CarryImuCoverage : std::uint8_t
+{
+  kInsufficientHistory,  // no usable FE endpoint, or no real sample at or before the window start
+  kCovered,              // the sample in force at every instant is at most kCarryImuGapNs old
+  kStructuralGap,        // a real sample held longer than kCarryImuGapNs inside the window
+};
+
+// `gapLeftNs` receives the epoch of the newest sample that starts a gap.
+inline CarryImuCoverage
+carryImuCoverage(const std::deque<CarryImu> & imu, std::int64_t startNs, std::int64_t endNs, std::int64_t & gapLeftNs)
+{
+  auto it = std::upper_bound(
+    imu.begin(), imu.end(), startNs, [](std::int64_t stamp, const CarryImu & sample) { return stamp < sample.ns; });
+  if (it == imu.begin())
+    return CarryImuCoverage::kInsufficientHistory;
+  --it;
+  bool gap = false;
+  while (true) {
+    const auto next = std::next(it);
+    const std::int64_t until = next != imu.end() && next->ns < endNs ? next->ns : endNs;
+    if (until - it->ns > kCarryImuGapNs) {
+      gap = true;
+      gapLeftNs = it->ns;
+    }
+    if (until == endNs)
+      break;
+    it = next;
+  }
+  return gap ? CarryImuCoverage::kStructuralGap : CarryImuCoverage::kCovered;
+}
+
+struct CarryPrepared
+{
+  CarryImuCoverage coverage = CarryImuCoverage::kInsufficientHistory;
+  bool newGap = false;  // a structural gap not reported before; the caller reports it once, as kReferenceImuCoverage
+};
+
 // Body rotation over [startNs, endNs] from bias-corrected gyro samples, each held until the next one. The sample in
 // force at every instant, the window's start and end included, must be no older than kCarryImuGapNs.
 inline bool carryGyroRotation(const std::deque<CarryImu> & imu,
@@ -258,9 +296,53 @@ public:
       imu_.pop_front();
   }
 
+  // Before the scan's #273 step, with its IMU noted: the FE window on the finalized pose history (the newest pose no
+  // later than end - 0.3 s, at most 0.45 s back, no FE gap over 0.2 s up to `endNs`) and its IMU coverage. `trust` is
+  // the #273 trust before the step. Each structural gap is new once, by its left sample.
+  CarryPrepared
+  prepareScanWindow(std::uint64_t sequence, std::int64_t endNs, std::uint64_t generation, RecoveryTrust trust)
+  {
+    window_ = Window{};
+    window_.prepared = true;
+    window_.sequence = sequence;
+    window_.endNs = endNs;
+    window_.generation = generation;
+    window_.pending = trust == RecoveryTrust::kPending;
+    CarryPrepared out;
+    if (generation != generation_)
+      return out;
+    std::int64_t later = endNs;
+    for (auto it = poses_.rbegin(); it != poses_.rend(); ++it) {
+      if (later - it->ns > kCarryPoseGapNs)
+        return out;
+      if (it->ns <= endNs - kCarryWindowNs) {
+        if (endNs - it->ns > kCarryWindowMaxNs)
+          return out;
+        window_.hasStart = true;
+        window_.start = *it;
+        break;
+      }
+      later = it->ns;
+    }
+    if (!window_.hasStart)
+      return out;
+    std::int64_t gapLeft = 0;
+    out.coverage = window_.coverage = carryImuCoverage(imu_, window_.start.ns, endNs, gapLeft);
+    if (out.coverage == CarryImuCoverage::kStructuralGap && gapLeft > reportedGapNs_) {
+      reportedGapNs_ = gapLeft;
+      out.newGap = true;
+    }
+    return out;
+  }
+
   // Once per completed scan, after its negatives and the #273 step. `stableNs` is reanchor_recovery_stable_sec.
   CarryVerdict scan(const CarryScan & in, const std::deque<CarryWheelSample> & wheel, std::int64_t stableNs)
   {
+    const Window window = window_.prepared && window_.sequence == in.sequence && window_.endNs == in.endNs &&
+                              window_.generation == in.generation
+                            ? window_
+                            : Window{};
+    window_ = Window{};
     if (in.generation != generation_) {
       generation_ = in.generation;
       origin_.clear();
@@ -275,7 +357,7 @@ public:
       poses_.pop_front();
     const bool measured = in.iterations > 0 && in.effective > 0 && std::isfinite(in.residual) && in.residual >= 0.0;
     const bool trusted = in.established && in.trust == RecoveryTrust::kLocalQualified && !in.degraded && !in.lost &&
-                         !scanNegative_ && measured;
+                         !scanNegative_ && measured && window.coverage != CarryImuCoverage::kStructuralGap;
     scanNegative_ = false;
     if (trusted && trustedRun_ > 0 && in.sequence == lastSequence_ + 1) {
       ++trustedRun_;
@@ -302,7 +384,9 @@ public:
     }
 
     CarryVerdict verdict;
-    if (unresolved() && in.trust == RecoveryTrust::kPending)
+    // A scan that was Pending before its #273 step stays on the qualified route even if a negative of the same scan
+    // reset the flag and the step then qualified.
+    if (unresolved() && (in.trust == RecoveryTrust::kPending || window.pending))
       pendingSeen_ = true;
     if (unresolved() && (hard_ & kCarryPermanentHard) == 0 &&
         (pendingSeen_ ? qualifiedSince_ && trusted
@@ -327,29 +411,21 @@ public:
     if (!measured || in.effective < kCarryMinEffective || in.residual > bound)
       return verdict;
 
-    // FE window: the newest pose no later than end - 0.3 s, through this scan, without interpolation.
-    auto start = poses_.rend();
-    for (auto it = poses_.rbegin(); it != poses_.rend(); ++it) {
-      if (it != poses_.rbegin() && std::prev(it)->ns - it->ns > kCarryPoseGapNs)
-        return verdict;
-      if (it->ns <= in.endNs - kCarryWindowNs) {
-        start = it;
-        break;
-      }
-    }
-    if (start == poses_.rend() || in.endNs - start->ns > kCarryWindowMaxNs)
+    // The window prepared for this very scan, without interpolation.
+    if (!window.hasStart || window.coverage != CarryImuCoverage::kCovered)
       return verdict;
-    const double span = static_cast<double>(in.endNs - start->ns) * 1e-9;
+    const Pose & start = window.start;
+    const double span = static_cast<double>(in.endNs - start.ns) * 1e-9;
     const Eigen::Vector3d up = in.up.normalized();
-    const Eigen::Vector3d moved = in.base - start->base;
+    const Eigen::Vector3d moved = in.base - start.base;
     const double vertical = moved.dot(up) / span;
     const double horizontal = (moved - moved.dot(up) * up).norm() / span;
     if (!std::isfinite(horizontal) || !(std::abs(vertical) <= kCarryMaxVerticalSpeed))
       return verdict;
     Eigen::Quaterniond gyro;
-    if (!carryGyroRotation(imu_, start->ns, in.endNs, in.gyroBias, gyro))
+    if (!carryGyroRotation(imu_, start.ns, in.endNs, in.gyroBias, gyro))
       return verdict;
-    const Eigen::Quaterniond startRotation(start->rotation);
+    const Eigen::Quaterniond startRotation(start.rotation);
     const Eigen::Vector3d axis = startRotation.conjugate() * up;
     const double feTwist = carryTwistAngle(startRotation.conjugate() * in.rotation, axis);
     const double gyroTwist = carryTwistAngle(gyro, axis);
@@ -357,13 +433,16 @@ public:
     if (!(std::abs(gap) / span <= kCarryMaxTwistRateDeg * M_PI / 180.0))
       return verdict;
 
-    const auto legs = carryWheelEvidence(wheel, start->ns, in.endNs, horizontal);
+    const auto legs = carryWheelEvidence(wheel, start.ns, in.endNs, horizontal);
     if (!legs.supported)
       return verdict;
     std::int64_t until =
       std::min({referenceUntil(in.endNs), legs.untilNs, referenceAdd(rawStartNs_, kCarryRawBudgetNs)});
-    if (in.trust == RecoveryTrust::kPending && in.deadlineNs >= 0)
+    if (in.trust == RecoveryTrust::kPending) {
+      if (in.deadlineNs < 0 || in.deadlineNs <= in.endNs)
+        return verdict;  // a Pending carry needs its recovery deadline, still ahead
       until = std::min(until, in.deadlineNs - 1);
+    }
     if (until < in.endNs)
       return verdict;
     verdict.permitted = true;
@@ -403,10 +482,22 @@ private:
     Eigen::Vector3d base = Eigen::Vector3d::Zero();
     Eigen::Matrix3d rotation = Eigen::Matrix3d::Identity();
   };
+  struct Window
+  {
+    bool prepared = false;
+    std::uint64_t sequence = 0, generation = 0;
+    std::int64_t endNs = 0;
+    bool pending = false;  // #273 Pending before the scan's step
+    bool hasStart = false;
+    Pose start;
+    CarryImuCoverage coverage = CarryImuCoverage::kInsufficientHistory;
+  };
 
   HealthyScanWindow origin_{kCarryOriginCapacity, kCarryOriginMinimum};
   std::deque<Pose> poses_;
   std::deque<CarryImu> imu_;
+  Window window_;
+  std::int64_t reportedGapNs_ = std::numeric_limits<std::int64_t>::min();
   std::uint64_t generation_ = 0, originScan_ = 0, rawEpisode_ = 0, rearm_ = 0, lastSequence_ = 0;
   std::uint32_t cause_ = 0, taint_ = 0, hard_ = 0;
   bool rawActive_ = false, scanNegative_ = false, qualifiedSince_ = false, pendingSeen_ = false;

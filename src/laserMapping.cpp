@@ -2968,7 +2968,6 @@ bool rebuildLocalMapStorage(int & map_before)
     ikdtree.Build(feats_down_world->points);
   }
   Localmap_Initialized = false;
-  fast_lio::resetReanchorGate(&reanchor_gate);
   return kept_prior;
 }
 
@@ -5384,7 +5383,7 @@ private:
   }
 
   // The production reset owner, shared verbatim by the late guards and the test-only scheduler.
-  void rebuildLocalMap(const char * tag)
+  bool rebuildLocalMap(const char * tag)
   {
     anchorEvidence(fast_lio::AnchorTraceReason::kMapReset,
                    fast_lio::kAnchorEventMapReset,
@@ -5402,6 +5401,21 @@ private:
     int map_before = 0;
     const bool kept_prior = rebuildLocalMapStorage(map_before);
     anchorTraceMapUpdated();
+    if (!fast_lio::mapBackendHoldsPoints(ikdtree)) {
+      fast_lio::tripReanchorLost(&reanchor_gate);
+      flio_degraded_odom = flio_map_frozen = true;
+      RCLCPP_ERROR(this->get_logger(),
+                   "[%s] reset completed with zero retained points; no usable local map: map %d -> %d pts "
+                   "at pos=[%.2f %.2f %.2f]",
+                   tag,
+                   map_before,
+                   ikdtree.size(),
+                   state_point.pos[0],
+                   state_point.pos[1],
+                   state_point.pos[2]);
+      return false;
+    }
+    fast_lio::resetReanchorGate(&reanchor_gate);
     if (kept_prior) {
       RCLCPP_ERROR(this->get_logger(),
                    "[%s] live map dropped and re-seeded from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: "
@@ -5426,6 +5440,7 @@ private:
                    map_before,
                    ikdtree.size());
     }
+    return true;
   }
 
   void timer_callback()
@@ -5908,6 +5923,10 @@ private:
               fast_lio::commitInitialReference(&recovery_state);
             anchorTraceMapUpdated();
           }
+        }
+        if (recovery_state.map_resets != 0 && !fast_lio::mapBackendHoldsPoints(ikdtree)) {
+          fast_lio::tripReanchorLost(&reanchor_gate);
+          flio_degraded_odom = flio_map_frozen = true;
         }
         return;
       }
@@ -6664,7 +6683,8 @@ private:
                      res_mean_last,
                      reanchor_on_fail.c_str());
         if (reanchor_on_fail == "reset_map") {
-          rebuildLocalMap("REANCHOR");
+          if (!rebuildLocalMap("REANCHOR"))
+            return;
         }
       }
       // Release the static hold.  The flag leaves this node as "the platform is
@@ -6982,7 +7002,8 @@ private:
             state_point = kf.get_x();
           }
           if (runaway_on_trip == "reset_map") {
-            rebuildLocalMap("RUNAWAY");
+            if (!rebuildLocalMap("RUNAWAY"))
+              return;
           } else if (runaway_on_trip == "fault_exit") {
             RCLCPP_FATAL(this->get_logger(),
                          "[RUNAWAY] exiting so the supervisor can restart the pipeline (runaway_on_trip=fault_exit)");

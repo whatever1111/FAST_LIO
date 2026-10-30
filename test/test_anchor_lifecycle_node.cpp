@@ -4916,7 +4916,12 @@ TEST(AnchorLifecycleRebuild, AResetWhoseRebuildTakesNoPointEndsTheAnchorOnce)
   ASSERT_TRUE(writePriorMap(priorMapPath()));
   for (const bool prior : {false, true}) {
     for (const bool policy : {false, true}) {
-      const Scenario scenario = resetRebuildsNoMap(prior, policy);
+      Scenario scenario = resetRebuildsNoMap(prior, policy);
+      scenario.capture_raw_state = scenario.capture_tf_graph = scenario.typed = true;
+      scenario.reference = true;
+      setParam(scenario, rclcpp::Parameter("publish.frontend_observation", true));
+      setParam(scenario, rclcpp::Parameter("publish.reference_health", true));
+      setParam(scenario, rclcpp::Parameter("publish.frontend_clock_domain", "fixture"));
       const ChildResult r = runScenario(scenario);
       SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
       ASSERT_TRUE(r.ok());
@@ -4935,9 +4940,18 @@ TEST(AnchorLifecycleRebuild, AResetWhoseRebuildTakesNoPointEndsTheAnchorOnce)
       EXPECT_EQ(rr.events & reset_events, reset_events);
       EXPECT_TRUE(rr.anchor_step && rr.usable) << "the anchor step ran on the valid anchor before the reset";
       EXPECT_TRUE(rr.map_updated) << "the rebuild was handed the scan's points";
-      EXPECT_TRUE(samePosition(rr.post_p, kBeyondTheMap)) << formatPosition(rr.post_p);
-      ASSERT_TRUE(rs.odom_seen);
-      EXPECT_TRUE(samePosition(rs.odom_p, kBeyondTheMap)) << formatPosition(rs.odom_p);
+      if (prior)
+        EXPECT_TRUE(samePosition(rr.post_p, kBeyondTheMap)) << formatPosition(rr.post_p);
+      ASSERT_EQ(rs.odom_seen, prior);
+      EXPECT_EQ(rr.published, prior);
+      EXPECT_EQ(rs.typed_seen, prior);
+      if (prior)
+        EXPECT_TRUE(samePosition(rs.odom_p, kBeyondTheMap)) << formatPosition(rs.odom_p);
+      else {
+        EXPECT_TRUE(rs.map_frozen && rs.raw_degraded);
+        for (const auto & transform : r.transforms)
+          EXPECT_NE(msKey(rclcpp::Time(transform.header.stamp).seconds()), msKey(rr.end_ns * 1e-9));
+      }
 
       // The reference moved on once, at the reset.
       EXPECT_EQ(rr.ref_gen, before.back()->record.ref_gen + 1);
@@ -4957,7 +4971,8 @@ TEST(AnchorLifecycleRebuild, AResetWhoseRebuildTakesNoPointEndsTheAnchorOnce)
       EXPECT_NE(rr.action, fast_lio::AnchorTraceAction::kPin);
       EXPECT_FALSE(rr.parked_applied);
       EXPECT_FALSE(rr.static_hold);
-      EXPECT_EQ(odomFlags(rs) & kFlagStaticHold, 0u);
+      if (prior)
+        EXPECT_EQ(odomFlags(rs) & kFlagStaticHold, 0u);
 
       const auto recovery = linesTagged(r, "[FE-RECOVERY]");
       if (policy) {
@@ -4966,7 +4981,8 @@ TEST(AnchorLifecycleRebuild, AResetWhoseRebuildTakesNoPointEndsTheAnchorOnce)
         EXPECT_EQ(valueOf(recovery.front(), "reason"), "map_reset") << recovery.front();
         EXPECT_EQ(valueOf(recovery.front(), "scan_seq"), std::to_string(rr.scan_seq)) << recovery.front();
         EXPECT_EQ(rr.trust_post, fast_lio::RecoveryTrust::kUnanchored);
-        EXPECT_EQ(odomFlags(rs), kFlagDegraded);
+        if (prior)
+          EXPECT_EQ(odomFlags(rs), kFlagDegraded);
         for (const auto * o : after) {
           EXPECT_EQ(o->record.trust_pre, fast_lio::RecoveryTrust::kUnanchored) << "step " << o->step;
           EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kUnanchored) << "step " << o->step;
@@ -4976,7 +4992,8 @@ TEST(AnchorLifecycleRebuild, AResetWhoseRebuildTakesNoPointEndsTheAnchorOnce)
       } else {
         EXPECT_TRUE(recovery.empty());
         EXPECT_EQ(rr.trust_post, fast_lio::RecoveryTrust::kLocalQualified);
-        EXPECT_EQ(odomFlags(rs), 0u);
+        if (prior)
+          EXPECT_EQ(odomFlags(rs), 0u);
         for (const auto * o : after)
           EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kLocalQualified) << "step " << o->step;
         EXPECT_EQ(counterValue(r, "map_reset_unanchored"), "0");
@@ -4991,6 +5008,8 @@ TEST(AnchorLifecycleRebuild, AResetWhoseRebuildTakesNoPointEndsTheAnchorOnce)
           EXPECT_TRUE(x.map_updated) << "step " << o->step << ": the empty map was not built again";
           EXPECT_FALSE(x.have_update) << "step " << o->step;
           EXPECT_FALSE(x.published) << "step " << o->step;
+          EXPECT_TRUE(o->map_frozen && o->raw_degraded);
+          EXPECT_NE(x.reference_health.legacyFlags & kFlagLost, 0u);
           EXPECT_EQ(x.anchor_state, fast_lio::AnchorState::kEmpty) << "step " << o->step;
           EXPECT_EQ(x.anchor_id, old_id) << "step " << o->step;
         }
@@ -5974,6 +5993,7 @@ TEST(AnchorLifecycleReference, FaultExitEndsTheScanWithAnIndependentDdsObserver)
     evidence.flush();
     EXPECT_TRUE(evidence.good());
     ASSERT_NE(trip.events & fast_lio::kAnchorEventRunawayTrip, 0u);
+    EXPECT_NE(trip.reference_health.hard & 8u, 0u);
     std::set<std::int64_t> legacy, typed;
     std::istringstream in(bytes);
     char encoding;
@@ -6076,7 +6096,9 @@ TEST(AnchorLifecycleReference, LateResetOverridesHealthyAndPreservesTheEstablish
   expectReferenceProjection(*event.front(), *value);
   EXPECT_EQ(value->startup_reference, 2);
   EXPECT_EQ(value->trust, 3);
-  EXPECT_EQ(value->local, 3);
+  EXPECT_EQ(value->local, 0);
+  EXPECT_FALSE(value->has_pose_binding);
+  EXPECT_NE(value->legacy_flags & kFlagLost, 0u);
   EXPECT_EQ(value->true_mask & 12u, 0u);
   EXPECT_NE(value->hard_mask & 4u, 0u);
   for (const auto * observation : result.phase(Phase::kAfter)) {
@@ -6085,6 +6107,8 @@ TEST(AnchorLifecycleReference, LateResetOverridesHealthyAndPreservesTheEstablish
     EXPECT_EQ(after->startup_reference, 2);
     EXPECT_EQ(after->trust, 3);
     EXPECT_FALSE(after->has_pose_binding);
+    EXPECT_NE(after->legacy_flags & kFlagLost, 0u);
+    EXPECT_EQ(after->hard_mask & 4u, 4u);
   }
 }
 

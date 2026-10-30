@@ -25,6 +25,18 @@
 namespace fast_lio
 {
 
+struct PriorMapReset
+{
+  bool installed_after;
+  bool required_prior_lost;
+};
+
+/// Only actual retention preserves installed identity. A freeze request cannot turn a replacement scan into a prior.
+inline PriorMapReset priorMapAfterReset(bool installed_before, bool kept_prior, bool freeze_requested)
+{
+  return {installed_before && kept_prior, installed_before && !kept_prior && freeze_requested};
+}
+
 /// A prior map centred this far from the origin is a global/UTM frame, not a local one.
 /// Field maps run to a few hundred metres; a UTM easting is ~10^5-10^6 m.
 inline constexpr double kPriorMapGlobalFrameDistM = 10000.0;

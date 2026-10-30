@@ -41,6 +41,8 @@ extern std::function<bool(double)> forceRunawayTrip;
 extern std::function<bool(double)> initialBuildTakesNoPoint;
 /// Schedule the production map-reset owner before the first reference is built.
 extern std::function<bool(double)> resetBeforeReference;
+/// Read-only reset receipt: installed before/after, required-prior latch, retained pinned voxels.
+extern std::function<void(bool, bool, bool, std::size_t)> afterPriorMapReset;
 /// Every scan record, whether or not zupt_anchor_trace_en prints it.
 extern std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 /// Every anchor trace line actually logged.

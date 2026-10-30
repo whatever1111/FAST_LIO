@@ -257,6 +257,11 @@ struct Observation
   bool raw_state_seen = false;
   bool map_frozen = false;
   bool raw_degraded = false;
+  bool prior_reset_seen = false;
+  bool prior_installed_before = false;
+  bool prior_installed_after = false;
+  bool required_prior_lost = false;
+  std::size_t retained_prior_voxels = 0;
 };
 static_assert(std::is_trivially_copyable<Observation>::value, "observations cross the pipe as bytes");
 
@@ -783,6 +788,11 @@ private:
       const Step * s = stepAt(end);
       return s != nullptr && s->reset_before_reference;
     };
+    fast_lio_test::afterPriorMapReset = [this](bool before, bool after, bool lost, std::size_t pinned) {
+      prior_reset_seen_ = true;
+      prior_reset_ = {before, after, lost};
+      retained_prior_voxels_ = pinned;
+    };
     // A scan's IMU batch is settled before its record is finished, so the record takes the batch reported since the
     // last record; a scan dropped where it is synced settles none. The hook runs with the input buffer unlocked.
     fast_lio_test::afterImuConsumption =
@@ -880,6 +890,7 @@ private:
     fast_lio_test::afterImuConsumption = {};
     fast_lio_test::afterPosePublish = {};
     fast_lio_test::resetBeforeReference = {};
+    fast_lio_test::afterPriorMapReset = {};
   }
 
   const Step * stepAt(double end) const
@@ -1059,6 +1070,11 @@ private:
     o.phase = index < 0 ? static_cast<int>(Phase::kWarmup)
                         : static_cast<int>(scenario_.steps[static_cast<std::size_t>(index)].phase);
     o.record = record;
+    o.prior_reset_seen = prior_reset_seen_;
+    o.prior_installed_before = prior_reset_[0];
+    o.prior_installed_after = prior_reset_[1];
+    o.required_prior_lost = prior_reset_[2];
+    o.retained_prior_voxels = retained_prior_voxels_;
     const auto raw = raw_by_seq_.find(record.scan_seq);
     if (raw != raw_by_seq_.end()) {
       o.raw_state_seen = true;
@@ -1466,6 +1482,9 @@ private:
   std::map<int, int> step_by_scan_;
   std::vector<fast_lio::AnchorScanRecord> records_;
   std::map<std::uint64_t, fast_lio_test::ImuInputSnapshot> raw_by_seq_;
+  bool prior_reset_seen_ = false;
+  std::array<bool, 3> prior_reset_{};
+  std::size_t retained_prior_voxels_ = 0;
   ImuBatch batch_;
   bool batch_pending_ = false;
   std::map<std::uint64_t, ImuBatch> batch_by_seq_;  // by scan_seq of the record that settled it
@@ -6013,6 +6032,78 @@ TEST(AnchorLifecycleReference, FaultExitEndsTheScanWithAnIndependentDdsObserver)
     if (policy == "fault_exit") {
       for (const auto & publication : result.pose_publications)
         EXPECT_NE(msKey(publication.stamp_ns * 1e-9), msKey(trip.end_ns * 1e-9));
+    }
+  }
+}
+
+TEST(AnchorLifecycleReference, LostRequiredPriorStopsLocalizationButRetainedAndOptionalPriorsDoNot)
+{
+  ASSERT_TRUE(writePriorMap(priorMapPath()));
+  // Two real callers, with policy disabled/enabled for the required unpinned prior; retained and optional controls.
+  for (int variant = 0; variant < 6; ++variant) {
+    const bool late = variant >= 2;
+    const bool pinned = variant == 4;
+    const bool freeze = variant != 5;
+    const bool policy = variant == 1 || variant == 3;
+    Scenario scenario = late ? resetRebuildsNoMap(false, policy) : verificationTimesOut(policy ? 10.0 : 0.0);
+    scenario = withReference(std::move(scenario));
+    scenario.capture_raw_state = scenario.capture_tf_graph = true;
+    setParam(scenario, rclcpp::Parameter("prior_map_pcd", priorMapPath()));
+    setParam(scenario, rclcpp::Parameter("prior_map_align", "as_delivered"));
+    setParam(scenario, rclcpp::Parameter("prior_map_pinned", pinned));
+    setParam(scenario, rclcpp::Parameter("prior_map_freeze", freeze));
+    if (late) {
+      for (auto & step : scenario.steps)
+        if (step.phase == Phase::kEvent)
+          step.pos = {0.0, 0.0, 0.0};  // successful finite replacement, independently of the empty-map regression
+    }
+    const auto result = runScenario(scenario);
+    SCOPED_TRACE("variant " + std::to_string(variant) + " " + result.describe());
+    ASSERT_TRUE(result.ok());
+    const Observation * reset = nullptr;
+    bool published_before = false;
+    for (const auto & observation : result.observations) {
+      if (hasEvent(observation, fast_lio::kAnchorEventMapReset)) {
+        ASSERT_EQ(reset, nullptr) << "reset must happen exactly once";
+        reset = &observation;
+      }
+      if (!reset)
+        published_before = published_before || observation.odom_seen;
+    }
+    ASSERT_TRUE(published_before);
+    ASSERT_NE(reset, nullptr);
+    ASSERT_TRUE(reset->prior_reset_seen && reset->prior_installed_before);
+    EXPECT_EQ(reset->prior_installed_after, pinned);
+    EXPECT_EQ(reset->retained_prior_voxels > 0, pinned);
+    const bool lost = freeze && !pinned;
+    EXPECT_EQ(reset->required_prior_lost, lost);
+    EXPECT_EQ(reset->record.published, !lost);
+    for (const auto & observation : result.observations) {
+      if (observation.record.scan_seq < reset->record.scan_seq)
+        continue;
+      EXPECT_EQ(observation.record.ref_gen, reset->record.ref_gen);
+      const auto * health = referenceFor(result, observation.record.scan_seq);
+      ASSERT_NE(health, nullptr);
+      // The reset records MapReset hard once; only the Unanchored latch (policy on) carries it to later scans.
+      if (&observation == reset || policy)
+        EXPECT_NE(health->hard_mask & 4u, 0u);
+      if (lost) {
+        EXPECT_FALSE(observation.record.published || observation.odom_seen || observation.typed_seen);
+        EXPECT_FALSE(health->has_pose_binding);
+        EXPECT_EQ(health->local, 0);
+        EXPECT_NE(health->legacy_flags & kFlagLost, 0u);
+        EXPECT_TRUE(observation.map_frozen && observation.raw_degraded);
+        EXPECT_EQ(observation.imu_batch, 1);
+        if (&observation != reset)
+          EXPECT_FALSE(observation.record.map_updated || observation.record.anchor_step);
+        for (const auto & transform : result.transforms)
+          EXPECT_NE(msKey(rclcpp::Time(transform.header.stamp).seconds()), msKey(observation.record.end_ns * 1e-9));
+      }
+    }
+    if (!lost) {
+      EXPECT_TRUE(result.observations.back().record.published);
+      if (!freeze)
+        EXPECT_TRUE(result.observations.back().record.map_updated);
     }
   }
 }

@@ -6,6 +6,21 @@
 #include <limits>
 #include <vector>
 
+TEST(PriorMapReset, RetentionPreservesIdentityAndOnlyLossOfAnInstalledRequiredPriorStopsLocalization)
+{
+  for (bool freeze : {false, true}) {
+    const auto cold = fast_lio::priorMapAfterReset(false, false, freeze);
+    EXPECT_FALSE(cold.installed_after);
+    EXPECT_FALSE(cold.required_prior_lost);
+    const auto retained = fast_lio::priorMapAfterReset(true, true, freeze);
+    EXPECT_TRUE(retained.installed_after);
+    EXPECT_FALSE(retained.required_prior_lost);
+    const auto lost = fast_lio::priorMapAfterReset(true, false, freeze);
+    EXPECT_FALSE(lost.installed_after);
+    EXPECT_EQ(lost.required_prior_lost, freeze);
+  }
+}
+
 using fast_lio::computePriorMapBounds;
 using fast_lio::kInitialPoseSize;
 using fast_lio::priorMapFitsCapacity;

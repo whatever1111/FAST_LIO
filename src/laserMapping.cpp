@@ -567,10 +567,11 @@ constexpr double kResBinEdges[kResBins] = {2.0, 5.0, 10.0, 20.0, 40.0, 1e9};
 int res_bin_n[kResBins] = {0};
 double res_bin_ss[kResBins] = {0.0};
 
-int consec_engulf = 0;            // running engulfed-scan streak
-int consec_low_eff = 0;           // running degenerate-scan streak counter
-bool flio_map_frozen = false;     // degraded: skip map_incremental (no garbage)
-bool flio_degraded_odom = false;  // degraded: inflate published pose covariance
+int consec_engulf = 0;             // running engulfed-scan streak
+int consec_low_eff = 0;            // running degenerate-scan streak counter
+bool flio_map_frozen = false;      // degraded: skip map_incremental (no garbage)
+bool required_prior_lost = false;  // scan-owner latch; only a fresh activation can reinstall a required prior
+bool flio_degraded_odom = false;   // degraded: inflate published pose covariance
 
 // Near-field ground geometry, in the LiDAR/cloud BODY frame so it is immune to
 // the Z drift it helps repair. Consumed by the ground recovery below; the
@@ -1557,7 +1558,7 @@ fast_lio::AnchorHealth currentAnchorHealth()
   in.degraded = flio_degraded_odom;
   in.hold_active = zupt_active || parked_hold_state.active;
   in.anchor_usable = anchor_usable;
-  in.lost = reanchor_gate.state == fast_lio::ReanchorState::kLost || reanchor_lost_this_scan;
+  in.lost = required_prior_lost || reanchor_gate.state == fast_lio::ReanchorState::kLost || reanchor_lost_this_scan;
   in.trust = recovery_state.trust;
   return fast_lio::anchorHealth(in);
 }
@@ -2779,6 +2780,7 @@ std::function<void(double, AnchorFixtureState &)> beforeAnchorStep;
 std::function<bool(double)> forceRunawayTrip;
 std::function<bool(double)> initialBuildTakesNoPoint;
 std::function<bool(double)> resetBeforeReference;
+std::function<void(bool, bool, bool, std::size_t)> afterPriorMapReset;
 std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 std::function<void(const std::string &)> afterAnchorTraceLine;
 std::function<void(std::uint8_t, std::int64_t, const std::array<std::uint8_t, 32> &)> afterPosePublish;
@@ -5400,7 +5402,26 @@ private:
       fast_lio::traceNs(lidar_end_time));
     int map_before = 0;
     const bool kept_prior = rebuildLocalMapStorage(map_before);
+    const auto prior = fast_lio::priorMapAfterReset(prior_map_installed_, kept_prior, prior_map_freeze_);
+#ifdef FASTLIO_TEST_HOOKS
+    if (fast_lio_test::afterPriorMapReset)
+      fast_lio_test::afterPriorMapReset(prior_map_installed_,
+                                        prior.installed_after,
+                                        required_prior_lost || prior.required_prior_lost,
+                                        ikdtree.pinnedVoxels());
+#endif
+    prior_map_installed_ = prior.installed_after;
+    required_prior_lost = required_prior_lost || prior.required_prior_lost;
     anchorTraceMapUpdated();
+    if (required_prior_lost) {
+      fast_lio::tripReanchorLost(&reanchor_gate);
+      flio_degraded_odom = flio_map_frozen = true;
+      RCLCPP_ERROR(this->get_logger(),
+                   "[%s] required prior map lost during reset; installed identity invalidated, freeze request "
+                   "retained. Normal pose and map growth stopped; restart explicitly to reload the prior.",
+                   tag);
+      return false;
+    }
     if (!fast_lio::mapBackendHoldsPoints(ikdtree)) {
       fast_lio::tripReanchorLost(&reanchor_gate);
       flio_degraded_odom = flio_map_frozen = true;
@@ -5530,6 +5551,11 @@ private:
         return;
       }
       anchor_scan_scope.noteImuSettlement(p_imu->lastOutcome());
+      if (required_prior_lost) {
+        fast_lio::tripReanchorLost(&reanchor_gate);
+        flio_degraded_odom = flio_map_frozen = true;
+        return;
+      }
       if (!processed) {
         anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuNotProcessed;
         if (p_imu->lastOutcome().disposition == fast_lio::ImuDisposition::kInvalid)

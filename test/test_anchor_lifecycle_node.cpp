@@ -54,6 +54,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <poll.h>
 #include <rcl/error_handling.h>
 #include <rcl/timer.h>
 #include <rcl/wait.h>
@@ -224,6 +225,7 @@ struct Scenario
   bool capture_raw_state = false;    // startup-only: snapshot at scope exit or an unlocked empty-IMU drop
   bool capture_tf_graph = false;     // independent old-output and disabled-publisher evidence
   bool wait_for_reference_repeat = false;
+  int external_pose_ack = -1;  // DDS observer in a separate process; warm-up must be acknowledged before stimuli
 };
 
 struct Observation
@@ -583,11 +585,11 @@ public:
     for (const auto & entry : scenario_.params)
       overrides.push_back(entry.second);
     rclcpp::NodeOptions options;
-    options.use_intra_process_comms(true);
+    options.use_intra_process_comms(scenario_.external_pose_ack < 0);
     options.parameter_overrides(overrides);
     subject_.emplace(factory_->create_node_instance(options));
     rclcpp::NodeOptions observer_options;
-    observer_options.use_intra_process_comms(true);
+    observer_options.use_intra_process_comms(scenario_.external_pose_ack < 0);
     observer_ = std::make_shared<rclcpp::Node>("anchor_lifecycle_observer", observer_options);
     imu_ =
       observer_->create_publisher<sensor_msgs::msg::Imu>(kImuTopic, rclcpp::QoS(rclcpp::KeepLast(1000)).reliable());
@@ -659,8 +661,19 @@ public:
     if (tf_ && !spinUntil([&] { return tf_->get_publisher_count() == 1; }))
       return "TF publisher never matched";
     reference_publishers_before_ = observer_->count_publishers("/lio_slam/reference_health");
+    if (scenario_.external_pose_ack >= 0 && !spinUntil([&] {
+          return observer_->count_subscribers("/Odometry") >= 2 && observer_->count_subscribers(kTypedTopic) >= 2;
+        }))
+      return "independent legacy and typed subscribers never appeared";
 
     std::string error = scenario_.warm_up ? warmUp() : std::string();
+    if (error.empty() && scenario_.external_pose_ack >= 0) {
+      pollfd ack{scenario_.external_pose_ack, POLLIN, 0};
+      char received = 0;
+      if (::poll(&ack, 1, static_cast<int>(kReceiptWaitNs / 1000000)) != 1 || ::read(ack.fd, &received, 1) != 1 ||
+          received != 'P')
+        error = "independent DDS observer did not acknowledge a legal legacy and typed pose";
+    }
     for (std::size_t i = 0; error.empty() && i < scenario_.steps.size(); ++i)
       error = scenario_.flexible ? runSlot(static_cast<int>(i)) : runScan(static_cast<int>(i));
     if (error.empty() && scenario_.flexible)
@@ -670,7 +683,8 @@ public:
       if (target == 0 || !spinUntil([&] { return repeated_reference_states_.count(target) != 0; }))
         error = "the final no-pose reference state was never actually repeated without input";
     }
-    reference_publishers_after_ = observer_->count_publishers("/lio_slam/reference_health");
+    if (rclcpp::ok())
+      reference_publishers_after_ = observer_->count_publishers("/lio_slam/reference_health");
     teardown();
     return error;
   }
@@ -1020,6 +1034,8 @@ private:
     const double end = scanEnd(scan);
     const bool done = spinUntil([&] {
       const auto * r = recordAt(end);
+      if (scenario_.external_pose_ack >= 0 && !rclcpp::ok())
+        return r != nullptr;  // shutdown cannot promise final telemetry delivery in the producer context
       return r != nullptr && (!r->published || odom_by_ms_.count(msKey(end)) > 0) &&
              (!scenario_.typed || !r->published || typed_by_ms_.count(msKey(end)) != 0) &&
              (!scenario_.capture_tf_graph || !r->published ||
@@ -5853,6 +5869,134 @@ void expectCompleteClosedArm(const ChildResult & result, const char * arm)
 }
 }  // namespace
 
+// Only this regression adds a second process. The producer retains the ordinary input/record fixture;
+// the external observer owns an independent context and stays alive after the real shutdown.
+TEST(AnchorLifecycleReference, FaultExitEndsTheScanWithAnIndependentDdsObserver)
+{
+  for (const std::string policy : {"fault_exit", "hold"}) {
+    SCOPED_TRACE(policy);
+    int ack[2], stop[2], report[2];
+    ASSERT_EQ(::pipe(ack), 0);
+    ASSERT_EQ(::pipe(stop), 0);
+    ASSERT_EQ(::pipe(report), 0);
+    const pid_t observer = ::fork();
+    ASSERT_GE(observer, 0);
+    if (observer == 0) {
+      ::close(ack[0]);
+      ::close(stop[1]);
+      ::close(report[0]);
+      ::alarm(kChildAlarmSeconds);
+      rclcpp::init(0, nullptr);
+      rclcpp::NodeOptions options;
+      options.use_intra_process_comms(false);
+      auto node = std::make_shared<rclcpp::Node>("fault_exit_dds_observer", options);
+      rclcpp::executors::SingleThreadedExecutor executor;
+      executor.add_node(node);
+      std::set<std::int64_t> legacy, typed;
+      bool acknowledged = false;
+      auto acknowledge = [&] {
+        if (acknowledged)
+          return;
+        for (auto stamp : legacy) {
+          if (typed.count(stamp)) {
+            acknowledged = ::write(ack[1], "P", 1) == 1;
+            return;
+          }
+        }
+      };
+      auto odom = node->create_subscription<nav_msgs::msg::Odometry>(
+        "/Odometry", rclcpp::QoS(rclcpp::KeepLast(50)).reliable(), [&](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+          legacy.insert(rclcpp::Time(msg->header.stamp).nanoseconds());
+          acknowledge();
+        });
+      auto observation = node->create_subscription<fast_lio_interfaces::msg::FrontendObservation>(
+        kTypedTopic,
+        rclcpp::QoS(rclcpp::KeepLast(200)).best_effort(),
+        [&](fast_lio_interfaces::msg::FrontendObservation::ConstSharedPtr msg) {
+          if (msg->has_pose) {
+            typed.insert(msg->observation_stamp_ns);
+            acknowledge();
+          }
+        });
+      pollfd finished{stop[0], POLLIN, 0};
+      while (::poll(&finished, 1, 0) == 0)
+        executor.spin_once(std::chrono::milliseconds(10));
+      // Bounded drain of earlier in-flight frames; this is fixture hang protection, not a delivery SLA.
+      const auto drain = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      while (std::chrono::steady_clock::now() < drain)
+        executor.spin_once(std::chrono::milliseconds(10));
+      std::ostringstream out;
+      for (auto stamp : legacy)
+        out << 'L' << ' ' << stamp << '\n';
+      for (auto stamp : typed)
+        out << 'T' << ' ' << stamp << '\n';
+      const std::string bytes = out.str();
+      const bool written = ::write(report[1], bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size());
+      rclcpp::shutdown();
+      ::_exit(acknowledged && written ? 0 : 4);
+    }
+    ::close(ack[1]);
+    ::close(stop[0]);
+    ::close(report[1]);
+    Scenario scenario = withReference(baseParams("fault_exit_dds_" + policy, true));
+    scenario.external_pose_ack = ack[0];
+    scenario.typed = true;
+    setParam(scenario, rclcpp::Parameter("runaway_watchdog_en", true));
+    setParam(scenario, rclcpp::Parameter("runaway_on_trip", policy));
+    setParam(scenario, rclcpp::Parameter("runaway_hold_sec", 0.25));
+    setParam(scenario, rclcpp::Parameter("zupt_en", false));
+    // The real watchdog sees the fixture velocity against real stationary IMU windows for 0.3 seconds.
+    // No forced trip: the fourth scan crosses hold_sec.
+    for (int i = 0; i < 4; ++i)
+      scenario.steps.push_back(step(Phase::kEvent, Imu::kStatic, Guard::kHealthy, {0.0, 0.0, 0.0}));
+    const ChildResult result = runScenario(scenario);
+    const bool stopped = ::write(stop[1], "D", 1) == 1;
+    ::close(stop[1]);
+    ::close(ack[0]);
+    std::string bytes;
+    const bool read = readAll(report[0], &bytes);
+    ::close(report[0]);
+    int status = 0;
+    ASSERT_EQ(::waitpid(observer, &status, 0), observer);
+    ASSERT_TRUE(stopped && read);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+    ASSERT_TRUE(result.ok()) << result.describe();
+    const auto events = result.phase(Phase::kEvent);
+    ASSERT_EQ(events.size(), 4u);
+    const auto & trip = events.back()->record;
+    std::ofstream evidence(std::string(FASTLIO_ANCHOR_NODE_RESULTS) + "/fault_exit_dds_" + policy + ".log");
+    evidence << "producer_status " << result.status << "\nobserver_status " << status << "\ntrip_scan_end_ns "
+             << trip.end_ns << "\nsubscriber_stamps (L=Odometry, T=FrontendObservation)\n"
+             << bytes;
+    for (const auto & publication : result.pose_publications)
+      evidence << "publish_return " << static_cast<unsigned>(publication.encoding) << ' ' << publication.stamp_ns
+               << '\n';
+    evidence.flush();
+    EXPECT_TRUE(evidence.good());
+    ASSERT_NE(trip.events & fast_lio::kAnchorEventRunawayTrip, 0u);
+    std::set<std::int64_t> legacy, typed;
+    std::istringstream in(bytes);
+    char encoding;
+    std::int64_t stamp;
+    while (in >> encoding >> stamp)
+      (encoding == 'L' ? legacy : typed).insert(stamp);
+    EXPECT_FALSE(legacy.empty());
+    EXPECT_FALSE(typed.empty());
+    // Compare stamps in milliseconds, as the producer's legacy conversion truncates floating seconds.
+    auto containsTrip = [&](const auto & stamps) {
+      return std::any_of(
+        stamps.begin(), stamps.end(), [&](auto ns) { return msKey(ns * 1e-9) == msKey(trip.end_ns * 1e-9); });
+    };
+    EXPECT_EQ(trip.published, policy == "hold");
+    EXPECT_EQ(containsTrip(legacy), policy == "hold");
+    EXPECT_EQ(containsTrip(typed), policy == "hold");
+    if (policy == "fault_exit") {
+      for (const auto & publication : result.pose_publications)
+        EXPECT_NE(msKey(publication.stamp_ns * 1e-9), msKey(trip.end_ns * 1e-9));
+    }
+  }
+}
+
 TEST(AnchorLifecycleReference, BuildPublishesEstablishedWithoutPoseAndKeepsEmptyBuildsCold)
 {
   const auto result = runScenario(withReference(emptyFirstBuilds()));
@@ -5942,6 +6086,29 @@ TEST(AnchorLifecycleReference, LateResetOverridesHealthyAndPreservesTheEstablish
     EXPECT_EQ(after->trust, 3);
     EXPECT_FALSE(after->has_pose_binding);
   }
+}
+
+// Between scans the front end projects the persistent Lost fact without recording a new negative event: the idle
+// snapshots after an empty reset repeat the scan's state revision instead of advancing it on every IMU sample.
+TEST(AnchorLifecycleReference, IdleSnapshotsAfterAnEmptyResetProjectLostWithoutANewNegative)
+{
+  const auto result = runScenario(withReference(resetRebuildsNoMap(false, true)));
+  ASSERT_TRUE(result.ok()) << result.describe();
+  const auto event = result.phase(Phase::kEvent);
+  ASSERT_EQ(event.size(), 1u);
+  const auto * reset = referenceFor(result, event.front()->record.scan_seq);
+  ASSERT_NE(reset, nullptr);
+  int idle = 0;
+  for (const auto & value : result.references) {
+    if (value.kind == 4 || value.has_scan_sequence || value.snapshot_sequence <= reset->snapshot_sequence)
+      continue;
+    EXPECT_EQ(value.kind, 3) << "idle snapshot " << value.snapshot_sequence << " advanced the state";
+    EXPECT_FALSE(value.has_pose_binding);
+    EXPECT_NE(value.legacy_flags & kFlagLost, 0u);
+    EXPECT_EQ(value.hard_mask & 4u, 4u);
+    ++idle;
+  }
+  EXPECT_GT(idle, 0);
 }
 
 TEST(AnchorLifecycleReference, QueuedScanCannotCoverANewerNoPoseImuLatch)

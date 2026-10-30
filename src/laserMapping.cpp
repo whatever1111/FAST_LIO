@@ -1667,11 +1667,14 @@ FinalFrontendSnapshot captureFinalFrontend(bool completed, bool scanEvent, doubl
   if (reference_health_en) {
     reference_publication_guard.run(
       [&] {
-        if (completed && (flio_degraded_odom || facts.runaway))
-          reference_progress.negative((flio_degraded_odom ? fast_lio::kReferenceRawDegraded : 0u) |
-                                        (facts.runaway ? fast_lio::kReferenceRunaway : 0u),
-                                      facts.runaway ? 8u : 0u);
-        if (completed && facts.lost)
+        // Runaway and Lost settle with the scan that reached them, whether or not it completed a pose. A snapshot
+        // between scans only projects the persistent facts; it records no new negative event.
+        const bool runaway = scanEvent && facts.runaway;
+        if ((completed && flio_degraded_odom) || runaway)
+          reference_progress.negative((completed && flio_degraded_odom ? fast_lio::kReferenceRawDegraded : 0u) |
+                                        (runaway ? fast_lio::kReferenceRunaway : 0u),
+                                      runaway ? 8u : 0u);
+        if (scanEvent && facts.lost)
           reference_progress.negative(0, 1);
         if (completed && !fast_lio::referencePoseFinite(facts.pose))
           reference_progress.negative(0, 32);
@@ -6984,6 +6987,7 @@ private:
             RCLCPP_FATAL(this->get_logger(),
                          "[RUNAWAY] exiting so the supervisor can restart the pipeline (runaway_on_trip=fault_exit)");
             rclcpp::shutdown();
+            return;
           } else {
             // hold: freeze the map and let the health flags stop downstream from
             // consuming a pose we no longer believe.

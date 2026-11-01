@@ -3120,8 +3120,12 @@ void startPcdWriter()
 
 void stopPcdWriter()  // drain queue + join; idempotent, call once at shutdown
 {
-  if (!pcd_writer_running.exchange(false))
-    return;
+  {
+    // Serialize this predicate change with the writer's wait to avoid a lost wakeup.
+    std::lock_guard<std::mutex> lk(pcd_queue_mtx);
+    if (!pcd_writer_running.exchange(false))
+      return;
+  }
   pcd_queue_cv.notify_all();
   if (pcd_writer_thread.joinable())
     pcd_writer_thread.join();

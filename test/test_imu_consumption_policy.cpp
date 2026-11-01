@@ -173,10 +173,10 @@ TEST(ImuConsumptionPolicy, BacklogKeepsTheExistingStrictBudgetAndInvalidatesDisc
   Transaction transaction;
   const auto token = transaction.borrow(queue, 2);
   transaction.settle(queue, token, ImuDisposition::kUncommitted);
-  EXPECT_EQ(
-    fast_lio::imuBacklogExcess(
-      queue.size(), [&](std::size_t i) { return queue[i].stamp; }, 2.0, 1.0, std::numeric_limits<double>::infinity()),
-    0u);
+  const auto stampAt = [&](std::size_t i) {
+    return queue[i].stamp;
+  };
+  EXPECT_EQ(fast_lio::imuBacklogExcess(queue.size(), stampAt, 2.0, 1.0, std::numeric_limits<double>::infinity()), 0u);
   const auto dropped = fast_lio::imuBacklogExcess(
     queue.size(),
     [&](std::size_t i) { return queue[i].stamp; },

@@ -58,7 +58,10 @@ TEST(ImuBacklogPolicy, ASingleSampleIsTheNewestAndStays)
 {
   EXPECT_EQ(excess({kEpoch}, kWindow), 0u);
   // Even against a newest stamp an hour ahead of it.
-  EXPECT_EQ(fast_lio::imuBacklogExcess(1, [](std::size_t) { return kEpoch; }, kEpoch + 3600.0, kWindow, kInf), 0u);
+  const auto stampAt = [](std::size_t) {
+    return kEpoch;
+  };
+  EXPECT_EQ(fast_lio::imuBacklogExcess(1, stampAt, kEpoch + 3600.0, kWindow, kInf), 0u);
 }
 
 TEST(ImuBacklogPolicy, SamplesInsideTheWindowStay)

@@ -8,6 +8,10 @@
 #include "cached_plane.hpp"
 #include "laser_mapping_test_types.hpp"
 
+#ifndef INSTANTIATE_TEST_SUITE_P
+#define INSTANTIATE_TEST_SUITE_P INSTANTIATE_TEST_CASE_P
+#endif
+
 // Keep the state opaque: use-ikfom.hpp also defines non-inline process functions.
 // The component owns its default-constructed state; this fixture never initializes
 // a ROS node or mutates that state, and the measurement model reads it only.

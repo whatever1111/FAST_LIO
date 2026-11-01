@@ -6,6 +6,7 @@
 #include <rclcpp_components/node_factory.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <class_loader/class_loader.hpp>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -23,11 +25,50 @@
 #include "laser_mapping_test_hooks.hpp"
 #include "preprocess.h"
 
+#ifdef FASTLIO_PCD_WRITER_TEST
+extern std::atomic<bool> pcd_writer_running;
+extern std::thread pcd_writer_thread;
+extern void stopPcdWriter();
+#endif
+
 namespace
 {
 // The class name RCLCPP_COMPONENTS_REGISTER_NODE(LaserMappingNode) registers.
 constexpr const char * kLaserMappingFactory = "rclcpp_components::NodeFactoryTemplate<LaserMappingNode>";
 
+#ifdef FASTLIO_PCD_WRITER_TEST
+class PcdWriterLifecycle : public ::testing::Test
+{
+protected:
+  void SetUp() override { rclcpp::init(0, nullptr); }
+
+  void TearDown() override
+  {
+    // Also clean up a failing base-version run, after recording the destructor's state.
+    stopPcdWriter();
+    rclcpp::shutdown();
+  }
+};
+
+TEST_F(PcdWriterLifecycle, ComponentDestructionStopsAndJoinsWriter)
+{
+  class_loader::ClassLoader loader(FASTLIO_TEST_COMPONENT_PATH);
+  auto factory = loader.createInstance<rclcpp_components::NodeFactory>(kLaserMappingFactory);
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+    {rclcpp::Parameter("mapping.extrinsic_T", std::vector<double>{0.0, 0.0, 0.0}),
+     rclcpp::Parameter("mapping.extrinsic_R", std::vector<double>{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}),
+     rclcpp::Parameter("pcd_save.pcd_save_en", true),
+     rclcpp::Parameter("runtime_pos_log_enable", false)});
+  {
+    auto subject = factory->create_node_instance(options);
+    EXPECT_TRUE(pcd_writer_running.load());
+    EXPECT_TRUE(pcd_writer_thread.joinable());
+  }
+  EXPECT_FALSE(pcd_writer_running.load());
+  EXPECT_FALSE(pcd_writer_thread.joinable());
+}
+#else
 struct ScanEvidence
 {
   std::size_t count;
@@ -433,4 +474,5 @@ TEST_F(RosScanBounds, FatalTransactionRejectsRealInputsAndBoundsBothQueues)
   EXPECT_EQ(fast_lio_test::inspectImuInput().imuQueued, final.imuQueued);
 }
 #endif
+#endif  // FASTLIO_PCD_WRITER_TEST
 }  // namespace

@@ -222,7 +222,7 @@ if(BUILD_TESTING)
     endif()
     find_package(class_loader REQUIRED)
     # Each executable creates one component; production globals outlive a node.
-    foreach(scan_test test_ros_scan_bounds test_ros_imu_fault)
+    foreach(scan_test test_ros_scan_bounds test_ros_imu_fault test_ros_pcd_writer)
       string(REGEX REPLACE "^test_" "" scan_receipt "${scan_test}")
       ament_add_gtest(${scan_test} test/test_ros_scan_bounds.cpp TIMEOUT 240)
       # Both fixtures use the broker's ROS domain and the real /Odometry endpoint.
@@ -244,6 +244,7 @@ if(BUILD_TESTING)
       endif()
     endforeach()
     target_compile_definitions(test_ros_imu_fault PRIVATE FASTLIO_INPUT_FAULT_TEST)
+    target_compile_definitions(test_ros_pcd_writer PRIVATE FASTLIO_PCD_WRITER_TEST)
     # The stationary anchor on the production call chain. Each scenario activates the component in its own
     # forked child; like the scan fixtures it uses the broker's ROS domain and the real /Odometry endpoint.
     # One executable, one CTest entry per gtest suite ("suite:entry suffix:timeout in seconds"), so each entry

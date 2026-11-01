@@ -5305,10 +5305,11 @@ public:
                     static_cast<unsigned long>(counts.events[i]),
                     static_cast<unsigned long>(counts.lostValid[i]));
     }
-    // The off-thread map worker is a global std::thread; when the node is used as a
-    // component (offline replay, composed pipelines) nobody else joins it before the
-    // library unloads → std::terminate. Idempotent with the standalone main's call.
+    // Both workers are global std::threads: component destruction must join them before
+    // library unload to avoid std::terminate. Match standalone shutdown order: finish map
+    // updates first, then drain PCD writes. Both stops are idempotent with main's calls.
     stopMapWorker();
+    stopPcdWriter();
     frontend_publisher.reset();
     reference_publisher.reset();
     reference_health_en = false;

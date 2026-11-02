@@ -397,9 +397,10 @@ sanitizer=${FASTLIO_TEST_SANITIZER}")
       message(STATUS "fast_lio: golden 只适用于 x86_64; the front-end contract entries are skipped on "
                      "${CMAKE_SYSTEM_PROCESSOR}")
     endif()
-    foreach(contract parameter pipeline)
-      set(contract_target test_frontend_${contract}_contract_node)
-      ament_add_gtest_executable(${contract_target} test/${contract_target}.cpp)
+    # Sources are spelled out because the parent repository's structure gates read them without expanding variables.
+    ament_add_gtest_executable(test_frontend_parameter_contract_node test/test_frontend_parameter_contract_node.cpp)
+    ament_add_gtest_executable(test_frontend_pipeline_contract_node test/test_frontend_pipeline_contract_node.cpp)
+    foreach(contract_target test_frontend_parameter_contract_node test_frontend_pipeline_contract_node)
       fastlio_test_sanitize(${contract_target})
       target_include_directories(${contract_target} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src

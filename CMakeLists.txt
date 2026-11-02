@@ -380,6 +380,64 @@ if(BUILD_TESTING)
         rosidl_target_interfaces(test_ivox_node_capacity_${capacity_case} ${PROJECT_NAME} "rosidl_typesupport_cpp")
       endif()
     endforeach()
+    # The legacy node's front-end contract fixtures (laserMapping S0), each compared with goldens the same
+    # executable generates (test/frontend_contract/README.md). The goldens hold x86_64 results; on other
+    # architectures the entries are registered skipped and configuration says why. The build string records the
+    # compile options a golden was generated with.
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" frontend_contract_config)
+    set(frontend_contract_build "compiler=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}, \
+build_type=${CMAKE_BUILD_TYPE}, flags=${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${frontend_contract_config}}, \
+sanitizer=${FASTLIO_TEST_SANITIZER}")
+    string(REPLACE ";" " " frontend_contract_build "${frontend_contract_build}")
+    string(REGEX REPLACE "[ \t]+" " " frontend_contract_build "${frontend_contract_build}")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+      set(frontend_contract_skip "")
+    else()
+      set(frontend_contract_skip SKIP_TEST)
+      message(STATUS "fast_lio: golden 只适用于 x86_64; the front-end contract entries are skipped on "
+                     "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+    foreach(contract parameter)
+      set(contract_target test_frontend_${contract}_contract_node)
+      ament_add_gtest_executable(${contract_target} test/${contract_target}.cpp)
+      fastlio_test_sanitize(${contract_target})
+      target_include_directories(${contract_target} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})
+      target_compile_definitions(${contract_target} PRIVATE
+        FASTLIO_TEST_COMPONENT_PATH="$<TARGET_FILE:fastlio_mapping_test_component>"
+        FASTLIO_CONTRACT_BUILD="${frontend_contract_build}"
+        FASTLIO_CONTRACT_ROS_DISTRO="$ENV{ROS_DISTRO}"
+        FASTLIO_CONTRACT_RESULTS="${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}")
+      target_link_libraries(${contract_target}
+        fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen OpenSSL::Crypto)
+      ament_target_dependencies(${contract_target} ${dependencies} class_loader)
+      if(cpp_typesupport_target)
+        target_link_libraries(${contract_target} ${cpp_typesupport_target})
+      else()
+        rosidl_target_interfaces(${contract_target} ${PROJECT_NAME} "rosidl_typesupport_cpp")
+      endif()
+    endforeach()
+    # "CTest entry:executable:gtest suite:timeout in seconds". Every case forks a child that activates the component
+    # on the broker's ROS domain with its real topics and services: the entries run serially.
+    foreach(contract_entry
+        "test_frontend_parameter_contract_node:test_frontend_parameter_contract_node:FrontendParameterContract:600")
+      string(REPLACE ":" ";" contract_entry "${contract_entry}")
+      list(GET contract_entry 0 contract_test)
+      list(GET contract_entry 1 contract_target)
+      list(GET contract_entry 2 contract_suite)
+      list(GET contract_entry 3 contract_timeout)
+      set(contract_result "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/${contract_test}.gtest.xml")
+      ament_add_test(${contract_test}
+        COMMAND "$<TARGET_FILE:${contract_target}>"
+          "--gtest_filter=${contract_suite}.*" "--gtest_output=xml:${contract_result}"
+        OUTPUT_FILE "${CMAKE_BINARY_DIR}/ament_cmake_gtest/${contract_test}.txt"
+        RESULT_FILE "${contract_result}"
+        TIMEOUT ${contract_timeout}
+        ${frontend_contract_skip})
+      set_tests_properties(${contract_test} PROPERTIES
+        REQUIRED_FILES "$<TARGET_FILE:${contract_target}>" LABELS "gtest" RUN_SERIAL TRUE)
+    endforeach()
     if(FASTLIO_TEST_SANITIZER)
       get_property(sanitizer_tests GLOBAL PROPERTY FASTLIO_TEST_SANITIZER_MANIFEST)
       string(REPLACE ";" "\n" sanitizer_tests "${sanitizer_tests}")

@@ -397,7 +397,7 @@ sanitizer=${FASTLIO_TEST_SANITIZER}")
       message(STATUS "fast_lio: golden 只适用于 x86_64; the front-end contract entries are skipped on "
                      "${CMAKE_SYSTEM_PROCESSOR}")
     endif()
-    foreach(contract parameter)
+    foreach(contract parameter pipeline)
       set(contract_target test_frontend_${contract}_contract_node)
       ament_add_gtest_executable(${contract_target} test/${contract_target}.cpp)
       fastlio_test_sanitize(${contract_target})
@@ -421,7 +421,9 @@ sanitizer=${FASTLIO_TEST_SANITIZER}")
     # "CTest entry:executable:gtest suite:timeout in seconds". Every case forks a child that activates the component
     # on the broker's ROS domain with its real topics and services: the entries run serially.
     foreach(contract_entry
-        "test_frontend_parameter_contract_node:test_frontend_parameter_contract_node:FrontendParameterContract:600")
+        "test_frontend_parameter_contract_node:test_frontend_parameter_contract_node:FrontendParameterContract:600"
+        "test_frontend_pipeline_contract_node:test_frontend_pipeline_contract_node:FrontendPipelineContract:900"
+        "test_frontend_pipeline_contract_node_worker:test_frontend_pipeline_contract_node:FrontendPipelineWorker:600")
       string(REPLACE ":" ";" contract_entry "${contract_entry}")
       list(GET contract_entry 0 contract_test)
       list(GET contract_entry 1 contract_target)
@@ -438,6 +440,8 @@ sanitizer=${FASTLIO_TEST_SANITIZER}")
       set_tests_properties(${contract_test} PROPERTIES
         REQUIRED_FILES "$<TARGET_FILE:${contract_target}>" LABELS "gtest" RUN_SERIAL TRUE)
     endforeach()
+    # The pipeline scenario with the map worker on, and the reset that joins it.
+    fastlio_test_sanitizer_select(test_frontend_pipeline_contract_node_worker test_frontend_pipeline_contract_node)
     if(FASTLIO_TEST_SANITIZER)
       get_property(sanitizer_tests GLOBAL PROPERTY FASTLIO_TEST_SANITIZER_MANIFEST)
       string(REPLACE ";" "\n" sanitizer_tests "${sanitizer_tests}")

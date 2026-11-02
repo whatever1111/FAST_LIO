@@ -1,0 +1,268 @@
+# frontend contract golden: parameter/defaults
+# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case defaults
+config overrides-only
+overrides 2
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+outcome constructed
+log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
+log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
+log INFO laser_mapping "p_pre->lidar_type 1"
+log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
+log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
+log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
+log INFO laser_mapping "Node init finished."
+parameters 241
+param adaptive_downsample_budget_sec type=double value=0.059999999999999998 read_only=0 descriptor_type=3
+param adaptive_downsample_en type=bool value=false read_only=0 descriptor_type=1
+param adaptive_downsample_lower_after type=integer value=100 read_only=0 descriptor_type=2
+param adaptive_downsample_max_voxel type=double value=0.5 read_only=0 descriptor_type=3
+param adaptive_downsample_raise_after type=integer value=5 read_only=0 descriptor_type=2
+param adaptive_downsample_release_sec type=double value=0.035000000000000003 read_only=0 descriptor_type=3
+param adaptive_downsample_step type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param canopy_ground_halfband type=double value=0.80000000000000004 read_only=0 descriptor_type=3
+param canopy_ground_z type=double value=-0.46999999999999997 read_only=0 descriptor_type=3
+param canopy_near_range type=double value=20 read_only=0 descriptor_type=3
+param common.imu_bias_topic type=string value="/fixposition/fpa/imubias" read_only=0 descriptor_type=4
+param common.imu_input_type type=string value="sensor_msgs" read_only=0 descriptor_type=4
+param common.imu_time_offset type=double value=0 read_only=0 descriptor_type=3
+param common.imu_topic type=string value="/livox/imu" read_only=0 descriptor_type=4
+param common.lid_topic type=string value="/livox/lidar" read_only=0 descriptor_type=4
+param common.time_offset_lidar_to_imu type=double value=0 read_only=0 descriptor_type=3
+param common.time_sync_en type=bool value=false read_only=0 descriptor_type=1
+param corr_dump_en type=bool value=false read_only=0 descriptor_type=1
+param corr_dump_windows type=string value="" read_only=0 descriptor_type=4
+param corr_gate_mad_scale type=double value=0 read_only=0 descriptor_type=3
+param corr_gate_rot_sigma_floor_deg type=double value=0 read_only=0 descriptor_type=3
+param corr_innov_gate_k type=double value=0 read_only=0 descriptor_type=3
+param corr_kernel type=string value="none" read_only=0 descriptor_type=4
+param corr_kernel_mad_scale type=double value=3 read_only=0 descriptor_type=3
+param corr_kernel_min_scale type=double value=0.029999999999999999 read_only=0 descriptor_type=3
+param corr_nn0_max type=double value=0 read_only=0 descriptor_type=3
+param cube_side_length type=double value=200 read_only=0 descriptor_type=3
+param data_dir type=string value="" read_only=0 descriptor_type=4
+param degeneracy_debug type=bool value=false read_only=0 descriptor_type=1
+param degeneracy_hard_projection type=bool value=false read_only=0 descriptor_type=1
+param degeneracy_lambda_abs_bad type=double value=2 read_only=0 descriptor_type=3
+param degeneracy_lambda_abs_good type=double value=20 read_only=0 descriptor_type=3
+param degeneracy_lambda_bad type=double value=0.02 read_only=0 descriptor_type=3
+param degeneracy_lambda_good type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param degeneracy_min_weight type=double value=0 read_only=0 descriptor_type=3
+param degeneracy_schur_en type=bool value=false read_only=0 descriptor_type=1
+param degeneracy_schur_ridge type=double value=9.9999999999999995e-07 read_only=0 descriptor_type=3
+param degeneracy_spectrum_trace type=bool value=false read_only=0 descriptor_type=1
+param degeneracy_weighting_en type=bool value=false read_only=0 descriptor_type=1
+param diagnostics.kalman_channel_enable type=bool value=false read_only=0 descriptor_type=1
+param diagnostics.latency_enable type=bool value=true read_only=0 descriptor_type=1
+param diagnostics.latency_log_period_sec type=double value=1 read_only=0 descriptor_type=3
+param divergence_guard_en type=bool value=true read_only=0 descriptor_type=1
+param divergence_guard_max_speed type=double value=30 read_only=0 descriptor_type=3
+param divergence_guard_min_eff type=integer value=50 read_only=0 descriptor_type=2
+param divergence_guard_streak type=integer value=5 read_only=0 descriptor_type=2
+param feature_extract_enable type=bool value=false read_only=0 descriptor_type=1
+param filter_size_corner type=double value=0.5 read_only=0 descriptor_type=3
+param filter_size_map type=double value=0.5 read_only=0 descriptor_type=3
+param filter_size_surf type=double value=0.5 read_only=0 descriptor_type=3
+param gravity_align_accel_tol type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param gravity_align_continuous type=bool value=false read_only=0 descriptor_type=1
+param gravity_align_en type=bool value=false read_only=0 descriptor_type=1
+param gravity_align_grav_cap_deg type=double value=3 read_only=0 descriptor_type=3
+param gravity_align_grav_freeze_degraded type=bool value=false read_only=0 descriptor_type=1
+param gravity_align_grav_leak type=double value=1 read_only=0 descriptor_type=3
+param gravity_align_gyro_tol type=double value=0.34999999999999998 read_only=0 descriptor_type=3
+param gravity_align_hold_s type=double value=0 read_only=0 descriptor_type=3
+param gravity_align_leg_edge_window_s type=double value=0.20000000000000001 read_only=0 descriptor_type=3
+param gravity_align_leg_lever_arm type=double_array value=[0,0,0] read_only=0 descriptor_type=8
+param gravity_align_leg_vel_sigma type=double value=0.14999999999999999 read_only=0 descriptor_type=3
+param gravity_align_lin_accel_comp type=bool value=false read_only=0 descriptor_type=1
+param gravity_align_lin_accel_source type=string value="leg" read_only=0 descriptor_type=4
+param gravity_align_mag_ref type=double value=0 read_only=0 descriptor_type=3
+param gravity_align_noise type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param gravity_align_noise_degraded type=double value=0 read_only=0 descriptor_type=3
+param gravity_align_noise_moving type=double value=0.044999999999999998 read_only=0 descriptor_type=3
+param gravity_align_noise_static type=double value=0.0080000000000000002 read_only=0 descriptor_type=3
+param gravity_align_sigma_policy type=string value="scene" read_only=0 descriptor_type=4
+param gravity_align_vel_sigma_scale type=double value=0 read_only=0 descriptor_type=3
+param gravity_align_window_s type=double value=0 read_only=0 descriptor_type=3
+param gravity_align_withhold_blind_moving type=bool value=false read_only=0 descriptor_type=1
+param gravity_align_z_weak_thresh type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param ground_recover_en type=bool value=false read_only=0 descriptor_type=1
+param ground_recover_max_residual type=double value=1 read_only=0 descriptor_type=3
+param ground_recover_max_rows type=integer value=4000 read_only=0 descriptor_type=2
+param ground_recover_min_inliers type=integer value=100 read_only=0 descriptor_type=2
+param ground_recover_scan_band type=double value=0.14999999999999999 read_only=0 descriptor_type=3
+param ground_recover_sector_tol type=double value=0.25 read_only=0 descriptor_type=3
+param guard_engulf_en type=bool value=true read_only=0 descriptor_type=1
+param guard_engulf_far_frac_min type=double value=0.14999999999999999 read_only=0 descriptor_type=3
+param guard_engulf_far_frac_release type=double value=0.34999999999999998 read_only=0 descriptor_type=3
+param guard_engulf_far_range type=double value=2 read_only=0 descriptor_type=3
+param guard_engulf_release_scans type=integer value=5 read_only=0 descriptor_type=2
+param guard_engulf_streak type=integer value=2 read_only=0 descriptor_type=2
+param guard_hole_en type=bool value=false read_only=0 descriptor_type=1
+param guard_hole_max_accel type=double value=1 read_only=0 descriptor_type=3
+param guard_hole_min_sec type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param guard_hole_reanchor_pos type=bool value=true read_only=0 descriptor_type=1
+param guard_release_inflate_en type=bool value=false read_only=0 descriptor_type=1
+param guard_release_keep_sigma type=double value=0.5 read_only=0 descriptor_type=3
+param guard_release_leg_max_age_s type=double value=0.5 read_only=0 descriptor_type=3
+param guard_release_leg_sigma type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param guard_release_pos_sigma_max type=double value=1 read_only=0 descriptor_type=3
+param guard_release_pos_sigma_min type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param guard_release_pos_sigma_rate type=double value=0.20000000000000001 read_only=0 descriptor_type=3
+param guard_release_rp_sigma_deg type=double value=0.5 read_only=0 descriptor_type=3
+param guard_release_rp_sigma_max_deg type=double value=3 read_only=0 descriptor_type=3
+param guard_release_rp_sigma_rate_deg type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param guard_release_vel_source type=string value="zero" read_only=0 descriptor_type=4
+param guard_release_yaw_sigma_deg type=double value=0 read_only=0 descriptor_type=3
+param guard_vel_reset_sigma type=double value=0 read_only=0 descriptor_type=3
+param health_pub_en type=bool value=true read_only=0 descriptor_type=1
+param imu_coverage.max_extrapolation_s type=double value=0 read_only=0 descriptor_type=3
+param imu_coverage.max_gap_s type=double value=0 read_only=0 descriptor_type=3
+param imu_gap_accel_max type=double value=1 read_only=0 descriptor_type=3
+param imu_gap_accel_max_z type=double value=0.20000000000000001 read_only=0 descriptor_type=3
+param imu_gap_empty_scans type=bool value=false read_only=0 descriptor_type=1
+param imu_gap_min_s type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param imu_gap_prior_en type=bool value=false read_only=0 descriptor_type=1
+param imu_gap_rate_rp_max type=double value=0 read_only=0 descriptor_type=3
+param imu_gap_rate_yaw_max type=double value=10 read_only=0 descriptor_type=3
+param imu_gap_verify_s type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param imu_init_require_still type=bool value=false read_only=0 descriptor_type=1
+param imu_init_still_gravity_ref type=double value=9.8100000000000005 read_only=0 descriptor_type=3
+param imu_init_still_gravity_tol type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param imu_init_still_gyro_rms_max type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param imu_init_still_max_gap_s type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param imu_init_still_min_duration_s type=double value=1 read_only=0 descriptor_type=3
+param imu_init_still_min_samples type=integer value=100 read_only=0 descriptor_type=2
+param imu_init_still_sustained_en type=bool value=false read_only=0 descriptor_type=1
+param imu_init_still_timeout_s type=double value=20 read_only=0 descriptor_type=3
+param imu_init_still_tol type=double value=0.029999999999999999 read_only=0 descriptor_type=3
+param initial_pose type=double_array value=[] read_only=0 descriptor_type=8
+param initial_pose_apply_roll_pitch type=bool value=false read_only=0 descriptor_type=1
+param initial_pose_full_rpy_override type=bool value=false read_only=0 descriptor_type=1
+param ivox_grid_resolution type=double value=0.5 read_only=0 descriptor_type=3
+param ivox_max_voxels type=integer value=5000000 read_only=0 descriptor_type=2
+param ivox_nearby_type type=integer value=26 read_only=0 descriptor_type=2
+param ivox_voxel_capacity type=integer value=50 read_only=0 descriptor_type=2
+param lidar_attitude_hold_en type=bool value=false read_only=0 descriptor_type=1
+param lidar_attitude_hold_far_frac type=double value=0 read_only=0 descriptor_type=3
+param lidar_attitude_hold_max_s type=double value=3 read_only=0 descriptor_type=3
+param lidar_attitude_hold_max_scan_gap_s type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param lidar_attitude_hold_min_effct type=integer value=100 read_only=0 descriptor_type=2
+param lidar_attitude_hold_min_rp_info type=double value=0 read_only=0 descriptor_type=3
+param lidar_attitude_hold_z_weak type=double value=0.90000000000000002 read_only=0 descriptor_type=3
+param lidar_consider_rp_en type=bool value=false read_only=0 descriptor_type=1
+param lidar_consider_rp_max_s type=double value=0 read_only=0 descriptor_type=3
+param lidar_consider_rp_min_info type=double value=0 read_only=0 descriptor_type=3
+param lidar_consider_rp_post_release_s type=double value=0 read_only=0 descriptor_type=3
+param lidar_consider_rp_while_engulfed type=bool value=true read_only=0 descriptor_type=1
+param lidar_consider_rp_z_weak_min type=double value=1.1000000000000001 read_only=0 descriptor_type=3
+param map_file_path type=string value="" read_only=0 descriptor_type=4
+param mapping.acc_cov type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param mapping.b_acc_cov type=double value=0.0001 read_only=0 descriptor_type=3
+param mapping.b_gyr_cov type=double value=0.0001 read_only=0 descriptor_type=3
+param mapping.det_range type=double value=300 read_only=0 descriptor_type=3
+param mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1] read_only=0 descriptor_type=8
+param mapping.extrinsic_T type=double_array value=[0,0,0] read_only=0 descriptor_type=8
+param mapping.extrinsic_est_en type=bool value=true read_only=0 descriptor_type=1
+param mapping.fov_degree type=double value=180 read_only=0 descriptor_type=3
+param mapping.gyr_cov type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param mapping.map_insert_delay_scans type=integer value=0 read_only=0 descriptor_type=2
+param max_buffered_scans type=integer value=100 read_only=0 descriptor_type=2
+param max_imu_backlog_sec type=double value=10 read_only=0 descriptor_type=3
+param max_iteration type=integer value=4 read_only=0 descriptor_type=2
+param max_scan_backlog_sec type=double value=0.5 read_only=0 descriptor_type=3
+param nn_refresh_gate_en type=bool value=false read_only=0 descriptor_type=1
+param nn_refresh_min_shift type=double value=0 read_only=0 descriptor_type=3
+param nn_refresh_ref_range type=double value=20 read_only=0 descriptor_type=3
+param pcd_save.interval type=integer value=-1 read_only=0 descriptor_type=2
+param pcd_save.pcd_save_en type=bool value=false read_only=0 descriptor_type=1
+param planar_constraint_en type=bool value=false read_only=0 descriptor_type=1
+param planar_constraint_noise type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param planar_constraint_z_weak_thresh type=double value=0.5 read_only=0 descriptor_type=3
+param point_filter_num type=integer value=2 read_only=0 descriptor_type=2
+param preprocess.blind type=double value=0.01 read_only=0 descriptor_type=3
+param preprocess.lidar_type type=integer value=1 read_only=0 descriptor_type=2
+param preprocess.max_scan_duration_s type=double value=0 read_only=0 descriptor_type=3
+param preprocess.scan_line type=integer value=16 read_only=0 descriptor_type=2
+param preprocess.scan_rate type=integer value=10 read_only=0 descriptor_type=2
+param preprocess.timestamp_unit type=integer value=2 read_only=0 descriptor_type=2
+param prior_map_align type=string value="as_delivered" read_only=0 descriptor_type=4
+param prior_map_freeze type=bool value=false read_only=0 descriptor_type=1
+param prior_map_pcd type=string value="" read_only=0 descriptor_type=4
+param prior_map_pinned type=bool value=false read_only=0 descriptor_type=1
+param prior_map_voxel type=double value=0 read_only=0 descriptor_type=3
+param publish.body_frame_id type=string value="body" read_only=0 descriptor_type=4
+param publish.dense_publish_en type=bool value=true read_only=0 descriptor_type=1
+param publish.effect_map_en type=bool value=false read_only=0 descriptor_type=1
+param publish.frontend_clock_domain type=string value="" read_only=0 descriptor_type=4
+param publish.frontend_idle_period_sec type=double value=0.5 read_only=0 descriptor_type=3
+param publish.frontend_observation type=bool value=false read_only=0 descriptor_type=1
+param publish.map_en type=bool value=false read_only=0 descriptor_type=1
+param publish.map_period_sec type=double value=5 read_only=0 descriptor_type=3
+param publish.odom_frame_id type=string value="lidar_odom" read_only=0 descriptor_type=4
+param publish.path_en type=bool value=true read_only=0 descriptor_type=1
+param publish.reference_health type=bool value=false read_only=1 descriptor_type=1
+param publish.scan_bodyframe_pub_en type=bool value=true read_only=0 descriptor_type=1
+param publish.scan_publish_en type=bool value=true read_only=0 descriptor_type=1
+param qos_overrides./parameter_events.publisher.depth type=integer value=1000 read_only=1 descriptor_type=2 description="qos policy {depth} for publisher {/parameter_events}"
+param qos_overrides./parameter_events.publisher.durability type=string value="volatile" read_only=1 descriptor_type=4 description="qos policy {durability} for publisher {/parameter_events}"
+param qos_overrides./parameter_events.publisher.history type=string value="keep_last" read_only=1 descriptor_type=4 description="qos policy {history} for publisher {/parameter_events}"
+param qos_overrides./parameter_events.publisher.reliability type=string value="reliable" read_only=1 descriptor_type=4 description="qos policy {reliability} for publisher {/parameter_events}"
+param qos_overrides./tf.publisher.depth type=integer value=100 read_only=1 descriptor_type=2 description="qos policy {depth} for publisher {/tf}"
+param qos_overrides./tf.publisher.durability type=string value="volatile" read_only=1 descriptor_type=4 description="qos policy {durability} for publisher {/tf}"
+param qos_overrides./tf.publisher.history type=string value="keep_last" read_only=1 descriptor_type=4 description="qos policy {history} for publisher {/tf}"
+param qos_overrides./tf.publisher.reliability type=string value="reliable" read_only=1 descriptor_type=4 description="qos policy {reliability} for publisher {/tf}"
+param reanchor_confirm_scans type=integer value=3 read_only=0 descriptor_type=2
+param reanchor_en type=bool value=true read_only=0 descriptor_type=1
+param reanchor_healthy_window type=integer value=100 read_only=0 descriptor_type=2
+param reanchor_max_res type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param reanchor_max_res_ratio type=double value=0 read_only=0 descriptor_type=3
+param reanchor_min_eff type=integer value=200 read_only=0 descriptor_type=2
+param reanchor_min_eff_ratio type=double value=0 read_only=0 descriptor_type=3
+param reanchor_on_fail type=string value="hold" read_only=0 descriptor_type=4
+param reanchor_recovery_stable_sec type=double value=1 read_only=0 descriptor_type=3
+param reanchor_res_floor type=double value=0.040000000000000001 read_only=0 descriptor_type=3
+param reanchor_timeout_sec type=double value=5 read_only=0 descriptor_type=3
+param reanchor_total_timeout_sec type=double value=0 read_only=0 descriptor_type=3
+param runaway_hold_sec type=double value=3 read_only=0 descriptor_type=3
+param runaway_on_trip type=string value="hold" read_only=0 descriptor_type=4
+param runaway_parked_speed_thresh type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param runaway_watchdog_en type=bool value=true read_only=0 descriptor_type=1
+param runaway_wheel_speed_margin type=double value=1 read_only=0 descriptor_type=3
+param runtime_pos_log_enable type=bool value=false read_only=0 descriptor_type=1
+param use_sim_time type=bool value=false read_only=0 descriptor_type=1
+param wheel_extrinsic_R type=double_array value=[] read_only=0 descriptor_type=8
+param wheel_odom_en type=bool value=false read_only=0 descriptor_type=1
+param wheel_speed_scale type=double value=1 read_only=0 descriptor_type=3
+param wheel_topic type=string value="/lio/twist" read_only=0 descriptor_type=4
+param wheel_vel_noise_vx type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param wheel_vel_noise_vy type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param wheel_vel_noise_vz type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param zupt_acc_span_ratio type=double value=0.02 read_only=0 descriptor_type=3
+param zupt_anchor_confirm_scans type=integer value=3 read_only=0 descriptor_type=2
+param zupt_anchor_max_scan_gap_s type=double value=0 read_only=0 descriptor_type=3
+param zupt_anchor_trace_en type=bool value=false read_only=0 descriptor_type=1
+param zupt_en type=bool value=true read_only=0 descriptor_type=1
+param zupt_gyro_thresh type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param zupt_hold_deadband_sigma type=double value=3 read_only=0 descriptor_type=3
+param zupt_hold_pos_noise type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param zupt_hold_rot_noise type=double value=0.02 read_only=0 descriptor_type=3
+param zupt_hold_vel_noise type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param zupt_parked_hold_en type=bool value=false read_only=0 descriptor_type=1
+param zupt_parked_hold_scans type=integer value=3 read_only=0 descriptor_type=2
+param zupt_require_wheel type=bool value=false read_only=0 descriptor_type=1
+param zupt_vel_reset_sigma type=double value=0 read_only=0 descriptor_type=3
+param zupt_wheel_max_age type=double value=0.5 read_only=0 descriptor_type=3
+param zupt_wheel_speed_thresh type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+set publish.reference_health type=bool value=true -> rejected "parameter 'publish.reference_health' cannot be set because it is read-only"
+after_set publish.reference_health type=bool value=false
+set filter_size_map type=double value=0.40000000000000002 -> ok
+after_set filter_size_map type=double value=0.40000000000000002
+set filter_size_map type=string value="0.4" -> rejected "Wrong parameter type, parameter {filter_size_map} is of type {double}, setting it to {string} is not allowed."
+after_set filter_size_map type=double value=0.40000000000000002
+set frontend_contract.undeclared type=integer value=1 -> rejected "parameter 'frontend_contract.undeclared' cannot be set because it was not declared"
+after_set frontend_contract.undeclared undeclared

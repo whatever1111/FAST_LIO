@@ -1,0 +1,13 @@
+# frontend contract golden: parameter/nan_imu_backlog
+# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case nan_imu_backlog
+config overrides-only
+overrides 3
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+override max_imu_backlog_sec type=double value=nan:0x7ff8000000000000
+outcome threw std::invalid_argument: "max_imu_backlog_sec must be finite"
+log FATAL laser_mapping "max_imu_backlog_sec must be finite (<= 0 disables the bound), got nan"

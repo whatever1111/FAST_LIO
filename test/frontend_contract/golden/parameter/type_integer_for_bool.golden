@@ -1,0 +1,12 @@
+# frontend contract golden: parameter/type_integer_for_bool
+# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case type_integer_for_bool
+config overrides-only
+overrides 3
+override feature_extract_enable type=integer value=1
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+outcome threw rclcpp::exceptions::InvalidParameterTypeException: "parameter 'feature_extract_enable' has invalid type: Wrong parameter type, parameter {feature_extract_enable} is of type {bool}, setting it to {integer} is not allowed."

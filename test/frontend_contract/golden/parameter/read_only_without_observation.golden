@@ -1,0 +1,12 @@
+# frontend contract golden: parameter/read_only_without_observation
+# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case read_only_without_observation
+config overrides-only
+overrides 3
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+override publish.reference_health type=bool value=true
+outcome threw std::invalid_argument: "reference health requires publish.frontend_observation=true and its clock domain"

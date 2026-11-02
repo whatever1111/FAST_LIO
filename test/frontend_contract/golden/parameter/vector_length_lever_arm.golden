@@ -1,0 +1,13 @@
+# frontend contract golden: parameter/vector_length_lever_arm
+# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case vector_length_lever_arm
+config overrides-only
+overrides 3
+override gravity_align_leg_lever_arm type=double_array value=[0.10000000000000001,0.20000000000000001]
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+outcome threw std::invalid_argument: "gravity_align_leg_lever_arm size mismatch"
+log FATAL laser_mapping "gravity_align_leg_lever_arm must have exactly 3 elements, got 2"

@@ -1,0 +1,47 @@
+# frontend contract golden: parameter/profile_xsw_hesai
+# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case profile_xsw_hesai
+config config/xsw_hesai.yaml sha256 8c372f9b78bd92e3bced041a0d0a1d61da780604452bedcf1ca4c0952ea008cd
+overrides 0
+outcome constructed
+log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
+log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
+log INFO laser_mapping "p_pre->lidar_type 5"
+log INFO laser_mapping "Standard IMU mode: topic=/fp_standard/imu"
+log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
+log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
+log INFO laser_mapping "Node init finished."
+parameters 241
+param common.imu_topic type=string value="/fp_standard/imu" read_only=0 descriptor_type=4
+param common.lid_topic type=string value="/hesai210/original" read_only=0 descriptor_type=4
+param cube_side_length type=double value=1000 read_only=0 descriptor_type=3
+param filter_size_map type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param filter_size_surf type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param gravity_align_gyro_tol type=double value=0.5 read_only=0 descriptor_type=3
+param initial_pose type=double_array value=[0,0,0,0,0,0] read_only=0 descriptor_type=8
+param map_file_path type=string value="/data/fast_lio_map.pcd" read_only=0 descriptor_type=4
+param mapping.acc_cov type=double value=0.0039939570888238808 read_only=0 descriptor_type=3
+param mapping.b_acc_cov type=double value=6.4356659353532566e-05 read_only=0 descriptor_type=3
+param mapping.b_gyr_cov type=double value=3.5640318696367613e-05 read_only=0 descriptor_type=3
+param mapping.det_range type=double value=60 read_only=0 descriptor_type=3
+param mapping.extrinsic_R type=double_array value=[0.99962916099999999,0.027169025999999999,0.001839893,-0.027217621000000001,0.998983238,0.035940112000000003,-0.00086156399999999999,-0.035976860999999999,0.999352252] read_only=0 descriptor_type=8
+param mapping.extrinsic_T type=double_array value=[-0.023944,0.001915,-0.0042620000000000002] read_only=0 descriptor_type=8
+param mapping.fov_degree type=double value=360 read_only=0 descriptor_type=3
+param mapping.gyr_cov type=double value=0.0015636343949698187 read_only=0 descriptor_type=3
+param max_iteration type=integer value=2 read_only=0 descriptor_type=2
+param pcd_save.pcd_save_en type=bool value=true read_only=0 descriptor_type=1
+param planar_constraint_en type=bool value=true read_only=0 descriptor_type=1
+param planar_constraint_noise type=double value=0.02 read_only=0 descriptor_type=3
+param planar_constraint_z_weak_thresh type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param point_filter_num type=integer value=3 read_only=0 descriptor_type=2
+param preprocess.blind type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param preprocess.lidar_type type=integer value=5 read_only=0 descriptor_type=2
+param preprocess.scan_line type=integer value=32 read_only=0 descriptor_type=2
+param preprocess.timestamp_unit type=integer value=0 read_only=0 descriptor_type=2
+param publish.dense_publish_en type=bool value=false read_only=0 descriptor_type=1
+param wheel_extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1] read_only=0 descriptor_type=8
+param wheel_vel_noise_vx type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param wheel_vel_noise_vy type=double value=0.02 read_only=0 descriptor_type=3

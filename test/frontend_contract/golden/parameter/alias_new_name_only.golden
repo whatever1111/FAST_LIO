@@ -1,0 +1,22 @@
+# frontend contract golden: parameter/alias_new_name_only
+# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case alias_new_name_only
+config overrides-only
+overrides 3
+override initial_pose_full_rpy_override type=bool value=true
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+outcome constructed
+log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
+log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
+log WARN laser_mapping "initial_pose_full_rpy_override=true: overriding IMU-aligned roll/pitch with values from initial_pose. Caller must ensure these match gravity (accel along -Z), else point cloud transforms will be incorrect."
+log INFO laser_mapping "p_pre->lidar_type 1"
+log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
+log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
+log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
+log INFO laser_mapping "Node init finished."
+parameters 241
+param initial_pose_full_rpy_override type=bool value=true read_only=0 descriptor_type=1

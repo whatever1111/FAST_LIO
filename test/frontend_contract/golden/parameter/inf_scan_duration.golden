@@ -1,0 +1,13 @@
+# frontend contract golden: parameter/inf_scan_duration
+# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case inf_scan_duration
+config overrides-only
+overrides 3
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+override preprocess.max_scan_duration_s type=double value=inf
+outcome threw std::invalid_argument: "preprocess.max_scan_duration_s must be finite and nonnegative"
+log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"

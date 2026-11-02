@@ -1,0 +1,21 @@
+# frontend contract golden: parameter/vector_length_initial_pose
+# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case vector_length_initial_pose
+config overrides-only
+overrides 3
+override initial_pose type=double_array value=[1,2,3]
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+outcome constructed
+log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
+log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
+log INFO laser_mapping "p_pre->lidar_type 1"
+log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
+log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
+log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
+log INFO laser_mapping "Node init finished."
+parameters 241
+param initial_pose type=double_array value=[1,2,3] read_only=0 descriptor_type=8

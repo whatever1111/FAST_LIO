@@ -1,0 +1,24 @@
+# frontend contract golden: parameter/prior_map_unknown_alignment
+# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case prior_map_unknown_alignment
+config overrides-only
+overrides 4
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+override prior_map_align type=string value="sideways"
+override prior_map_pcd type=string value="/nonexistent/fastlio_contract/prior.pcd"
+outcome constructed
+log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
+log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
+log ERROR laser_mapping "prior_map_align='sideways' is not a known value (as_delivered | relocalization) - loading the map as delivered"
+log INFO laser_mapping "p_pre->lidar_type 1"
+log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
+log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
+log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
+log INFO laser_mapping "Node init finished."
+parameters 241
+param prior_map_align type=string value="sideways" read_only=0 descriptor_type=4
+param prior_map_pcd type=string value="/nonexistent/fastlio_contract/prior.pcd" read_only=0 descriptor_type=4

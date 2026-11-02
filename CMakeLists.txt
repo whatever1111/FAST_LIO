@@ -177,6 +177,51 @@ endif()
 ament_target_dependencies(fastlio_mapping_component ${dependencies})
 rclcpp_components_register_nodes(fastlio_mapping_component "LaserMappingNode")
 
+# ─────────── Test-only sanitizer instrumentation ───────────────────────────────
+# FASTLIO_TEST_SANITIZER is empty by default and then changes no target. With
+# -DFASTLIO_TEST_SANITIZER=thread, fastlio_test_sanitize() adds -fsanitize=thread to the compile
+# and link options of fastlio_mapping_test_component, of every test executable that links it and
+# of the negative control, and of nothing else: the global flags (CMAKE_CXX_FLAGS,
+# add_compile_options, link_libraries) and the production targets stay as they are.
+# The configuration exists for the front-end phase of the parent repository's
+# `tools/ci/run_local.sh sanitize tsan`, which builds only what that phase runs:
+#   colcon build --packages-select fast_lio --cmake-target fastlio_test_sanitizer_suite \
+#     --cmake-args -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DFASTLIO_TEST_SANITIZER=thread
+#   ctest -L '^fastlio_test_sanitizer$'    (the tests that suite builds; nothing else is built)
+# The suite compiles laserMapping.cpp once, instrumented: under the option the test component
+# does not wait for the two production targets, which the suite does not build.
+# fastlio_test_sanitizer.txt in the build directory lists the component, the selected test
+# executables and the negative control, for the phase's instrumentation check. The negative
+# control is a deliberate data race and not a CTest test: the phase runs it and requires TSan's
+# report, so a build in which instrumentation silently did not happen cannot pass.
+set(FASTLIO_TEST_SANITIZER "" CACHE STRING "Instrument the node test component and its tests: empty or thread")
+set_property(CACHE FASTLIO_TEST_SANITIZER PROPERTY STRINGS "" thread)
+if(NOT FASTLIO_TEST_SANITIZER STREQUAL "")
+  if(NOT FASTLIO_TEST_SANITIZER STREQUAL "thread")
+    message(FATAL_ERROR "FASTLIO_TEST_SANITIZER must be empty or thread, not '${FASTLIO_TEST_SANITIZER}'")
+  endif()
+  if(NOT BUILD_TESTING OR NOT USE_IVOX)
+    message(FATAL_ERROR "FASTLIO_TEST_SANITIZER instruments the node test component: it needs BUILD_TESTING and USE_IVOX")
+  endif()
+  message(STATUS "fast_lio: test component and its tests instrumented with -fsanitize=${FASTLIO_TEST_SANITIZER}")
+endif()
+function(fastlio_test_sanitize target)
+  if(FASTLIO_TEST_SANITIZER)
+    target_compile_options(${target} PRIVATE -fsanitize=${FASTLIO_TEST_SANITIZER} -fno-omit-frame-pointer)
+    target_link_options(${target} PRIVATE -fsanitize=${FASTLIO_TEST_SANITIZER})
+  endif()
+endfunction()
+# Selects a registered test for the sanitizer phase: the label ctest selects it by, a timeout that
+# only bounds a hang of the instrumented run, and its executable in the suite and the manifest.
+function(fastlio_test_sanitizer_select test target)
+  if(FASTLIO_TEST_SANITIZER)
+    set_property(TEST ${test} APPEND PROPERTY LABELS fastlio_test_sanitizer)
+    set_tests_properties(${test} PROPERTIES TIMEOUT 900)
+    add_dependencies(fastlio_test_sanitizer_suite ${target})
+    set_property(GLOBAL APPEND PROPERTY FASTLIO_TEST_SANITIZER_MANIFEST "test ${test} $<TARGET_FILE:${target}>")
+  endif()
+endfunction()
+
 if(BUILD_TESTING)
   # Link the real production model: do not compile a copied h-model into the test.
   ament_add_gtest(test_h_model_scan_bounds test/test_h_model_scan_bounds.cpp TIMEOUT 120)
@@ -209,8 +254,21 @@ if(BUILD_TESTING)
     else()
       rosidl_target_interfaces(fastlio_mapping_test_component ${PROJECT_NAME} "rosidl_typesupport_cpp")
     endif()
-    add_dependencies(fastlio_mapping_test_component fastlio_mapping fastlio_mapping_component)
+    fastlio_test_sanitize(fastlio_mapping_test_component)
+    if(NOT FASTLIO_TEST_SANITIZER)
+      add_dependencies(fastlio_mapping_test_component fastlio_mapping fastlio_mapping_component)
+    else()
+      add_custom_target(fastlio_test_sanitizer_suite)
+      add_dependencies(fastlio_test_sanitizer_suite fastlio_mapping_test_component)
+      add_executable(fastlio_tsan_negative_control test/tsan_negative_control.cpp)
+      fastlio_test_sanitize(fastlio_tsan_negative_control)
+      add_dependencies(fastlio_test_sanitizer_suite fastlio_tsan_negative_control)
+    endif()
+    # Map worker: the blocking Add, reset join, delayed batches and old-epoch interleavings run
+    # under test barriers on the real worker functions.
     ament_add_gtest(test_async_map_reset test/test_async_map_reset.cpp TIMEOUT 30)
+    fastlio_test_sanitize(test_async_map_reset)
+    fastlio_test_sanitizer_select(test_async_map_reset test_async_map_reset)
     target_include_directories(test_async_map_reset PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/test ${PCL_INCLUDE_DIRS})
     target_link_libraries(test_async_map_reset fastlio_mapping_test_component ${PCL_LIBRARIES} Eigen3::Eigen)
@@ -225,6 +283,7 @@ if(BUILD_TESTING)
     foreach(scan_test test_ros_scan_bounds test_ros_imu_fault test_ros_pcd_writer)
       string(REGEX REPLACE "^test_" "" scan_receipt "${scan_test}")
       ament_add_gtest(${scan_test} test/test_ros_scan_bounds.cpp TIMEOUT 240)
+      fastlio_test_sanitize(${scan_test})
       # Both fixtures use the broker's ROS domain and the real /Odometry endpoint.
       # Serialize their processes rather than allocating an unleased test domain.
       set_tests_properties(${scan_test} PROPERTIES RUN_SERIAL TRUE)
@@ -245,6 +304,8 @@ if(BUILD_TESTING)
     endforeach()
     target_compile_definitions(test_ros_imu_fault PRIVATE FASTLIO_INPUT_FAULT_TEST)
     target_compile_definitions(test_ros_pcd_writer PRIVATE FASTLIO_PCD_WRITER_TEST)
+    # PCD writer thread: started by the component's construction, stopped and joined by its destruction.
+    fastlio_test_sanitizer_select(test_ros_pcd_writer test_ros_pcd_writer)
     # The stationary anchor on the production call chain. Each scenario activates the component in its own
     # forked child; like the scan fixtures it uses the broker's ROS domain and the real /Odometry endpoint.
     # One executable, one CTest entry per gtest suite ("suite:entry suffix:timeout in seconds"), so each entry
@@ -264,6 +325,7 @@ if(BUILD_TESTING)
       "AnchorLifecycleStartup:startup:600"
       "AnchorLifecycleReference:reference:600")
     ament_add_gtest_executable(test_anchor_lifecycle_node test/test_anchor_lifecycle_node.cpp)
+    fastlio_test_sanitize(test_anchor_lifecycle_node)
     set(anchor_node_suites "")
     foreach(anchor_node_entry ${anchor_node_entries})
       string(REPLACE ":" ";" anchor_node_entry "${anchor_node_entry}")
@@ -318,6 +380,15 @@ if(BUILD_TESTING)
         rosidl_target_interfaces(test_ivox_node_capacity_${capacity_case} ${PROJECT_NAME} "rosidl_typesupport_cpp")
       endif()
     endforeach()
+    if(FASTLIO_TEST_SANITIZER)
+      get_property(sanitizer_tests GLOBAL PROPERTY FASTLIO_TEST_SANITIZER_MANIFEST)
+      string(REPLACE ";" "\n" sanitizer_tests "${sanitizer_tests}")
+      file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/fastlio_test_sanitizer.txt" CONTENT
+        "component fastlio_mapping_test_component $<TARGET_FILE:fastlio_mapping_test_component>
+negative_control fastlio_tsan_negative_control $<TARGET_FILE:fastlio_tsan_negative_control>
+${sanitizer_tests}
+")
+    endif()
   endif()
   ament_add_gtest(test_cached_plane test/test_cached_plane.cpp)
   target_include_directories(test_cached_plane PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

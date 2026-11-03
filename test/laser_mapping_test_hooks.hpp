@@ -185,6 +185,11 @@ public:
 
   const std::vector<EffectiveValue> & values() const { return entries_; }
   void clear() { entries_.clear(); }
+  /// Appends another recorder's entries; the fixture sorts by name, so the order does not matter.
+  void append(const EffectiveRecorder & other)
+  {
+    entries_.insert(entries_.end(), other.entries_.begin(), other.entries_.end());
+  }
 
 private:
   void add(const std::string & name, const std::string & type, const std::string & value)

@@ -145,13 +145,27 @@ TEST_F(LostRecovery, RepeatedLossCommitsEpochsTwoThenThree)
   EXPECT_EQ(recovery.map_resets, 3u);
 }
 
+TEST_F(LostRecovery, LastExactlyRepresentableEpochCanCommit)
+{
+  lost.coordinate_epoch = (std::uint64_t{1} << 53) - 1;
+  begin();
+  EXPECT_TRUE(scan(1, 0, 200));
+  EXPECT_EQ(lost.coordinate_epoch, std::uint64_t{1} << 53);
+  EXPECT_EQ(static_cast<std::uint64_t>(static_cast<double>(lost.coordinate_epoch)), lost.coordinate_epoch);
+  EXPECT_EQ(recovery.trust, RecoveryTrust::kLocalQualified);
+  EXPECT_EQ(lost.epochs_committed, 1u);
+}
+
 TEST_F(LostRecovery, EpochExhaustionNeverWrapsOrQualifies)
 {
-  lost.coordinate_epoch = std::numeric_limits<std::uint64_t>::max();
+  lost.coordinate_epoch = std::uint64_t{1} << 53;
   begin();
   EXPECT_FALSE(scan(1, 0, 200));
   EXPECT_EQ(recovery.trust, RecoveryTrust::kUnanchored);
-  EXPECT_EQ(lost.coordinate_epoch, std::numeric_limits<std::uint64_t>::max());
+  EXPECT_EQ(recovery.cause, RecoveryCause::kDeadline);
+  EXPECT_EQ(lost.coordinate_epoch, std::uint64_t{1} << 53);
+  EXPECT_EQ(lost.epochs_committed, 0u);
+  EXPECT_EQ(lost.attempts, 1u);
 }
 
 TEST(LostRecoveryParameters, ValidatesDurationAndRequiresTheLatchPolicy)

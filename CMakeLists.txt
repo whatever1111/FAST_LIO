@@ -323,7 +323,8 @@ if(BUILD_TESTING)
       "AnchorLifecycleHold:hold:240"
       "AnchorLifecycleExport:export:240"
       "AnchorLifecycleStartup:startup:600"
-      "AnchorLifecycleReference:reference:600")
+      "AnchorLifecycleReference:reference:600"
+      "AnchorLifecycleLostRecovery:lost_recovery:600")
     ament_add_gtest_executable(test_anchor_lifecycle_node test/test_anchor_lifecycle_node.cpp)
     fastlio_test_sanitize(test_anchor_lifecycle_node)
     set(anchor_node_suites "")

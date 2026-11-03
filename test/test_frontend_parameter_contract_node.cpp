@@ -1102,6 +1102,14 @@ TEST(FrontendParameterContract, VectorLengthInitialPose)
 }
 
 // Non-finite values.
+TEST(FrontendParameterContract, LostRecoveryRequiresRecoveryBudget)
+{
+  ParameterCase c = overridesCase("lost_recovery_requires_budget", Expect::kRejected);
+  setOverride(c, rclcpp::Parameter("lost_recovery_en", true));
+  setOverride(c, rclcpp::Parameter("reanchor_total_timeout_sec", 0.0));
+  checkCase(c);
+}
+
 TEST(FrontendParameterContract, NanImuBacklog)
 {
   ParameterCase c = overridesCase("nan_imu_backlog", Expect::kRejected);

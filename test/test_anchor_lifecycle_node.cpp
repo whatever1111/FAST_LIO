@@ -793,6 +793,10 @@ private:
       prior_reset_ = {before, after, lost};
       retained_prior_voxels_ = pinned;
     };
+    fast_lio_test::afterLostRecoveryCommit = [this](std::uint64_t epoch, bool preserved) {
+      lines_.push_back("BPLUS_STATE epoch=" + std::to_string(epoch) + " preserved=" + std::to_string(preserved));
+      line_input_ns_.push_back(newest_imu_ns_);
+    };
     // A scan's IMU batch is settled before its record is finished, so the record takes the batch reported since the
     // last record; a scan dropped where it is synced settles none. The hook runs with the input buffer unlocked.
     fast_lio_test::afterImuConsumption =
@@ -886,6 +890,7 @@ private:
     fast_lio_test::forceRunawayTrip = {};
     fast_lio_test::initialBuildTakesNoPoint = {};
     fast_lio_test::afterAnchorScanRecord = {};
+    fast_lio_test::afterLostRecoveryCommit = {};
     fast_lio_test::afterAnchorTraceLine = {};
     fast_lio_test::afterImuConsumption = {};
     fast_lio_test::afterPosePublish = {};
@@ -6577,4 +6582,179 @@ TEST(AnchorLifecycleReference, EnablingRequiresTheExistingTypedIdentity)
   result = runScenario(scenario);
   EXPECT_FALSE(result.ok());
   EXPECT_NE(result.error.find("explicit clock domain"), std::string::npos);
+}
+
+namespace
+{
+Scenario lostEpochScenario(bool reset, bool enabled = true)
+{
+  auto scenario = withReference(pendingExport(kExportShortBudget));
+  scenario.name = reset ? "lost_epoch_reset" : "lost_epoch_deadline";
+  setParam(scenario, rclcpp::Parameter("lost_recovery_en", enabled));
+  setParam(scenario, rclcpp::Parameter("lost_recovery_stable_sec", 0.25));
+  setParam(scenario, rclcpp::Parameter("runaway_watchdog_en", true));
+  setParam(scenario, rclcpp::Parameter("runaway_on_trip", "reset_map"));
+  scenario.steps.clear();
+  append(scenario, 5, slot(Phase::kBefore, Imu::kMoving));
+  if (reset) {
+    auto trip = slot(Phase::kEvent);
+    trip.trip = true;
+    append(scenario, 1, trip);
+  } else {
+    append(scenario, 15, slot(Phase::kEvent, Imu::kMoving, Guard::kDegraded));
+  }
+  append(scenario, 20, slot(Phase::kAfter));
+  return scenario;
+}
+
+void expectEpochCommit(const ChildResult & result, std::uint64_t epoch)
+{
+  const auto events = recoveryLines(result, "epoch_committed");
+  const auto event = std::find_if(events.begin(), events.end(), [&](const std::string & line) {
+    return valueOf(line, "coordinate_epoch") == std::to_string(epoch);
+  });
+  ASSERT_NE(event, events.end());
+  const auto seq = std::stoull(valueOf(*event, "scan_seq"));
+  const auto observation = std::find_if(
+    result.observations.begin(), result.observations.end(), [&](const auto & o) { return o.record.scan_seq == seq; });
+  ASSERT_NE(observation, result.observations.end());
+  EXPECT_EQ(observation->record.trust_post, fast_lio::RecoveryTrust::kLocalQualified);
+  ASSERT_TRUE(observation->odom_seen);
+  EXPECT_EQ(observation->odom_twist_cov[6], static_cast<double>(epoch));
+  const auto * reference = referenceFor(result, seq);
+  ASSERT_NE(reference, nullptr);
+  EXPECT_EQ(reference->coordinate_epoch, epoch);
+  EXPECT_EQ(reference->kind, 1);
+  ASSERT_TRUE(reference->has_pose_binding);
+  for (int axis = 0; axis < 3; ++axis) {
+    EXPECT_EQ(reference->pose_binding[axis], observation->odom_p[axis]);
+    EXPECT_EQ(reference->pose_binding[axis + 3], observation->odom_q[axis + 1]);
+  }
+  EXPECT_EQ(reference->pose_binding[6], observation->odom_q[0]);
+  const auto * previous = referenceFor(result, seq - 1);
+  ASSERT_NE(previous, nullptr);
+  EXPECT_GT(reference->state_revision, previous->state_revision);
+  EXPECT_EQ(reference->qualified_event_sequence, previous->qualified_event_sequence + 1);
+  EXPECT_EQ(reference->trust, 1);
+  EXPECT_EQ(reference->taint_mask, 0u);
+  EXPECT_EQ(reference->hard_mask, 0u);
+  const auto typed = std::find_if(result.typed_poses.begin(), result.typed_poses.end(), [&](const auto & value) {
+    return value.has_observation_stamp && value.observation_stamp_ns == observation->odom_stamp_ns;
+  });
+  ASSERT_NE(typed, result.typed_poses.end());
+  EXPECT_EQ(typed->coordinate_epoch, epoch);
+  const auto state = "BPLUS_STATE epoch=" + std::to_string(epoch) + " preserved=1";
+  EXPECT_NE(std::find(result.lines.begin(), result.lines.end(), state), result.lines.end());
+}
+}  // namespace
+
+TEST(AnchorLifecycleLostRecovery, LostRecoveryDeadlineCommitsANewEpoch)
+{
+  const auto result = runScenario(lostEpochScenario(false));
+  SCOPED_TRACE(describeRun(result));
+  ASSERT_TRUE(result.ok());
+  ASSERT_FALSE(recoveryLines(result, "unanchored").empty());
+  expectEpochCommit(result, 2);
+}
+
+TEST(AnchorLifecycleLostRecovery, LostRecoveryMapResetCommitsANewEpoch)
+{
+  const auto result = runScenario(lostEpochScenario(true));
+  SCOPED_TRACE(describeRun(result));
+  ASSERT_TRUE(result.ok());
+  expectEpochCommit(result, 2);
+}
+
+TEST(AnchorLifecycleLostRecovery, LostRecoveryDisabledPreservesTheLatchAndLegacyZero)
+{
+  const auto result = runScenario(lostEpochScenario(true, false));
+  SCOPED_TRACE(describeRun(result));
+  ASSERT_TRUE(result.ok());
+  EXPECT_TRUE(recoveryLines(result, "epoch_committed").empty());
+  for (const auto * observation : result.phase(Phase::kAfter)) {
+    EXPECT_EQ(observation->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
+    ASSERT_TRUE(observation->odom_seen);
+    EXPECT_EQ(observation->odom_twist_cov[6], 0.0);
+  }
+  for (const auto & value : result.references)
+    if (value.has_coordinate_epoch)
+      EXPECT_EQ(value.coordinate_epoch, 1u);
+  for (const auto & value : result.typed_poses)
+    EXPECT_EQ(value.coordinate_epoch, 1u);
+}
+
+TEST(AnchorLifecycleLostRecovery, LostRecoveryRepeatedResetAdvancesToEpochThree)
+{
+  auto scenario = lostEpochScenario(true);
+  auto trip = slot(Phase::kHoldReset);
+  trip.trip = true;
+  append(scenario, 1, trip);
+  append(scenario, 20, slot(Phase::kAfterReset));
+  const auto result = runScenario(scenario);
+  SCOPED_TRACE(describeRun(result));
+  ASSERT_TRUE(result.ok());
+  ASSERT_EQ(recoveryLines(result, "epoch_committed").size(), 2u);
+  expectEpochCommit(result, 2);
+  expectEpochCommit(result, 3);
+}
+
+TEST(AnchorLifecycleLostRecovery, LostRecoveryInterruptedCandidateMustEarnANewStableRun)
+{
+  for (int interruption = 0; interruption < 3; ++interruption) {
+    auto scenario = lostEpochScenario(true);
+    scenario.steps.resize(8);  // reset, then two healthy scans: less than the 0.25 s stable interval
+    auto event = slot(Phase::kHoldReset, Imu::kMoving, Guard::kDegraded);
+    if (interruption != 0) {
+      event.guard = Guard::kHealthy;
+      event.trip = true;
+      setParam(scenario, rclcpp::Parameter("runaway_on_trip", interruption == 1 ? "hold" : "reset_map"));
+      // The initial reset must still occur: use the deadline latch for the hold variant instead.
+      if (interruption == 1) {
+        scenario = lostEpochScenario(false);
+        scenario.steps.resize(22);
+        setParam(scenario, rclcpp::Parameter("runaway_on_trip", "hold"));
+      }
+    }
+    append(scenario, 1, event);
+    append(scenario, 20, slot(Phase::kAfterReset));
+    const auto result = runScenario(scenario);
+    SCOPED_TRACE(std::to_string(interruption) + " " + describeRun(result));
+    ASSERT_TRUE(result.ok());
+    for (const auto * observation : result.phase(Phase::kHoldReset))
+      EXPECT_EQ(observation->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
+    const auto after = result.phase(Phase::kAfterReset);
+    ASSERT_GE(after.size(), 3u);
+    // Two scans span only 0.15 s: the interrupted run must not contribute its elapsed time.
+    EXPECT_EQ(after[0]->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
+    EXPECT_EQ(after[1]->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
+    expectEpochCommit(result, 2);
+  }
+}
+
+TEST(AnchorLifecycleLostRecovery, LostRecoveryDroppedScanMustEarnANewStableRun)
+{
+  for (bool repeated : {false, true}) {
+    auto scenario = lostEpochScenario(true);
+    scenario.steps.resize(8);  // reset, then two healthy scans: only 0.15 s of the 0.25 s stable interval
+    auto dropped = slot(Phase::kHoldReset);
+    dropped.cloud = repeated ? Cloud::kDense : Cloud::kEmpty;
+    dropped.repeat = repeated ? 1 : 0;
+    append(scenario, 1, dropped);
+    append(scenario, 20, slot(Phase::kAfterReset));
+    const auto result = runScenario(scenario);
+    SCOPED_TRACE(std::to_string(repeated) + " " + describeRun(result));
+    ASSERT_TRUE(result.ok());
+    const auto rejected = result.phase(Phase::kHoldReset);
+    ASSERT_EQ(rejected.size(), 1u);
+    EXPECT_EQ(rejected.front()->record.outcome,
+              repeated ? fast_lio::AnchorScanOutcome::kDroppedNonadvancing
+                       : fast_lio::AnchorScanOutcome::kDroppedInvalidTime);
+    EXPECT_FALSE(rejected.front()->odom_seen);
+    const auto after = result.phase(Phase::kAfterReset);
+    ASSERT_GE(after.size(), 3u);
+    // Even though the sync rejection did not allocate a lifecycle scan ID, it broke the matching run.
+    EXPECT_EQ(after[0]->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
+    EXPECT_EQ(after[1]->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
+    expectEpochCommit(result, 2);
+  }
 }

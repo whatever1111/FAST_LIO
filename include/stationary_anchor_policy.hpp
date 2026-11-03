@@ -32,7 +32,7 @@
 // unobserved IMU stretch is not one of them), or at start + total_ns in
 // Unanchored. A
 // map reset leads to Unanchored as well: the rebuilt map is seeded from the very
-// pose in question. Unanchored is latched for the life of the process, because a
+// pose in question. Unanchored is latched within one source instance and coordinate epoch, because a
 // rebuilt or re-matched local map shows that the scans agree with each other,
 // not where the platform is. While Pending the caller keeps the local map
 // frozen, so the scans cannot vouch for themselves with points they added.
@@ -459,7 +459,7 @@ enum class RecoveryTrust : std::uint8_t
 {
   kLocalQualified,  ///< the reference is trusted as far as the local checks go
   kPending,         ///< an unsupported-recovery episode is running against its deadline
-  kUnanchored,      ///< latched: the position is not trusted again in this process
+  kUnanchored,      ///< latched within this source instance and coordinate epoch
 };
 
 enum class RecoveryCause : std::uint8_t
@@ -705,7 +705,7 @@ inline RecoveryEvent observeRecoveryScan(RecoveryState * recovery,
   return event;
 }
 
-/// A map reset. With the policy on, the reference is not trusted again in this process. A reset is never a cold
+/// A map reset. With the policy on, this epoch's reference is not trusted again. A reset is never a cold
 /// start: it revokes one that is still open, and latches whether or not the first reference was built.
 inline RecoveryEvent
 resetRecoveryReference(RecoveryState * recovery, std::int64_t now_ns, const RecoveryParams & params)

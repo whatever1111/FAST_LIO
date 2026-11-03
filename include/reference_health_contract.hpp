@@ -251,6 +251,7 @@ public:
 
   bool stateChanged(const ReferenceHealthSnapshot & value) const
   {
+    // Unanchored is latched within one source instance and coordinate epoch; a committed epoch is a new context.
     return !hasPrevious_ || negativeSequence_ != settledNegative_ || value.trust != previous_.trust ||
            value.lifecycle != previous_.lifecycle || value.startupReference != previous_.startupReference ||
            value.referenceGeneration != previous_.referenceGeneration ||

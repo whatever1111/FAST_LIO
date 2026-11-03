@@ -43,6 +43,8 @@ extern std::function<bool(double)> initialBuildTakesNoPoint;
 extern std::function<bool(double)> resetBeforeReference;
 /// Read-only reset receipt: installed before/after, required-prior latch, retained pinned voxels.
 extern std::function<void(bool, bool, bool, std::size_t)> afterPriorMapReset;
+/// Commit receipt: epoch, exact preservation of ba/bg/grav and estimator covariance across the epoch transition.
+extern std::function<void(std::uint64_t, bool)> afterLostRecoveryCommit;
 /// Every scan record, whether or not zupt_anchor_trace_en prints it.
 extern std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 /// Every anchor trace line actually logged.

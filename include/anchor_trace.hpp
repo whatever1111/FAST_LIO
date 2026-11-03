@@ -559,6 +559,7 @@ enum class RecoveryTraceEvent : std::uint8_t
   kPending,
   kQualified,
   kUnanchored,
+  kEpochCommitted,
 };
 
 /// Where a recovery record was written: on the scan path, or by the check every IMU sample the front end takes runs.
@@ -854,6 +855,8 @@ inline const char * recoveryTraceEventName(RecoveryTraceEvent event)
       return "qualified";
     case RecoveryTraceEvent::kUnanchored:
       return "unanchored";
+    case RecoveryTraceEvent::kEpochCommitted:
+      return "epoch_committed";
   }
   return "unknown";
 }

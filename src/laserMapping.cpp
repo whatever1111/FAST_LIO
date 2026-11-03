@@ -113,6 +113,7 @@
 #include "gravity_align_kinematics.hpp"
 #include "imu_backlog_policy.hpp"
 #include "imu_gap_prior.hpp"
+#include "lost_recovery_policy.hpp"
 #include "map_backend_reference.hpp"
 #include "parked_hold.hpp"
 #include "preprocess.h"
@@ -504,6 +505,9 @@ bool anchor_ever_created = false;  // an anchor has been created in this process
 // in the node's default mutually exclusive callback group; no other thread touches it.
 fast_lio::RecoveryParams recovery_params;
 fast_lio::RecoveryState recovery_state;
+fast_lio::LostRecoveryParams lost_recovery_params;
+fast_lio::LostRecoveryState lost_recovery;
+bool lost_recovery_map_ready = false;
 std::uint64_t lifecycle_scan_seq = 0;  // one per scan the scan path starts on: a matching run is consecutive in it
 bool anchor_scan_evaluated = false;    // the scan being processed reached the anchor step
 bool reanchor_lost_this_scan = false;  // the gate declared the scan being processed lost, whatever re-armed it since
@@ -1572,6 +1576,7 @@ struct FinalFrontendSnapshot
   fast_lio::FrontendFacts frontend;
   fast_lio::ReferenceHealthSnapshot reference;
   std::int64_t poseStamp = 0;
+  std::uint64_t coordinateEpoch = lost_recovery.coordinate_epoch;
 };
 FinalFrontendSnapshot anchor_final_snapshot;
 bool anchor_final_frozen = false;
@@ -1685,7 +1690,7 @@ FinalFrontendSnapshot captureFinalFrontend(bool completed, bool scanEvent, doubl
         value.frameId = odom_frame_id;
         value.childFrameId = body_frame_id;
         value.hasCoordinateEpoch = facts.contextKnown;
-        value.coordinateEpoch = facts.contextKnown ? 1 : 0;
+        value.coordinateEpoch = facts.contextKnown ? final.coordinateEpoch : 0;
         value.producerContractId = reference_contract_id;
         value.configId = reference_config_id;
         value.enabledPolicyMask = fast_lio::kReferenceImplemented;
@@ -1856,7 +1861,10 @@ void recoveryTransition(fast_lio::RecoveryTraceEvent event, fast_lio::RecoveryCa
   transition.reset_count = recovery_state.map_resets;
   transition.path = anchor_idle_path ? fast_lio::RecoveryTracePath::kIdle : fast_lio::RecoveryTracePath::kScan;
   fast_lio::saturatingIncrement(&anchor_trace_counters.events);
-  emitAnchorTraceLine(fast_lio::formatRecoveryTransition(transition));
+  auto line = fast_lio::formatRecoveryTransition(transition);
+  if (event == fast_lio::RecoveryTraceEvent::kEpochCommitted)
+    line += " coordinate_epoch=" + std::to_string(lost_recovery.coordinate_epoch);
+  emitAnchorTraceLine(line);
 }
 
 // The parked streak counts the scans of one candidate or anchor, so whatever ends that, or breaks the evidence
@@ -1872,6 +1880,12 @@ void endParkedStreak()
 void anchorEvidence(
   fast_lio::AnchorTraceReason reason, std::uint32_t bit, std::uint64_t * counter, double stamp, bool report)
 {
+  constexpr auto breaksLostRecovery = fast_lio::kAnchorEventMapReset | fast_lio::kAnchorEventReferenceChanged |
+                                      fast_lio::kAnchorEventLost | fast_lio::kAnchorEventRunawayTrip |
+                                      fast_lio::kAnchorEventTimeEpoch | fast_lio::kAnchorEventScanHole |
+                                      fast_lio::kAnchorEventImuCoverageGap | fast_lio::kAnchorEventImuBridge;
+  if (bit & breaksLostRecovery)
+    fast_lio::abandonLostRecovery(&lost_recovery, lost_recovery_params);
   if (reference_health_en) {
     std::uint32_t cause = 0, hard = 0;
     switch (reason) {
@@ -2181,6 +2195,9 @@ void dropStationaryAnchor(fast_lio::AnchorDrop drop, double stamp)
 // new generation.
 void changeStationaryReference(fast_lio::AnchorDrop drop, double stamp)
 {
+  fast_lio::abandonLostRecovery(&lost_recovery, lost_recovery_params);
+  if (lost_recovery_params.enabled)
+    lost_recovery_map_ready = false;
   const fast_lio::AnchorState before = stationary_anchor.state;
   fast_lio::changeAnchorReference(&stationary_anchor, drop);
   noteAnchorEnded(before, drop, stamp);
@@ -2213,13 +2230,21 @@ void noteRecoveryEvent(const fast_lio::RecoveryEvent & event, std::int64_t stamp
     recoveryTransition(fast_lio::RecoveryTraceEvent::kQualified, event.cause, stamp_ns);
   }
   if (event.unanchored) {
+    if (lost_recovery_params.enabled)
+      lost_recovery_map_ready = false;
     fast_lio::saturatingIncrement(event.cause == fast_lio::RecoveryCause::kMapReset
                                     ? &anchor_trace_counters.map_reset_unanchored
                                     : &anchor_trace_counters.recovery_expired);
-    RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
-                 "[FE-RECOVERY] UNANCHORED (%s): the position is not trusted again in this process and odometry "
-                 "stays flagged degraded; only a restart restores normal operation",
-                 fast_lio::recoveryCauseName(event.cause));
+    if (lost_recovery_params.enabled) {
+      RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                   "[FE-RECOVERY] UNANCHORED (%s): this coordinate epoch stays untrusted; LOST recovery is armed",
+                   fast_lio::recoveryCauseName(event.cause));
+    } else {
+      RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                   "[FE-RECOVERY] UNANCHORED (%s): the position is not trusted again in this process and odometry "
+                   "stays flagged degraded; only a restart restores normal operation",
+                   fast_lio::recoveryCauseName(event.cause));
+    }
     recoveryTransition(fast_lio::RecoveryTraceEvent::kUnanchored, event.cause, stamp_ns);
   }
 }
@@ -2407,6 +2432,7 @@ private:
 // old scan is not, and a scan whose drop ends candidate and anchor alike needs no second word.
 void recordDroppedAnchorScan(fast_lio::AnchorScanOutcome outcome, double beg, double end, bool unevaluated)
 {
+  fast_lio::abandonLostRecovery(&lost_recovery, lost_recovery_params);
   beginAnchorScanRecord(beg, end);
   anchor_scan_record.outcome = outcome;
   if (unevaluated)
@@ -2781,6 +2807,7 @@ std::function<bool(double)> forceRunawayTrip;
 std::function<bool(double)> initialBuildTakesNoPoint;
 std::function<bool(double)> resetBeforeReference;
 std::function<void(bool, bool, bool, std::size_t)> afterPriorMapReset;
+std::function<void(std::uint64_t, bool)> afterLostRecoveryCommit;
 std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 std::function<void(const std::string &)> afterAnchorTraceLine;
 std::function<void(std::uint8_t, std::int64_t, const std::array<std::uint8_t, 32> &)> afterPosePublish;
@@ -3269,6 +3296,12 @@ void set_posestamp(T & out)
   out.pose.orientation.w = geoQuat.w;
 }
 
+void exportLostRecoveryEpoch(const FinalFrontendSnapshot & final)
+{
+  if (lost_recovery_params.enabled)
+    odomAftMapped.twist.covariance[6] = static_cast<double>(final.coordinateEpoch);
+}
+
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped,
                       std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br,
                       const FinalFrontendSnapshot & final)
@@ -3296,6 +3329,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.twist.covariance[5] =
       fast_lio::imuInitDegradedCell(health_pub_en, p_imu->sustainedInitActive(), p_imu->initializationDegraded());
     odomAftMapped.twist.covariance[0] = 1.0;  // sentinel/version
+    exportLostRecoveryEpoch(final);
     // Flags say what the front end did about this scan, which is what a
     // consumer must act on: a degraded pose is fresh and self-consistent, so
     // staleness gates downstream pass it through unchanged (dog 2, 2026-09-04).
@@ -3398,7 +3432,7 @@ void buildAndPublishFrontendObservation(bool completed,
   message.frame_id = odom_frame_id;
   message.child_frame_id = body_frame_id;
   message.has_coordinate_epoch = facts.contextKnown;
-  message.coordinate_epoch = facts.contextKnown ? 1 : 0;  // map replacements do not change the pose frame
+  message.coordinate_epoch = facts.contextKnown ? final.coordinateEpoch : 0;
   message.has_input_stamp = frontend_progress.hasInputStamp;
   message.input_stamp_ns = frontend_progress.inputStamp;
   message.has_pose = completed;
@@ -4324,6 +4358,7 @@ public:
     this->declare_parameter<int>("reanchor_healthy_window", 100);
     this->declare_parameter<double>("reanchor_total_timeout_sec", 0.0);
     this->declare_parameter<double>("reanchor_recovery_stable_sec", 1.0);
+    declareLostRecoveryParameters();
     frontend_observation_en = this->declare_parameter<bool>("publish.frontend_observation", false);
     rcl_interfaces::msg::ParameterDescriptor referenceDescriptor;
     referenceDescriptor.read_only = true;
@@ -4743,6 +4778,7 @@ public:
     }
     reanchor_healthy_res =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
+    loadLostRecoveryParameters(reanchor_total_timeout_sec);
     reanchor_healthy_eff =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
     this->get_parameter_or<bool>("runaway_watchdog_en", runaway_params.enabled, true);
@@ -5389,9 +5425,93 @@ private:
     fout_kalman.flush();
   }
 
+  void declareLostRecoveryParameters()
+  {
+    rcl_interfaces::msg::ParameterDescriptor descriptor;
+    descriptor.read_only = true;
+    this->declare_parameter<bool>("lost_recovery_en", false, descriptor);
+    this->declare_parameter<double>("lost_recovery_stable_sec", 2.0, descriptor);
+  }
+
+  void loadLostRecoveryParameters(double total_s)
+  {
+    const bool enabled = this->get_parameter("lost_recovery_en").as_bool();
+    const double stable_s = this->get_parameter("lost_recovery_stable_sec").as_double();
+    if (enabled && !health_pub_en) {
+      throw std::invalid_argument(
+        "lost_recovery_en=true requires health_pub_en=true "
+        "(the coordinate epoch is published in the /Odometry health block)");
+    }
+    if (!fast_lio::resolveLostRecoveryParams(enabled, stable_s, total_s, &lost_recovery_params)) {
+      throw std::invalid_argument(
+        "lost_recovery_stable_sec must be finite and positive (representable in ns); "
+        "lost_recovery_en=true requires reanchor_total_timeout_sec > 0");
+    }
+  }
+
+  void observeLostRecovery(bool degraded, bool match_ok, std::int64_t begin_ns, std::int64_t end_ns)
+  {
+    if (!lost_recovery_params.enabled)
+      return;
+    constexpr auto breaks = fast_lio::kAnchorEventMapReset | fast_lio::kAnchorEventLost |
+                            fast_lio::kAnchorEventRunawayTrip | fast_lio::kAnchorEventTimeEpoch;
+    if (degraded || reanchor_gate.state == fast_lio::ReanchorState::kLost || (anchor_scan_record.events & breaks) ||
+        input_epoch_guard.faulted() || required_prior_lost) {
+      fast_lio::abandonLostRecovery(&lost_recovery, lost_recovery_params);
+      return;
+    }
+    if (!fast_lio::lostRecoveryArmed(recovery_state, lost_recovery_params))
+      return;
+    if (!lost_recovery.candidate) {
+      if (effct_feat_num < reanchor_params.min_eff)
+        return;
+      if (!lost_recovery_map_ready) {
+        if (!rebuildLocalMap("LOST_RECOVERY"))
+          return;
+        // This scan matched the old reference. The rebuilt map must earn its own matching run.
+        fast_lio::beginLostRecoveryCandidate(
+          &lost_recovery, stationary_anchor.reference_generation, lifecycle_scan_seq, -1, lost_recovery_params);
+        return;
+      }
+      fast_lio::beginLostRecoveryCandidate(
+        &lost_recovery, stationary_anchor.reference_generation, lifecycle_scan_seq, begin_ns, lost_recovery_params);
+    }
+#ifdef FASTLIO_TEST_HOOKS
+    const auto before = state_point;
+    const auto covariance = kf.get_P();
+#endif
+    if (fast_lio::observeLostRecoveryCandidate(&lost_recovery,
+                                               &recovery_state,
+                                               lifecycle_scan_seq,
+                                               begin_ns,
+                                               end_ns,
+                                               match_ok,
+                                               stationary_anchor.reference_generation,
+                                               lost_recovery_params)) {
+      if (reference_health_en)
+        reference_progress.qualified();
+      RCLCPP_WARN(this->get_logger(),
+                  "[FE-RECOVERY] committed local coordinate epoch %llu",
+                  static_cast<unsigned long long>(lost_recovery.coordinate_epoch));
+      recoveryTransition(fast_lio::RecoveryTraceEvent::kEpochCommitted, fast_lio::RecoveryCause::kStable, end_ns);
+      lost_recovery_map_ready = false;
+#ifdef FASTLIO_TEST_HOOKS
+      if (fast_lio_test::afterLostRecoveryCommit) {
+        bool preserved = (covariance.array() == kf.get_P().array()).all();
+        for (int i = 0; i < 3; ++i)
+          preserved = preserved && before.ba[i] == state_point.ba[i] && before.bg[i] == state_point.bg[i] &&
+                      before.grav[i] == state_point.grav[i];
+        fast_lio_test::afterLostRecoveryCommit(lost_recovery.coordinate_epoch, preserved);
+      }
+#endif
+    }
+  }
+
   // The production reset owner, shared verbatim by the late guards and the test-only scheduler.
   bool rebuildLocalMap(const char * tag)
   {
+    if (lost_recovery_params.enabled)
+      lost_recovery_map_ready = false;
     anchorEvidence(fast_lio::AnchorTraceReason::kMapReset,
                    fast_lio::kAnchorEventMapReset,
                    &anchor_trace_counters.map_reset,
@@ -5442,6 +5562,8 @@ private:
       return false;
     }
     fast_lio::resetReanchorGate(&reanchor_gate);
+    if (lost_recovery_params.enabled)
+      lost_recovery_map_ready = true;
     if (kept_prior) {
       RCLCPP_ERROR(this->get_logger(),
                    "[%s] live map dropped and re-seeded from the current scan (%d pts) at pos=[%.2f %.2f %.2f]: "
@@ -7089,6 +7211,8 @@ private:
                         anchor_in.end_ns);
       if (recovery_state.trust == fast_lio::RecoveryTrust::kPending)
         flio_map_frozen = true;
+      observeLostRecovery(
+        flio_in_degraded, recovery_match, fast_lio::traceNs(Measures.lidar_beg_time), anchor_in.end_ns);
       anchorTraceAfterStep();
 
       /*** Optional degeneracy diagnostics ***/

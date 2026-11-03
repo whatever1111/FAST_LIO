@@ -2101,6 +2101,9 @@ public:
   }
   void clearConsiderRotation() { consider_rot_en_ = false; }
   bool considerRotationActive() const { return consider_rot_en_; }
+#ifdef FASTLIO_TEST_HOOKS
+  int maximumIterationsForTest() const { return maximum_iter; }
+#endif
 
 private:
   state x_;

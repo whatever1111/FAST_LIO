@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/profile_giant
-# fork_sha: 05be5af0ddb42e4acc6033f5db44c1f4aed06ac3
+# fork_sha: d0954dad996b80b634c7490d82e1b840f9ad7d4a
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
@@ -7,13 +7,29 @@ case profile_giant
 config config/giant.yaml sha256 9e60a3436ad89cce76aea4dc612858de2fc5463d6d4b5505b947ac28e865fd18
 overrides 0
 outcome constructed
+event.v1 declare_front declared=152 names_sha256=72240e39dce4e9e76b872a8148dea8da023c70892815026ae4491cd9a5e70eec
+event.v1 typed_outputs declared=156 names_sha256=290f74c67d809641cd79e76e56561b78a5bac88ed5f0337f3933991532fc1ebc
+event.v1 declare_back declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
+event.v1 lost_recovery_loaded declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
+event.v1 read_policies declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
 log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
+event.v1 anchor_gap_resolved declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
 log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
+event.v1 map_backend declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
 log INFO laser_mapping "p_pre->lidar_type 2"
+event.v1 read_inputs declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+event.v1 filter_init declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
 log INFO laser_mapping "Standard IMU mode: topic=/dkt/imu"
 log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
+event.v1 subscriptions declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+event.v1 cloud_publishers declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+event.v1 odometry_publishers declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
+event.v1 scan_timer declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
+event.v1 map_timer declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
+event.v1 config_id declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
 log INFO laser_mapping "Node init finished."
+event.v1 constructed declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
 parameters 243
 param common.imu_bias_topic type=string value="" read_only=0 descriptor_type=4
 param common.imu_topic type=string value="/dkt/imu" read_only=0 descriptor_type=4
@@ -39,3 +55,35 @@ param publish.dense_publish_en type=bool value=false read_only=0 descriptor_type
 param publish.map_en type=bool value=true read_only=0 descriptor_type=1
 param wheel_extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1] read_only=0 descriptor_type=8
 param wheel_vel_noise_vz type=double value=0.20000000000000001 read_only=0 descriptor_type=3
+effective.v1.count 308
+effective.v1 common.imu_bias_topic string[0] ""
+effective.v1 common.imu_topic string[8] "/dkt/imu"
+effective.v1 common.lid_topic string[15] "/rs_velo/points"
+effective.v1 cube_side_length float64 0x408f400000000000
+effective.v1 derived:extrinsic_and_noise:Lidar_R_wrt_IMU float64[3x3] [0xbf8d438d1d8a5482,0xbfeffd36f7e3d1cc,0x3f96516db0dd82fd,0x3fef2ccf6be37de9,0xbf8273d5bab21816,0x3fccdaa0cae642c0,0xbfccd1aeb3dd11be,0x3f990a7829068987,0x3fef2b25b317efe1]
+effective.v1 derived:extrinsic_and_noise:Lidar_T_wrt_IMU float64[3x1] [0xbf15c209246bf013,0x3ff5e3315d701d9f,0x3fee690364388ebd]
+effective.v1 derived:extrinsic_and_noise:p_imu->Lidar_R_wrt_IMU float64[3x3] [0xbf8d438d1d8a5482,0xbfeffd36f7e3d1cc,0x3f96516db0dd82fd,0x3fef2ccf6be37de9,0xbf8273d5bab21816,0x3fccdaa0cae642c0,0xbfccd1aeb3dd11be,0x3f990a7829068987,0x3fef2b25b317efe1]
+effective.v1 derived:extrinsic_and_noise:p_imu->Lidar_T_wrt_IMU float64[3x1] [0xbf15c209246bf013,0x3ff5e3315d701d9f,0x3fee690364388ebd]
+effective.v1 derived:extrinsic_and_noise:p_imu->cov_acc_scale float64[3x1] [0x3f847ae147ae147b,0x3f847ae147ae147b,0x3f847ae147ae147b]
+effective.v1 derived:extrinsic_and_noise:p_imu->cov_gyr_scale float64[3x1] [0x3f747ae147ae147b,0x3f747ae147ae147b,0x3f747ae147ae147b]
+effective.v1 derived:iteration_count:kf.maximum_iter int32 3
+effective.v1 diagnostics.latency_enable bool 0
+effective.v1 initial_pose float64[6] [0x0000000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000]
+effective.v1 map_file_path string[22] "/data/fast_lio_map.pcd"
+effective.v1 mapping.acc_cov float64 0x3f847ae147ae147b
+effective.v1 mapping.det_range float32 0x42700000
+effective.v1 mapping.extrinsic_R float64[9] [0xbf8d438d1d8a5482,0xbfeffd36f7e3d1cc,0x3f96516db0dd82fd,0x3fef2ccf6be37de9,0xbf8273d5bab21816,0x3fccdaa0cae642c0,0xbfccd1aeb3dd11be,0x3f990a7829068987,0x3fef2b25b317efe1]
+effective.v1 mapping.extrinsic_T float64[3] [0xbf15c209246bf013,0x3ff5e3315d701d9f,0x3fee690364388ebd]
+effective.v1 mapping.fov_degree float64 0x4076800000000000
+effective.v1 mapping.gyr_cov float64 0x3f747ae147ae147b
+effective.v1 max_iteration int32 3
+effective.v1 pcd_save.pcd_save_en bool 1
+effective.v1 point_filter_num int32 3
+effective.v1 preprocess.blind float64 0x3fe0000000000000
+effective.v1 preprocess.lidar_type int32 2
+effective.v1 preprocess.scan_line int32 5
+effective.v1 preprocess.timestamp_unit int32 0
+effective.v1 publish.dense_publish_en bool 0
+effective.v1 publish.map_en bool 1
+effective.v1 wheel_extrinsic_R float64[9] [0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000]
+effective.v1 wheel_vel_noise_vz float64 0x3fc999999999999a

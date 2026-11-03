@@ -1,5 +1,5 @@
 # frontend contract golden: pipeline/scan_drops
-# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# fork_sha: d0954dad996b80b634c7490d82e1b840f9ad7d4a
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
@@ -61,9 +61,14 @@ imu_process
 imu_batch seq=4 disposition=committed reason=processed samples=20 pending=1 first_id=53
 scan_prepared count=2000 end=1.3500000000000001
 h_rows feats=2000 end=1.3500000000000001 effective=1076
+h_matrix.v1 end=0x3ff599999999999a valid=1 h_x=1076x12 h_x_sha256=8e131744d799d734b571118b5b9fb1badd6b4df41f4abc7247e70baad9ff4801 h=1076 h_sha256=71631d41e39111d5b3806f52683f8857fbdc7e10f63f454afb6aba7512a161f9
 h_rows feats=2000 end=1.3500000000000001 effective=1076
+h_matrix.v1 end=0x3ff599999999999a valid=1 h_x=1076x12 h_x_sha256=354bb8f1d7052b39e5c46928bfc0c651cacf485b8c451dd70e79ca3cc6fc8e4d h=1076 h_sha256=48b37a348065563c0f0722e02bc94a806dac961d5a7d6218dbcdccbcaf605d94
 h_rows feats=2000 end=1.3500000000000001 effective=1076
+h_matrix.v1 end=0x3ff599999999999a valid=1 h_x=1076x12 h_x_sha256=0cf05910c8375ee3d6e792bac7441e9a6ba8980b44b1eb5da7475e47efcce94c h=1076 h_sha256=428fb677405924743650ca6732534b9f9475444f04702ac114f687565422c114
 h_rows feats=2000 end=1.3500000000000001 effective=1076
+h_matrix.v1 end=0x3ff599999999999a valid=1 h_x=1076x12 h_x_sha256=053da88147a4ab6e8bc871d5c200c9a72118e5637acbb0da1f0e9d8b970c149c h=1076 h_sha256=4f968011692b90d2c184f7257d2d23241f80286d1ffd83772d9a2930f25385ac
+filter_update.v1 end=0x3ff599999999999a pos=[0x3e862afacd404ce0,0xbf969354cdb667ec,0x3f2202a2a3530eaa] rot_xyzw=[0x3f05c40355eac807,0x3e69e0248caa98ab,0xbf1e03524295872f,0x3feffffffc04c8f9] offset_R_L_I_xyzw=[0xbe555268da1b8310,0xbd807fba206403cd,0xbe13aad626f9473e,0x3feffffffffffffe] offset_T_L_I=[0x3dcaee561c93a7d6,0xbe8c6e7433b92deb,0x3e13bc4bd5ed69e3] vel=[0x3e8a83af8d006509,0xbf7205f80d879e0d,0x3f2d2fafe475d10a] bg=[0x3e6cdb0362180d16,0xbd7ffd0bd31dd474,0x3e33ad396e6e9718] ba=[0xbd6cf12c861427a5,0x3e9bbd4364eb7baf,0xbe2300460ca863e1] grav=[0x3d6bd89fb73c6d62,0xbe9ab0600a59fa7f,0xc0239e353f7ced8c] P=23x23 P_sha256=3c5ee682b4a229464bb926ea44e451b719443a33db59f51ea3be6228cdf0565d P_diag=[0x3ff0a3e2d49e5536,0x3f717b9737bde000,0x3f84828f55775600,0x3f6c3c64fb577900,0x3efa881470550000,0x3ef076f6122b0000,0x3ee4f8a760f8a999,0x3ee4f8a7cae597a5,0x3ee4f8a7cadd0050,0x3ee4f8b588e34e9a,0x3ee4f8a8645cbbc1,0x3ee4f8a8725afdef,0x3ff001aadb75b080,0x3fef1c7611bd1508,0x3feec90ac9d8269b,0x3f1a3d66ff097403,0x3f1a3d6713f9f725,0x3f1a3d6713f5adb4,0x3f5062b6838a3837,0x3f5062b61f749564,0x3f5062b61fdf30f9,0x3ee4f8b588e3680c,0x3ee4f8b50da27cc9]
 guard end=1.3500000000000001 forced=healthy
 trace "[ZUPT-ANCHOR] v=6 event=candidate_started reason=- event_seq=1 scan_seq=4 stamp_ns=1350000000 anchor_id=1 anchor_valid=0 created_ns=1350000000 last_evidence_ns=1350000000 anchor_state=qualifying stationary_episode=1 reference_generation=0 streak=1"
 pose_publish encoding=0 stamp_ns=1350000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
@@ -91,7 +96,10 @@ imu_process
 imu_batch seq=5 disposition=committed reason=processed samples=20 pending=1 first_id=73
 scan_prepared count=2000 end=1.45
 h_rows feats=2000 end=1.45 effective=2000
+h_matrix.v1 end=0x3ff7333333333333 valid=1 h_x=2000x12 h_x_sha256=6ee0afc4edc48bfe42bf251f9bbb1b427ae04f13c78e38207d4dc098fe4b2076 h=2000 h_sha256=a7e796edb6410c56b97eca1ab66b466cf0f805afbb46b8bceee7855ab01063a5
 h_rows feats=2000 end=1.45 effective=2000
+h_matrix.v1 end=0x3ff7333333333333 valid=1 h_x=2000x12 h_x_sha256=ed7fd9ccaacf478e21a8e4a22a84f75abc1cf4355f43d09fc8f588a1524514ee h=2000 h_sha256=a915f31118ae9715bc0a71d8244f2d531f9ab653ab062ac26ffd53c7256bb453
+filter_update.v1 end=0x3ff7333333333333 pos=[0xbea8d0efca9ebf80,0xbf968eb23d57d30f,0x3f26450087ed3143] rot_xyzw=[0x3f0d757eb291ec51,0xbe9c9c2bd2f3e786,0xbf1e04dabface60c,0x3feffffffba1e43f] offset_R_L_I_xyzw=[0xbe554013a87f0ac1,0xbd8dc57df4a3aebc,0xbe13a64093df7e19,0x3feffffffffffffe] offset_T_L_I=[0x3dc92dd6cce902c1,0xbe8c628a95eb0f96,0x3e1f2e35cd719c94] vel=[0xbeb964177ba99219,0xbf261d97d636caaa,0xbeff0c98503cc22c] bg=[0xbe6cf6a3224da41a,0x3e7bb0646a4f0357,0x3e4eb9bfea9b9dcf] ba=[0x3dac00515c5d54c1,0x3e9bd8551c1b7f81,0x3e611bcf78e68826] grav=[0xbdab25f8aa4d779d,0xbe9aca68b20ca16c,0xc0239e353f7ced8c] P=23x23 P_sha256=4dd75202e8fafa11bdeca5e26ea3b820bc279920f98941f3df4077e08df7c3d2 P_diag=[0x3ff16fcb041d75be,0x3f86c9d120656024,0x3f6577311855bcb0,0x3f51734cf592a700,0x3ee630837b75b520,0x3f112867cc0e3be4,0x3ee4f8a751be1387,0x3ee4f8a7cac00e3f,0x3ee4f8a7cad724b6,0x3ee4f8b588305d72,0x3ee4f8a8599d9a31,0x3ee4f8a7f9e08513,0x3ff0026f867d6a14,0x3fef0dbd3d2a1ba1,0x3fc02baa6f021f08,0x3f1a3dd5772559a7,0x3f19d6179060f1f2,0x3f1a40abce32af15,0x3f5062eadbbb19af,0x3f5062ea76769fe0,0x3f5062b100c8b790,0x3ee4f8b588c1aa7f,0x3ee4f8b50c0bd50e]
 guard end=1.45 forced=healthy
 pose_publish encoding=0 stamp_ns=1449999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=5 outcome=published beg_ns=1400000000 end_ns=1450000000 gap_ns=50000000 published=1 flags=0 events=0x0
@@ -118,7 +126,10 @@ imu_process
 imu_batch seq=6 disposition=committed reason=processed samples=20 pending=1 first_id=93
 scan_prepared count=2000 end=1.55
 h_rows feats=2000 end=1.55 effective=2000
+h_matrix.v1 end=0x3ff8cccccccccccd valid=1 h_x=2000x12 h_x_sha256=50670fb4b2925a4db7d034682cd1c2c33a829e78187f3363242cdd0f8fb85970 h=2000 h_sha256=315a4ed67cab75b2567b382f3d24f1b62f9b9406581e5527bffdb256315b6065
 h_rows feats=2000 end=1.55 effective=2000
+h_matrix.v1 end=0x3ff8cccccccccccd valid=1 h_x=2000x12 h_x_sha256=22af9c1f6937e9c6561b2e4c93ecc609084bf0718070e378e385cb20d9d81db1 h=2000 h_sha256=73b06be0cefa90bd307572f67b82e17172cf08058050a19b081e9697b7bbbb29
+filter_update.v1 end=0x3ff8cccccccccccd pos=[0x3e76f0e0112ac1e2,0xbf96906d0d09a0e2,0x3f2760b1981d3549] rot_xyzw=[0x3f0eea75f7f59afe,0xbe9d82933e325d73,0xbf1e085cb7aa3df9,0x3feffffffb8b13f8] offset_R_L_I_xyzw=[0xbe55841708acafb2,0xbd968d46daf39af7,0xbe13a317db08c24f,0x3feffffffffffffe] offset_T_L_I=[0x3dcdb0b27ade3de5,0xbe8c5f30e74885aa,0x3e2135ed2d4dfada] vel=[0x3e866c9c20b5e990,0xbf236e3e88ba330b,0x3f104534ff63e7ac] bg=[0xbe80c61fb87d7e8e,0x3e8623c155ddd796,0x3e62c2a82f394b36] ba=[0xbdcc5b6d42927fb2,0x3e9c3811a4a18e5f,0x3e7334c1df64d1cc] grav=[0x3dcb02861620376f,0xbe9b2677481cfc42,0xc0239e353f7ced8c] P=23x23 P_sha256=82e74cd48dabe8bf661eca373e5763d3ff49675846fd88162a3c1f0f3a857a8b P_diag=[0x3ff28d0b1238e822,0x3fa4387ebda981e5,0x3f5a685c39e4d606,0x3f453f2a97fadc1c,0x3ee62272fc0b281c,0x3f1eb94040946500,0x3ee4f8a748fa0c53,0x3ee4f8a7ca1fd55b,0x3ee4f8a7cad5d8ba,0x3ee4f8b587314e47,0x3ee4f8a857cb3fd2,0x3ee4f8a7d85cadcf,0x3ff00325d926f7d3,0x3fef1ae27067672f,0x3f9530253f3c5b20,0x3f1a3c8fbbb6bcd7,0x3f194857fbd77c99,0x3f1a43ee3a9f7ab2,0x3f50631f338af018,0x3f50631eca8fe404,0x3f50626fd0b7179b,0x3ee4f8b58828626a,0x3ee4f8b506e0a3ef]
 guard end=1.55 forced=healthy
 trace "[ZUPT-ANCHOR] v=6 event=created reason=- event_seq=2 scan_seq=6 stamp_ns=1550000000 anchor_id=1 anchor_valid=1 created_ns=1350000000 last_evidence_ns=1550000000 anchor_state=valid stationary_episode=1 reference_generation=0 streak=3"
 pose_publish encoding=0 stamp_ns=1550000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
@@ -146,7 +157,10 @@ imu_process
 imu_batch seq=7 disposition=committed reason=processed samples=20 pending=1 first_id=113
 scan_prepared count=2000 end=1.6500000000000001
 h_rows feats=2000 end=1.6500000000000001 effective=2000
+h_matrix.v1 end=0x3ffa666666666667 valid=1 h_x=2000x12 h_x_sha256=c9fe2bf6a6eeeebbcef03c3c6f4d21b58186caa94bce56325a0eeb6bd2fc5f63 h=2000 h_sha256=072e65a75e9ab4b645d4ccf348c2050e3680448ee5a7bcfb5f1f5a6d9fc66cf5
 h_rows feats=2000 end=1.6500000000000001 effective=2000
+h_matrix.v1 end=0x3ffa666666666667 valid=1 h_x=2000x12 h_x_sha256=92dafcf4c19dc855fb1b13966ace7b41c26e7c2a8febb2151cc798a9a7dc1339 h=2000 h_sha256=8a14100c632bdb08812db3f431887e076666a6b5d5ba5b0068340836edcbd201
+filter_update.v1 end=0x3ffa666666666667 pos=[0x3eb731b0b9541874,0xbf96940ccb44d85a,0x3f27f075ab9ea2bd] rot_xyzw=[0x3f0f93002b60c7b4,0xbe9c95af7f44fab9,0xbf1e0dd4185bd78a,0x3feffffffb7f82b1] offset_R_L_I_xyzw=[0xbe56082abae89b05,0xbda6e3dbacdea3e2,0xbe13a12d2f94ca7f,0x3feffffffffffffe] offset_T_L_I=[0x3dd1c6240b97f230,0xbe8c5c5fc9513f7e,0x3e220b653b880999] vel=[0x3e7eb496daaeec98,0xbf2427a8d0a8dd4b,0x3f14dbfbc3f0a304] bg=[0xbe8905795abb87dc,0x3e8a75d6e292defe,0x3e71bbd943c3f094] ba=[0xbde880a1242f4a93,0x3e9ce42d0e34488e,0x3e87e371dcd5790c] grav=[0x3de762af02c8bfcd,0xbe9bcbdbcceb8660,0xc0239e353f7ced8c] P=23x23 P_sha256=cef7d4674c494878037aec6425023a5772a9eefc7c502a8ecf5645c33d366b1c P_diag=[0x3ff3fbf6e5d402ec,0x3fb665966fc6ff1b,0x3f53b10b7701872c,0x3f3fa4371d277c74,0x3ee609ba0153c344,0x3f2668150515ceab,0x3ee4f8a73793cdd4,0x3ee4f8a7c8ad8a77,0x3ee4f8a7cad5ac0c,0x3ee4f8b586371684,0x3ee4f8a8571693a4,0x3ee4f8a7d2edbf89,0x3ff0041eef566dec,0x3fef2c5e17ef4d79,0x3f81ce1d992c4e3a,0x3f1a36722b838030,0x3f18ca3a6e99f3e6,0x3f1a472ceb590e9f,0x3f5063538aab8390,0x3f50635316c4d547,0x3f50616c0083ed3f,0x3ee4f8b586b75716,0x3ee4f8b4f7fe44b4]
 guard end=1.6500000000000001 forced=healthy
 pose_publish encoding=0 stamp_ns=1650000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=7 outcome=published beg_ns=1600000000 end_ns=1650000000 gap_ns=50000000 published=1 flags=0 events=0x0
@@ -187,7 +201,10 @@ imu_process
 imu_batch seq=8 disposition=committed reason=processed samples=40 pending=1 first_id=133
 scan_prepared count=2000 end=1.8500000000000001
 h_rows feats=2000 end=1.8500000000000001 effective=2000
+h_matrix.v1 end=0x3ffd99999999999a valid=1 h_x=2000x12 h_x_sha256=4f8ce9194ac72d3a2046067120e454e7bf3e53d9a9fc954e9f66f9eb12d268dc h=2000 h_sha256=91064ac1bef75a1b71427c0033e25efccb3cb8ad50376b4cae4ec6a5d5a4e2cc
 h_rows feats=2000 end=1.8500000000000001 effective=2000
+h_matrix.v1 end=0x3ffd99999999999a valid=1 h_x=2000x12 h_x_sha256=f9ab2f467ffa401aef0bc6021a7490fade8a142e81f8d5d6198c09b4de09df31 h=2000 h_sha256=5b0d0a1f8263f6dc1622c0709ea39ea2c323a1a424617afb7adf949ce234c28e
+filter_update.v1 end=0x3ffd99999999999a pos=[0x3ed024bf0baebfaa,0xbf969de5901a61db,0x3f24a1c6bed79bff] rot_xyzw=[0x3f0a8813caa76290,0xbe952518869da4cd,0xbf1e1ad5dacf3da7,0x3feffffffbc5b63b] offset_R_L_I_xyzw=[0xbe57bac30ec23990,0xbdbb3b73c585d522,0xbe139ae8c4c7bdb9,0x3feffffffffffffe] offset_T_L_I=[0x3dd58f5005256278,0xbe8c5cf16dde95f1,0x3e21e96129b386de] vel=[0x3eb0be67af23b346,0xbf29753587428a89,0x3f22072129896810] bg=[0x3eafd54979f0017c,0x3e9245e829acd779,0x3e823367407177b4] ba=[0xbe026dfba4438097,0x3e9ef7511073135e,0x3eb49a4f82405789] grav=[0x3e01941e1b2b1dd9,0xbe9dc8d57ec5c6f5,0xc0239e353f7ced8b] P=23x23 P_sha256=0667be0b4bc0580ff33505a97ca61d947d9888b6ba24471e4a05dc1d82324040 P_diag=[0x3ff7d0d5212d763b,0x3fcef9ed9aa84382,0x3f516daa6e34e972,0x3f3becfa5c0edaa8,0x3ee616fd367fe2a0,0x3f32b92f5e7b7925,0x3ee4f8a6ee7435aa,0x3ee4f8a7c3691b46,0x3ee4f8a7cad49df0,0x3ee4f8b5854ad80c,0x3ee4f8a856afb324,0x3ee4f8a7d03a8199,0x3ff006f9b07d6c5d,0x3fef68f8603d1125,0x3f6ee3d3e45fb2d8,0x3f1a1c285c6b2215,0x3f17e46c8ba9c848,0x3f1a4dba08c6e850,0x3f5063bd8e96a5d4,0x3f5063bce63d3e10,0x3f5057fda3586113,0x3ee4f8b58173e547,0x3ee4f8b4b2326377]
 guard end=1.8500000000000001 forced=healthy
 pose_publish encoding=0 stamp_ns=1850000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=9 outcome=published beg_ns=1800000000 end_ns=1850000000 gap_ns=150000000 published=1 flags=0 events=0x0
@@ -214,7 +231,10 @@ imu_process
 imu_batch seq=9 disposition=committed reason=processed samples=20 pending=1 first_id=173
 scan_prepared count=2000 end=1.95
 h_rows feats=2000 end=1.95 effective=2000
+h_matrix.v1 end=0x3fff333333333333 valid=1 h_x=2000x12 h_x_sha256=9d394d9f6c83e89fc1c7e734be2d2b1a2b4bc717bcecefc8e759a6c46ea4c955 h=2000 h_sha256=0bbed39a9c5928c4af0a595e7ca68b052dcb9591fae6542c9ff3d6c6dbec0bb8
 h_rows feats=2000 end=1.95 effective=2000
+h_matrix.v1 end=0x3fff333333333333 valid=1 h_x=2000x12 h_x_sha256=5464fac5570d418fab2b55eb510694320141ceb63afde4187bc2bc0e8c6f2b7c h=2000 h_sha256=ccbd64bd3bab92665f06329b20b0136bc3b797a4f79e7f766e10ad93a6dd4a03
+filter_update.v1 end=0x3fff333333333333 pos=[0x3ed64ef27cb0b70b,0xbf96a930d134f2ac,0x3f25795beddf59c8] rot_xyzw=[0x3f0c1dc7be63e27f,0xbe9707b4bc3970e5,0xbf1e25f26d284e0e,0x3feffffffbad71b3] offset_R_L_I_xyzw=[0xbe591df759c407a2,0xbdc3c0bd5558c637,0xbe139a5d2e166e2e,0x3feffffffffffffe] offset_T_L_I=[0x3dd807908cf90f5d,0xbe8c57cc6056396d,0x3e22bfb2090bd720] vel=[0xbe3c58dab56add00,0xbf27c935e7491d4c,0x3f1760126a57722f] bg=[0x3ea2f05ae8b73c71,0x3e9449ce59bc57fa,0x3e8a053e45489243] ba=[0xbe0aac8207da87ac,0x3ea0617729dd7a65,0x3ec114ae89553960] grav=[0x3e0969178b9759f7,0xbe9f81745848745f,0xc0239e353f7ced8a] P=23x23 P_sha256=7cbce6aa21bea746b5e023c7d3adb0169879ded5ea25b173192efcdcc9921c54 P_diag=[0x3ffa348063042a91,0x3fd64b66111987e9,0x3f4dac95065bff64,0x3f380a4981eec63f,0x3ee5ebb699d48700,0x3f36a3385c813aa8,0x3ee4f8a672b6473a,0x3ee4f8a7ba6a1b02,0x3ee4f8a7cad478a1,0x3ee4f8b5845eb104,0x3ee4f8a85667a614,0x3ee4f8a7cf920a84,0x3ff0084a6a03d26b,0x3fef7b6a1d334334,0x3f674419fa81822b,0x3f19fa39187be675,0x3f1776aef1296d5c,0x3f1a50e42a47ea24,0x3f5063f1df94e502,0x3f5063f0dc3f1c9f,0x3f504d18f976b000,0x3ee4f8b578755db1,0x3ee4f8b4393c1b1c]
 guard end=1.95 forced=healthy
 pose_publish encoding=0 stamp_ns=1950000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=10 outcome=published beg_ns=1900000000 end_ns=1950000000 gap_ns=50000000 published=1 flags=0 events=0x0
@@ -255,7 +275,10 @@ imu_process
 imu_batch seq=10 disposition=committed reason=processed samples=40 pending=1 first_id=193
 scan_prepared count=2000 end=2.1499999999999999
 h_rows feats=2000 end=2.1499999999999999 effective=2000
+h_matrix.v1 end=0x4001333333333333 valid=1 h_x=2000x12 h_x_sha256=fac300024e07812f13c885ccbfb7e0c2f4ac5de1a06a97180df83645e249e3c3 h=2000 h_sha256=5924db5e29ab3af92a7b1bf5c1163c0ac023e83948014c8150ec2a433b3d9785
 h_rows feats=2000 end=2.1499999999999999 effective=2000
+h_matrix.v1 end=0x4001333333333333 valid=1 h_x=2000x12 h_x_sha256=c5fddf084faf2bb225cea3e182a6c3996d02de3213d7f740a248ec715e615d97 h=2000 h_sha256=1aa17979e6317259105d290426579e07f948a723a2117167d07d4d83e2b35413
+filter_update.v1 end=0x4001333333333333 pos=[0x3ee15a44aab12d06,0xbf96bb5f9923c83b,0x3f238cac72cab96d] rot_xyzw=[0x3f08e5f0ead4bd9c,0xbe90acd32ada0a54,0xbf1e3b259a775736,0x3feffffffbd3198a] offset_R_L_I_xyzw=[0xbe5c6aee7918a1b4,0xbdd2080314656540,0xbe139640a5bc6739,0x3feffffffffffffd] offset_T_L_I=[0x3ddb3b2d41d61727,0xbe8c52debb20f555,0x3e232cb93708b89e] vel=[0x3eab0962db491faa,0xbf2cac8874ab331b,0x3f24ac94381c23a9] bg=[0x3ec036226470729c,0x3e96614915e69a9b,0x3e940548c09d05c9] ba=[0xbe1869235f217f66,0x3ea27847c986e87b,0x3ed659e03adba8e4] grav=[0x3e173d1daca97eca,0xbea1c02e39cee31a,0xc0239e353f7ced88] P=23x23 P_sha256=0817b2030ab1e057600f43b6518bc31b2bad275decbdb000794f233ac1ee99e6 P_diag=[0x3ffff351b72f68e0,0x3fe3d5d315a6fe42,0x3f4d240cb2317c70,0x3f37a738929707b7,0x3ee60691ff8879a8,0x3f3ef155d9619b38,0x3ee4f8a536dc62d3,0x3ee4f8a7a467ab52,0x3ee4f8a7cad411aa,0x3ee4f8b58372da00,0x3ee4f8a8560a0eeb,0x3ee4f8a7cef34469,0x3ff00c0b05df12a9,0x3fefb9a08ea4e455,0x3f60dad11a5e5c6c,0x3f19bb9f479afe2b,0x3f16aaa4b52168fa,0x3f1a5753ddcba660,0x3f50645bd5e6b0eb,0x3f506459e65d0cf1,0x3f501d1be33837ab,0x3ee4f8b56273ca27,0x3ee4f8b3009aee8e]
 guard end=2.1499999999999999 forced=healthy
 pose_publish encoding=0 stamp_ns=2149999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=12 outcome=published beg_ns=2100000000 end_ns=2150000000 gap_ns=150000000 published=1 flags=0 events=0x0
@@ -282,7 +305,10 @@ imu_process
 imu_batch seq=11 disposition=committed reason=processed samples=20 pending=1 first_id=233
 scan_prepared count=2000 end=2.25
 h_rows feats=2000 end=2.25 effective=2000
+h_matrix.v1 end=0x4002000000000000 valid=1 h_x=2000x12 h_x_sha256=b28470e8f006ffc47c16eab028c72bcabfa7d3e2994a1bd7ee5fb011e2b6cf42 h=2000 h_sha256=2d40274a78f32586a4659ecaad241abd33f73652252c86b2212e26ff428290fc
 h_rows feats=2000 end=2.25 effective=2000
+h_matrix.v1 end=0x4002000000000000 valid=1 h_x=2000x12 h_x_sha256=2dc0fefb7d92903becebe1a9faf355f0242f2ff7f22c96579cf468d43b03ddac h=2000 h_sha256=b8bde2c5dda6aab2a63a6b7db4eda3d2f68fdbb3427268d57be355e49e1fcfa3
+filter_update.v1 end=0x4002000000000000 pos=[0x3ee508a2eb8606e6,0xbf96d284c8097c09,0x3f247e5d1d4ca7f4] rot_xyzw=[0x3f0abd60e12d6fc5,0xbe94bb4c4899e391,0xbf1e4c9f6483b9fe,0x3feffffffbb73120] offset_R_L_I_xyzw=[0xbe5f133d2034680b,0xbdd77f4602099f6e,0xbe13960de0484b1f,0x3feffffffffffffc] offset_T_L_I=[0x3ddd8d105de14587,0xbe8c4c61b7fc3dae,0x3e23b9a5df137668] vel=[0xbe219e43eaaf5600,0xbf2b04f485d7867c,0x3f18bcd855dc7121] bg=[0x3eb52ad4643ad90a,0x3e980f2a37c9c162,0x3e99bd7be04c9fc2] ba=[0xbe1f7609e0b9d0d4,0x3ea42c9c49b1151e,0x3edd5fb896f545d8] grav=[0x3e1de89703eb845d,0xbea3626cf085b9a1,0xc0239e353f7ced87] P=23x23 P_sha256=eda2bbc283bf9e3456b03d9009c17822d958e4d8dd26d86cbbfa47743e55787b P_diag=[0x4001a54d0ac7aa76,0x3fe9142c5bee6070,0x3f4a28d28933ca60,0x3f356daeacd82722,0x3ee5e34998ada35c,0x3f419f9c2eac3832,0x3ee4f8a36ec5dd52,0x3ee4f8a7842c4ecd,0x3ee4f8a7cad3de3f,0x3ee4f8b582874942,0x3ee4f8a855a375d1,0x3ee4f8a7cebd6bb3,0x3ff00d762986766b,0x3fefc721b17dd402,0x3f5d036d120069e4,0x3f197a884ae55e8a,0x3f16486f3581fa16,0x3f1a5a5cd6a7b41b,0x3f5064901405d06a,0x3f50648cce15bf7b,0x3f4feeb16f3e436f,0x3ee4f8b542398c2b,0x3ee4f8b13b1eb150]
 guard end=2.25 forced=healthy
 pose_publish encoding=0 stamp_ns=2250000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=13 outcome=published beg_ns=2200000000 end_ns=2250000000 gap_ns=50000000 published=1 flags=0 events=0x0
@@ -311,7 +337,10 @@ imu_process
 imu_batch seq=12 disposition=committed reason=processed samples=1 pending=1 first_id=253
 scan_prepared count=2000 end=2.3499999999999996
 h_rows feats=2000 end=2.3499999999999996 effective=2000
+h_matrix.v1 end=0x4002cccccccccccc valid=1 h_x=2000x12 h_x_sha256=adea83ff8d26b7407fa31d0890b2053b393b83ed294871137a84552d011966e6 h=2000 h_sha256=b2ea8332c66748e6b048bc073b0f2d7c62a1c56dd29639dbc53580339bbc2f90
 h_rows feats=2000 end=2.3499999999999996 effective=2000
+h_matrix.v1 end=0x4002cccccccccccc valid=1 h_x=2000x12 h_x_sha256=7bcdcdf5251936bd21d9b603bf6d741d0ebc1342377208d1e1eff783dd454a6a h=2000 h_sha256=bf8d957b454149a00dc5a45b7e3b6eb4462c29e56831df5c02a4e11f5ee6566b
+filter_update.v1 end=0x4002cccccccccccc pos=[0x3ee941ccc7d84030,0xbf96ec58d74b9d2c,0x3f251386485e3bed] rot_xyzw=[0x3f0cc4cd10cb318e,0xbe9d7e23ad2c87c4,0xbf1e7e32038a9f02,0x3feffffffb8f41ad] offset_R_L_I_xyzw=[0xbe61399cc47e7d9c,0xbddfc027f579cf64,0xbe1395bb18361930,0x3feffffffffffffb] offset_T_L_I=[0x3de000af4bc6f4dc,0xbe8c45c885214de4,0x3e23c8108f46a61d] vel=[0x3e96a43cb66dc776,0xbf2b7605ba195c3a,0x3f1ad952e9d77a49] bg=[0x3eafd28cbe5b6d50,0x3e97e89e3a11613f,0x3ea03c3762aeff62] ba=[0xbe24efd3e1ea860d,0x3ea653f70117c75e,0x3edc977e6386b44d] grav=[0x3e23dff7aab0c8dc,0xbea574fc4fafa66d,0xc0239e353f7ced85] P=23x23 P_sha256=5200205da65e506993271cbbdd26d6e0b63b99778151ae8ae4b8a2f8ff2c7288 P_diag=[0x4003793e1a755a9d,0x3feee8b368f1a58b,0x3f48e631d8c9a83e,0x3f362481a1f4e56e,0x3ee62bc8825ae080,0x3f58b0fc210ababb,0x3ee4f8a0f9fc1966,0x3ee4f8a7571bc807,0x3ee4f8a7cad3daa0,0x3ee4f8b5819c12fd,0x3ee4f8a85528de91,0x3ee4f8a7ceb91d78,0x3ff0128e744536a6,0x3fefd97ec9ff672c,0x3f6596f20f2d7aa3,0x3f197c2d2085869c,0x3f1682fecef50a61,0x3f1a99ea002fb51c,0x3f50688d5508f517,0x3f5068883607a2e4,0x3f4fe28025f73a5a,0x3ee4f8b51529b99a,0x3ee4f8aec89bdd8d]
 guard end=2.3499999999999996 forced=healthy
 pose_publish encoding=0 stamp_ns=2349999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=14 outcome=published beg_ns=2300000000 end_ns=2350000000 gap_ns=50000000 published=1 flags=0 events=0x0
@@ -328,6 +357,7 @@ record.update map_updated=1 have_update=1 dp=9.8393650658354457e-05 dq=7.9998865
 record.reference present=0 snapshot=0 revision=0 scan=14 qualified=0 kind=1 lifecycle=2 startup=2 trust=1 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=131 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2452500000 effective_ns=2349999999 state_until_ns=2652500000 hr_until_ns=0
 trace "[ZUPT-ANCHOR] v=6 event=evidence reason=imu_coverage_gap event_seq=3 scan_seq=15 stamp_ns=2450000000 anchor_id=1 anchor_valid=1 created_ns=1350000000 last_evidence_ns=2350000000 anchor_state=valid stationary_episode=1 reference_generation=0 streak=0"
 trace "[ZUPT-ANCHOR] v=6 event=invalidated reason=imu_coverage_gap event_seq=4 scan_seq=15 stamp_ns=2450000000 anchor_id=1 anchor_valid=0 created_ns=1350000000 last_evidence_ns=2350000000 anchor_state=empty stationary_episode=1 reference_generation=0 streak=0"
+imu_retain.v1 seq=13 disposition=uncommitted reason=empty_window borrowed=0 pending=1 first_queued_id=254 faulted=0
 record seq=15 outcome=dropped_empty_imu beg_ns=2400000000 end_ns=2450000000 gap_ns=50000000 published=0 flags=-1 events=0x4
 record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=blind action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=1 static_hold=0
 record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
@@ -352,7 +382,10 @@ imu_process
 imu_batch seq=14 disposition=committed reason=processed samples=20 pending=1 first_id=254
 scan_prepared count=2000 end=2.5499999999999998
 h_rows feats=2000 end=2.5499999999999998 effective=2000
+h_matrix.v1 end=0x4004666666666666 valid=1 h_x=2000x12 h_x_sha256=aa90ab3c642e4e110e0e6477c7c09c4c96d08e0100b6907f625ee31ac819d7b0 h=2000 h_sha256=ba0820d86ac0b2db7545dbc7361602c935c96e84df3f070162931b7151e70ef1
 h_rows feats=2000 end=2.5499999999999998 effective=2000
+h_matrix.v1 end=0x4004666666666666 valid=1 h_x=2000x12 h_x_sha256=9a0d3219e8b610c4957836d6aafe052f26e29548121348d45ff3f30803844e72 h=2000 h_sha256=14820b2280f323cef063a919e2ebf8ee9602eb79adb88c769b434c66eeeb1863
+filter_update.v1 end=0x4004666666666666 pos=[0x3ef0b588cc9c8b31,0xbf9711d060efa41b,0x3f23bf4fb0146a36] rot_xyzw=[0x3f095e2400769f9d,0xbe942cfc090ae96b,0xbf1effef44216485,0x3feffffffb9e2112] offset_R_L_I_xyzw=[0xbe643b141cc445e6,0xbde86d807502d421,0xbe1393d65c6af363,0x3feffffffffffff9] offset_T_L_I=[0x3de17d42a7fee0ea,0xbe8c3d132e5245e5,0x3e242092bd3118d6] vel=[0x3ea6405333469374,0xbf31934915ffadab,0x3f262853fdde7995] bg=[0x3ec5a9ce8965ccf6,0x3e9a6bf878c6d3a2,0x3ea51a09630bbaea] ba=[0xbe2ff2182a8918ca,0x3eaa284d6377e967,0x3ee627c98a0569b1] grav=[0x3e2e523a147b8628,0xbea920aefe5d67d8,0xc0239e353f7ced80] P=23x23 P_sha256=475fc5b9e0f7494b9218c43fad42e3e71d2e6f0bb311044bd366511e5a5dded3 P_diag=[0x40079debb670020b,0x3ff63cffda205480,0x3f4cb1ced78233d6,0x3f3911ff66e89b5c,0x3ee62dbfef5f7400,0x3f65ae96f84cabdc,0x3ee4f89c926394d0,0x3ee4f8a7041bc0c7,0x3ee4f8a7cad3d039,0x3ee4f8b580b1366e,0x3ee4f8a8547ac017,0x3ee4f8a7ceae410e,0x3ff01b3893e5306c,0x3ff00c68fe3b0b8e,0x3f6c81472bdb566d,0x3f1976bc9606b348,0x3f16ba7e9ba2a7ba,0x3f1ae3411fcd5a9b,0x3f506d28d7b7e42f,0x3f506d206847a6ac,0x3f4f9ba004be2d79,0x3ee4f8b4c22c70af,0x3ee4f8aa63a1593f]
 guard end=2.5499999999999998 forced=healthy
 trace "[ZUPT-ANCHOR] v=6 event=candidate_started reason=- event_seq=5 scan_seq=16 stamp_ns=2550000000 anchor_id=2 anchor_valid=0 created_ns=2550000000 last_evidence_ns=2550000000 anchor_state=qualifying stationary_episode=2 reference_generation=0 streak=1"
 pose_publish encoding=0 stamp_ns=2549999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
@@ -380,7 +413,10 @@ imu_process
 imu_batch seq=15 disposition=committed reason=processed samples=20 pending=1 first_id=274
 scan_prepared count=2000 end=2.6499999999999999
 h_rows feats=2000 end=2.6499999999999999 effective=2000
+h_matrix.v1 end=0x4005333333333333 valid=1 h_x=2000x12 h_x_sha256=62c34b9a195647f6a4afdf279eadd35b9e0cf54a0ae27040cb6fe4f7ab8aa8cb h=2000 h_sha256=759fc266bdea4d452bc94fcc528793e9089626a3c6d24830aa6625d103fa274c
 h_rows feats=2000 end=2.6499999999999999 effective=2000
+h_matrix.v1 end=0x4005333333333333 valid=1 h_x=2000x12 h_x_sha256=def6099bc85297587f7aca8b3ff2391a76be57093540ab8e86dd60133c93ee2a h=2000 h_sha256=0e073fc5a306a92a5b52a715379038c8059391d2c2976dcacd22a7862f9113e1
+filter_update.v1 end=0x4005333333333333 pos=[0x3ef4176a999cfaf0,0xbf973ce5b299a504,0x3f24c65e4c0b3fa6] rot_xyzw=[0x3f0b24ff29af2e63,0xbe953f5c3c50ec47,0xbf1f5264f8473c06,0x3feffffffb72ba7f] offset_R_L_I_xyzw=[0xbe66b18e691c2369,0xbdefc2886d0dab47,0xbe1393bc14c8ac47,0x3feffffffffffff7] offset_T_L_I=[0x3de2fca2a4f411ba,0xbe8c351be1588686,0x3e244048aee785f7] vel=[0x3ea23e3e49bc39c7,0xbf2f31eeebc0ba4a,0x3f18e8ea7daefaa0] bg=[0x3ebf48fafb9370ce,0x3e97838e5fa7d711,0x3ea930c49406c78d] ba=[0xbe34a666820872e2,0x3ead4cf9631a756c,0x3ee8b619d98182d0] grav=[0x3e3398864c97c18f,0xbeac25a11421d8e1,0xc0239e353f7ced7c] P=23x23 P_sha256=0640f8409c7e6d5ffe835da769fc7ef755f9b35e3042fad3303a6e2786be8f27 P_diag=[0x4009ea874372f940,0x3ffa0276e87ffa3b,0x3f4b380dce8ebe92,0x3f3651ad895ecb93,0x3ee5e689fff810bc,0x3f6642e782245772,0x3ee4f896d9ea3657,0x3ee4f8a6968b6a7f,0x3ee4f8a7cad39f91,0x3ee4f8b57fc6ddda,0x3ee4f8a853b0d6fd,0x3ee4f8a7ce9d3ebb,0x3ff01c792a0e0b55,0x3ff00bf1a4e2bb94,0x3f68028d097c12e9,0x3f192ccc704414a3,0x3f165938e3e91a0a,0x3f1ae61184d5ad85,0x3f506d5cd7040f65,0x3f506d501aad27f2,0x3f4ef2e8d22a7506,0x3ee4f8b454a015c1,0x3ee4f8a4acb5ffa7]
 guard end=2.6499999999999999 forced=healthy
 pose_publish encoding=0 stamp_ns=2649999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=17 outcome=published beg_ns=2600000000 end_ns=2650000000 gap_ns=50000000 published=1 flags=0 events=0x0
@@ -407,7 +443,10 @@ imu_process
 imu_batch seq=16 disposition=committed reason=processed samples=20 pending=1 first_id=294
 scan_prepared count=2000 end=2.75
 h_rows feats=2000 end=2.75 effective=2000
+h_matrix.v1 end=0x4006000000000000 valid=1 h_x=2000x12 h_x_sha256=14b53e8b752ca8288c546b4853f785ea33c8480e1a0bab550dd90dca19df191f h=2000 h_sha256=7fbe796563ec515b8036acfb4b19130e127e3d85b672e03fb8870f5d219e6878
 h_rows feats=2000 end=2.75 effective=2000
+h_matrix.v1 end=0x4006000000000000 valid=1 h_x=2000x12 h_x_sha256=4b4840e5ff5c788335561e668c6006129f94f96aca9573165a5d38fd49c38285 h=2000 h_sha256=c938c6167a8528eaf0cf4a5e33884385fa780476685e75b62f68965a1e3f4fc3
+filter_update.v1 end=0x4006000000000000 pos=[0x3ef79c1c57d20c8d,0xbf976dc18804e8b6,0x3f25ad3e61f6794d] rot_xyzw=[0x3f0c6880207483db,0xbe96fe011e2e3500,0xbf1fa8de16f67920,0x3feffffffb4be717] offset_R_L_I_xyzw=[0xbe6984b742f2902c,0xbdf3d551ac60cc84,0xbe13932e12affd64,0x3feffffffffffff5] offset_T_L_I=[0x3de463f832bf9645,0xbe8c2ca4c5bf390b,0x3e24588107f93b85] vel=[0x3ea6ca2441381cdc,0xbf30356d160d141b,0x3f190522fa685e39] bg=[0x3eb49c85de68ed1f,0x3e971a188ff5f5d6,0x3ead998cc8d4e8df] ba=[0xbe39b1c04b461861,0x3eb073ccd4d6533d,0x3eeb2bf4c9ce47f9] grav=[0x3e385f4b33e46e47,0xbeaf9c08c504cae2,0xc0239e353f7ced76] P=23x23 P_sha256=9dc5330c499c833f6730685516b202160538b8b6b1bf0d3cf264c81fe5e1ae92 P_diag=[0x400c5ed9f08b4f59,0x3ffe09a29d9cb139,0x3f49a69e72cf0bde,0x3f34c7b4db7abe27,0x3ee5e3f9a759e284,0x3f66db676bbff867,0x3ee4f88f86f17bd1,0x3ee4f8a60803c0a3,0x3ee4f8a7cad38899,0x3ee4f8b57edc306c,0x3ee4f8a852c9b394,0x3ee4f8a7ce8d2c15,0x3ff01d9ead0fb058,0x3ff008fdaa6e77d5,0x3f639da79a9364ca,0x3f18dd028241d93b,0x3f15fa7c108eb498,0x3f1ae8d10ccd72ab,0x3f506d90bb85b2a1,0x3f506d7e7f430e79,0x3f4e219779aa81a4,0x3ee4f8b3c61da073,0x3ee4f89d5a48155d]
 guard end=2.75 forced=healthy
 trace "[ZUPT-ANCHOR] v=6 event=created reason=- event_seq=6 scan_seq=18 stamp_ns=2750000000 anchor_id=2 anchor_valid=1 created_ns=2550000000 last_evidence_ns=2750000000 anchor_state=valid stationary_episode=2 reference_generation=0 streak=3"
 pose_publish encoding=0 stamp_ns=2750000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000

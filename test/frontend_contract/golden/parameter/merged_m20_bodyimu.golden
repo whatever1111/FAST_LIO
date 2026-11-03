@@ -1,0 +1,88 @@
+# frontend contract golden: parameter/merged_m20_bodyimu
+# fork_sha: d0954dad996b80b634c7490d82e1b840f9ad7d4a
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case merged_m20_bodyimu
+config test/frontend_contract/m20_bodyimu_laser_mapping.yaml sha256 a1dbe30368193e6ebf2d95a5ef528c2527a7ce98ed5e6083f7ca6b13dcff3f2d
+overrides 0
+outcome constructed
+event.v1 declare_front declared=152 names_sha256=72240e39dce4e9e76b872a8148dea8da023c70892815026ae4491cd9a5e70eec
+event.v1 typed_outputs declared=156 names_sha256=290f74c67d809641cd79e76e56561b78a5bac88ed5f0337f3933991532fc1ebc
+event.v1 declare_back declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
+event.v1 lost_recovery_loaded declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
+event.v1 read_policies declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
+log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
+event.v1 anchor_gap_resolved declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
+log INFO laser_mapping "[IVOX] map backend = iVox (res=0.20 nearby=26 voxel_cap=50 max_voxels=5000000)"
+event.v1 map_backend declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+log INFO laser_mapping "p_pre->lidar_type 2"
+event.v1 read_inputs declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+event.v1 filter_init declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+log INFO laser_mapping "Standard IMU mode: topic=/lio/imu"
+log INFO laser_mapping "Wheel twist subscribed: topic=/lio/wheel_twist scale=1.000 (fusion off, static hold on, parked hold off)"
+event.v1 subscriptions declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+event.v1 cloud_publishers declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+event.v1 odometry_publishers declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
+event.v1 scan_timer declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
+event.v1 map_timer declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
+log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
+event.v1 config_id declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
+log INFO laser_mapping "Node init finished."
+event.v1 constructed declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
+parameters 243
+param common.imu_input_type type=string value="standard" read_only=0 descriptor_type=4
+param common.imu_topic type=string value="/lio/imu" read_only=0 descriptor_type=4
+param common.lid_topic type=string value="/lio/points" read_only=0 descriptor_type=4
+param cube_side_length type=double value=1000 read_only=0 descriptor_type=3
+param filter_size_map type=double value=0.14999999999999999 read_only=0 descriptor_type=3
+param filter_size_surf type=double value=0.14999999999999999 read_only=0 descriptor_type=3
+param initial_pose type=double_array value=[0,0,0,0,0,0] read_only=0 descriptor_type=8
+param ivox_grid_resolution type=double value=0.20000000000000001 read_only=0 descriptor_type=3
+param mapping.b_acc_cov type=double value=6.4356659353532566e-05 read_only=0 descriptor_type=3
+param mapping.b_gyr_cov type=double value=3.5640318696367613e-05 read_only=0 descriptor_type=3
+param mapping.det_range type=double value=60 read_only=0 descriptor_type=3
+param mapping.fov_degree type=double value=360 read_only=0 descriptor_type=3
+param mapping.gyr_cov type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param max_iteration type=integer value=3 read_only=0 descriptor_type=2
+param nn_refresh_min_shift type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param preprocess.blind type=double value=0.29999999999999999 read_only=0 descriptor_type=3
+param preprocess.lidar_type type=integer value=2 read_only=0 descriptor_type=2
+param preprocess.scan_line type=integer value=96 read_only=0 descriptor_type=2
+param preprocess.timestamp_unit type=integer value=0 read_only=0 descriptor_type=2
+param publish.dense_publish_en type=bool value=false read_only=0 descriptor_type=1
+param wheel_extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1] read_only=0 descriptor_type=8
+param wheel_topic type=string value="/lio/wheel_twist" read_only=0 descriptor_type=4
+param wheel_vel_noise_vz type=double value=0.20000000000000001 read_only=0 descriptor_type=3
+effective.v1.count 308
+effective.v1 common.imu_input_type string[8] "standard"
+effective.v1 common.imu_topic string[8] "/lio/imu"
+effective.v1 common.lid_topic string[11] "/lio/points"
+effective.v1 cube_side_length float64 0x408f400000000000
+effective.v1 derived:extrinsic_and_noise:p_imu->cov_bias_acc float64[3x1] [0x3f10dee6fd22d845,0x3f10dee6fd22d845,0x3f10dee6fd22d845]
+effective.v1 derived:extrinsic_and_noise:p_imu->cov_bias_gyr float64[3x1] [0x3f02af90069829d8,0x3f02af90069829d8,0x3f02af90069829d8]
+effective.v1 derived:extrinsic_and_noise:p_imu->cov_gyr_scale float64[3x1] [0x3fa999999999999a,0x3fa999999999999a,0x3fa999999999999a]
+effective.v1 derived:filter_setters:downSizeFilterMap.leaf_size float32[3x1] [0x3e19999a,0x3e19999a,0x3e19999a]
+effective.v1 derived:filter_setters:downSizeFilterSurf.leaf float64 0x3fc3333340000000
+effective.v1 derived:iteration_count:kf.maximum_iter int32 3
+effective.v1 derived:ivox:ikdtree.inv_res_ float32 0x40a00000
+effective.v1 derived:ivox:ikdtree.res_ float32 0x3e4ccccd
+effective.v1 filter_size_map float64 0x3fc3333333333333
+effective.v1 filter_size_surf float64 0x3fc3333333333333
+effective.v1 initial_pose float64[6] [0x0000000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000]
+effective.v1 ivox_grid_resolution float64 0x3fc999999999999a
+effective.v1 mapping.b_acc_cov float64 0x3f10dee6fd22d845
+effective.v1 mapping.b_gyr_cov float64 0x3f02af90069829d8
+effective.v1 mapping.det_range float32 0x42700000
+effective.v1 mapping.fov_degree float64 0x4076800000000000
+effective.v1 mapping.gyr_cov float64 0x3fa999999999999a
+effective.v1 max_iteration int32 3
+effective.v1 nn_refresh_min_shift float64 0x3fa999999999999a
+effective.v1 preprocess.blind float64 0x3fd3333333333333
+effective.v1 preprocess.lidar_type int32 2
+effective.v1 preprocess.scan_line int32 96
+effective.v1 preprocess.timestamp_unit int32 0
+effective.v1 publish.dense_publish_en bool 0
+effective.v1 wheel_extrinsic_R float64[9] [0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000]
+effective.v1 wheel_topic string[16] "/lio/wheel_twist"
+effective.v1 wheel_vel_noise_vz float64 0x3fc999999999999a

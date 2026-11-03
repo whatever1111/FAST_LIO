@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/alias_both_names_disagree
-# fork_sha: 05be5af0ddb42e4acc6033f5db44c1f4aed06ac3
+# fork_sha: d0954dad996b80b634c7490d82e1b840f9ad7d4a
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
@@ -11,14 +11,33 @@ override initial_pose_full_rpy_override type=bool value=false
 override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
 override mapping.extrinsic_T type=double_array value=[0,0,0]
 outcome constructed
+event.v1 declare_front declared=152 names_sha256=72240e39dce4e9e76b872a8148dea8da023c70892815026ae4491cd9a5e70eec
+event.v1 typed_outputs declared=156 names_sha256=290f74c67d809641cd79e76e56561b78a5bac88ed5f0337f3933991532fc1ebc
+event.v1 declare_back declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
+event.v1 lost_recovery_loaded declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
+event.v1 read_policies declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
 log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
+event.v1 anchor_gap_resolved declared=235 names_sha256=a3cd81c1eccff939b95656c799bd32ca96d8641c46a2e49fa0ca497db56b0c27
 log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
+event.v1 map_backend declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
 log WARN laser_mapping "Parameter 'initial_pose_apply_roll_pitch' is deprecated; use 'initial_pose_full_rpy_override' instead."
 log WARN laser_mapping "initial_pose_full_rpy_override=true: overriding IMU-aligned roll/pitch with values from initial_pose. Caller must ensure these match gravity (accel along -Z), else point cloud transforms will be incorrect."
 log INFO laser_mapping "p_pre->lidar_type 1"
+event.v1 read_inputs declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+event.v1 filter_init declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
 log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
 log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
+event.v1 subscriptions declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+event.v1 cloud_publishers declared=239 names_sha256=0d81d9d3a11e82d08bce5d0399eaffda1148b60051ab0564ef9a471216466ae6
+event.v1 odometry_publishers declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
+event.v1 scan_timer declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
+event.v1 map_timer declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
+event.v1 config_id declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
 log INFO laser_mapping "Node init finished."
+event.v1 constructed declared=243 names_sha256=cad680af2e0d8f52fc3468449009765439c7a0e8ec0c9176e190acea9fa3f782
 parameters 243
 param initial_pose_apply_roll_pitch type=bool value=true read_only=0 descriptor_type=1
+effective.v1.count 308
+effective.v1 derived:initial_pose_alias:initial_pose_full_rpy_override_ bool 1
+effective.v1 initial_pose_apply_roll_pitch bool 1

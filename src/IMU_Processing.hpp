@@ -137,6 +137,10 @@ class ImuProcess
   // gate "linear acceleration ≈ 0" (|‖a_raw‖ − g_raw| small) in a scale-agnostic
   // way, regardless of whether the IMU reports in m/s² or g.
   double gravity_norm() const { return mean_acc.norm(); }
+#ifdef FASTLIO_TEST_HOOKS
+  const M3D & lidarRotationForTest() const { return Lidar_R_wrt_IMU; }
+  const V3D & lidarTranslationForTest() const { return Lidar_T_wrt_IMU; }
+#endif
 
  private:
   // Discard only the invalid initialization window. In particular, keep the

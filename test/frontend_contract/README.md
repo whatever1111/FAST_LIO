@@ -3,31 +3,42 @@
 Inputs and goldens of the two contract fixtures of the legacy front-end node (laserMapping S0):
 
 - `test/test_frontend_parameter_contract_node.cpp`: what the node does with its parameters: the declared
-  defaults, the three platform profiles, the deprecated alias, type errors, vector lengths, NaN and Inf, prior-map
-  settings and the read-only descriptor. Per case it records the configuration (profile path and sha256, every
-  override), whether construction returned or threw (type and text), what construction logged at INFO and above,
-  every declared parameter with type, value and descriptor as the node's parameter services report them, and the
-  outcome of fixed runtime set requests.
+  defaults, the platform profiles (this package's own files and the parent repository's merged profiles), the
+  deprecated alias, type errors, vector lengths, NaN and Inf, prior-map settings, the read-only descriptor, typed
+  outputs with their configuration ID, and two invalid values at once. Per case it records the configuration
+  (profile path and sha256, every override), whether construction returned or threw (type and text), what
+  construction logged at INFO and above with the constructor's stage boundaries between those lines (`event.v1`),
+  every declared parameter with type, value and descriptor as the node's parameter services report them, the
+  outcome of fixed runtime set requests, and the configuration in effect when the constructor returned
+  (`effective.v1`: every parameter's storage and the state derived from it, floating values as bit patterns).
 - `test/test_frontend_pipeline_contract_node.cpp`: what the node does with a fixed input stream, through its real
   subscriptions, scan path and `/Odometry` publisher: the stage order the existing `FASTLIO_TEST_HOOKS` report,
   every scan's anchor record (outcome, state around the anchor step, pose covariance, anchor, recovery), the
   published odometry, the anchor and recovery trace and the input transaction, for bootstrap, matching, no match,
   invalid, repeated and empty scans, IMU commit, invalid, fatal and coverage gap, the input epoch, the anchor, the
-  parked prior, the pin, scan holes and recovery, map resets, and the map worker with a delayed insertion.
+  parked prior, the pin, scan holes and recovery, map resets, and the map worker with a delayed insertion. Every
+  scenario also records the measurement Jacobian and residuals of each iteration (`h_matrix.v1`), the filter state
+  and covariance after each lidar update (`filter_update.v1`) and the IMU samples an empty scan leaves queued
+  (`imu_retain.v1`); the typed scenario records both typed outputs, field by field, with a fixed instance and a
+  fixed repeat clock.
+
+Lines whose first word is a `.v1` name (`event.v1`, `effective.v1`, `h_matrix.v1`, ...) were added to records
+that existed before them; removing them gives each earlier record unchanged.
 
 Each case is compared with its golden line for line, character for character. Doubles are written with 17
 significant digits and NaN with its bit pattern; nothing is compared with a tolerance. Masked: the package's
-source directory in recorded text (`<ROOT_DIR>/`), which differs between build machines. The fixtures' headers
-list what is not recorded and why. Each case's receipt (`test_results/fast_lio/frontend_contract/`) records the
-comparison's result and the identity of the golden it used; a pipeline receipt also lists the branches the
-scenario reached with their counts, the branches the existing hooks cannot reach, and the hooks S1 adds for them.
+source directory in recorded text (`<ROOT_DIR>/`), which differs between build machines; an effective text value
+it masks is typed `string-masked` and its raw bytes stay in the case's receipt. The fixtures' headers list what is
+not recorded and why. Each case's receipt (`test_results/fast_lio/frontend_contract/`) records the comparison's
+result and the identity of the golden it used; a pipeline receipt also lists the branches the scenario reached
+with their counts.
 
 ## Files
 
 - `golden/parameter/<case>.golden`, `golden/pipeline/<scenario>.golden`: the goldens. The `# ` header lines name
   the fork commit, the architecture, the ROS distribution and the compile options a golden was generated with; the
-  comparison reads them and compares the rest. The parameter `defaults` golden holds the whole parameter table;
-  every other parameter golden holds only the table lines that differ from it.
+  comparison reads them and compares the rest. The parameter `defaults` golden holds the whole parameter table
+  and effective configuration; every other parameter golden holds only the lines of either that differ from it.
 - `m20_laser_mapping.yaml`: the M20 profile's front-end parameters as the parent repository merges them; the
   fixture cannot read the parent repository. It is a test input of the parameter fixture, not a contract on the
   parent's configuration. Provenance: LIO-SLAM commit `59be99aa91cf2626db3555334875993ec3d032af`,
@@ -35,7 +46,19 @@ scenario reached with their counts, the branches the existing hooks cannot reach
   with `config/profiles/m20/fast_lio.yaml` (sha256
   `2e4d38cd98f5c2728d4e44ceaf982ffe5402a9794f14f7a7905afbf2a71ce1cc`) by
   `python3 tools/offline_params.py --config-root config --profile m20 --out <dir>` (its `laser_mapping.yaml`,
-  unchanged); sha256 `1da5c594fc924243439963c639568292fe65aa0e437ffa9be8cd9a62d73678dc`.
+  unchanged); sha256 `1da5c594fc924243439963c639568292fe65aa0e437ffa9be8cd9a62d73678dc`. The same command at
+  LIO-SLAM commit `ea8abf72ecdbf0e2d392a93e960500665dba9dde` gives the same bytes.
+- `giant_allpoint_laser_mapping.yaml`, `giant_laser_mapping.yaml`, `giant_hesai_fp_laser_mapping.yaml`,
+  `m20_bodyimu_laser_mapping.yaml`: the parent repository's other merged profiles, made by the same command with
+  `--profile <name>` at LIO-SLAM commit `ea8abf72ecdbf0e2d392a93e960500665dba9dde` from `config/fast_lio.base.yaml`
+  (sha256 above) and `config/profiles/<name>/fast_lio.yaml`; each file is that run's `laser_mapping.yaml`, unchanged.
+
+  | profile | `fast_lio.yaml` sha256 | merged file sha256 |
+  | --- | --- | --- |
+  | `giant_allpoint` | `2868fa9a1907e198d2d1a8c6c6a145e2b3c2cf3887f5aa383dd6788002448257` | `f461a66ef3fb4c9b1f5d25f290af7cc84c4538171b1d4c462967dc215521d5ad` |
+  | `giant` | `c4975a4893f08018a1576c4366cf68f4436616ab3a1cb0b7934093ab131dc0e1` | `3d988bbbf0b91116ccab783c14ea49fe1a0110c5ba8da88f0ecafc8dedd43311` |
+  | `giant_hesai_fp` | `082ef82c5677d4269a07535229633db6f328a74199a0340da4dc979e419dcd1a` | `404e8101fc7481faa5e7964688d4b75329693dcd73896e0dd6c25c914592e600` |
+  | `m20_bodyimu` | `854f72c8e04a4c51de6be08e35fb7f893c46b1dd5cf143699f57d7b375146e7c` | `a1dbe30368193e6ebf2d95a5ef528c2527a7ce98ed5e6083f7ca6b13dcff3f2d` |
 
 ## The goldens apply to x86_64 only
 

@@ -1,0 +1,13 @@
+# frontend contract golden: parameter/lost_recovery_requires_health_publication
+# fork_sha: 013027b7f68314dd00fa9e063ad452a282548339
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case lost_recovery_requires_health_publication
+config overrides-only
+overrides 4
+override health_pub_en type=bool value=false
+override lost_recovery_en type=bool value=true
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+outcome threw std::invalid_argument: "lost_recovery_en=true requires health_pub_en=true (the coordinate epoch is published in the /Odometry health block)"

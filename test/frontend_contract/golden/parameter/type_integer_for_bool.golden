@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/type_integer_for_bool
-# fork_sha: 16bd54f7da5e1a499fe55eeb71d594f93f1fde53
+# fork_sha: 05be5af0ddb42e4acc6033f5db44c1f4aed06ac3
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=

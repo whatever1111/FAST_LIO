@@ -1110,6 +1110,14 @@ TEST(FrontendParameterContract, LostRecoveryRequiresRecoveryBudget)
   checkCase(c);
 }
 
+TEST(FrontendParameterContract, LostRecoveryRequiresHealthPublication)
+{
+  ParameterCase c = overridesCase("lost_recovery_requires_health_publication", Expect::kRejected);
+  setOverride(c, rclcpp::Parameter("lost_recovery_en", true));
+  setOverride(c, rclcpp::Parameter("health_pub_en", false));
+  checkCase(c);
+}
+
 TEST(FrontendParameterContract, NanImuBacklog)
 {
   ParameterCase c = overridesCase("nan_imu_backlog", Expect::kRejected);

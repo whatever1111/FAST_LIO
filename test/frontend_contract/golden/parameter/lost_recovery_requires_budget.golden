@@ -1,0 +1,13 @@
+# frontend contract golden: parameter/lost_recovery_requires_budget
+# fork_sha: 05be5af0ddb42e4acc6033f5db44c1f4aed06ac3
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+case lost_recovery_requires_budget
+config overrides-only
+overrides 4
+override lost_recovery_en type=bool value=true
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+override reanchor_total_timeout_sec type=double value=0
+outcome threw std::invalid_argument: "lost_recovery_stable_sec must be finite and positive (representable in ns); lost_recovery_en=true requires reanchor_total_timeout_sec > 0"

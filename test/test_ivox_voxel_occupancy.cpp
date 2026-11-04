@@ -1,7 +1,9 @@
-// How many points a voxel ends up holding — the relation the per-voxel reserve is sized from.
+// How many points a voxel ends up holding — the relation the per-voxel reserve is sized from —
+// and which of them the entry view shows.
 
 #include <pcl/point_types.h>
 
+#include <algorithm>
 #include <array>
 #include <gtest/gtest.h>
 #include <vector>
@@ -34,6 +36,36 @@ Ivox alignedGrid(int per_voxel_cap = 50)
   v.Init(0.3f, 26, per_voxel_cap, 1000);
   v.set_downsample_param(0.3f);
   return v;
+}
+
+// 1 m voxels over a 0.1 m dedup grid: a voxel holds several points, so a view can cut one short.
+Ivox fineGrid(std::size_t max_voxels = 1000)
+{
+  Ivox v;
+  v.Init(1.0f, 26, 50, max_voxels);
+  v.set_downsample_param(0.1f);
+  return v;
+}
+
+pcl::PointXYZ pointAt(float x, float y, float z)
+{
+  return cloudOf({{x, y, z}}).front();
+}
+
+// The x of every point a search finds near `query` (up to 20 of them), sorted.
+std::vector<float> nearestXs(const Ivox & v, const pcl::PointXYZ & query, bool in_view)
+{
+  Cloud near;
+  std::vector<float> sqdist;
+  if (in_view)
+    v.Nearest_Search_View(query, 20, near, sqdist);
+  else
+    v.Nearest_Search(query, 20, near, sqdist);
+  std::vector<float> xs;
+  for (const auto & p : near)
+    xs.push_back(p.x);
+  std::sort(xs.begin(), xs.end());
+  return xs;
 }
 }  // namespace
 
@@ -217,4 +249,160 @@ TEST(IvoxVoxelOccupancy, InvalidQueriesClearOutputsAndIntegerEdgeNeighborsDoNotO
     EXPECT_TRUE(distances.empty());
     EXPECT_EQ(v.Add_Points(query, true), 0);
   }
+}
+
+TEST(IvoxEntryView, ShowsOnlyThePointsTheMapHeldWhenItOpened)
+{
+  Ivox v = fineGrid();
+  Cloud entry = cloudOf({{0.05f, 0.05f, 0.05f}, {0.55f, 0.05f, 0.05f}});  // one voxel
+  ASSERT_EQ(v.Add_Points(entry, true), 2);
+  ASSERT_TRUE(v.BeginEntryView());
+  EXPECT_TRUE(v.entryViewActive());
+  // After the opening, both of map_incremental's paths: into the voxel the view holds, and into a new one.
+  Cloud later = cloudOf({{0.25f, 0.05f, 0.05f}, {1.25f, 0.05f, 0.05f}});
+  ASSERT_EQ(v.Add_Points(later, true), 2);
+  Cloud later_raw = cloudOf({{0.35f, 0.05f, 0.05f}});
+  ASSERT_EQ(v.Add_Points(later_raw, false), 1);
+
+  const pcl::PointXYZ query = pointAt(0.6f, 0.05f, 0.05f);
+  EXPECT_EQ(nearestXs(v, query, true), (std::vector<float>{0.05f, 0.55f}));
+  EXPECT_EQ(nearestXs(v, query, false), (std::vector<float>{0.05f, 0.25f, 0.35f, 0.55f, 1.25f}));
+
+  v.EndEntryView();
+  EXPECT_FALSE(v.entryViewActive());
+  EXPECT_EQ(nearestXs(v, query, true), nearestXs(v, query, false));
+}
+
+TEST(IvoxEntryView, WithNothingAddedSinceTheOpeningTheViewSearchIsTheMapSearch)
+{
+  Ivox v = fineGrid();
+  std::vector<std::array<float, 3>> xyz;
+  for (int i = 0; i < 30; ++i)
+    for (int j = 0; j < 30; ++j)
+      xyz.push_back({0.1f * static_cast<float>(i) + 0.03f,
+                     0.1f * static_cast<float>(j) + 0.04f,
+                     0.02f * static_cast<float>((i * j) % 5)});
+  Cloud map = cloudOf(xyz);
+  ASSERT_GT(v.Add_Points(map, true), 0);
+  ASSERT_TRUE(v.BeginEntryView());
+  // A point the dedup refuses changes no voxel, so it opens no entry either.
+  Cloud refused = cloudOf({xyz.front()});
+  ASSERT_EQ(v.Add_Points(refused, true), 0);
+
+  for (int q = 0; q < 40; ++q) {
+    const pcl::PointXYZ query = pointAt(0.07f * static_cast<float>(q), 0.05f * static_cast<float>(q), 0.03f);
+    Cloud near_map, near_view;
+    std::vector<float> d_map, d_view;
+    v.Nearest_Search(query, 5, near_map, d_map);
+    v.Nearest_Search_View(query, 5, near_view, d_view);
+    ASSERT_EQ(near_view.size(), near_map.size()) << q;
+    for (std::size_t i = 0; i < near_map.size(); ++i) {
+      EXPECT_EQ(d_view[i], d_map[i]) << q;
+      EXPECT_EQ(near_view[i].x, near_map[i].x) << q;
+      EXPECT_EQ(near_view[i].y, near_map[i].y) << q;
+      EXPECT_EQ(near_view[i].z, near_map[i].z) << q;
+    }
+  }
+}
+
+TEST(IvoxEntryView, AnEvictedVoxelLeavesTheViewAndComesBackOutsideIt)
+{
+  Ivox v = fineGrid(2);
+  Cloud first = cloudOf({{0.5f, 0.5f, 0.5f}});  // the oldest voxel
+  Cloud second = cloudOf({{5.5f, 0.5f, 0.5f}});
+  ASSERT_EQ(v.Add_Points(first, true), 1);
+  ASSERT_EQ(v.Add_Points(second, true), 1);
+  ASSERT_TRUE(v.BeginEntryView());
+
+  Cloud third = cloudOf({{10.5f, 0.5f, 0.5f}});  // a new voxel at capacity: the oldest goes
+  ASSERT_EQ(v.Add_Points(third, true), 1);
+  ASSERT_EQ(v.evictedVoxels(), 1u);
+  EXPECT_TRUE(nearestXs(v, first.front(), true).empty()) << "evicted: gone from the view with the map";
+  EXPECT_EQ(nearestXs(v, second.front(), true), (std::vector<float>{5.5f}));
+  EXPECT_TRUE(nearestXs(v, third.front(), true).empty()) << "added after the opening";
+  EXPECT_EQ(nearestXs(v, third.front(), false), (std::vector<float>{10.5f}));
+
+  // The evicted voxel comes back with the very point it held at the opening: a voxel created after the opening.
+  ASSERT_EQ(v.Add_Points(first, true), 1);
+  EXPECT_TRUE(nearestXs(v, first.front(), true).empty());
+  EXPECT_EQ(nearestXs(v, first.front(), false), (std::vector<float>{0.5f}));
+}
+
+TEST(IvoxEntryView, ClearAndBuildReopenAnOpenViewOnTheNewMap)
+{
+  Ivox v = fineGrid();
+  Cloud entry = cloudOf({{0.5f, 0.5f, 0.5f}});
+  ASSERT_EQ(v.Add_Points(entry, true), 1);
+  ASSERT_TRUE(v.BeginEntryView());
+
+  v.clear();
+  EXPECT_TRUE(v.entryViewActive());
+  Cloud after_clear = cloudOf({{0.55f, 0.5f, 0.5f}});
+  ASSERT_EQ(v.Add_Points(after_clear, true), 1);
+  EXPECT_TRUE(nearestXs(v, entry.front(), true).empty()) << "reopened on the empty map";
+  EXPECT_EQ(nearestXs(v, entry.front(), false), (std::vector<float>{0.55f}));
+
+  Cloud built = cloudOf({{0.15f, 0.5f, 0.5f}, {1.15f, 0.5f, 0.5f}});
+  v.Build(built);
+  EXPECT_TRUE(v.entryViewActive());
+  // After the build: into a built voxel, and into a new one.
+  Cloud after_build = cloudOf({{0.35f, 0.5f, 0.5f}, {0.45f, 1.5f, 0.5f}});
+  ASSERT_EQ(v.Add_Points(after_build, true), 2);
+  const pcl::PointXYZ query = pointAt(0.3f, 0.5f, 0.5f);
+  EXPECT_EQ(nearestXs(v, query, true), (std::vector<float>{0.15f, 1.15f})) << "the built points are the view";
+  EXPECT_EQ(nearestXs(v, query, false), (std::vector<float>{0.15f, 0.35f, 0.45f, 1.15f}));
+}
+
+TEST(IvoxEntryView, DoesNotOpenOverAPinnedTier)
+{
+  Ivox v = fineGrid();
+  Cloud prior = cloudOf({{0.5f, 0.5f, 0.5f}});
+  ASSERT_EQ(v.AddPinnedPoints(prior), 1);
+  Cloud live = cloudOf({{0.15f, 0.5f, 0.5f}});
+  ASSERT_EQ(v.Add_Points(live, true), 1);
+
+  EXPECT_FALSE(v.BeginEntryView());
+  EXPECT_FALSE(v.entryViewActive());
+  Cloud later = cloudOf({{0.25f, 0.5f, 0.5f}});
+  ASSERT_EQ(v.Add_Points(later, true), 1);
+  const pcl::PointXYZ query = pointAt(0.3f, 0.5f, 0.5f);
+  EXPECT_EQ(nearestXs(v, query, false), (std::vector<float>{0.15f, 0.25f, 0.5f}));
+  EXPECT_EQ(nearestXs(v, query, true), nearestXs(v, query, false)) << "no view: the view search is the map search";
+}
+
+TEST(IvoxEntryView, APinnedAdditionWhileOpenStaysOutOfTheViewAndIsReported)
+{
+  Ivox v = fineGrid();
+  Cloud live = cloudOf({{0.15f, 0.5f, 0.5f}});
+  ASSERT_EQ(v.Add_Points(live, true), 1);
+  ASSERT_TRUE(v.BeginEntryView());
+  EXPECT_FALSE(v.entryViewPinned());
+
+  // Into the live voxel, which it pins, and into a new voxel.
+  Cloud prior = cloudOf({{0.55f, 0.5f, 0.5f}, {0.5f, 1.5f, 0.5f}});
+  ASSERT_EQ(v.AddPinnedPoints(prior), 2);
+  EXPECT_TRUE(v.entryViewPinned());
+  EXPECT_TRUE(v.entryViewActive());
+  const pcl::PointXYZ query = pointAt(0.3f, 0.5f, 0.5f);
+  EXPECT_EQ(nearestXs(v, query, true), (std::vector<float>{0.15f}));
+  EXPECT_EQ(nearestXs(v, query, false), (std::vector<float>{0.15f, 0.5f, 0.55f}));
+
+  v.EndEntryView();
+  EXPECT_FALSE(v.entryViewPinned());
+}
+
+TEST(IvoxEntryView, CountsTheCallersFramesOnlyWhileOpen)
+{
+  Ivox v = fineGrid();
+  v.countEntryViewFrame();
+  EXPECT_EQ(v.entryViewFrames(), 0u);
+  ASSERT_TRUE(v.BeginEntryView());
+  v.countEntryViewFrame();
+  v.countEntryViewFrame();
+  EXPECT_EQ(v.entryViewFrames(), 2u);
+  ASSERT_TRUE(v.BeginEntryView());  // reopening starts over
+  EXPECT_EQ(v.entryViewFrames(), 0u);
+  v.countEntryViewFrame();
+  v.EndEntryView();
+  EXPECT_EQ(v.entryViewFrames(), 0u);
 }

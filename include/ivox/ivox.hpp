@@ -13,6 +13,8 @@
 // concurrently from many threads (FAST-LIO's h_share runs it under `omp parallel for`) — it
 // only does const unordered_map lookups. AddPoints mutates the grid and MUST NOT overlap a
 // search; FAST-LIO's async map worker already guarantees that via its join-before-search.
+// The entry view follows the same rule: opening and closing it must not overlap an addition,
+// and Nearest_Search_View is a search like any other.
 #pragma once
 
 #include <Eigen/Core>
@@ -76,6 +78,7 @@ public:
   {
     clear();
     Add_Points(points, true);
+    view_n_.clear();  // an open entry view reopens on the rebuilt map, the built points included
   }
 
   // Drop everything the live scans put here, keep the pinned tier (a preloaded prior map).
@@ -122,6 +125,7 @@ public:
     lru_.clear();
     num_points_ = 0;
     pinned_voxels_ = 0;
+    view_n_.clear();  // an open entry view reopens on the empty map
   }
 
   // Add points that must survive both eviction and clearLive(): a prior map is not something
@@ -138,6 +142,43 @@ public:
   }
 
   int Add_Points(PointVector & points, bool downsample_on) { return addPoints(points, downsample_on, false); }
+
+  // --- Entry view --------------------------------------------------------------------------
+  // The map as it stood when the view was opened, kept while the map itself goes on growing:
+  // what laserMapping qualifies a recovery against, so that the scans being qualified cannot
+  // vouch for themselves with points they added. A voxel only ever appends points and is only
+  // ever removed whole, so what it held at the opening is a prefix of its points. An open view
+  // records that prefix's length the first time a voxel grows, 0 for a voxel created after the
+  // opening, and nothing for a voxel that has not grown. A removed voxel leaves the view with
+  // the map; clear() and Build() reopen an open view on the new map (Build's points are in it).
+  // A pinned tier is another run's map: the view does not open while one is loaded, and a
+  // pinned addition while it is open is kept out of it like any later point and reported by
+  // entryViewPinned().
+  bool BeginEntryView()
+  {
+    EndEntryView();
+    if (pinned_voxels_ > 0)
+      return false;
+    view_active_ = true;
+    return true;
+  }
+  void EndEntryView()
+  {
+    view_active_ = false;
+    view_pinned_ = false;
+    view_frames_ = 0;
+    robin_hood::unordered_flat_map<Key, std::size_t, KeyHash>().swap(view_n_);  // release the table
+  }
+  bool entryViewActive() const { return view_active_; }
+  bool entryViewPinned() const { return view_pinned_; }
+  // The caller's count of the scans it inserted while the view was open; the map itself counts
+  // points, not scans. An addition never touches it, so it belongs to the caller's thread alone.
+  void countEntryViewFrame()
+  {
+    if (view_active_)
+      ++view_frames_;
+  }
+  std::size_t entryViewFrames() const { return view_frames_; }
 
 private:
   int addPoints(PointVector & points, bool downsample_on, bool pinned)
@@ -187,16 +228,23 @@ private:
         }
         map_.emplace(k, std::move(v));
         was_added = true;
+        if (view_active_) {
+          view_n_[k] = 0;  // created after the opening: none of it is in the view
+          view_pinned_ = view_pinned_ || pinned;
+        }
       } else {
         Voxel & v = it->second;
         if (pinned && !v.pinned) {  // a live voxel the prior map also covers becomes pinned
           lru_.erase(v.lru);
           v.pinned = true;
           ++pinned_voxels_;
+          view_pinned_ = view_pinned_ || view_active_;
         }
         if (!v.pinned)
           lru_.splice(lru_.begin(), lru_, v.lru);  // touch (most-recently-used)
         if (static_cast<int>(v.pts.size()) < per_voxel_cap_) {
+          if (view_active_)
+            view_n_.emplace(k, v.pts.size());  // the first growth since the opening keeps the old length
           v.pts.push_back(p);
           was_added = true;
         }
@@ -221,6 +269,27 @@ public:
                       std::vector<float> & sqdist,
                       float max_dist = std::numeric_limits<float>::infinity()) const
   {
+    search(point, k, nearest, sqdist, max_dist, false);
+  }
+  // Nearest_Search over the entry view: every voxel up to the length it had when the view was
+  // opened. Without an open view it searches the whole map, as Nearest_Search does.
+  void Nearest_Search_View(const PointType & point,
+                           int k,
+                           PointVector & nearest,
+                           std::vector<float> & sqdist,
+                           float max_dist = std::numeric_limits<float>::infinity()) const
+  {
+    search(point, k, nearest, sqdist, max_dist, view_active_);
+  }
+
+private:
+  void search(const PointType & point,
+              int k,
+              PointVector & nearest,
+              std::vector<float> & sqdist,
+              float max_dist,
+              bool in_view) const
+  {
     nearest.clear();
     sqdist.clear();
     if (k <= 0 || !representable(point, inv_res_))
@@ -240,7 +309,15 @@ public:
       auto it = map_.find(Key{static_cast<int>(x), static_cast<int>(y), static_cast<int>(z)});
       if (it == map_.end())
         continue;
-      for (const auto & p : it->second.pts) {
+      const PointVector & pts = it->second.pts;
+      std::size_t visible = pts.size();
+      if (in_view) {
+        const auto recorded = view_n_.find(it->first);
+        if (recorded != view_n_.end())
+          visible = recorded->second;
+      }
+      for (std::size_t i = 0; i < visible; ++i) {
+        const PointType & p = pts[i];
         const float dx = p.x - point.x, dy = p.y - point.y, dz = p.z - point.z;
         const float d2 = dx * dx + dy * dy + dz * dz;
         if (d2 <= max_sq)
@@ -258,6 +335,7 @@ public:
     }
   }
 
+public:
   template<typename BoxT>
   int Delete_Point_Boxes(std::vector<BoxT> & /*boxes*/)
   {
@@ -439,6 +517,11 @@ private:
   std::size_t num_points_ = 0;
   std::size_t evicted_voxels_ = 0;
   std::size_t pinned_voxels_ = 0;
+  // Entry view: the points each voxel that grew since the opening had then; see BeginEntryView().
+  robin_hood::unordered_flat_map<Key, std::size_t, KeyHash> view_n_;
+  bool view_active_ = false;
+  bool view_pinned_ = false;
+  std::size_t view_frames_ = 0;
 };
 
 }  // namespace lio_ivox

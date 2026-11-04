@@ -1944,10 +1944,40 @@ TEST(FrontendPipelineContract, EntryViewMovingRecovery)
   checkScenario(entryViewScenario());
 }
 
-// The scenario the front-end ThreadSanitizer phase runs: the map worker and the reset that joins it.
+// The worker suite is what the front-end ThreadSanitizer phase runs. Here: the map worker and the reset that joins it.
 TEST(FrontendPipelineWorker, AsyncMapDelayAndReset)
 {
   checkScenario(workerScenario());
+}
+
+// A record without what only a run with the map worker writes: the count of the batches it added.
+std::string withoutMapAdds(std::string record)
+{
+  const std::string tag = " map_adds=";
+  for (auto at = record.find(tag); at != std::string::npos; at = record.find(tag, at))
+    record.erase(at, record.find_first_not_of("0123456789", at + tag.size()) - at);
+  return record;
+}
+
+// The entry view under the map worker, as production runs it: the view opens, is searched and closes between the
+// worker's additions. The scan path joins the worker before any of that, so each scan finds the map the synchronous
+// path gives it, and the record, the worker's counts aside, is the synchronous run's. That run is compared with its
+// golden, so this one needs none.
+TEST(FrontendPipelineWorker, EntryViewRecoveryRecordsWhatTheSynchronousPathRecords)
+{
+  const Scenario synchronous = entryViewScenario();
+  Scenario worker = synchronous;
+  worker.async_map = true;
+  worker.claims.push_back("async_map_add");
+  const ChildRun expected = runScenario(synchronous);
+  const ChildRun actual = runScenario(worker);
+  ASSERT_TRUE(expected.ok()) << expected.describe();
+  ASSERT_TRUE(actual.ok()) << actual.describe();
+  for (const auto & claim : worker.claims)
+    EXPECT_GT(actual.count(claim), 0u) << "the worker run did not reach the claimed branch " << claim;
+  const Comparison comparison = compareLines(expected.record, withoutMapAdds(actual.record));
+  EXPECT_EQ(comparison.result, "equal") << "line " << comparison.line << "\n  synchronous: " << comparison.expected
+                                        << "\n  worker: " << comparison.actual;
 }
 
 }  // namespace

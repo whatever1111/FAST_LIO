@@ -652,6 +652,30 @@ Scenario workerScenario()
   return s;
 }
 
+constexpr double kEntryViewStep = 0.04;  // m along x per scan: the fixture's 0.4 m/s
+
+// reanchor_recovery_entry_view on (#369), test_anchor_lifecycle_node's entry_view_moving: the platform moves on along
+// x through a recovery, its registration states injected. One healthy scan, the last supported one; three degraded
+// scans, which start Pending and stay out of the map; healthy scans, which go into the map while Pending and are
+// matched against the entry view until it qualifies the recovery after the stable time, and go on after it.
+Scenario entryViewScenario()
+{
+  Scenario s = baseScenario("entry_view_moving");
+  setPolicy(s, 10.0, 1.0);
+  setParam(s, rclcpp::Parameter("reanchor_recovery_entry_view", true));
+  int k = 0;
+  const auto along = [&k]() {
+    return std::array<double, 3>{kEntryViewStep * k++, 0.0, 0.0};
+  };
+  s.slots.push_back(injected("last_supported", true, kGuardHealthy, along()));
+  for (int i = 0; i < 3; ++i)
+    s.slots.push_back(injected("degraded_moving", true, kGuardDegraded, along()));
+  for (int i = 0; i < 15; ++i)
+    s.slots.push_back(injected("healthy_moving", true, kGuardHealthy, along()));
+  s.claims = {"recovery_started", "recovery_qualified", "pending_map_update", "published", "odometry"};
+  return s;
+}
+
 // ---------------------------------------------------------------------------
 // Branches
 // ---------------------------------------------------------------------------
@@ -720,6 +744,10 @@ constexpr Branch kBranches[] = {
   {"delayed_insertion",
    "published map updates whose batch the worker had not added when the next scan was prepared (worker suite only)",
    "test_async_map_reset AsyncMapReset.EveryBatchOfAMultiScanDelayIsDiscarded"},
+  {"pending_map_update",
+   "records of scans still Pending after the recovery step whose points went into the map "
+   "(reanchor_recovery_entry_view)",
+   "test_anchor_lifecycle_node AnchorLifecycleEntryView.*"},
 };
 
 // What the existing hooks cannot reach. Each entry names the hook S1 adds under FASTLIO_TEST_HOOKS and where; the
@@ -1072,6 +1100,8 @@ private:
       ++counts_["published"];
       published_ends_.push_back(key);
     }
+    if (r.trust_post == fast_lio::RecoveryTrust::kPending && r.map_updated)
+      ++counts_["pending_map_update"];
     const auto rows = h_max_effective_.find(key);
     if (r.end_ns >= 0 && rows != h_max_effective_.end()) {
       ++counts_[rows->second > 0 ? "normal_match" : "no_match"];
@@ -1907,6 +1937,11 @@ TEST(FrontendPipelineContract, ImuFatal)
 TEST(FrontendPipelineContract, InputEpoch)
 {
   checkScenario(inputEpochScenario());
+}
+
+TEST(FrontendPipelineContract, EntryViewMovingRecovery)
+{
+  checkScenario(entryViewScenario());
 }
 
 // The scenario the front-end ThreadSanitizer phase runs: the map worker and the reset that joins it.

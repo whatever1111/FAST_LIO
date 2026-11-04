@@ -328,6 +328,32 @@ TEST(IvoxEntryView, AnEvictedVoxelLeavesTheViewAndComesBackOutsideIt)
   EXPECT_EQ(nearestXs(v, first.front(), false), (std::vector<float>{0.5f}));
 }
 
+TEST(IvoxEntryView, APerVoxelCapKeepsWhatEachVoxelHeldAtTheOpening)
+{
+  Ivox v;
+  v.Init(1.0f, 26, 3, 1000);
+  v.set_downsample_param(0.1f);
+  // One voxel with room for one more point, and one already full.
+  Cloud entry = cloudOf({{0.05f, 0.05f, 0.05f},
+                         {0.25f, 0.05f, 0.05f},
+                         {5.05f, 0.05f, 0.05f},
+                         {5.25f, 0.05f, 0.05f},
+                         {5.45f, 0.05f, 0.05f}});
+  ASSERT_EQ(v.Add_Points(entry, true), 5);
+  ASSERT_TRUE(v.BeginEntryView());
+
+  // The last point of the first voxel, one over its cap, and one over the cap of the full voxel.
+  Cloud later = cloudOf({{0.45f, 0.05f, 0.05f}, {0.65f, 0.05f, 0.05f}, {5.65f, 0.05f, 0.05f}});
+  ASSERT_EQ(v.Add_Points(later, true), 1);
+
+  const pcl::PointXYZ query = pointAt(0.3f, 0.05f, 0.05f);
+  EXPECT_EQ(nearestXs(v, query, true), (std::vector<float>{0.05f, 0.25f}));
+  EXPECT_EQ(nearestXs(v, query, false), (std::vector<float>{0.05f, 0.25f, 0.45f}));
+  const pcl::PointXYZ query_full = pointAt(5.3f, 0.05f, 0.05f);
+  EXPECT_EQ(nearestXs(v, query_full, true), (std::vector<float>{5.05f, 5.25f, 5.45f}));
+  EXPECT_EQ(nearestXs(v, query_full, false), (std::vector<float>{5.05f, 5.25f, 5.45f}));
+}
+
 TEST(IvoxEntryView, ClearAndBuildReopenAnOpenViewOnTheNewMap)
 {
   Ivox v = fineGrid();

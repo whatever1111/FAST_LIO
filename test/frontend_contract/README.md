@@ -30,12 +30,12 @@ scenario reached with their counts, the branches the existing hooks cannot reach
   every other parameter golden holds only the table lines that differ from it.
 - `m20_laser_mapping.yaml`: the M20 profile's front-end parameters as the parent repository merges them; the
   fixture cannot read the parent repository. It is a test input of the parameter fixture, not a contract on the
-  parent's configuration. Provenance: LIO-SLAM commit `59be99aa91cf2626db3555334875993ec3d032af`,
+  parent's configuration. Provenance: LIO-SLAM commit `78d278d7cb65bc0e8c144db4c2136388a17dc015`,
   `config/fast_lio.base.yaml` (sha256 `06304727793dc7e85e32c421a8b9b7fdf3cec9fc6ca0867da3c24af16a7aa644`) merged
   with `config/profiles/m20/fast_lio.yaml` (sha256
-  `2e4d38cd98f5c2728d4e44ceaf982ffe5402a9794f14f7a7905afbf2a71ce1cc`) by
+  `244e57bf7dc493fc249dbf94e09d0a36d8a5ec5a29357dbcbd84516b48b1dfaf`) by
   `python3 tools/offline_params.py --config-root config --profile m20 --out <dir>` (its `laser_mapping.yaml`,
-  unchanged); sha256 `1da5c594fc924243439963c639568292fe65aa0e437ffa9be8cd9a62d73678dc`.
+  unchanged); sha256 `8e6575d416bcad226c25571f2efc3891b5f2d80b96a85ce28ee18fe5c499932f`.
 
 ## The goldens apply to x86_64 only
 

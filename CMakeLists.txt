@@ -324,7 +324,8 @@ if(BUILD_TESTING)
       "AnchorLifecycleExport:export:240"
       "AnchorLifecycleStartup:startup:600"
       "AnchorLifecycleReference:reference:600"
-      "AnchorLifecycleLostRecovery:lost_recovery:600")
+      "AnchorLifecycleLostRecovery:lost_recovery:600"
+      "AnchorLifecycleEntryView:entry_view:300")
     ament_add_gtest_executable(test_anchor_lifecycle_node test/test_anchor_lifecycle_node.cpp)
     fastlio_test_sanitize(test_anchor_lifecycle_node)
     set(anchor_node_suites "")
@@ -575,6 +576,14 @@ ${sanitizer_tests}
     target_include_directories(test_ivox_voxel_occupancy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                                  ${PCL_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR})
     target_link_libraries(test_ivox_voxel_occupancy ${PCL_LIBRARIES})
+  endif()
+  # Pure header over the map backend's entry view: the re-anchor gate's evidence by
+  # h_share_model's correspondence rules, blind to what the map took in since the view opened.
+  ament_add_gtest(test_recovery_view_match test/test_recovery_view_match.cpp)
+  if(TARGET test_recovery_view_match)
+    target_include_directories(test_recovery_view_match PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                                ${PCL_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR})
+    target_link_libraries(test_recovery_view_match ${PCL_LIBRARIES})
   endif()
   # Both map backends, whatever USE_IVOX is: the front end's first local reference needs the initial
   # build to have left the backend holding points, not only to have been called.

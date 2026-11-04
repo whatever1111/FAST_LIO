@@ -119,6 +119,7 @@
 #include "preprocess.h"
 #include "prior_map_load.hpp"
 #include "reanchor_gate.hpp"
+#include "recovery_view_match.hpp"
 #include "reference_health_contract.hpp"
 #include "rp_consider.hpp"
 #include "runaway_watchdog.hpp"
@@ -2205,6 +2206,18 @@ void changeStationaryReference(fast_lio::AnchorDrop drop, double stamp)
   fast_lio::revokeRecoveryStartup(&recovery_state);
 }
 
+// What the human-readable end of a recovery adds while its entry view is open (reanchor_recovery_entry_view): the
+// scans the map took in meanwhile. Empty otherwise, so those lines read as before; the structured trace line
+// never carries it.
+std::string entryViewNote()
+{
+#ifdef USE_IVOX
+  if (ikdtree.entryViewActive())
+    return " view_inserted=" + std::to_string(ikdtree.entryViewFrames());
+#endif
+  return std::string();
+}
+
 void noteRecoveryEvent(const fast_lio::RecoveryEvent & event, std::int64_t stamp_ns)
 {
   const double total_s = static_cast<double>(recovery_params.total_ns) * 1e-9;
@@ -2224,9 +2237,10 @@ void noteRecoveryEvent(const fast_lio::RecoveryEvent & event, std::int64_t stamp
       reference_progress.qualified();
     fast_lio::saturatingIncrement(&anchor_trace_counters.recovery_qualified);
     RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
-                "[FE-RECOVERY] recovery #%llu qualified: %.1fs of unbroken matching on the same reference",
+                "[FE-RECOVERY] recovery #%llu qualified: %.1fs of unbroken matching on the same reference%s",
                 static_cast<unsigned long long>(recovery_state.episode),
-                stable_s);
+                stable_s,
+                entryViewNote().c_str());
     recoveryTransition(fast_lio::RecoveryTraceEvent::kQualified, event.cause, stamp_ns);
   }
   if (event.unanchored) {
@@ -2237,13 +2251,15 @@ void noteRecoveryEvent(const fast_lio::RecoveryEvent & event, std::int64_t stamp
                                     : &anchor_trace_counters.recovery_expired);
     if (lost_recovery_params.enabled) {
       RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
-                   "[FE-RECOVERY] UNANCHORED (%s): this coordinate epoch stays untrusted; LOST recovery is armed",
-                   fast_lio::recoveryCauseName(event.cause));
+                   "[FE-RECOVERY] UNANCHORED (%s): this coordinate epoch stays untrusted; LOST recovery is armed%s",
+                   fast_lio::recoveryCauseName(event.cause),
+                   entryViewNote().c_str());
     } else {
       RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
                    "[FE-RECOVERY] UNANCHORED (%s): the position is not trusted again in this process and odometry "
-                   "stays flagged degraded; only a restart restores normal operation",
-                   fast_lio::recoveryCauseName(event.cause));
+                   "stays flagged degraded; only a restart restores normal operation%s",
+                   fast_lio::recoveryCauseName(event.cause),
+                   entryViewNote().c_str());
     }
     recoveryTransition(fast_lio::RecoveryTraceEvent::kUnanchored, event.cause, stamp_ns);
   }
@@ -2811,6 +2827,8 @@ std::function<void(std::uint64_t, bool)> afterLostRecoveryCommit;
 std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRecord;
 std::function<void(const std::string &)> afterAnchorTraceLine;
 std::function<void(std::uint8_t, std::int64_t, const std::array<std::uint8_t, 32> &)> afterPosePublish;
+std::function<void(double, int, double, int, double, std::size_t)> afterRecoveryViewMatch;
+std::function<void(double, bool)> afterMapInsertion;
 
 ImuInputSnapshot inspectImuInput()
 {
@@ -3053,6 +3071,13 @@ void map_incremental()
   }
   PointToAdd = std::move(ready->first);
   PointNoNeedDownsample = std::move(ready->second);
+#ifdef USE_IVOX
+  ikdtree.countEntryViewFrame();
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::afterMapInsertion)
+    fast_lio_test::afterMapInsertion(lidar_end_time, ikdtree.entryViewActive());
+#endif
+#endif
 
   if (async_map_en) {
     // Off-thread: the worker calls Add_Points during the inter-scan gap; joined before
@@ -4358,6 +4383,7 @@ public:
     this->declare_parameter<int>("reanchor_healthy_window", 100);
     this->declare_parameter<double>("reanchor_total_timeout_sec", 0.0);
     this->declare_parameter<double>("reanchor_recovery_stable_sec", 1.0);
+    this->declare_parameter<bool>("reanchor_recovery_entry_view", false);
     declareLostRecoveryParameters();
     frontend_observation_en = this->declare_parameter<bool>("publish.frontend_observation", false);
     rcl_interfaces::msg::ParameterDescriptor referenceDescriptor;
@@ -4779,6 +4805,7 @@ public:
     reanchor_healthy_res =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
     loadLostRecoveryParameters(reanchor_total_timeout_sec);
+    loadRecoveryEntryView();
     reanchor_healthy_eff =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
     this->get_parameter_or<bool>("runaway_watchdog_en", runaway_params.enabled, true);
@@ -5507,6 +5534,92 @@ private:
     }
   }
 
+  // reanchor_recovery_entry_view: a pending recovery is qualified against the map it began with, iVox's entry
+  // view, and its scans keep going into the map; off, the map stays frozen until the recovery ends.
+  void loadRecoveryEntryView()
+  {
+    this->get_parameter_or<bool>("reanchor_recovery_entry_view", reanchor_recovery_entry_view_, false);
+#ifndef USE_IVOX
+    if (reanchor_recovery_entry_view_) {
+      RCLCPP_FATAL(this->get_logger(), "reanchor_recovery_entry_view needs the iVox map backend (USE_IVOX)");
+      throw std::invalid_argument("reanchor_recovery_entry_view needs the iVox map backend");
+    }
+#endif
+  }
+
+  /// Opens the entry view once per pending recovery and closes it when the recovery is no longer pending.
+  /// Called from the scan loop only, after joinMapAdd() and before this scan's map insertion, so that neither
+  /// overlaps an addition. A recovery begun elsewhere (the IMU callback, the coverage checks before the join)
+  /// is picked up by the next call. A recovery that begins over a pinned tier does not get a view.
+  void syncRecoveryEntryView()
+  {
+#ifdef USE_IVOX
+    const bool pending = recovery_state.trust == fast_lio::RecoveryTrust::kPending;
+    if (!pending && ikdtree.entryViewActive())
+      ikdtree.EndEntryView();
+    if (reanchor_recovery_entry_view_ && pending && entry_view_round_ != recovery_state.episode) {
+      entry_view_round_ = recovery_state.episode;
+      ikdtree.BeginEntryView();
+    }
+#endif
+  }
+
+  bool recoveryEntryViewServes() const
+  {
+#ifdef USE_IVOX
+    return reanchor_recovery_entry_view_ && recovery_state.trust == fast_lio::RecoveryTrust::kPending &&
+           ikdtree.entryViewActive();
+#else
+    return false;
+#endif
+  }
+
+  /// The re-anchor gate's match test for the recovery. While the entry view serves a pending recovery the
+  /// evidence is this scan matched against the view at its final state, by h_share_model's rules
+  /// (recovery_view_match.hpp) and with the update's prior covariance `prior_P`; otherwise it is
+  /// h_share_model's own count.
+  bool recoveryMatchOk(const fast_lio::ReanchorReference & reference,
+                       const Eigen::Matrix<double, 23, 23> & prior_P) const
+  {
+    int effective = effct_feat_num;
+    double res_mean = res_mean_last;
+#ifdef USE_IVOX
+    if (recoveryEntryViewServes()) {
+      fast_lio::RecoveryViewPose pose;
+      pose.rot = state_point.rot;
+      pose.pos = state_point.pos;
+      pose.rot_li = state_point.offset_R_L_I;
+      pose.pos_li = state_point.offset_T_L_I;
+      const auto search = [](const PointType & p, int k, PointVector & near, std::vector<float> & sqdist) {
+        ikdtree.Nearest_Search_View(p, k, near, sqdist);
+      };
+      const fast_lio::RecoveryViewMatch match = fast_lio::matchRecoveryView<NUM_MATCH_POINTS, PointVector>(
+        feats_down_body->points, pose, search, corr_gate, prior_P.block<6, 6>(0, 0), LASER_POINT_COV);
+#ifdef FASTLIO_TEST_HOOKS
+      if (fast_lio_test::afterRecoveryViewMatch)
+        fast_lio_test::afterRecoveryViewMatch(
+          lidar_end_time, effct_feat_num, res_mean_last, match.effective, match.res_mean, ikdtree.entryViewFrames());
+#endif
+      effective = match.effective;
+      res_mean = match.res_mean;
+    }
+#endif
+    return fast_lio::reanchorMatchOk(effective, res_mean, reanchor_params, reference);
+  }
+
+  /// Pending freezes the map unless the entry view serves the recovery and no pinned tier joined the map while
+  /// it was open (a pinned tier is not a scan: the view never shows it, so the frozen map is the safe side).
+  bool pendingRecoveryFreezesMap() const
+  {
+    if (recovery_state.trust != fast_lio::RecoveryTrust::kPending)
+      return false;
+#ifdef USE_IVOX
+    if (recoveryEntryViewServes() && !ikdtree.entryViewPinned())
+      return false;
+#endif
+    return true;
+  }
+
   // The production reset owner, shared verbatim by the late guards and the test-only scheduler.
   bool rebuildLocalMap(const char * tag)
   {
@@ -6188,7 +6301,7 @@ private:
       }
       EkfUpdateDiagnostics lidarDiagnostics;
       Eigen::Matrix<double, 23, 23> lidarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
-      if (kalman_channel_diag_en || corr_dump_scan_active)
+      if (kalman_channel_diag_en || corr_dump_scan_active || reanchor_recovery_entry_view_)
         lidarCovarianceBefore = kf.get_P();
       {
         // Consider roll/pitch on this scan? Decided from what the previous scan left (its roll/pitch information
@@ -7185,8 +7298,12 @@ private:
        *   supported scan, and so did a stretch of this scan the IMU did not
        *   observe. While it runs, the only way back is the re-anchor
        *   gate's own match test, passed by consecutive scans of one reference
-       *   for the stable time, and the map stays frozen meanwhile so the scans
-       *   cannot vouch for themselves with points they added. ***/
+       *   for the stable time, and the scans must not vouch for themselves with
+       *   points they added: by default the map stays frozen meanwhile. With
+       *   reanchor_recovery_entry_view the scans the guard did not call
+       *   degraded keep going into the map and the test counts only the points
+       *   it held when the episode began (iVox's entry view); a pinned tier
+       *   brings the freeze back. ***/
       const bool scan_held = anchor_write.writer == AnchorWrite::Writer::kPin;  // a pin that was not taken back
       const bool scan_supported = (!reanchor.degraded || scan_held) &&
                                   reanchor_gate.state != fast_lio::ReanchorState::kLost &&
@@ -7198,9 +7315,9 @@ private:
       } else {
         startAnchorRecovery(fast_lio::RecoveryCause::kDegraded, anchor_in.end_ns);
       }
-      const bool recovery_match =
-        !flio_in_degraded && reanchor_gate.state != fast_lio::ReanchorState::kLost &&
-        fast_lio::reanchorMatchOk(effct_feat_num, res_mean_last, reanchor_params, reanchor_reference);
+      syncRecoveryEntryView();
+      const bool recovery_match = !flio_in_degraded && reanchor_gate.state != fast_lio::ReanchorState::kLost &&
+                                  recoveryMatchOk(reanchor_reference, lidarCovarianceBefore);
       noteRecoveryEvent(fast_lio::observeRecoveryScan(&recovery_state,
                                                       lifecycle_scan_seq,
                                                       fast_lio::traceNs(Measures.lidar_beg_time),
@@ -7209,7 +7326,8 @@ private:
                                                       stationary_anchor.reference_generation,
                                                       recovery_params),
                         anchor_in.end_ns);
-      if (recovery_state.trust == fast_lio::RecoveryTrust::kPending)
+      syncRecoveryEntryView();
+      if (pendingRecoveryFreezesMap())
         flio_map_frozen = true;
       observeLostRecovery(
         flio_in_degraded, recovery_match, fast_lio::traceNs(Measures.lidar_beg_time), anchor_in.end_ns);
@@ -7748,6 +7866,8 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::TransformStamped>::SharedPtr prior_map_align_sub_;
   std::vector<double> initial_pose_vec_;
   bool initial_pose_full_rpy_override_ = false;
+  bool reanchor_recovery_entry_view_ = false;  // qualify a pending recovery against its entry view
+  std::uint64_t entry_view_round_ = 0;         // the recovery episode the entry view was last opened for
 };
 
 #ifndef FASTLIO_AS_COMPONENT

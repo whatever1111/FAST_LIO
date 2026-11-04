@@ -75,6 +75,7 @@
 #include "laser_mapping_test_hooks.hpp"
 #include "odom_covariance_contract.hpp"
 #include "preprocess.h"
+#include "reanchor_gate.hpp"
 
 namespace
 {
@@ -226,6 +227,7 @@ struct Scenario
   bool capture_tf_graph = false;     // independent old-output and disabled-publisher evidence
   bool wait_for_reference_repeat = false;
   int external_pose_ack = -1;  // DDS observer in a separate process; warm-up must be acknowledged before stimuli
+  bool view_probe = false;     // the entry view's matches and every map insertion, as [VIEW-PROBE] lines
 };
 
 struct Observation
@@ -823,6 +825,23 @@ private:
       [this](std::uint8_t encoding, std::int64_t stamp, const std::array<std::uint8_t, 32> & id) {
         pose_publications_.push_back({encoding, stamp, id});
       };
+    if (scenario_.view_probe) {
+      fast_lio_test::afterRecoveryViewMatch =
+        [this](double end, int whole_eff, double whole_res, int view_eff, double view_res, std::size_t frames) {
+          std::ostringstream line;
+          line.precision(17);
+          line << "[VIEW-PROBE] event=match end_ms=" << msKey(end) << " whole_eff=" << whole_eff
+               << " whole_res=" << whole_res << " view_eff=" << view_eff << " view_res=" << view_res
+               << " frames=" << frames;
+          lines_.push_back(line.str());
+          line_input_ns_.push_back(newest_imu_ns_);
+        };
+      fast_lio_test::afterMapInsertion = [this](double end, bool view_open) {
+        lines_.push_back("[VIEW-PROBE] event=insert end_ms=" + std::to_string(msKey(end)) +
+                         " view_open=" + std::to_string(view_open ? 1 : 0));
+        line_input_ns_.push_back(newest_imu_ns_);
+      };
+    }
   }
 
   struct ImuBatch
@@ -896,6 +915,8 @@ private:
     fast_lio_test::afterPosePublish = {};
     fast_lio_test::resetBeforeReference = {};
     fast_lio_test::afterPriorMapReset = {};
+    fast_lio_test::afterRecoveryViewMatch = {};
+    fast_lio_test::afterMapInsertion = {};
   }
 
   const Step * stepAt(double end) const
@@ -1983,8 +2004,9 @@ void expectTransitionKeys(const std::vector<std::string> & transitions, const st
 // What only the per-scan trace observes (anchor_trace.hpp, "Since version 2"), on every scan of a run with the
 // trace on: which of the fields are present; that a candidate's stored pose is the pose its first scan had, stays
 // what it was, and is the target of every write that uses it; what a pin and a zero-only scan leave in the state;
-// that a Pending scan adds nothing to the map.
-void expectAnchorWriteFields(const ChildResult & r, const std::string & name)
+// that a Pending scan adds nothing to the map. With `entry_view` (reanchor_recovery_entry_view) only a degraded
+// Pending scan does not.
+void expectAnchorWriteFields(const ChildResult & r, const std::string & name, bool entry_view = false)
 {
   struct Pose
   {
@@ -2042,7 +2064,7 @@ void expectAnchorWriteFields(const ChildResult & r, const std::string & name)
       EXPECT_TRUE(std::isfinite(x.upd_dp) && x.upd_dp >= 0.0) << at;
       EXPECT_TRUE(std::isfinite(x.upd_dq) && x.upd_dq >= 0.0) << at;
     }
-    if (x.trust_post == fast_lio::RecoveryTrust::kPending) {
+    if (x.trust_post == fast_lio::RecoveryTrust::kPending && (x.degraded || !entry_view)) {
       EXPECT_FALSE(x.map_updated) << at << ": a Pending scan added its points to the map";
     }
   }
@@ -2058,7 +2080,10 @@ void expectAnchorWriteFields(const ChildResult & r, const std::string & name)
 }
 
 // K7 on the node: one scan record per scan taken, sequences without gaps or repeats, counters that reconcile.
-void expectTraceAccountsForEveryScan(const ChildResult & r, bool trace_on, const std::string & name)
+void expectTraceAccountsForEveryScan(const ChildResult & r,
+                                     bool trace_on,
+                                     const std::string & name,
+                                     bool entry_view = false)
 {
   const auto scans = linesTagged(r, "[ZUPT-ANCHOR-SCAN]");
   const auto transitions = transitionLines(r);
@@ -2083,7 +2108,7 @@ void expectTraceAccountsForEveryScan(const ChildResult & r, bool trace_on, const
     }
     return;
   }
-  expectAnchorWriteFields(r, name);
+  expectAnchorWriteFields(r, name, entry_view);
   ASSERT_EQ(scans.size(), r.observations.size()) << name;
   for (std::size_t i = 0; i < scans.size(); ++i) {
     const auto & o = r.observations[i];
@@ -5331,6 +5356,163 @@ TEST(AnchorLifecycleExport, ABridgedScanReportsItsOwnVerdict)
   }
   EXPECT_GT(pending_degraded, 0);
   EXPECT_GT(pending_clear, 0) << "no healthy Pending scan after the verification";
+}
+
+// ---------------------------------------------------------------------------
+// The entry view (reanchor_recovery_entry_view, #369): the scans of a pending recovery go into the map, and its
+// re-anchor match counts only the points the map held when the recovery began
+// ---------------------------------------------------------------------------
+
+constexpr double kViewStep = 0.04;    // m the moving platform goes on along x per scan: the fixture's 0.4 m/s
+constexpr double kViewLift = 0.5;     // m: the fixture's strip this far below a scan gives none of its points a match
+constexpr double kViewBudget = 2.0;   // s, reanchor_total_timeout_sec of the run that cannot qualify
+constexpr int kViewLiftedScans = 20;  // its healthy Pending scans: the budget runs out among them
+
+// One healthy moving scan, the last supported one; three degraded scans, which start Pending; `matching` healthy
+// scans; three healthy scans after them. Moving: every scan a step further along x, the IMU turning. Lifted: from
+// the event on, parked kViewLift above the pose the map was built at.
+Scenario entryViewRun(const std::string & name, bool entry_view, bool lifted, int matching, double total)
+{
+  Scenario s = baseParams(name, true);
+  s.view_probe = true;
+  setPolicy(s, total, 1.0);
+  setParam(s, rclcpp::Parameter("reanchor_recovery_entry_view", entry_view));
+  const Imu imu = lifted ? Imu::kStatic : Imu::kMoving;
+  int k = 0;
+  const auto next = [&k, lifted]() {
+    const std::array<double, 3> p = {lifted ? 0.0 : kViewStep * k, 0.0, lifted && k > 0 ? kViewLift : 0.0};
+    ++k;
+    return p;
+  };
+  s.steps.push_back(step(Phase::kBefore, Imu::kMoving, Guard::kHealthy, next()));
+  for (int i = 0; i < 3; ++i)
+    s.steps.push_back(step(Phase::kEvent, imu, Guard::kDegraded, next()));
+  for (int i = 0; i < matching; ++i)
+    s.steps.push_back(step(Phase::kAfter, imu, Guard::kHealthy, next()));
+  for (int i = 0; i < 3; ++i)
+    s.steps.push_back(step(Phase::kLater, imu, Guard::kHealthy, next()));
+  return s;
+}
+
+const Observation * scanEndingAt(const ChildResult & r, std::int64_t end_ms)
+{
+  for (const auto & o : r.observations)
+    if (msKey(static_cast<double>(o.record.end_ns) * 1e-9) == end_ms)
+      return &o;
+  return nullptr;
+}
+
+// Moving on through a recovery with the entry view on. The degraded scans that start it stay out of the map; every
+// healthy Pending scan goes into it, and is matched against the entry view, which counts one more of them each
+// time; the view qualifies the recovery after the stable time on the map it began with. The view is open at a map
+// insertion exactly when the recovery is still pending: not on the scan that qualified it, nor after.
+TEST(AnchorLifecycleEntryView, AMovingRecoveryMapsItsHealthyScansAndQualifiesOnTheMapItBeganWith)
+{
+  const Scenario scenario = entryViewRun("entry_view_moving", true, false, kExportRun + 1, kExportBudget);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  expectTraceAccountsForEveryScan(r, true, scenario.name, true);
+  const auto event = r.phase(Phase::kEvent);
+  const auto after = r.phase(Phase::kAfter);
+  ASSERT_EQ(event.size(), 3u);
+  ASSERT_EQ(after.size(), static_cast<std::size_t>(kExportRun + 1));
+  for (const auto * o : event) {
+    EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kPending) << "step " << o->step;
+    EXPECT_TRUE(o->record.degraded) << "step " << o->step;
+    EXPECT_FALSE(o->record.map_updated) << "step " << o->step << ": a degraded scan went into the map";
+  }
+  const Observation * confirming = completesRun(after, 0, kNsPerSecond);
+  ASSERT_EQ(confirming, after[static_cast<std::size_t>(kExportRun - 1)]);
+  const auto qualified = recoveryLines(r, "qualified");
+  ASSERT_EQ(qualified.size(), 1u);
+  EXPECT_EQ(valueOf(qualified.front(), "scan_seq"), std::to_string(confirming->record.scan_seq)) << qualified.front();
+  EXPECT_TRUE(recoveryLines(r, "unanchored").empty());
+  EXPECT_EQ(counterValue(r, "recovery_qualified"), "1");
+
+  const auto matches = linesWhere(r, "[VIEW-PROBE]", "event", "match");
+  ASSERT_EQ(matches.size(), static_cast<std::size_t>(kExportRun));
+  for (std::size_t i = 0; i < matches.size(); ++i) {
+    const Observation & o = *after[i];
+    EXPECT_EQ(valueOf(matches[i], "end_ms"), std::to_string(msKey(static_cast<double>(o.record.end_ns) * 1e-9)));
+    EXPECT_EQ(valueOf(matches[i], "frames"), std::to_string(i)) << matches[i];
+    EXPECT_FALSE(o.record.parked) << "step " << o.step;
+    EXPECT_TRUE(o.record.map_updated) << "step " << o.step;
+    if (&o != confirming) {
+      EXPECT_EQ(o.record.trust_post, fast_lio::RecoveryTrust::kPending) << "step " << o.step;
+    }
+  }
+  int open = 0;
+  for (const auto & line : linesWhere(r, "[VIEW-PROBE]", "event", "insert")) {
+    const Observation * o = scanEndingAt(r, toI64(valueOf(line, "end_ms")));
+    ASSERT_NE(o, nullptr) << line;
+    EXPECT_TRUE(o->record.map_updated) << line;
+    const bool pending = o->record.trust_post == fast_lio::RecoveryTrust::kPending;
+    EXPECT_EQ(valueOf(line, "view_open"), pending ? "1" : "0") << line;
+    open += pending ? 1 : 0;
+  }
+  EXPECT_EQ(open, kExportRun - 1);
+}
+
+// Parked kViewLift above the pose the map was built at from the event on: the map the recovery began with gives the
+// scans nothing to match. Each healthy Pending scan goes into the map, and from the second one on h_share_model
+// matches the scan to the points the ones before it put there, well enough for the re-anchor test. The entry view
+// does not show those points: the recovery is not qualified on them and runs out.
+TEST(AnchorLifecycleEntryView, ARecoveryIsNotQualifiedOnPointsItsOwnScansPutIntoTheMap)
+{
+  const Scenario scenario = entryViewRun("entry_view_own_points", true, true, kViewLiftedScans, kViewBudget);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  expectTraceAccountsForEveryScan(r, true, scenario.name, true);
+  EXPECT_TRUE(recoveryLines(r, "qualified").empty());
+  const auto latched = recoveryLines(r, "unanchored");
+  ASSERT_EQ(latched.size(), 1u);
+  EXPECT_EQ(valueOf(latched.front(), "reason"), "deadline") << latched.front();
+
+  const fast_lio::ReanchorParams gate;  // the node runs with the default reanchor_min_eff and reanchor_max_res
+  const auto matches = linesWhere(r, "[VIEW-PROBE]", "event", "match");
+  ASSERT_GE(matches.size(), 2u);
+  for (std::size_t i = 0; i < matches.size(); ++i) {
+    const std::string & line = matches[i];
+    const Observation * o = scanEndingAt(r, toI64(valueOf(line, "end_ms")));
+    ASSERT_NE(o, nullptr) << line;
+    EXPECT_EQ(o->phase, static_cast<int>(Phase::kAfter)) << line;
+    EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kPending) << line;
+    EXPECT_TRUE(o->record.map_updated) << line;
+    EXPECT_FALSE(
+      fast_lio::reanchorMatchOk(std::stoi(valueOf(line, "view_eff")), std::stod(valueOf(line, "view_res")), gate))
+      << line;
+    if (i > 0) {
+      EXPECT_TRUE(
+        fast_lio::reanchorMatchOk(std::stoi(valueOf(line, "whole_eff")), std::stod(valueOf(line, "whole_res")), gate))
+        << line << ": the scans before it put no points there that match it";
+    }
+  }
+}
+
+// The moving run with the entry view off, as the front end ran before it: no scan is matched against a view, none
+// is open at any map insertion, and no Pending scan goes into the map.
+TEST(AnchorLifecycleEntryView, WithTheEntryViewOffAPendingRecoveryLeavesTheMapAlone)
+{
+  const Scenario scenario = entryViewRun("entry_view_off", false, false, kExportRun + 1, kExportBudget);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  expectTraceAccountsForEveryScan(r, true, scenario.name);
+  EXPECT_TRUE(linesWhere(r, "[VIEW-PROBE]", "event", "match").empty());
+  int healthy_pending = 0;
+  for (const auto * o : fromPhase(r, Phase::kEvent)) {
+    if (o->record.trust_post != fast_lio::RecoveryTrust::kPending)
+      continue;
+    healthy_pending += o->record.degraded ? 0 : 1;
+    EXPECT_FALSE(o->record.map_updated) << "step " << o->step;
+  }
+  EXPECT_GT(healthy_pending, 0);
+  const auto inserts = linesWhere(r, "[VIEW-PROBE]", "event", "insert");
+  EXPECT_FALSE(inserts.empty());
+  for (const auto & line : inserts)
+    EXPECT_EQ(valueOf(line, "view_open"), "0") << line;
 }
 
 // ---------------------------------------------------------------------------

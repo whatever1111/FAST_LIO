@@ -51,6 +51,12 @@ extern std::function<void(const fast_lio::AnchorScanRecord &)> afterAnchorScanRe
 extern std::function<void(const std::string &)> afterAnchorTraceLine;
 /// Successful publish return: encoding 0 Odometry, 1 pose FrontendObservation.
 extern std::function<void(std::uint8_t, std::int64_t, const std::array<std::uint8_t, 32> &)> afterPosePublish;
+/// A pending recovery's re-anchor match that its entry view served (reanchor_recovery_entry_view): scan end time,
+/// h_share_model's own (effct, res_mean) on the whole map, the entry view's, and the scans the map took while the
+/// view was open. Neither count reaches an output: only whether the recovery qualified does.
+extern std::function<void(double, int, double, int, double, std::size_t)> afterRecoveryViewMatch;
+/// A scan's points went into the map (map_incremental): scan end time and whether an entry view was open then.
+extern std::function<void(double, bool)> afterMapInsertion;
 
 struct ImuInputSnapshot
 {

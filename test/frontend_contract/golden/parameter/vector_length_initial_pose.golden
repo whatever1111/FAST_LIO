@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/vector_length_initial_pose
-# fork_sha: 05be5af0ddb42e4acc6033f5db44c1f4aed06ac3
+# fork_sha: fc3ab0f57f2f16c967184b5709d8ee1708a52657
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
@@ -17,5 +17,5 @@ log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
 log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
 log INFO laser_mapping "Node init finished."
-parameters 243
+parameters 244
 param initial_pose type=double_array value=[1,2,3] read_only=0 descriptor_type=8

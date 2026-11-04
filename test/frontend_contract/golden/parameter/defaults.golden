@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/defaults
-# fork_sha: 05be5af0ddb42e4acc6033f5db44c1f4aed06ac3
+# fork_sha: fc3ab0f57f2f16c967184b5709d8ee1708a52657
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
@@ -16,7 +16,7 @@ log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
 log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
 log INFO laser_mapping "Node init finished."
-parameters 243
+parameters 244
 param adaptive_downsample_budget_sec type=double value=0.059999999999999998 read_only=0 descriptor_type=3
 param adaptive_downsample_en type=bool value=false read_only=0 descriptor_type=1
 param adaptive_downsample_lower_after type=integer value=100 read_only=0 descriptor_type=2
@@ -226,6 +226,7 @@ param reanchor_max_res_ratio type=double value=0 read_only=0 descriptor_type=3
 param reanchor_min_eff type=integer value=200 read_only=0 descriptor_type=2
 param reanchor_min_eff_ratio type=double value=0 read_only=0 descriptor_type=3
 param reanchor_on_fail type=string value="hold" read_only=0 descriptor_type=4
+param reanchor_recovery_entry_view type=bool value=false read_only=0 descriptor_type=1
 param reanchor_recovery_stable_sec type=double value=1 read_only=0 descriptor_type=3
 param reanchor_res_floor type=double value=0.040000000000000001 read_only=0 descriptor_type=3
 param reanchor_timeout_sec type=double value=5 read_only=0 descriptor_type=3

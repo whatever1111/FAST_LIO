@@ -1,0 +1,711 @@
+# frontend contract golden: pipeline/entry_view_moving
+# fork_sha: fc3ab0f57f2f16c967184b5709d8ee1708a52657
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+slot 0 warm_up scan=0 start=1 end=1.05 imu=static cloud=dense guard=healthy
+scan_begin end=1.05
+imu_batch seq=1 disposition=committed reason=bootstrap samples=12 pending=1 first_id=1
+record seq=1 outcome=bootstrap beg_ns=1000000000 end_ns=1050000000 gap_ns=-1 published=0 flags=-1 events=0x0
+record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=0 valid=0 created_ns=-1 state=empty episode=0 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=cold
+record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=0 have_update=0 dp=nan:0x7ff8000000000000 dq=nan:0x7ff8000000000000
+record.reference present=0 snapshot=0 revision=0 scan=1 qualified=0 kind=3 lifecycle=1 startup=1 trust=1 local=0 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=2 cause=0 taint=0 hard=0 has_pose=0 evaluated_ns=1052499998 effective_ns=1050000000 state_until_ns=1252499998 hr_until_ns=0
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=-inf
+slot 1 warm_up scan=1 start=1.1000000000000001 end=1.1500000000000001 imu=static cloud=dense guard=healthy
+scan_begin end=1.1500000000000001
+imu_process
+imu_batch seq=2 disposition=committed reason=initialization_complete samples=20 pending=1 first_id=13
+record seq=2 outcome=imu_not_processed beg_ns=1100000000 end_ns=1150000000 gap_ns=-1 published=0 flags=-1 events=0x0
+record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=0 valid=0 created_ns=-1 state=empty episode=0 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=cold
+record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=0 have_update=0 dp=nan:0x7ff8000000000000 dq=nan:0x7ff8000000000000
+record.reference present=0 snapshot=0 revision=0 scan=2 qualified=0 kind=3 lifecycle=1 startup=1 trust=1 local=0 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=2 cause=0 taint=0 hard=0 has_pose=0 evaluated_ns=1152500000 effective_ns=1150000000 state_until_ns=1352500000 hr_until_ns=0
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=1.1500000000000001
+slot 2 warm_up scan=2 start=1.2 end=1.25 imu=static cloud=dense guard=healthy
+scan_begin end=1.25
+imu_process
+imu_batch seq=3 disposition=committed reason=processed samples=20 pending=1 first_id=33
+scan_prepared count=2000 end=1.25
+initial_build end=1.25
+record seq=3 outcome=before_anchor_step beg_ns=1200000000 end_ns=1250000000 gap_ns=-1 published=0 flags=-1 events=0x0
+record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=0 valid=0 created_ns=-1 state=empty episode=0 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
+record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=0 dp=nan:0x7ff8000000000000 dq=nan:0x7ff8000000000000
+record.reference present=0 snapshot=0 revision=0 scan=3 qualified=0 kind=3 lifecycle=2 startup=2 trust=1 local=0 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=3 cause=0 taint=0 hard=0 has_pose=0 evaluated_ns=1252499999 effective_ns=1250000000 state_until_ns=1452499999 hr_until_ns=0
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=1.25
+slot 3 warm_up scan=3 start=1.3 end=1.3500000000000001 imu=static cloud=dense guard=healthy
+scan_begin end=1.3500000000000001
+imu_process
+imu_batch seq=4 disposition=committed reason=processed samples=20 pending=1 first_id=53
+scan_prepared count=2000 end=1.3500000000000001
+h_rows feats=2000 end=1.3500000000000001 effective=1076
+h_rows feats=2000 end=1.3500000000000001 effective=1076
+h_rows feats=2000 end=1.3500000000000001 effective=1076
+h_rows feats=2000 end=1.3500000000000001 effective=1076
+guard end=1.3500000000000001 forced=healthy
+anchor_step_fixture end=1.3500000000000001 inject=0
+trace "[ZUPT-ANCHOR] v=6 event=candidate_started reason=- event_seq=1 scan_seq=4 stamp_ns=1350000000 anchor_id=1 anchor_valid=0 created_ns=1350000000 last_evidence_ns=1350000000 anchor_state=qualifying stationary_episode=1 reference_generation=0 streak=1"
+pose_publish encoding=0 stamp_ns=1350000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=4 outcome=published beg_ns=1300000000 end_ns=1350000000 gap_ns=-1 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=zero_velocity parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=qualifying episode=1 ref_gen=0 used=0 streak=1 have_pose=1 p=[1.6516364687076869e-07,-0.022046399169631956,0.00013740763976076892] q=[0.99999999258423522,4.1514732165196014e-05,4.819698203499723e-08,-0.00011449040961999662]
+record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
+record.pre have=1 p=[1.6516364687076869e-07,-0.022046399169631956,0.00013740763976076892] q=[0.99999999258423522,4.1514732165196014e-05,4.819698203499723e-08,-0.00011449040961999662] v=[1.9754765512371616e-07,-0.0044002236904599036,0.00022267362713147165]
+record.act have=1 p=[1.6516364687076869e-07,-0.022046399169631956,0.00013740763976076892] q=[0.99999999258423522,4.1514732165196014e-05,4.819698203499723e-08,-0.00011449040961999662] v=[0,0,0] pose_cov=[1.0400112443360974,4.1874580203962072e-06,3.118373392465334e-05,-2.0342404310446426e-07,3.7681497922104068e-05,4.9775387209712485e-05,-1.2708108582144293e-07,0.0042682558959015182,0.0053392653420826081,0.0034330812058682714,-4.9222228430794839e-06,-6.8356552221900349e-05,3.4398181672002845e-05,0.0053392653407473506,0.010014648242683499,0.0053449147548068777,0.00015314824310343791,4.0720260062436567e-07,-1.2840778504026888e-07,0.0034330812095865471,0.0053449147559988322,0.0034467670727585942,-4.9292715140220493e-06,2.7228450713691863e-07,5.1904537592128985e-06,-4.922198429714569e-06,0.0001531482467841438,-4.9292663066346131e-06,2.5302469130794591e-05,-1.4302388999834242e-09,-3.6151158389269907e-10,-6.8356551790308277e-05,4.0719972538695387e-07,2.7228364537143325e-07,-1.4302625421734854e-09,1.5701954121594142e-05]
+record.post have=1 p=[1.6516364687076869e-07,-0.022046399169631956,0.00013740763976076892] q=[0.99999999258423522,4.1514732165196014e-05,4.819698203499723e-08,-0.00011449040961999662] v=[0,0,0]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=1 finite=1 sym=5.219161262684475e-05 min_eig=5.8994918962658627e-09 pose_pre=[1.0400112443360974,4.1874580203962072e-06,3.118373392465334e-05,-2.0342404310446426e-07,3.7681497922104068e-05,4.9775387209712485e-05,-1.2708108582144293e-07,0.0042682558959015182,0.0053392653420826081,0.0034330812058682714,-4.9222228430794839e-06,-6.8356552221900349e-05,3.4398181672002845e-05,0.0053392653407473506,0.010014648242683499,0.0053449147548068777,0.00015314824310343791,4.0720260062436567e-07,-1.2840778504026888e-07,0.0034330812095865471,0.0053449147559988322,0.0034467670727585942,-4.9292715140220493e-06,2.7228450713691863e-07,5.1904537592128985e-06,-4.922198429714569e-06,0.0001531482467841438,-4.9292663066346131e-06,2.5302469130794591e-05,-1.4302388999834242e-09,-3.6151158389269907e-10,-6.8356551790308277e-05,4.0719972538695387e-07,2.7228364537143325e-07,-1.4302625421734854e-09,1.5701954121594142e-05] pose_post=[1.0400112443360974,4.1874580203962072e-06,3.118373392465334e-05,-2.0342404310446426e-07,3.7681497922104068e-05,4.9775387209712485e-05,-1.2708108582144293e-07,0.0042682558959015182,0.0053392653420826081,0.0034330812058682714,-4.9222228430794839e-06,-6.8356552221900349e-05,3.4398181672002845e-05,0.0053392653407473506,0.010014648242683499,0.0053449147548068777,0.00015314824310343791,4.0720260062436567e-07,-1.2840778504026888e-07,0.0034330812095865471,0.0053449147559988322,0.0034467670727585942,-4.9292715140220493e-06,2.7228450713691863e-07,5.1904537592128985e-06,-4.922198429714569e-06,0.0001531482467841438,-4.9292663066346131e-06,2.5302469130794591e-05,-1.4302388999834242e-09,-3.6151158389269907e-10,-6.8356551790308277e-05,4.0719972538695387e-07,2.7228364537143325e-07,-1.4302625421734854e-09,1.5701954121594142e-05]
+record.update map_updated=1 have_update=1 dp=0.022046714395528574 dq=0.00024356953239661484
+record.reference present=0 snapshot=0 revision=0 scan=4 qualified=0 kind=1 lifecycle=2 startup=2 trust=1 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=131 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=1352500000 effective_ns=1350000000 state_until_ns=1552500000 hr_until_ns=0
+odom stamp_ns=1350000000 frame="lidar_odom" child="body"
+odom.pose p=[1.6516364687076869e-07,-0.022046399169631956,0.00013740763976076892] q_xyzw=[4.1514732165196014e-05,4.819698203499723e-08,-0.00011449040961999662,0.99999999258423522]
+odom.pose_cov [0.0034467670727585942,-4.9292715140220493e-06,2.7228450713691863e-07,-1.2840778504026888e-07,0.0034330812095865471,0.0053449147559988322,-4.9292663066346131e-06,2.5302469130794591e-05,-1.4302388999834242e-09,5.1904537592128985e-06,-4.922198429714569e-06,0.0001531482467841438,2.7228364537143325e-07,-1.4302625421734854e-09,1.5701954121594142e-05,-3.6151158389269907e-10,-6.8356551790308277e-05,4.0719972538695387e-07,-2.0342404310446426e-07,3.7681497922104068e-05,4.9775387209712485e-05,1.0400112443360974,4.1874580203962072e-06,3.118373392465334e-05,0.0034330812058682714,-4.9222228430794839e-06,-6.8356552221900349e-05,-1.2708108582144293e-07,0.0042682558959015182,0.0053392653420826081,0.0053449147548068777,0.00015314824310343791,4.0720260062436567e-07,3.4398181672002845e-05,0.0053392653407473506,0.010014648242683499]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,7.9143623762491453e-13,-3.9769657642761171e-07,-9.8089999999999904,0,0,-1,0,0,0,0,0,0,1076,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0048895607872080186,0,0,0,0,0,0,0]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=1.3500000000000001
+slot 4 warm_up scan=4 start=1.3999999999999999 end=1.45 imu=static cloud=dense guard=healthy
+scan_begin end=1.45
+imu_process
+imu_batch seq=5 disposition=committed reason=processed samples=20 pending=1 first_id=73
+scan_prepared count=2000 end=1.45
+h_rows feats=2000 end=1.45 effective=2000
+h_rows feats=2000 end=1.45 effective=2000
+guard end=1.45 forced=healthy
+anchor_step_fixture end=1.45 inject=0
+pose_publish encoding=0 stamp_ns=1449999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=5 outcome=published beg_ns=1400000000 end_ns=1450000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=zero_velocity parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=qualifying episode=1 ref_gen=0 used=0 streak=2 have_pose=1 p=[1.6516364687076869e-07,-0.022046399169631956,0.00013740763976076892] q=[0.99999999258423522,4.1514732165196014e-05,4.819698203499723e-08,-0.00011449040961999662]
+record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
+record.pre have=1 p=[-7.3957916878716922e-07,-0.022028717989047538,0.00016990310174448174] q=[0.99999999186469057,5.618851566510013e-05,-4.2632287296196082e-07,-0.00011451325546554136] v=[-1.513420541465342e-06,-0.00016872862316360165,-2.9610823744254607e-05]
+record.act have=1 p=[-7.3957916878716922e-07,-0.022028717989047538,0.00016990310174448174] q=[0.99999999186469057,5.618851566510013e-05,-4.2632287296196082e-07,-0.00011451325546554136] v=[0,0,0] pose_cov=[1.0897932205910901,5.7103767317188743e-07,-8.9379060133119539e-06,-4.4073106844027035e-06,4.1905874996058952e-06,4.9705709389788501e-05,-3.6387218094236518e-06,0.01112712268938771,0.0012390213193906093,0.00079755384513543115,-1.8833835284306549e-06,-7.0306871572178213e-05,-1.025161658658693e-05,0.0012390213787162622,0.0026203116309982608,0.0016348676368940895,3.2623486763430035e-06,-8.687564602582617e-07,-3.5921561873774511e-06,0.00079755383242364401,0.0016348676251688064,0.0010650874667512134,-2.1818422182967784e-06,-4.4186287951785199e-07,3.9544101459171864e-06,-1.8833903139195275e-06,3.2623502822185652e-06,-2.1818411993566086e-06,1.0580781107017714e-05,-1.9518709198619483e-08,-4.9160169031278163e-08,-7.0306739143256625e-05,-8.6828131943323163e-07,-4.4172507128149413e-07,-1.9496810474515558e-08,6.5451941749325069e-05]
+record.post have=1 p=[-7.3957916878716922e-07,-0.022028717989047538,0.00016990310174448174] q=[0.99999999186469057,5.618851566510013e-05,-4.2632287296196082e-07,-0.00011451325546554136] v=[0,0,0]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=1 finite=1 sym=0.00054901723701271583 min_eig=1.8222993814112189e-09 pose_pre=[1.0897932205910901,5.7103767317188743e-07,-8.9379060133119539e-06,-4.4073106844027035e-06,4.1905874996058952e-06,4.9705709389788501e-05,-3.6387218094236518e-06,0.01112712268938771,0.0012390213193906093,0.00079755384513543115,-1.8833835284306549e-06,-7.0306871572178213e-05,-1.025161658658693e-05,0.0012390213787162622,0.0026203116309982608,0.0016348676368940895,3.2623486763430035e-06,-8.687564602582617e-07,-3.5921561873774511e-06,0.00079755383242364401,0.0016348676251688064,0.0010650874667512134,-2.1818422182967784e-06,-4.4186287951785199e-07,3.9544101459171864e-06,-1.8833903139195275e-06,3.2623502822185652e-06,-2.1818411993566086e-06,1.0580781107017714e-05,-1.9518709198619483e-08,-4.9160169031278163e-08,-7.0306739143256625e-05,-8.6828131943323163e-07,-4.4172507128149413e-07,-1.9496810474515558e-08,6.5451941749325069e-05] pose_post=[1.0897932205910901,5.7103767317188743e-07,-8.9379060133119539e-06,-4.4073106844027035e-06,4.1905874996058952e-06,4.9705709389788501e-05,-3.6387218094236518e-06,0.01112712268938771,0.0012390213193906093,0.00079755384513543115,-1.8833835284306549e-06,-7.0306871572178213e-05,-1.025161658658693e-05,0.0012390213787162622,0.0026203116309982608,0.0016348676368940895,3.2623486763430035e-06,-8.687564602582617e-07,-3.5921561873774511e-06,0.00079755383242364401,0.0016348676251688064,0.0010650874667512134,-2.1818422182967784e-06,-4.4186287951785199e-07,3.9544101459171864e-06,-1.8833903139195275e-06,3.2623502822185652e-06,-2.1818411993566086e-06,1.0580781107017714e-05,-1.9518709198619483e-08,-4.9160169031278163e-08,-7.0306739143256625e-05,-8.6828131943323163e-07,-4.4172507128149413e-07,-1.9496810474515558e-08,6.5451941749325069e-05]
+record.update map_updated=1 have_update=1 dp=3.5143839517559296e-05 dq=2.9368314830877237e-05
+record.reference present=0 snapshot=0 revision=0 scan=5 qualified=0 kind=1 lifecycle=2 startup=2 trust=1 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=131 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=1452499999 effective_ns=1449999999 state_until_ns=1652499999 hr_until_ns=0
+odom stamp_ns=1449999999 frame="lidar_odom" child="body"
+odom.pose p=[-7.3957916878716922e-07,-0.022028717989047538,0.00016990310174448174] q_xyzw=[5.618851566510013e-05,-4.2632287296196082e-07,-0.00011451325546554136,0.99999999186469057]
+odom.pose_cov [0.0010650874667512134,-2.1818422182967784e-06,-4.4186287951785199e-07,-3.5921561873774511e-06,0.00079755383242364401,0.0016348676251688064,-2.1818411993566086e-06,1.0580781107017714e-05,-1.9518709198619483e-08,3.9544101459171864e-06,-1.8833903139195275e-06,3.2623502822185652e-06,-4.4172507128149413e-07,-1.9496810474515558e-08,6.5451941749325069e-05,-4.9160169031278163e-08,-7.0306739143256625e-05,-8.6828131943323163e-07,-4.4073106844027035e-06,4.1905874996058952e-06,4.9705709389788501e-05,1.0897932205910901,5.7103767317188743e-07,-8.9379060133119539e-06,0.00079755384513543115,-1.8833835284306549e-06,-7.0306871572178213e-05,-3.6387218094236518e-06,0.01112712268938771,0.0012390213193906093,0.0016348676368940895,3.2623486763430035e-06,-8.687564602582617e-07,-1.025161658658693e-05,0.0012390213787162622,0.0026203116309982608]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-1.2345629138741906e-11,-3.9921194354638532e-07,-9.8089999999999904,0,0,-1,0,0,0,0,0,0,2000,0,0,0,0,0,0,1,0,0,0,0,0,0,1.1537969112396241e-06,0,0,0,0,0,0,0]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=1.45
+slot 5 last_supported scan=5 start=1.5 end=1.55 imu=moving cloud=dense guard=healthy inject=[0,0,0]
+scan_begin end=1.55
+imu_process
+imu_batch seq=6 disposition=committed reason=processed samples=20 pending=1 first_id=93
+scan_prepared count=2000 end=1.55
+h_rows feats=2000 end=1.55 effective=1322
+h_rows feats=2000 end=1.55 effective=1322
+h_rows feats=2000 end=1.55 effective=1322
+h_rows feats=2000 end=1.55 effective=1975
+h_rows feats=2000 end=1.55 effective=1975
+guard end=1.55 forced=healthy
+anchor_step_fixture end=1.55 inject=1
+trace "[ZUPT-ANCHOR] v=6 event=evidence reason=motion event_seq=2 scan_seq=6 stamp_ns=1550000000 anchor_id=1 anchor_valid=0 created_ns=1350000000 last_evidence_ns=1450000000 anchor_state=qualifying stationary_episode=1 reference_generation=0 streak=0"
+trace "[ZUPT-ANCHOR] v=6 event=candidate_dropped reason=motion event_seq=3 scan_seq=6 stamp_ns=1550000000 anchor_id=1 anchor_valid=0 created_ns=1350000000 last_evidence_ns=1550000000 anchor_state=empty stationary_episode=1 reference_generation=0 streak=0"
+pose_publish encoding=0 stamp_ns=1550000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=6 outcome=published beg_ns=1500000000 end_ns=1550000000 gap_ns=50000000 published=1 flags=0 events=0x1
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
+record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.17499320873493512 dq=0.0091809166998281094
+record.reference present=0 snapshot=0 revision=0 scan=6 qualified=0 kind=1 lifecycle=2 startup=2 trust=1 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=131 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=1552500000 effective_ns=1550000000 state_until_ns=1752500000 hr_until_ns=0
+odom stamp_ns=1550000000 frame="lidar_odom" child="body"
+odom.pose p=[0,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,4.027613988119625e-09,-0.00026068296289521759,-9.8089999965360608,0,0,0.014311072754493032,0,0,0,0,0,0,1975,0,0,0,0,0,0,1,0,0,0,0,0,0,0.00092641905893253371,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=1.55
+slot 6 degraded_moving scan=6 start=1.6000000000000001 end=1.6500000000000001 imu=moving cloud=dense guard=degraded inject=[0.040000000000000001,0,0]
+scan_begin end=1.6500000000000001
+imu_process
+imu_batch seq=7 disposition=committed reason=processed samples=20 pending=1 first_id=113
+scan_prepared count=2000 end=1.6500000000000001
+h_rows feats=2000 end=1.6500000000000001 effective=1225
+h_rows feats=2000 end=1.6500000000000001 effective=1225
+h_rows feats=2000 end=1.6500000000000001 effective=1225
+h_rows feats=2000 end=1.6500000000000001 effective=1225
+h_rows feats=2000 end=1.6500000000000001 effective=1971
+guard end=1.6500000000000001 forced=degraded
+anchor_step_fixture end=1.6500000000000001 inject=1
+trace "[FE-RECOVERY] v=6 event=pending reason=degraded event_seq=4 scan_seq=7 stamp_ns=1650000000 episode=1 start_ns=1550000000 deadline_ns=11550000000 elapsed_ns=100000000 reset_count=0 path=scan"
+pose_publish encoding=0 stamp_ns=1650000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=7 outcome=published beg_ns=1600000000 end_ns=1650000000 gap_ns=50000000 published=1 flags=1 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=1 degraded=1 gate_pre=healthy gate_post=blind action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=1 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.recovery trust_pre=local trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.040000000000000001,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.040000000000000001,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=0 have_update=1 dp=0.01972543969496721 dq=0.029401073091985187
+record.reference present=0 snapshot=0 revision=0 scan=7 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=2 hr_kind=0 legacy_flags=1 present_mask=143 true_mask=1 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=1652500000 effective_ns=1650000000 state_until_ns=1852500000 hr_until_ns=0
+odom stamp_ns=1650000000 frame="lidar_odom" child="body"
+odom.pose p=[0.040000000000000001,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,100.01000000000001,0,0,0,0,0,0,100.01000000000001,0,0,0,0,0,0,100.01000000000001]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,1,-6.0156379506488066e-07,-0.00023920545648836462,-9.8089999970833102,0,0,0.014965760488286873,0,0,0,0,0,0,1971,0,0,0,0,0,0,1,0,0,0,0,0,0,0.001972336777571432,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=1 degraded_odom=1 filter_end=1.6500000000000001
+slot 7 degraded_moving scan=7 start=1.7000000000000002 end=1.7500000000000002 imu=moving cloud=dense guard=degraded inject=[0.080000000000000002,0,0]
+scan_begin end=1.75
+imu_process
+imu_batch seq=8 disposition=committed reason=processed samples=20 pending=1 first_id=133
+scan_prepared count=2000 end=1.75
+h_rows feats=2000 end=1.75 effective=1249
+h_rows feats=2000 end=1.75 effective=1249
+h_rows feats=2000 end=1.75 effective=1249
+h_rows feats=2000 end=1.75 effective=1249
+h_rows feats=2000 end=1.75 effective=1971
+guard end=1.75 forced=degraded
+anchor_step_fixture end=1.75 inject=1
+pose_publish encoding=0 stamp_ns=1750000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=8 outcome=published beg_ns=1700000000 end_ns=1750000000 gap_ns=50000000 published=1 flags=1 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=1 degraded=1 gate_pre=blind gate_post=blind action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=1 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.080000000000000002,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.080000000000000002,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=0 have_update=1 dp=0.019411153471081709 dq=0.029219043761651312
+record.reference present=0 snapshot=0 revision=0 scan=8 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=2 hr_kind=0 legacy_flags=1 present_mask=143 true_mask=1 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=1752500000 effective_ns=1750000000 state_until_ns=1952500000 hr_until_ns=0
+odom stamp_ns=1750000000 frame="lidar_odom" child="body"
+odom.pose p=[0.080000000000000002,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,100.01000000000001,0,0,0,0,0,0,100.01000000000001,0,0,0,0,0,0,100.01000000000001]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,1,-1.2381045090286428e-06,-0.00022281629988849016,-9.8089999974692272,0,0,0.014787732141216453,0,0,0,0,0,0,1971,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0018675815085358331,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=1 degraded_odom=1 filter_end=1.75
+slot 8 degraded_moving scan=8 start=1.8 end=1.8500000000000001 imu=moving cloud=dense guard=degraded inject=[0.12,0,0]
+scan_begin end=1.8500000000000001
+imu_process
+imu_batch seq=9 disposition=committed reason=processed samples=20 pending=1 first_id=153
+scan_prepared count=2000 end=1.8500000000000001
+h_rows feats=2000 end=1.8500000000000001 effective=1282
+h_rows feats=2000 end=1.8500000000000001 effective=1282
+h_rows feats=2000 end=1.8500000000000001 effective=1282
+h_rows feats=2000 end=1.8500000000000001 effective=1282
+h_rows feats=2000 end=1.8500000000000001 effective=1969
+guard end=1.8500000000000001 forced=degraded
+anchor_step_fixture end=1.8500000000000001 inject=1
+pose_publish encoding=0 stamp_ns=1850000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=9 outcome=published beg_ns=1800000000 end_ns=1850000000 gap_ns=50000000 published=1 flags=1 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=1 degraded=1 gate_pre=blind gate_post=blind action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=1 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.12,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.12,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=0 have_update=1 dp=0.01926965390523229 dq=0.028556136108589199
+record.reference present=0 snapshot=0 revision=0 scan=9 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=2 hr_kind=0 legacy_flags=1 present_mask=143 true_mask=1 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=1852500000 effective_ns=1850000000 state_until_ns=2052500000 hr_until_ns=0
+odom stamp_ns=1850000000 frame="lidar_odom" child="body"
+odom.pose p=[0.12,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,100.01000000000001,0,0,0,0,0,0,100.01000000000001,0,0,0,0,0,0,100.01000000000001]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,1,-1.7976273375740377e-06,-0.00024418607593556466,-9.8089999969604378,0,0,0.014263340928700092,0,0,0,0,0,0,1969,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0017267219483882658,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=1 degraded_odom=1 filter_end=1.8500000000000001
+slot 9 healthy_moving scan=9 start=1.8999999999999999 end=1.95 imu=moving cloud=dense guard=healthy inject=[0.16,0,0]
+scan_begin end=1.95
+imu_process
+imu_batch seq=10 disposition=committed reason=processed samples=20 pending=1 first_id=173
+scan_prepared count=2000 end=1.95
+h_rows feats=2000 end=1.95 effective=1313
+h_rows feats=2000 end=1.95 effective=1313
+h_rows feats=2000 end=1.95 effective=1313
+h_rows feats=2000 end=1.95 effective=1313
+h_rows feats=2000 end=1.95 effective=1970
+guard end=1.95 forced=healthy
+anchor_step_fixture end=1.95 inject=1
+pose_publish encoding=0 stamp_ns=1950000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=10 outcome=published beg_ns=1900000000 end_ns=1950000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=blind gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.16,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.16,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.021074272634272979 dq=0.028135139691069216
+record.reference present=0 snapshot=0 revision=0 scan=10 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=129 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=1952499999 effective_ns=1950000000 state_until_ns=2152499999 hr_until_ns=0
+odom stamp_ns=1950000000 frame="lidar_odom" child="body"
+odom.pose p=[0.16,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-2.6352272378235187e-06,-0.00028967028154818246,-9.8089999957225071,0,0,0.014103628744712778,0,0,0,0,0,0,1970,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0016617089661244814,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=1.95
+slot 10 healthy_moving scan=10 start=2 end=2.0499999999999998 imu=moving cloud=dense guard=healthy inject=[0.20000000000000001,0,0]
+scan_begin end=2.0499999999999998
+imu_process
+imu_batch seq=11 disposition=committed reason=processed samples=20 pending=1 first_id=193
+scan_prepared count=2000 end=2.0499999999999998
+h_rows feats=2000 end=2.0499999999999998 effective=1853
+h_rows feats=2000 end=2.0499999999999998 effective=1853
+h_rows feats=2000 end=2.0499999999999998 effective=1853
+h_rows feats=2000 end=2.0499999999999998 effective=1980
+h_rows feats=2000 end=2.0499999999999998 effective=1980
+guard end=2.0499999999999998 forced=healthy
+anchor_step_fixture end=2.0499999999999998 inject=1
+pose_publish encoding=0 stamp_ns=2049999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=11 outcome=published beg_ns=2000000000 end_ns=2050000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.20000000000000001,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.20000000000000001,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.037389358923096555 dq=0.024598439832736498
+record.reference present=0 snapshot=0 revision=0 scan=11 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=129 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2052500000 effective_ns=2049999999 state_until_ns=2252500000 hr_until_ns=0
+odom stamp_ns=2049999999 frame="lidar_odom" child="body"
+odom.pose p=[0.20000000000000001,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-5.8475554280084326e-05,-0.00044228952046654687,-9.808999989854243,0,0,0.012880124944065693,0,0,0,0,0,0,1980,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0025062205890814464,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=2.0499999999999998
+slot 11 healthy_moving scan=11 start=2.1000000000000001 end=2.1499999999999999 imu=moving cloud=dense guard=healthy inject=[0.23999999999999999,0,0]
+scan_begin end=2.1499999999999999
+imu_process
+imu_batch seq=12 disposition=committed reason=processed samples=20 pending=1 first_id=213
+scan_prepared count=2000 end=2.1499999999999999
+h_rows feats=2000 end=2.1499999999999999 effective=1854
+h_rows feats=2000 end=2.1499999999999999 effective=1854
+h_rows feats=2000 end=2.1499999999999999 effective=1854
+h_rows feats=2000 end=2.1499999999999999 effective=1980
+h_rows feats=2000 end=2.1499999999999999 effective=1980
+guard end=2.1499999999999999 forced=healthy
+anchor_step_fixture end=2.1499999999999999 inject=1
+pose_publish encoding=0 stamp_ns=2149999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=12 outcome=published beg_ns=2100000000 end_ns=2150000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.23999999999999999,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.23999999999999999,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.03845714000625558 dq=0.024415885278432317
+record.reference present=0 snapshot=0 revision=0 scan=12 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=129 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2152499999 effective_ns=2149999999 state_until_ns=2352499999 hr_until_ns=0
+odom stamp_ns=2149999999 frame="lidar_odom" child="body"
+odom.pose p=[0.23999999999999999,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00011373419568925512,-0.00060054254284342486,-9.8089999809569335,0,0,0.012889756639841824,0,0,0,0,0,0,1980,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0025065462170827269,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=2.1499999999999999
+slot 12 healthy_moving scan=12 start=2.2000000000000002 end=2.25 imu=moving cloud=dense guard=healthy inject=[0.28000000000000003,0,0]
+scan_begin end=2.25
+imu_process
+imu_batch seq=13 disposition=committed reason=processed samples=20 pending=1 first_id=233
+scan_prepared count=2000 end=2.25
+h_rows feats=2000 end=2.25 effective=1855
+h_rows feats=2000 end=2.25 effective=1855
+h_rows feats=2000 end=2.25 effective=1855
+h_rows feats=2000 end=2.25 effective=1980
+h_rows feats=2000 end=2.25 effective=1980
+guard end=2.25 forced=healthy
+anchor_step_fixture end=2.25 inject=1
+pose_publish encoding=0 stamp_ns=2250000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=13 outcome=published beg_ns=2200000000 end_ns=2250000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.28000000000000003,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.28000000000000003,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.039600998574325315 dq=0.024147905463019145
+record.reference present=0 snapshot=0 revision=0 scan=13 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=129 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2252499998 effective_ns=2250000000 state_until_ns=2452499998 hr_until_ns=0
+odom stamp_ns=2250000000 frame="lidar_odom" child="body"
+odom.pose p=[0.28000000000000003,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.0001681551180027721,-0.0007638302233404276,-9.8089999688187923,0,0,0.013233528996695467,0,0,0,0,0,0,1980,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0023719295031494566,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=2.25
+slot 13 healthy_moving scan=13 start=2.2999999999999998 end=2.3499999999999996 imu=moving cloud=dense guard=healthy inject=[0.32000000000000001,0,0]
+scan_begin end=2.3499999999999996
+imu_process
+imu_batch seq=14 disposition=committed reason=processed samples=20 pending=1 first_id=253
+scan_prepared count=2000 end=2.3499999999999996
+h_rows feats=2000 end=2.3499999999999996 effective=1855
+h_rows feats=2000 end=2.3499999999999996 effective=1855
+h_rows feats=2000 end=2.3499999999999996 effective=1855
+h_rows feats=2000 end=2.3499999999999996 effective=1980
+h_rows feats=2000 end=2.3499999999999996 effective=1980
+guard end=2.3499999999999996 forced=healthy
+anchor_step_fixture end=2.3499999999999996 inject=1
+pose_publish encoding=0 stamp_ns=2349999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=14 outcome=published beg_ns=2300000000 end_ns=2350000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.32000000000000001,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.32000000000000001,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.041506507276846516 dq=0.024014347955431725
+record.reference present=0 snapshot=0 revision=0 scan=14 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=129 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2352500000 effective_ns=2349999999 state_until_ns=2552500000 hr_until_ns=0
+odom stamp_ns=2349999999 frame="lidar_odom" child="body"
+odom.pose p=[0.32000000000000001,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00021984470493550417,-0.00093808253174612502,-9.8089999526796419,0,0,0.012896504766367327,0,0,0,0,0,0,1980,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0022966312263349091,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=2.3499999999999996
+slot 14 healthy_moving scan=14 start=2.4000000000000004 end=2.4500000000000002 imu=moving cloud=dense guard=healthy inject=[0.35999999999999999,0,0]
+scan_begin end=2.4499999999999997
+imu_process
+imu_batch seq=15 disposition=committed reason=processed samples=20 pending=1 first_id=273
+scan_prepared count=2000 end=2.4499999999999997
+h_rows feats=2000 end=2.4499999999999997 effective=1856
+h_rows feats=2000 end=2.4499999999999997 effective=1856
+h_rows feats=2000 end=2.4499999999999997 effective=1856
+h_rows feats=2000 end=2.4499999999999997 effective=1980
+h_rows feats=2000 end=2.4499999999999997 effective=1980
+guard end=2.4499999999999997 forced=healthy
+anchor_step_fixture end=2.4499999999999997 inject=1
+pose_publish encoding=0 stamp_ns=2449999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=15 outcome=published beg_ns=2400000000 end_ns=2450000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.35999999999999999,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.35999999999999999,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.044812666072659005 dq=0.023672321407968131
+record.reference present=0 snapshot=0 revision=0 scan=15 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=129 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2452500000 effective_ns=2449999999 state_until_ns=2652500000 hr_until_ns=0
+odom stamp_ns=2449999999 frame="lidar_odom" child="body"
+odom.pose p=[0.35999999999999999,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00027167884379187971,-0.0011289444949607434,-9.8089999312710052,0,0,0.01274428982909071,0,0,0,0,0,0,1980,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0023099502755535972,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=2.4499999999999997
+slot 15 healthy_moving scan=15 start=2.5 end=2.5499999999999998 imu=moving cloud=dense guard=healthy inject=[0.40000000000000002,0,0]
+scan_begin end=2.5499999999999998
+imu_process
+imu_batch seq=16 disposition=committed reason=processed samples=20 pending=1 first_id=293
+scan_prepared count=2000 end=2.5499999999999998
+h_rows feats=2000 end=2.5499999999999998 effective=1857
+h_rows feats=2000 end=2.5499999999999998 effective=1857
+h_rows feats=2000 end=2.5499999999999998 effective=1857
+h_rows feats=2000 end=2.5499999999999998 effective=1984
+h_rows feats=2000 end=2.5499999999999998 effective=1984
+guard end=2.5499999999999998 forced=healthy
+anchor_step_fixture end=2.5499999999999998 inject=1
+pose_publish encoding=0 stamp_ns=2549999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=16 outcome=published beg_ns=2500000000 end_ns=2550000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.40000000000000002,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.40000000000000002,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.062573884110141129 dq=0.022184253252480281
+record.reference present=0 snapshot=0 revision=0 scan=16 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=129 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2552500000 effective_ns=2549999999 state_until_ns=2752500000 hr_until_ns=0
+odom stamp_ns=2549999999 frame="lidar_odom" child="body"
+odom.pose p=[0.40000000000000002,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00030250942037430092,-0.0014056851106750302,-9.8089998946139758,0,0,0.012674490050188997,0,0,0,0,0,0,1984,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0017063531483854017,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=2.5499999999999998
+slot 16 healthy_moving scan=16 start=2.6000000000000001 end=2.6499999999999999 imu=moving cloud=dense guard=healthy inject=[0.44,0,0]
+scan_begin end=2.6499999999999999
+imu_process
+imu_batch seq=17 disposition=committed reason=processed samples=20 pending=1 first_id=313
+scan_prepared count=2000 end=2.6499999999999999
+h_rows feats=2000 end=2.6499999999999999 effective=1865
+h_rows feats=2000 end=2.6499999999999999 effective=1865
+h_rows feats=2000 end=2.6499999999999999 effective=1865
+h_rows feats=2000 end=2.6499999999999999 effective=1984
+h_rows feats=2000 end=2.6499999999999999 effective=1984
+guard end=2.6499999999999999 forced=healthy
+anchor_step_fixture end=2.6499999999999999 inject=1
+pose_publish encoding=0 stamp_ns=2649999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=17 outcome=published beg_ns=2600000000 end_ns=2650000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.44,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.44,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.062305005239249728 dq=0.0220964826219666
+record.reference present=0 snapshot=0 revision=0 scan=17 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=129 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2652499999 effective_ns=2649999999 state_until_ns=2852499999 hr_until_ns=0
+odom stamp_ns=2649999999 frame="lidar_odom" child="body"
+odom.pose p=[0.44,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00033009780403880966,-0.0016816088448985455,-9.8089998503021079,0,0,0.012685201810250322,0,0,0,0,0,0,1984,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0016613839074007927,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=2.6499999999999999
+slot 17 healthy_moving scan=17 start=2.7000000000000002 end=2.75 imu=moving cloud=dense guard=healthy inject=[0.47999999999999998,0,0]
+scan_begin end=2.75
+imu_process
+imu_batch seq=18 disposition=committed reason=processed samples=20 pending=1 first_id=333
+scan_prepared count=2000 end=2.75
+h_rows feats=2000 end=2.75 effective=1885
+h_rows feats=2000 end=2.75 effective=1885
+h_rows feats=2000 end=2.75 effective=1885
+h_rows feats=2000 end=2.75 effective=1984
+h_rows feats=2000 end=2.75 effective=1984
+guard end=2.75 forced=healthy
+anchor_step_fixture end=2.75 inject=1
+pose_publish encoding=0 stamp_ns=2750000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=18 outcome=published beg_ns=2700000000 end_ns=2750000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.47999999999999998,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.47999999999999998,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.062061337922371382 dq=0.022004921521195677
+record.reference present=0 snapshot=0 revision=0 scan=18 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=129 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2752500000 effective_ns=2750000000 state_until_ns=2952500000 hr_until_ns=0
+odom stamp_ns=2750000000 frame="lidar_odom" child="body"
+odom.pose p=[0.47999999999999998,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00035777155941504125,-0.0019565160621931518,-9.8089997983507011,0,0,0.012702353839734332,0,0,0,0,0,0,1984,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0016465834191729946,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=2.75
+slot 18 healthy_moving scan=18 start=2.7999999999999998 end=2.8499999999999996 imu=moving cloud=dense guard=healthy inject=[0.52000000000000002,0,0]
+scan_begin end=2.8499999999999996
+imu_process
+imu_batch seq=19 disposition=committed reason=processed samples=20 pending=1 first_id=353
+scan_prepared count=2000 end=2.8499999999999996
+h_rows feats=2000 end=2.8499999999999996 effective=1912
+h_rows feats=2000 end=2.8499999999999996 effective=1912
+h_rows feats=2000 end=2.8499999999999996 effective=1912
+h_rows feats=2000 end=2.8499999999999996 effective=1986
+h_rows feats=2000 end=2.8499999999999996 effective=1986
+guard end=2.8499999999999996 forced=healthy
+anchor_step_fixture end=2.8499999999999996 inject=1
+pose_publish encoding=0 stamp_ns=2849999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=19 outcome=published beg_ns=2800000000 end_ns=2850000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=pending episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.52000000000000002,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.52000000000000002,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.061726756885963387 dq=0.021958443593053555
+record.reference present=0 snapshot=0 revision=0 scan=19 qualified=0 kind=1 lifecycle=2 startup=2 trust=2 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=129 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2852500000 effective_ns=2849999999 state_until_ns=3052500000 hr_until_ns=0
+odom stamp_ns=2849999999 frame="lidar_odom" child="body"
+odom.pose p=[0.52000000000000002,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00038540829516026294,-0.0022298758658447107,-9.8089997389700088,0,0,0.012707864177410802,0,0,0,0,0,0,1986,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0016177739621649335,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=2.8499999999999996
+slot 19 healthy_moving scan=19 start=2.9000000000000004 end=2.9500000000000002 imu=moving cloud=dense guard=healthy inject=[0.56000000000000005,0,0]
+scan_begin end=2.9499999999999997
+imu_process
+imu_batch seq=20 disposition=committed reason=processed samples=20 pending=1 first_id=373
+scan_prepared count=2000 end=2.9499999999999997
+h_rows feats=2000 end=2.9499999999999997 effective=1939
+h_rows feats=2000 end=2.9499999999999997 effective=1939
+h_rows feats=2000 end=2.9499999999999997 effective=1939
+h_rows feats=2000 end=2.9499999999999997 effective=1989
+h_rows feats=2000 end=2.9499999999999997 effective=1989
+guard end=2.9499999999999997 forced=healthy
+anchor_step_fixture end=2.9499999999999997 inject=1
+trace "[FE-RECOVERY] v=6 event=qualified reason=stable event_seq=5 scan_seq=20 stamp_ns=2950000000 episode=1 start_ns=1550000000 deadline_ns=11550000000 elapsed_ns=1400000000 reset_count=0 path=scan"
+pose_publish encoding=0 stamp_ns=2949999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=20 outcome=published beg_ns=2900000000 end_ns=2950000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=pending trust_post=local episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.56000000000000005,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.56000000000000005,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.061411114685375093 dq=0.021888558597097242
+record.reference present=0 snapshot=0 revision=0 scan=20 qualified=0 kind=1 lifecycle=2 startup=2 trust=1 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=131 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=2952500000 effective_ns=2949999999 state_until_ns=3152500000 hr_until_ns=0
+odom stamp_ns=2949999999 frame="lidar_odom" child="body"
+odom.pose p=[0.56000000000000005,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00041353198829207103,-0.0025017918898790768,-9.8089996722412156,0,0,0.012716627595259733,0,0,0,0,0,0,1989,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0016427897460020745,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=2.9499999999999997
+slot 20 healthy_moving scan=20 start=3 end=3.0499999999999998 imu=moving cloud=dense guard=healthy inject=[0.59999999999999998,0,0]
+scan_begin end=3.0499999999999998
+imu_process
+imu_batch seq=21 disposition=committed reason=processed samples=20 pending=1 first_id=393
+scan_prepared count=2000 end=3.0499999999999998
+h_rows feats=2000 end=3.0499999999999998 effective=1964
+h_rows feats=2000 end=3.0499999999999998 effective=1964
+h_rows feats=2000 end=3.0499999999999998 effective=1964
+h_rows feats=2000 end=3.0499999999999998 effective=1992
+h_rows feats=2000 end=3.0499999999999998 effective=1992
+guard end=3.0499999999999998 forced=healthy
+anchor_step_fixture end=3.0499999999999998 inject=1
+pose_publish encoding=0 stamp_ns=3049999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=21 outcome=published beg_ns=3000000000 end_ns=3050000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=local trust_post=local episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.59999999999999998,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.59999999999999998,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.061150852658720355 dq=0.021819631367826529
+record.reference present=0 snapshot=0 revision=0 scan=21 qualified=0 kind=1 lifecycle=2 startup=2 trust=1 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=131 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=3052500000 effective_ns=3049999999 state_until_ns=3252500000 hr_until_ns=0
+odom stamp_ns=3049999999 frame="lidar_odom" child="body"
+odom.pose p=[0.59999999999999998,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00044315427942627164,-0.0027723566114113054,-9.8089995982084091,0,0,0.012725638578628523,0,0,0,0,0,0,1992,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0016081523763606827,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=3.0499999999999998
+slot 21 healthy_moving scan=21 start=3.1000000000000001 end=3.1499999999999999 imu=moving cloud=dense guard=healthy inject=[0.64000000000000001,0,0]
+scan_begin end=3.1499999999999999
+imu_process
+imu_batch seq=22 disposition=committed reason=processed samples=20 pending=1 first_id=413
+scan_prepared count=2000 end=3.1499999999999999
+h_rows feats=2000 end=3.1499999999999999 effective=1989
+h_rows feats=2000 end=3.1499999999999999 effective=1989
+h_rows feats=2000 end=3.1499999999999999 effective=1989
+h_rows feats=2000 end=3.1499999999999999 effective=1996
+h_rows feats=2000 end=3.1499999999999999 effective=1996
+guard end=3.1499999999999999 forced=healthy
+anchor_step_fixture end=3.1499999999999999 inject=1
+pose_publish encoding=0 stamp_ns=3149999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=22 outcome=published beg_ns=3100000000 end_ns=3150000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=local trust_post=local episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.64000000000000001,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.64000000000000001,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.061128896030347553 dq=0.021810992635531167
+record.reference present=0 snapshot=0 revision=0 scan=22 qualified=0 kind=1 lifecycle=2 startup=2 trust=1 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=131 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=3152499999 effective_ns=3149999999 state_until_ns=3352499999 hr_until_ns=0
+odom stamp_ns=3149999999 frame="lidar_odom" child="body"
+odom.pose p=[0.64000000000000001,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00048908020874561728,-0.0030404522876859583,-9.8089995165893473,0,0,0.01276031496285137,0,0,0,0,0,0,1996,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0015578757008474194,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=3.1499999999999999
+slot 22 healthy_moving scan=22 start=3.2000000000000002 end=3.25 imu=moving cloud=dense guard=healthy inject=[0.68000000000000005,0,0]
+scan_begin end=3.25
+imu_process
+imu_batch seq=23 disposition=committed reason=processed samples=20 pending=1 first_id=433
+scan_prepared count=2000 end=3.25
+h_rows feats=2000 end=3.25 effective=2000
+h_rows feats=2000 end=3.25 effective=2000
+h_rows feats=2000 end=3.25 effective=2000
+h_rows feats=2000 end=3.25 effective=1999
+h_rows feats=2000 end=3.25 effective=1999
+guard end=3.25 forced=healthy
+anchor_step_fixture end=3.25 inject=1
+pose_publish encoding=0 stamp_ns=3250000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=23 outcome=published beg_ns=3200000000 end_ns=3250000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=local trust_post=local episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.68000000000000005,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.68000000000000005,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.060533196153825158 dq=0.021727218149114869
+record.reference present=0 snapshot=0 revision=0 scan=23 qualified=0 kind=1 lifecycle=2 startup=2 trust=1 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=131 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=3252499998 effective_ns=3250000000 state_until_ns=3452499998 hr_until_ns=0
+odom stamp_ns=3250000000 frame="lidar_odom" child="body"
+odom.pose p=[0.68000000000000005,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00053380313586789616,-0.0033060974060661551,-9.8089994283195754,0,0,0.012742414359284228,0,0,0,0,0,0,1999,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0016310884095001603,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=3.25
+slot 23 healthy_moving scan=23 start=3.3000000000000003 end=3.3500000000000001 imu=moving cloud=dense guard=healthy inject=[0.71999999999999997,0,0]
+scan_begin end=3.3499999999999996
+imu_process
+imu_batch seq=24 disposition=committed reason=processed samples=20 pending=1 first_id=453
+scan_prepared count=2000 end=3.3499999999999996
+h_rows feats=2000 end=3.3499999999999996 effective=2000
+h_rows feats=2000 end=3.3499999999999996 effective=2000
+h_rows feats=2000 end=3.3499999999999996 effective=2000
+h_rows feats=2000 end=3.3499999999999996 effective=2000
+h_rows feats=2000 end=3.3499999999999996 effective=2000
+guard end=3.3499999999999996 forced=healthy
+anchor_step_fixture end=3.3499999999999996 inject=1
+pose_publish encoding=0 stamp_ns=3349999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
+record seq=24 outcome=published beg_ns=3300000000 end_ns=3350000000 gap_ns=50000000 published=1 flags=0 events=0x0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
+record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.recovery trust_pre=local trust_post=local episode=1 start_ns=1550000000 deadline_ns=11550000000 startup_reference=established
+record.pre have=1 p=[0.71999999999999997,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
+record.post have=1 p=[0.71999999999999997,0,0] q=[1,0,0,0] v=[0.40000000000000002,-0.29999999999999999,0.050000000000000003]
+record.target have=0 p=[0,0,0] q=[1,0,0,0]
+record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
+record.update map_updated=1 have_update=1 dp=0.060161963606823077 dq=0.021651216207953985
+record.reference present=0 snapshot=0 revision=0 scan=24 qualified=0 kind=1 lifecycle=2 startup=2 trust=1 local=1 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=131 cause=0 taint=0 hard=0 has_pose=1 evaluated_ns=3352500000 effective_ns=3349999999 state_until_ns=3552500000 hr_until_ns=0
+odom stamp_ns=3349999999 frame="lidar_odom" child="body"
+odom.pose p=[0.71999999999999997,0,0] q_xyzw=[0,0,0,1]
+odom.pose_cov [0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.001,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01,0,0,0,0,0,0,0.01]
+odom.twist linear=[0,0,0] angular=[0,0,0]
+odom.twist_cov [1,0,-0.00056622863945208091,-0.0035716651315885585,-9.8089993333975158,0,0,0.012377115786452012,0,0,0,0,0,0,2000,0,0,0,0,0,0,1,0,0,0,0,0,0,0.0015431397557258606,0,0,0,0,0,0,0.50249378105604448]
+inputs lidar_queued=0 imu_queued=1 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=3.3499999999999996
+trace "[ZUPT-ANCHOR] v=6 event=counters event_seq=6 scans=24 events=5 candidates=1 created=0 candidates_dropped=1 invalidated=0 invalidated_motion=0 invalidated_evidence_unknown=0 invalidated_scan_hole=0 invalidated_imu_coverage_gap=0 invalidated_imu_bridge=0 invalidated_map_reset=0 invalidated_reference_changed=0 invalidated_time_epoch=0 invalidated_lost=0 invalidated_not_qualified=0 pin_applied=0 parked_prior_applied=0 zero_only_unanchored=0 blocked_stale_use=0 evidence_unknown=0 motion=1 scan_hole=0 imu_coverage_gap=0 imu_bridge=0 map_reset=0 reference_changed=0 lost=0 time_epoch=0 recovery_started=1 recovery_qualified=1 recovery_expired=0 map_reset_unanchored=0 sequence_exhausted=0"
+teardown odometry_received=21

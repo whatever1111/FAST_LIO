@@ -1,10 +1,10 @@
 # frontend contract golden: parameter/profile_m20
-# fork_sha: 05be5af0ddb42e4acc6033f5db44c1f4aed06ac3
+# fork_sha: fc3ab0f57f2f16c967184b5709d8ee1708a52657
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
 case profile_m20
-config test/frontend_contract/m20_laser_mapping.yaml sha256 1da5c594fc924243439963c639568292fe65aa0e437ffa9be8cd9a62d73678dc
+config test/frontend_contract/m20_laser_mapping.yaml sha256 8e6575d416bcad226c25571f2efc3891b5f2d80b96a85ce28ee18fe5c499932f
 overrides 0
 outcome constructed
 log INFO laser_mapping "[RP-CONSIDER] lidar update considers roll/pitch while engulfed=1, 2.5s after a release, when the previous scan's roll/pitch information < 1500 or z_weak >= 1.10 (cap 0.0s)"
@@ -16,7 +16,7 @@ log INFO laser_mapping "Standard IMU mode: topic=/lio/imu"
 log INFO laser_mapping "Wheel twist subscribed: topic=/wheel_odom/twist scale=1.000 (fusion off, static hold on, parked hold on)"
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
 log INFO laser_mapping "Node init finished."
-parameters 243
+parameters 244
 param adaptive_downsample_max_voxel type=double value=0.34999999999999998 read_only=0 descriptor_type=3
 param common.imu_input_type type=string value="standard" read_only=0 descriptor_type=4
 param common.imu_topic type=string value="/lio/imu" read_only=0 descriptor_type=4
@@ -82,6 +82,7 @@ param preprocess.timestamp_unit type=integer value=0 read_only=0 descriptor_type
 param publish.dense_publish_en type=bool value=false read_only=0 descriptor_type=1
 param publish.path_en type=bool value=false read_only=0 descriptor_type=1
 param reanchor_on_fail type=string value="reset_map" read_only=0 descriptor_type=4
+param reanchor_recovery_entry_view type=bool value=true read_only=0 descriptor_type=1
 param reanchor_total_timeout_sec type=double value=10 read_only=0 descriptor_type=3
 param runaway_on_trip type=string value="reset_map" read_only=0 descriptor_type=4
 param wheel_extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1] read_only=0 descriptor_type=8

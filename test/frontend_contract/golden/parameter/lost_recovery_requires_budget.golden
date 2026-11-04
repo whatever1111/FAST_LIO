@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/lost_recovery_requires_budget
-# fork_sha: 05be5af0ddb42e4acc6033f5db44c1f4aed06ac3
+# fork_sha: fc3ab0f57f2f16c967184b5709d8ee1708a52657
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=

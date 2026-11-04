@@ -5515,6 +5515,32 @@ TEST(AnchorLifecycleEntryView, WithTheEntryViewOffAPendingRecoveryLeavesTheMapAl
     EXPECT_EQ(valueOf(line, "view_open"), "0") << line;
 }
 
+// The moving run, and a second recovery after it. A run has as many recoveries as the platform meets, and each gets
+// a view of its own: the second one's starts with no scan inserted and qualifies it just as the first one did.
+TEST(AnchorLifecycleEntryView, EveryRecoveryOfARunQualifiesOnAViewOfItsOwn)
+{
+  Scenario scenario = entryViewRun("entry_view_second", true, false, kExportRun + 1, kExportBudget);
+  double x = scenario.steps.back().pos[0];
+  const auto next = [&x]() {
+    x += kViewStep;
+    return std::array<double, 3>{x, 0.0, 0.0};
+  };
+  for (int i = 0; i < 3; ++i)
+    scenario.steps.push_back(step(Phase::kLater, Imu::kMoving, Guard::kDegraded, next()));
+  for (int i = 0; i < kExportRun + 1; ++i)
+    scenario.steps.push_back(step(Phase::kLater, Imu::kMoving, Guard::kHealthy, next()));
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  EXPECT_EQ(recoveryLines(r, "pending").size(), 2u);
+  EXPECT_EQ(recoveryLines(r, "qualified").size(), 2u);
+  EXPECT_TRUE(recoveryLines(r, "unanchored").empty());
+  const auto matches = linesWhere(r, "[VIEW-PROBE]", "event", "match");
+  ASSERT_EQ(matches.size(), static_cast<std::size_t>(2 * kExportRun));
+  for (std::size_t i = 0; i < matches.size(); ++i)
+    EXPECT_EQ(valueOf(matches[i], "frames"), std::to_string(i % kExportRun)) << matches[i];
+}
+
 // ---------------------------------------------------------------------------
 // The first local reference: what starts an unsupported recovery before it
 // ---------------------------------------------------------------------------

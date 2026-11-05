@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/profile_giant
-# fork_sha: 187b36eb76b5bfa9e2157b8c2f87fb1e56e55341
+# fork_sha: 37a2745154d0c7d4d073308ea60e4522bd150f2f
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -42,6 +42,7 @@ param mapping.acc_cov type=double value=0.01 read_only=0 descriptor_type=3
 param mapping.det_range type=double value=60 read_only=0 descriptor_type=3
 param mapping.extrinsic_R type=double_array value=[-0.014289,-0.99965999999999999,0.021794999999999998,0.97421999999999997,-0.0090100000000000006,0.22542200000000001,-0.22514899999999999,0.024454,0.97401700000000002] read_only=0 descriptor_type=8
 param mapping.extrinsic_T type=double_array value=[-8.2999999999999998e-05,1.3679669999999999,0.95031900000000002] read_only=0 descriptor_type=8
+param mapping.extrinsic_est_en type=bool value=true read_only=0 descriptor_type=1
 param mapping.fov_degree type=double value=360 read_only=0 descriptor_type=3
 param mapping.gyr_cov type=double value=0.0050000000000000001 read_only=0 descriptor_type=3
 param max_iteration type=integer value=3 read_only=0 descriptor_type=2
@@ -74,6 +75,7 @@ effective.v1 mapping.acc_cov float64 0x3f847ae147ae147b
 effective.v1 mapping.det_range float32 0x42700000
 effective.v1 mapping.extrinsic_R float64[9] [0xbf8d438d1d8a5482,0xbfeffd36f7e3d1cc,0x3f96516db0dd82fd,0x3fef2ccf6be37de9,0xbf8273d5bab21816,0x3fccdaa0cae642c0,0xbfccd1aeb3dd11be,0x3f990a7829068987,0x3fef2b25b317efe1]
 effective.v1 mapping.extrinsic_T float64[3] [0xbf15c209246bf013,0x3ff5e3315d701d9f,0x3fee690364388ebd]
+effective.v1 mapping.extrinsic_est_en bool 1
 effective.v1 mapping.fov_degree float64 0x4076800000000000
 effective.v1 mapping.gyr_cov float64 0x3f747ae147ae147b
 effective.v1 max_iteration int32 3

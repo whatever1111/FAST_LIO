@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/typed_alias_both_names_set
-# fork_sha: 187b36eb76b5bfa9e2157b8c2f87fb1e56e55341
+# fork_sha: 37a2745154d0c7d4d073308ea60e4522bd150f2f
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -46,7 +46,7 @@ param publish.frontend_clock_domain type=string value="fixture" read_only=0 desc
 param publish.frontend_observation type=bool value=true read_only=0 descriptor_type=1
 param publish.reference_health type=bool value=true read_only=1 descriptor_type=1
 effective.v1.count 309
-effective.v1 derived:config_id:reference_config_id bytes[32] 2572d74c2821d11ded32e24f73644ab7d05ad512f5e71b63b1f46946a4c6b385
+effective.v1 derived:config_id:reference_config_id bytes[32] 28a384e5526ad88764ad4546955ff1cf62fd5aff5ed5ed530ca63da3bc1d9a65
 effective.v1 derived:config_id:reference_contract_id bytes[32] 7f76d47e6a3b97253e1d11c9fe21871a0fe9f723b749c0bd0ad894d84054de06
 effective.v1 derived:frontend_activation:frontend_clock_domain string[7] "fixture"
 effective.v1 derived:frontend_activation:frontend_observation_en bool 1

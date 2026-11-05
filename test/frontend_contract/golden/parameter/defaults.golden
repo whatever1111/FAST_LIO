@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/defaults
-# fork_sha: 187b36eb76b5bfa9e2157b8c2f87fb1e56e55341
+# fork_sha: 37a2745154d0c7d4d073308ea60e4522bd150f2f
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -185,7 +185,7 @@ param mapping.b_gyr_cov type=double value=0.0001 read_only=0 descriptor_type=3
 param mapping.det_range type=double value=300 read_only=0 descriptor_type=3
 param mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1] read_only=0 descriptor_type=8
 param mapping.extrinsic_T type=double_array value=[0,0,0] read_only=0 descriptor_type=8
-param mapping.extrinsic_est_en type=bool value=true read_only=0 descriptor_type=1
+param mapping.extrinsic_est_en type=bool value=false read_only=0 descriptor_type=1
 param mapping.fov_degree type=double value=180 read_only=0 descriptor_type=3
 param mapping.gyr_cov type=double value=0.10000000000000001 read_only=0 descriptor_type=3
 param mapping.map_insert_delay_scans type=integer value=0 read_only=0 descriptor_type=2
@@ -512,7 +512,7 @@ effective.v1 mapping.b_gyr_cov float64 0x3f1a36e2eb1c432d
 effective.v1 mapping.det_range float32 0x43960000
 effective.v1 mapping.extrinsic_R float64[9] [0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000]
 effective.v1 mapping.extrinsic_T float64[3] [0x0000000000000000,0x0000000000000000,0x0000000000000000]
-effective.v1 mapping.extrinsic_est_en bool 1
+effective.v1 mapping.extrinsic_est_en bool 0
 effective.v1 mapping.fov_degree float64 0x4066800000000000
 effective.v1 mapping.gyr_cov float64 0x3fb999999999999a
 effective.v1 mapping.map_insert_delay_scans int32 0

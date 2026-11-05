@@ -1000,6 +1000,15 @@ void FrontendParameters::readDiagnosticsAndMapSave(const rclcpp::Node & node,
   readInto(node, diagnostics.diagnostics_latency_log_period_sec, latency_log_period_sec);
   readInto(node, diagnostics.diagnostics_kalman_channel_enable, values_.kalman_channel_diag_en);
   readInto(node, imu.mapping_extrinsic_est_en, extrinsic_est_en);
+  if (values_.attitude_hold.enabled && extrinsic_est_en) {
+    RCLCPP_FATAL(node.get_logger(),
+                 "lidar_attitude_hold_en and mapping.extrinsic_est_en cannot both be true: the hold projects only the "
+                 "attitude columns of H onto yaw, so the extrinsic rotation columns would let roll and pitch "
+                 "information into the state");
+    throw std::invalid_argument(
+      "lidar_attitude_hold_en=true requires mapping.extrinsic_est_en=false "
+      "(the hold does not project the extrinsic rotation columns of H)");
+  }
   readInto(node, map.mapping_map_insert_delay_scans, map_insert_delay_scans);
   if (map_insert_delay_scans > 0) {
     RCLCPP_WARN(node.get_logger(), "[MAP] deterministic insertion lag: %d scan(s)", map_insert_delay_scans);

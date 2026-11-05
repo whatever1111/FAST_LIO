@@ -5,7 +5,8 @@ Inputs and goldens of the two contract fixtures of the legacy front-end node (la
 - `test/test_frontend_parameter_contract_node.cpp`: what the node does with its parameters: the declared
   defaults, the platform profiles (this package's own files and the parent repository's merged profiles), the
   deprecated alias, type errors, vector lengths, NaN and Inf, prior-map settings, the read-only descriptor, typed
-  outputs with their configuration ID, and two invalid values at once. Per case it records the configuration
+  outputs with their configuration ID, the attitude hold alone and with online extrinsic estimation, and two invalid
+  values at once. Per case it records the configuration
   (profile path and sha256, every override), whether construction returned or threw (type and text), what
   construction logged at INFO and above with the constructor's stage boundaries between those lines (`event.v1`),
   every declared parameter with type, value and descriptor as the node's parameter services report them, the

@@ -1478,6 +1478,35 @@ TEST(FrontendParameterContract, ReadOnlyWithObservation)
   checkCase(c);
 }
 
+// The attitude hold projects only the attitude columns of H, so the node refuses it together with online extrinsic
+// estimation, and says which two parameters and why. On its own the hold starts: estimation is off unless asked for.
+TEST(FrontendParameterContract, AttitudeHoldWithOnlineExtrinsic)
+{
+  ParameterCase c = overridesCase("attitude_hold_with_online_extrinsic", Expect::kRejected);
+  setOverride(c, rclcpp::Parameter("lidar_attitude_hold_en", true));
+  setOverride(c, rclcpp::Parameter("mapping.extrinsic_est_en", true));
+  std::string record;
+  checkCase(c, &record);
+  EXPECT_NE(record.find("\noutcome threw std::invalid_argument: "), std::string::npos) << record;
+  EXPECT_NE(record.find("\nlog FATAL "), std::string::npos) << record;
+  for (const auto & line : splitLines(record)) {
+    if (line.rfind("outcome ", 0) != 0 && line.rfind("log FATAL ", 0) != 0)
+      continue;
+    EXPECT_NE(line.find("lidar_attitude_hold_en"), std::string::npos) << line;
+    EXPECT_NE(line.find("mapping.extrinsic_est_en"), std::string::npos) << line;
+  }
+}
+
+TEST(FrontendParameterContract, AttitudeHoldAlone)
+{
+  ParameterCase c = overridesCase("attitude_hold_alone", Expect::kConstructed);
+  setOverride(c, rclcpp::Parameter("lidar_attitude_hold_en", true));
+  std::string record;
+  checkCase(c, &record);
+  EXPECT_EQ(effectiveValue(record, "lidar_attitude_hold_en"), "1");
+  EXPECT_EQ(effectiveValue(record, "mapping.extrinsic_est_en"), "0");
+}
+
 // Two invalid values in one configuration: the record shows which check refuses it, and the stages and lines the
 // constructor reached before it, so a check moved ahead of another or ahead of a side effect shows.
 TEST(FrontendParameterContract, TwoInvalidObservationThenBacklog)

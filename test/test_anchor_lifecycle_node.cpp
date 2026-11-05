@@ -5541,6 +5541,211 @@ TEST(AnchorLifecycleEntryView, EveryRecoveryOfARunQualifiesOnAViewOfItsOwn)
     EXPECT_EQ(valueOf(matches[i], "frames"), std::to_string(i % kExportRun)) << matches[i];
 }
 
+// The view's account of a recovery, `served` being the scans it served in order, from the first one matched against
+// it to the one the recovery ended on. Each of them was matched against the view, which had counted the Pending
+// scans that went into the map before it; those insertions found the view open, and no other insertion of the run.
+void expectEntryViewServed(const ChildResult & r, const std::vector<const Observation *> & served)
+{
+  const auto matches = linesWhere(r, "[VIEW-PROBE]", "event", "match");
+  ASSERT_EQ(matches.size(), served.size());
+  std::vector<const Observation *> inserted;
+  for (std::size_t i = 0; i < served.size(); ++i) {
+    const Observation & o = *served[i];
+    EXPECT_EQ(valueOf(matches[i], "end_ms"), std::to_string(msKey(static_cast<double>(o.record.end_ns) * 1e-9)));
+    EXPECT_EQ(valueOf(matches[i], "frames"), std::to_string(inserted.size())) << matches[i];
+    if (o.record.map_updated && o.record.trust_post == fast_lio::RecoveryTrust::kPending)
+      inserted.push_back(&o);
+  }
+  std::size_t open = 0;
+  for (const auto & line : linesWhere(r, "[VIEW-PROBE]", "event", "insert")) {
+    const Observation * o = scanEndingAt(r, toI64(valueOf(line, "end_ms")));
+    ASSERT_NE(o, nullptr) << line;
+    const bool pending = std::find(inserted.begin(), inserted.end(), o) != inserted.end();
+    EXPECT_EQ(valueOf(line, "view_open"), pending ? "1" : "0") << line;
+    open += pending ? 1 : 0;
+  }
+  EXPECT_EQ(open, inserted.size());
+}
+
+// The run's one recovery qualified on the scan that completes `stable_ns` of `scans` from index `first` on, every scan
+// of `scans` up to that one served by the view.
+void expectQualifiedOnItsView(const ChildResult & r,
+                              const std::vector<const Observation *> & scans,
+                              std::size_t first,
+                              std::int64_t stable_ns)
+{
+  const Observation * confirming = completesRun(scans, first, stable_ns);
+  ASSERT_NE(confirming, nullptr);
+  const auto qualified = recoveryLines(r, "qualified");
+  ASSERT_EQ(qualified.size(), 1u);
+  EXPECT_EQ(valueOf(qualified.front(), "scan_seq"), std::to_string(confirming->record.scan_seq)) << qualified.front();
+  EXPECT_TRUE(recoveryLines(r, "unanchored").empty());
+  expectEntryViewServed(r, {scans.begin(), std::find(scans.begin(), scans.end(), confirming) + 1});
+}
+
+// A runaway map reset on a healthy scan of the moving recovery. The reset latches the recovery Unanchored there and
+// then, so the same scan's recovery step finds nothing pending and closes the view: that scan is not matched against
+// it, and neither it nor any scan after it goes into the map with the view open.
+TEST(AnchorLifecycleEntryView, AMapResetLatchesTheRecoveryAndClosesItsView)
+{
+  constexpr int matching = 4;  // healthy Pending scans before the reset, well short of the stable time
+  Scenario scenario = entryViewRun("entry_view_map_reset", true, false, matching, kExportBudget);
+  setParam(scenario, rclcpp::Parameter("runaway_watchdog_en", true));
+  setParam(scenario, rclcpp::Parameter("runaway_on_trip", "reset_map"));
+  scenario.steps[scenario.steps.size() - 3].trip = true;  // the first of the three scans after them
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  expectTraceAccountsForEveryScan(r, true, scenario.name, true);
+  const auto after = r.phase(Phase::kAfter);
+  const auto later = r.phase(Phase::kLater);
+  ASSERT_EQ(after.size(), static_cast<std::size_t>(matching));
+  ASSERT_EQ(later.size(), 3u);
+  const auto & reset = later.front()->record;
+  EXPECT_TRUE(hasEvent(*later.front(), fast_lio::kAnchorEventMapReset));
+  EXPECT_EQ(reset.trust_pre, fast_lio::RecoveryTrust::kPending);
+  for (const auto * o : later) {
+    EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kUnanchored) << "step " << o->step;
+    EXPECT_TRUE(o->record.map_updated) << "step " << o->step;
+  }
+  const auto latched = recoveryLines(r, "unanchored");
+  ASSERT_EQ(latched.size(), 1u);
+  EXPECT_EQ(valueOf(latched.front(), "reason"), "map_reset") << latched.front();
+  EXPECT_EQ(valueOf(latched.front(), "scan_seq"), std::to_string(reset.scan_seq)) << latched.front();
+  EXPECT_TRUE(recoveryLines(r, "qualified").empty());
+  EXPECT_EQ(counterValue(r, "map_reset_unanchored"), "1");
+  expectEntryViewServed(r, after);
+}
+
+constexpr int kViewInstallAfter = 3;                      // healthy Pending scans before the prior map goes in
+constexpr std::int64_t kViewInstallStableNs = 500000000;  // pendingByDegradedScans()'s stable time
+
+// The recovery of pendingByDegradedScans() with a prior map waiting for its alignment, which comes in on the scan after
+// kViewInstallAfter healthy Pending scans.
+Scenario entryViewPriorInstall()
+{
+  Scenario s = traced(pendingByDegradedScans("entry_view_prior_install", 3, kExportBudget), true);
+  s.view_probe = true;
+  s.prior_map = true;
+  s.relocalizations = {{{0.0, 0.0, 0.0}}};
+  setParam(s, rclcpp::Parameter("reanchor_recovery_entry_view", true));
+  setParam(s, rclcpp::Parameter("prior_map_pcd", priorMapPath()));
+  setParam(s, rclcpp::Parameter("prior_map_align", "relocalization"));
+  append(s, kViewInstallAfter, slot(Phase::kAfter));
+  Step install = slot(Phase::kLater);
+  install.relocalization = 0;
+  s.steps.push_back(install);
+  append(s, 8, slot(Phase::kLater));
+  return s;
+}
+
+// A prior map installed while the view is open. The scan loop installs it after the map join, and the view keeps it
+// out as it keeps any later point out, but a pinned tier is not a scan: from the scan of the install to the end of the
+// recovery the map is frozen again, and the view goes on serving the match. The install changed the reference, so the
+// stable time starts over on that scan; once the recovery qualifies the view is closed and the scans go into the map.
+TEST(AnchorLifecycleEntryView, APriorMapInstalledDuringARecoveryFreezesTheMapUntilItEnds)
+{
+  ASSERT_TRUE(writePriorMap(priorMapPath()));
+  const ChildResult r = runScenario(entryViewPriorInstall());
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const auto after = r.phase(Phase::kAfter);
+  const auto later = r.phase(Phase::kLater);
+  ASSERT_EQ(after.size(), static_cast<std::size_t>(kViewInstallAfter));
+  ASSERT_EQ(later.size(), 9u);
+  EXPECT_EQ(later.front()->record.ref_gen, after.back()->record.ref_gen + 1);
+  EXPECT_EQ(counterValue(r, "reference_changed"), "1");
+  for (const auto * o : after) {
+    EXPECT_EQ(o->record.trust_post, fast_lio::RecoveryTrust::kPending) << "step " << o->step;
+    EXPECT_TRUE(o->record.map_updated) << "step " << o->step;
+  }
+  const Observation * confirming = completesRun(later, 0, kViewInstallStableNs);
+  ASSERT_NE(confirming, nullptr);
+  ASSERT_NE(confirming, later.back());
+  for (const auto * o : later) {
+    const bool pending = o->record.scan_seq < confirming->record.scan_seq;
+    EXPECT_EQ(o->record.trust_post == fast_lio::RecoveryTrust::kPending, pending) << "step " << o->step;
+    EXPECT_EQ(o->record.map_updated, !pending) << "step " << o->step;
+  }
+  std::vector<const Observation *> scans = after;
+  scans.insert(scans.end(), later.begin(), later.end());
+  expectQualifiedOnItsView(r, scans, after.size(), kViewInstallStableNs);
+}
+
+// A recovery found by the first scan after a hole, and one found by the IMU clock while no scan arrives: both start
+// ahead of the scan loop's recovery step, which opens the view on the first scan back. That scan is the first one
+// matched against it, and the scans after it qualify the recovery on the map it began with.
+TEST(AnchorLifecycleEntryView, AScanHoleRecoveryOpensItsViewOnTheFirstScanBack)
+{
+  for (const int missing : {5, 10}) {
+    Scenario scenario = traced(scanHole(missing, Imu::kStatic), true);
+    scenario.name = "entry_view_scan_hole_" + std::to_string(missing);
+    scenario.view_probe = true;
+    setParam(scenario, rclcpp::Parameter("reanchor_recovery_entry_view", true));
+    const ChildResult r = runScenario(scenario);
+    SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+    ASSERT_TRUE(r.ok());
+    const auto pending = recoveryLines(r, "pending");
+    ASSERT_EQ(pending.size(), 1u);
+    EXPECT_EQ(valueOf(pending.front(), "reason"), "scan_hole") << pending.front();
+    EXPECT_EQ(valueOf(pending.front(), "path"), missing == 5 ? "scan" : "idle") << pending.front();
+    const auto after = r.phase(Phase::kAfter);
+    ASSERT_EQ(after.size(), 14u);
+    expectQualifiedOnItsView(r, after, 0, kNsPerSecond);
+  }
+}
+
+// An IMU dropout the motion model bridges starts the recovery on the scan that sees it, ahead of that scan's own
+// recovery step, so the view opens there. The bridged scans are matched against it and go into the map, and only the
+// scans after them count toward the stable time.
+TEST(AnchorLifecycleEntryView, AnImuBridgeRecoveryOpensItsViewOnTheBridgedScan)
+{
+  Scenario scenario = traced(imuBridge(0.2, 10.0), true);
+  scenario.name = "entry_view_imu_bridge";
+  scenario.view_probe = true;
+  setParam(scenario, rclcpp::Parameter("reanchor_recovery_entry_view", true));
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const auto scans = fromPhase(r, Phase::kEvent);
+  std::size_t last_bridged = scans.size();
+  for (std::size_t i = 0; i < scans.size(); ++i)
+    if (hasEvent(*scans[i], fast_lio::kAnchorEventImuBridge))
+      last_bridged = i;
+  ASSERT_LT(last_bridged + 1, scans.size());
+  const auto pending = recoveryLines(r, "pending");
+  ASSERT_EQ(pending.size(), 1u);
+  EXPECT_EQ(valueOf(pending.front(), "reason"), "imu_bridge") << pending.front();
+  EXPECT_EQ(valueOf(pending.front(), "scan_seq"), std::to_string(scans.front()->record.scan_seq)) << pending.front();
+  expectQualifiedOnItsView(r, scans, last_bridged + 1, kNsPerSecond);
+}
+
+// An IMU coverage gap starts the recovery on a scan that leaves before the recovery step, frozen and unpublished: the
+// next scan opens the view, nothing having gone into the map in between, and the healthy scans qualify the recovery.
+TEST(AnchorLifecycleEntryView, ACoverageGapRecoveryOpensItsViewOnTheNextScan)
+{
+  Scenario scenario = traced(lostImu(LostImu::kTail), true);
+  scenario.name = "entry_view_coverage_gap";
+  scenario.view_probe = true;
+  setParam(scenario, rclcpp::Parameter("reanchor_recovery_entry_view", true));
+  scenario.steps.resize(scenario.steps.size() - 3);  // lostImu()'s degraded scans
+  append(scenario, 14, slot(Phase::kAfter));
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const auto event = r.phase(Phase::kEvent);
+  ASSERT_EQ(event.size(), 1u);
+  EXPECT_EQ(event.front()->record.outcome, fast_lio::AnchorScanOutcome::kImuCoverageGap);
+  EXPECT_FALSE(event.front()->record.anchor_step);
+  const auto pending = recoveryLines(r, "pending");
+  ASSERT_EQ(pending.size(), 1u);
+  EXPECT_EQ(valueOf(pending.front(), "reason"), "imu_coverage_gap") << pending.front();
+  EXPECT_EQ(valueOf(pending.front(), "scan_seq"), std::to_string(event.front()->record.scan_seq)) << pending.front();
+  const auto after = r.phase(Phase::kAfter);
+  ASSERT_EQ(after.size(), 14u);
+  expectQualifiedOnItsView(r, after, 0, kNsPerSecond);
+}
+
 // ---------------------------------------------------------------------------
 // The first local reference: what starts an unsupported recovery before it
 // ---------------------------------------------------------------------------

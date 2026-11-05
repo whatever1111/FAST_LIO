@@ -1,11 +1,13 @@
 # frontend contract golden: parameter/type_integer_array_for_double_array
-# fork_sha: fc3ab0f57f2f16c967184b5709d8ee1708a52657
+# fork_sha: 187b36eb76b5bfa9e2157b8c2f87fb1e56e55341
 # arch: x86_64
 # ros_distro: humble
-# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
 case type_integer_array_for_double_array
 config overrides-only
 overrides 2
 override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
 override mapping.extrinsic_T type=integer_array value=[0,0,0]
 outcome threw rclcpp::exceptions::InvalidParameterTypeException: "parameter 'mapping.extrinsic_T' has invalid type: Wrong parameter type, parameter {mapping.extrinsic_T} is of type {double_array}, setting it to {integer_array} is not allowed."
+event.v1 declare_front declared=153 names_sha256=7a09cb33feca00eb2edf82716ef8205fec69556808f3a181484b8e6c8d30aa7c
+event.v1 typed_outputs declared=157 names_sha256=8aec833e61c10385d01066c2547302af0479a5abb8c51d8fce357b497f04e0f0

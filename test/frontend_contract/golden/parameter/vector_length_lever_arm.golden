@@ -1,8 +1,8 @@
 # frontend contract golden: parameter/vector_length_lever_arm
-# fork_sha: fc3ab0f57f2f16c967184b5709d8ee1708a52657
+# fork_sha: 187b36eb76b5bfa9e2157b8c2f87fb1e56e55341
 # arch: x86_64
 # ros_distro: humble
-# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
 case vector_length_lever_arm
 config overrides-only
 overrides 3
@@ -10,4 +10,7 @@ override gravity_align_leg_lever_arm type=double_array value=[0.1000000000000000
 override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
 override mapping.extrinsic_T type=double_array value=[0,0,0]
 outcome threw std::invalid_argument: "gravity_align_leg_lever_arm size mismatch"
+event.v1 declare_front declared=153 names_sha256=7a09cb33feca00eb2edf82716ef8205fec69556808f3a181484b8e6c8d30aa7c
+event.v1 typed_outputs declared=157 names_sha256=8aec833e61c10385d01066c2547302af0479a5abb8c51d8fce357b497f04e0f0
+event.v1 declare_back declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
 log FATAL laser_mapping "gravity_align_leg_lever_arm must have exactly 3 elements, got 2"

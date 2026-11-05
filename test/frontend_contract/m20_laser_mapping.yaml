@@ -122,7 +122,7 @@ laser_mapping:
     zupt_acc_span_ratio: 0.02
     zupt_wheel_speed_thresh: 0.05
     zupt_wheel_max_age: 0.5
-    zupt_require_wheel: false
+    zupt_require_wheel: true
     zupt_parked_hold_en: true
     zupt_parked_hold_scans: 3
     zupt_hold_pos_noise: 0.05
@@ -140,6 +140,7 @@ laser_mapping:
     reanchor_total_timeout_sec: 10.0
     reanchor_recovery_stable_sec: 1.0
     reanchor_recovery_entry_view: true
+    lost_recovery_en: true
     runaway_watchdog_en: true
     runaway_parked_speed_thresh: 0.3
     runaway_wheel_speed_margin: 1.0

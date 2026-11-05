@@ -1,0 +1,91 @@
+# frontend contract golden: parameter/merged_giant_hesai_fp
+# fork_sha: 187b36eb76b5bfa9e2157b8c2f87fb1e56e55341
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
+case merged_giant_hesai_fp
+config test/frontend_contract/giant_hesai_fp_laser_mapping.yaml sha256 404e8101fc7481faa5e7964688d4b75329693dcd73896e0dd6c25c914592e600
+overrides 0
+outcome constructed
+event.v1 declare_front declared=153 names_sha256=7a09cb33feca00eb2edf82716ef8205fec69556808f3a181484b8e6c8d30aa7c
+event.v1 typed_outputs declared=157 names_sha256=8aec833e61c10385d01066c2547302af0479a5abb8c51d8fce357b497f04e0f0
+event.v1 declare_back declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
+event.v1 lost_recovery_loaded declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
+event.v1 read_policies declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
+log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
+event.v1 anchor_gap_resolved declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
+log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
+event.v1 map_backend declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
+log INFO laser_mapping "p_pre->lidar_type 2"
+event.v1 read_inputs declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
+event.v1 filter_init declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
+log INFO laser_mapping "Standard IMU mode: topic=/lio/imu"
+log INFO laser_mapping "Wheel twist subscribed: topic=/lio/wheel_twist scale=1.000 (fusion off, static hold on, parked hold off)"
+event.v1 subscriptions declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
+event.v1 cloud_publishers declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
+event.v1 odometry_publishers declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
+event.v1 scan_timer declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
+event.v1 map_timer declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
+log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
+event.v1 config_id declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
+log INFO laser_mapping "Node init finished."
+event.v1 constructed declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
+parameters 244
+param common.imu_input_type type=string value="standard" read_only=0 descriptor_type=4
+param common.imu_topic type=string value="/lio/imu" read_only=0 descriptor_type=4
+param common.lid_topic type=string value="/lio/points" read_only=0 descriptor_type=4
+param cube_side_length type=double value=1000 read_only=0 descriptor_type=3
+param initial_pose type=double_array value=[0,0,0,0,0,0] read_only=0 descriptor_type=8
+param mapping.acc_cov type=double value=0.0039939570888238808 read_only=0 descriptor_type=3
+param mapping.b_acc_cov type=double value=6.4356659353532566e-05 read_only=0 descriptor_type=3
+param mapping.b_gyr_cov type=double value=3.5640318696367613e-05 read_only=0 descriptor_type=3
+param mapping.det_range type=double value=60 read_only=0 descriptor_type=3
+param mapping.extrinsic_R type=double_array value=[0.99962916099999999,0.027169025999999999,0.001839893,-0.027217621000000001,0.998983238,0.035940112000000003,-0.00086156399999999999,-0.035976860999999999,0.999352252] read_only=0 descriptor_type=8
+param mapping.extrinsic_T type=double_array value=[-0.023944,0.001915,-0.0042620000000000002] read_only=0 descriptor_type=8
+param mapping.fov_degree type=double value=360 read_only=0 descriptor_type=3
+param mapping.gyr_cov type=double value=0.0015636343949698187 read_only=0 descriptor_type=3
+param max_iteration type=integer value=3 read_only=0 descriptor_type=2
+param nn_refresh_min_shift type=double value=0.050000000000000003 read_only=0 descriptor_type=3
+param point_filter_num type=integer value=3 read_only=0 descriptor_type=2
+param preprocess.blind type=double value=0.10000000000000001 read_only=0 descriptor_type=3
+param preprocess.lidar_type type=integer value=2 read_only=0 descriptor_type=2
+param preprocess.scan_line type=integer value=32 read_only=0 descriptor_type=2
+param preprocess.timestamp_unit type=integer value=0 read_only=0 descriptor_type=2
+param publish.dense_publish_en type=bool value=false read_only=0 descriptor_type=1
+param wheel_extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1] read_only=0 descriptor_type=8
+param wheel_topic type=string value="/lio/wheel_twist" read_only=0 descriptor_type=4
+param wheel_vel_noise_vz type=double value=0.20000000000000001 read_only=0 descriptor_type=3
+effective.v1.count 309
+effective.v1 common.imu_input_type string[8] "standard"
+effective.v1 common.imu_topic string[8] "/lio/imu"
+effective.v1 common.lid_topic string[11] "/lio/points"
+effective.v1 cube_side_length float64 0x408f400000000000
+effective.v1 derived:extrinsic_and_noise:Lidar_R_wrt_IMU float64[3x3] [0x3feffcf64b53eef3,0x3f9bd232788964d4,0x3f5e251210d74656,0xbf9bdeefa04799d9,0x3feff7abb20eca37,0x3fa266be0b4f24bd,0xbf4c3b529a095eac,0xbfa26b8f22d0c304,0x3feffab192f0c434]
+effective.v1 derived:extrinsic_and_noise:Lidar_T_wrt_IMU float64[3x1] [0xbf9884c6a3bddfca,0x3f5f601797cc3a00,0xbf717507e9d94d0e]
+effective.v1 derived:extrinsic_and_noise:p_imu->Lidar_R_wrt_IMU float64[3x3] [0x3feffcf64b53eef3,0x3f9bd232788964d4,0x3f5e251210d74656,0xbf9bdeefa04799d9,0x3feff7abb20eca37,0x3fa266be0b4f24bd,0xbf4c3b529a095eac,0xbfa26b8f22d0c304,0x3feffab192f0c434]
+effective.v1 derived:extrinsic_and_noise:p_imu->Lidar_T_wrt_IMU float64[3x1] [0xbf9884c6a3bddfca,0x3f5f601797cc3a00,0xbf717507e9d94d0e]
+effective.v1 derived:extrinsic_and_noise:p_imu->cov_acc_scale float64[3x1] [0x3f705bf7b14000fb,0x3f705bf7b14000fb,0x3f705bf7b14000fb]
+effective.v1 derived:extrinsic_and_noise:p_imu->cov_bias_acc float64[3x1] [0x3f10dee6fd22d845,0x3f10dee6fd22d845,0x3f10dee6fd22d845]
+effective.v1 derived:extrinsic_and_noise:p_imu->cov_bias_gyr float64[3x1] [0x3f02af90069829d8,0x3f02af90069829d8,0x3f02af90069829d8]
+effective.v1 derived:extrinsic_and_noise:p_imu->cov_gyr_scale float64[3x1] [0x3f599e5ba5b70711,0x3f599e5ba5b70711,0x3f599e5ba5b70711]
+effective.v1 derived:iteration_count:kf.maximum_iter int32 3
+effective.v1 initial_pose float64[6] [0x0000000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000]
+effective.v1 mapping.acc_cov float64 0x3f705bf7b14000fb
+effective.v1 mapping.b_acc_cov float64 0x3f10dee6fd22d845
+effective.v1 mapping.b_gyr_cov float64 0x3f02af90069829d8
+effective.v1 mapping.det_range float32 0x42700000
+effective.v1 mapping.extrinsic_R float64[9] [0x3feffcf64b53eef3,0x3f9bd232788964d4,0x3f5e251210d74656,0xbf9bdeefa04799d9,0x3feff7abb20eca37,0x3fa266be0b4f24bd,0xbf4c3b529a095eac,0xbfa26b8f22d0c304,0x3feffab192f0c434]
+effective.v1 mapping.extrinsic_T float64[3] [0xbf9884c6a3bddfca,0x3f5f601797cc3a00,0xbf717507e9d94d0e]
+effective.v1 mapping.fov_degree float64 0x4076800000000000
+effective.v1 mapping.gyr_cov float64 0x3f599e5ba5b70711
+effective.v1 max_iteration int32 3
+effective.v1 nn_refresh_min_shift float64 0x3fa999999999999a
+effective.v1 point_filter_num int32 3
+effective.v1 preprocess.blind float64 0x3fb999999999999a
+effective.v1 preprocess.lidar_type int32 2
+effective.v1 preprocess.scan_line int32 32
+effective.v1 preprocess.timestamp_unit int32 0
+effective.v1 publish.dense_publish_en bool 0
+effective.v1 wheel_extrinsic_R float64[9] [0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000]
+effective.v1 wheel_topic string[16] "/lio/wheel_twist"
+effective.v1 wheel_vel_noise_vz float64 0x3fc999999999999a

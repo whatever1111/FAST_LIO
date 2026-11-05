@@ -359,6 +359,12 @@ public:
   std::size_t evictedVoxels() const { return evicted_voxels_; }
   std::size_t pinnedVoxels() const { return pinned_voxels_; }
   bool atCapacity() const { return map_.size() >= max_voxels_; }
+#ifdef FASTLIO_TEST_HOOKS
+  float resolutionForTest() const { return res_; }
+  float inverseResolutionForTest() const { return inv_res_; }
+  int voxelCapacityForTest() const { return per_voxel_cap_; }
+  const std::vector<std::array<int, 3>> & neighborOffsetsForTest() const { return nbr_; }
+#endif
 
 private:
   struct Key

@@ -1790,7 +1790,11 @@ void publishReferenceRepeat() noexcept
   if (!reference_health_en)
     return;
   static SteadyClock::time_point last;
+#ifdef FASTLIO_TEST_HOOKS
+  const auto now = fast_lio_test::referenceRepeatClock ? fast_lio_test::referenceRepeatClock() : SteadyClock::now();
+#else
   const auto now = SteadyClock::now();
+#endif
   if (last.time_since_epoch().count() != 0 && now - last < std::chrono::milliseconds(100))
     return;
   last = now;
@@ -2742,12 +2746,24 @@ bool sync_packages(MeasureGroup & meas)
   }
   if (meas.imu.empty()) {
     imu_fifo_transaction.settle(imu_buffer, pending_imu_token, fast_lio::ImuDisposition::kUncommitted);
+#ifdef FASTLIO_TEST_HOOKS
+    const std::uint64_t emptyWindowSequence = pending_imu_token.sequence;
+    const std::size_t emptyWindowSamples = pending_imu_token.prefix.size();
+    const std::size_t emptyWindowPending = imu_buffer.size();
+    const std::uint64_t emptyWindowFirst = imu_buffer.empty() ? 0 : imu_buffer.front().identity;
+    const bool emptyWindowFaulted = imu_fifo_transaction.faulted();
+#endif
     ++empty_scan_imu_count;
     frontendDrop();
     beginAnchorScanRecord(meas.lidar_beg_time, meas.lidar_end_time);
     anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kDroppedEmptyImu;
     markImuCoverageGap(meas.lidar_end_time);
     lock.unlock();
+#ifdef FASTLIO_TEST_HOOKS
+    if (fast_lio_test::afterEmptyImuWindow)
+      fast_lio_test::afterEmptyImuWindow(
+        emptyWindowSequence, emptyWindowSamples, emptyWindowPending, emptyWindowFirst, emptyWindowFaulted);
+#endif
     finishAnchorScanRecord();
     RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping.imu_transactions"),
                  "[IMU-CONSUMPTION-SYNC] reason=empty begin=%.9f end=%.9f token=%lu",
@@ -2807,6 +2823,8 @@ std::atomic<uint64_t> g_async_add_us{0};  // last completed worker Add() wall ti
 double g_map_join_wait_ms = 0;            // last joinMapAdd() block time (main-only)
 
 #ifdef FASTLIO_TEST_HOOKS
+#include <rcl/timer.h>
+
 #include "laser_mapping_test_hooks.hpp"
 namespace fast_lio_test
 {
@@ -2829,6 +2847,41 @@ std::function<void(const std::string &)> afterAnchorTraceLine;
 std::function<void(std::uint8_t, std::int64_t, const std::array<std::uint8_t, 32> &)> afterPosePublish;
 std::function<void(double, int, double, int, double, std::size_t)> afterRecoveryViewMatch;
 std::function<void(double, bool)> afterMapInsertion;
+std::function<void(double, bool, const Eigen::MatrixXd &, const Eigen::VectorXd &)> afterHModelMatrices;
+std::function<void(double, const FilterSnapshot &)> afterLidarUpdate;
+std::function<void(std::uint64_t, std::size_t, std::size_t, std::uint64_t, bool)> afterEmptyImuWindow;
+std::function<bool(std::array<std::uint8_t, 16> &)> overrideFrontendInstance;
+std::function<std::chrono::steady_clock::time_point()> referenceRepeatClock;
+std::function<void(const char *, const std::vector<std::string> &)> afterConstructionStage;
+std::function<void(const std::vector<EffectiveValue> &)> afterConstruction;
+
+FilterSnapshot filterSnapshot()
+{
+  const state_ikfom & x = kf.get_x();
+  const auto & P = kf.get_P();
+  static_assert(std::decay<decltype(P)>::type::RowsAtCompileTime == 23 &&
+                  std::decay<decltype(P)>::type::ColsAtCompileTime == 23,
+                "FilterSnapshot holds a 23x23 error-state covariance");
+  FilterSnapshot snapshot;
+  for (int i = 0; i < 3; ++i) {
+    snapshot.pos[i] = x.pos[i];
+    snapshot.offset_T_L_I[i] = x.offset_T_L_I[i];
+    snapshot.vel[i] = x.vel[i];
+    snapshot.bg[i] = x.bg[i];
+    snapshot.ba[i] = x.ba[i];
+    snapshot.grav[i] = x.grav[i];
+  }
+  for (int i = 0; i < 4; ++i) {
+    snapshot.rot_xyzw[i] = x.rot.coeffs()[i];
+    snapshot.offset_R_L_I_xyzw[i] = x.offset_R_L_I.coeffs()[i];
+  }
+  for (int r = 0; r < 23; ++r) {
+    for (int c = 0; c < 23; ++c) {
+      snapshot.P[r * 23 + c] = P(r, c);
+    }
+  }
+  return snapshot;
+}
 
 ImuInputSnapshot inspectImuInput()
 {
@@ -2853,6 +2906,9 @@ int reconfirmLastImuBatch()
     imu_fifo_transaction.settle(imu_buffer, last_imu_token_for_test, fast_lio::ImuDisposition::kCommitted));
 }
 }  // namespace fast_lio_test
+
+// Constructor locals, recorded where the constructor last applies each; the effective record copies them at its end.
+fast_lio_test::EffectiveRecorder effective_locals_for_test;
 #endif
 
 // The divergence guard's verdict for this scan. A test build may replace it to drive the anchor logic through a
@@ -4005,6 +4061,10 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   if (effct_feat_num < 1) {
     ekfom_data.valid = false;
     std::cerr << "No Effective Points!" << std::endl;
+#ifdef FASTLIO_TEST_HOOKS
+    if (fast_lio_test::afterHModelMatrices)
+      fast_lio_test::afterHModelMatrices(lidar_end_time, ekfom_data.valid, Eigen::MatrixXd(), Eigen::VectorXd());
+#endif
     return;
   }
 
@@ -4218,6 +4278,10 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     }
   }
 
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::afterHModelMatrices)
+    fast_lio_test::afterHModelMatrices(lidar_end_time, ekfom_data.valid, ekfom_data.h_x, ekfom_data.h);
+#endif
   solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -4226,6 +4290,9 @@ class LaserMappingNode : public rclcpp::Node
 public:
   LaserMappingNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
   {
+#ifdef FASTLIO_TEST_HOOKS
+    effective_locals_for_test.clear();
+#endif
     this->declare_parameter<bool>("publish.path_en", true);
     this->declare_parameter<bool>("publish.effect_map_en", false);
     this->declare_parameter<bool>("publish.map_en", false);
@@ -4385,6 +4452,9 @@ public:
     this->declare_parameter<double>("reanchor_recovery_stable_sec", 1.0);
     this->declare_parameter<bool>("reanchor_recovery_entry_view", false);
     declareLostRecoveryParameters();
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("declare_front");
+#endif
     frontend_observation_en = this->declare_parameter<bool>("publish.frontend_observation", false);
     rcl_interfaces::msg::ParameterDescriptor referenceDescriptor;
     referenceDescriptor.read_only = true;
@@ -4413,6 +4483,10 @@ public:
         randomBytes += static_cast<std::size_t>(count);
       }
       frontend_has_instance = randomBytes == frontend_instance.size();
+#ifdef FASTLIO_TEST_HOOKS
+      if (fast_lio_test::overrideFrontendInstance)
+        frontend_has_instance = fast_lio_test::overrideFrontendInstance(frontend_instance);
+#endif
       if (!frontend_has_instance) {
         frontend_instance.fill(0);
         RCLCPP_ERROR(this->get_logger(), "Frontend activation UUID unavailable; typed identity remains unknown");
@@ -4427,6 +4501,10 @@ public:
           this->create_publisher<fast_lio_interfaces::msg::ReferenceHealth>("/lio_slam/reference_health", frontendQos);
       }
     }
+#ifdef FASTLIO_TEST_HOOKS
+    effective_locals_for_test.value("publish.frontend_idle_period_sec", frontendIdlePeriod);
+    constructionStageForTest("typed_outputs");
+#endif
     this->declare_parameter<bool>("runaway_watchdog_en", true);
     this->declare_parameter<double>("runaway_parked_speed_thresh", 0.3);
     this->declare_parameter<double>("runaway_wheel_speed_margin", 1.0);
@@ -4545,6 +4623,9 @@ public:
     this->declare_parameter<double>("wheel_vel_noise_vy", 0.05);
     this->declare_parameter<double>("wheel_vel_noise_vz", 0.10);
     this->declare_parameter<vector<double>>("wheel_extrinsic_R", vector<double>());
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("declare_back");
+#endif
     this->get_parameter_or<bool>("publish.path_en", path_en, true);
     this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
     this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
@@ -4723,6 +4804,9 @@ public:
       if (release_source != "leg" && release_source != "keep" && release_source != "zero") {
         RCLCPP_WARN(this->get_logger(), "guard_release_vel_source '%s' unknown: using 'zero'", release_source.c_str());
       }
+#ifdef FASTLIO_TEST_HOOKS
+      effective_locals_for_test.value("guard_release_vel_source", release_source);
+#endif
     }
     this->get_parameter_or<double>("guard_release_leg_max_age_s", release_vel_params.leg_max_age_s, 0.5);
     this->get_parameter_or<double>("guard_release_leg_sigma", release_vel_params.leg_sigma, 0.3);
@@ -4805,9 +4889,17 @@ public:
     reanchor_healthy_res =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
     loadLostRecoveryParameters(reanchor_total_timeout_sec);
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("lost_recovery_loaded");
+#endif
     loadRecoveryEntryView();
     reanchor_healthy_eff =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
+#ifdef FASTLIO_TEST_HOOKS
+    effective_locals_for_test.value("reanchor_healthy_window", reanchor_healthy_window);
+    effective_locals_for_test.value("reanchor_total_timeout_sec", reanchor_total_timeout_sec);
+    effective_locals_for_test.value("reanchor_recovery_stable_sec", reanchor_recovery_stable_sec);
+#endif
     this->get_parameter_or<bool>("runaway_watchdog_en", runaway_params.enabled, true);
     this->get_parameter_or<double>("runaway_parked_speed_thresh", runaway_params.parked_speed_thresh, 0.3);
     this->get_parameter_or<double>("runaway_wheel_speed_margin", runaway_params.wheel_speed_margin, 1.0);
@@ -4835,6 +4927,10 @@ public:
       if (root_dir.back() != '/')
         root_dir += '/';
     }
+#ifdef FASTLIO_TEST_HOOKS
+    effective_locals_for_test.value("data_dir", data_dir_param);
+    constructionStageForTest("read_policies");
+#endif
     this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
     this->get_parameter_or<string>("common.imu_topic", imu_topic, "/livox/imu");
     this->get_parameter_or<string>("common.imu_input_type", imu_input_type, string("sensor_msgs"));
@@ -4875,6 +4971,10 @@ public:
                 static_cast<long long>(recovery_params.total_ns),
                 static_cast<long long>(recovery_params.stable_ns),
                 recovery_params.enabled() ? "platform policy on" : "platform policy off");
+#ifdef FASTLIO_TEST_HOOKS
+    effective_locals_for_test.value("zupt_anchor_max_scan_gap_s", zupt_anchor_max_scan_gap_s);
+    constructionStageForTest("anchor_gap_resolved");
+#endif
     this->get_parameter_or<double>("preprocess.max_scan_duration_s", max_scan_duration_s, 0.0);
     this->get_parameter_or<double>("imu_coverage.max_gap_s", p_imu->coverage_params.max_gap_s, 0.0);
     this->get_parameter_or<double>("imu_coverage.max_extrapolation_s", p_imu->coverage_params.max_extrapolation_s, 0.0);
@@ -4923,6 +5023,10 @@ public:
                       "[IMU-GAP] imu_coverage.max_gap_s is 0: gaps of any length are bridged by dead reckoning");
         }
       }
+#ifdef FASTLIO_TEST_HOOKS
+      effective_locals_for_test.value("imu_gap_rate_rp_max", rate_rp_deg);
+      effective_locals_for_test.value("imu_gap_rate_yaw_max", rate_yaw_deg);
+#endif
     }
     if (!std::isfinite(max_scan_duration_s) || max_scan_duration_s < 0.0)
       throw std::invalid_argument("preprocess.max_scan_duration_s must be finite and nonnegative");
@@ -4958,7 +5062,16 @@ public:
                   ivox_nearby,
                   ivox_vcap,
                   ivox_maxvox);
+#ifdef FASTLIO_TEST_HOOKS
+      effective_locals_for_test.value("ivox_grid_resolution", ivox_res);
+      effective_locals_for_test.value("ivox_nearby_type", ivox_nearby);
+      effective_locals_for_test.value("ivox_voxel_capacity", ivox_vcap);
+      effective_locals_for_test.value("ivox_max_voxels", ivox_maxvox);
+#endif
     }
+#endif
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("map_backend");
 #endif
     this->get_parameter_or<bool>("diagnostics.latency_enable", latency_diag_en, true);
     this->get_parameter_or<double>("diagnostics.latency_log_period_sec", latency_log_period_sec, 1.0);
@@ -5005,6 +5118,9 @@ public:
                      "this build uses ikd-Tree - loading the map as delivered instead");
 #endif
       }
+#ifdef FASTLIO_TEST_HOOKS
+      effective_locals_for_test.value("prior_map_align", align_name);
+#endif
     }
     this->get_parameter_or<vector<double>>("initial_pose", initial_pose_vec_, vector<double>());
     {
@@ -5025,6 +5141,10 @@ public:
                     "these match gravity (accel along -Z), else point cloud "
                     "transforms will be incorrect.");
       }
+#ifdef FASTLIO_TEST_HOOKS
+      effective_locals_for_test.value("initial_pose_full_rpy_override", full_rpy_override);
+      effective_locals_for_test.value("initial_pose_apply_roll_pitch", legacy_apply_rp);
+#endif
     }
     this->get_parameter_or<bool>("wheel_odom_en", wheel_odom_en, false);
     this->get_parameter_or<string>("wheel_topic", wheel_topic, string("/lio/twist"));
@@ -5036,7 +5156,13 @@ public:
     this->get_parameter_or<vector<double>>("wheel_extrinsic_R", wext, vector<double>());
     if (wext.size() == 9)
       R_robot_to_imu = Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(wext.data());
+#ifdef FASTLIO_TEST_HOOKS
+    effective_locals_for_test.value("wheel_extrinsic_R", wext);
+#endif
     RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("read_inputs");
+#endif
 
     path.header.stamp = this->get_clock()->now();
     path.header.frame_id = odom_frame_id;
@@ -5068,6 +5194,9 @@ public:
 
     fill(epsi, epsi + 23, 0.001);
     kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("filter_init");
+#endif
 
     /*** debug record ***/
     if (runtime_pos_log) {
@@ -5162,6 +5291,9 @@ public:
                   zupt_en ? "on" : "off",
                   parked_hold_params.enabled ? "on" : "off");
     }
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("subscriptions");
+#endif
     if (degeneracy_params.enable) {
       RCLCPP_INFO(this->get_logger(),
                   "Subspace weighting ON (%s): a position direction is held back only when its share is under %.3f "
@@ -5180,6 +5312,9 @@ public:
     pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
     pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
     pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("cloud_publishers");
+#endif
     if (frontend_observation_en &&
         (!fast_lio::frontendIdentifier(odom_frame_id, 64) || !fast_lio::frontendIdentifier(body_frame_id, 64))) {
       throw std::invalid_argument("frontend observation frame identifiers must contain 1..64 bytes");
@@ -5187,6 +5322,9 @@ public:
     pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
     pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("odometry_publishers");
+#endif
 
     //------------------------------------------------------------------------------------------------------
     auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -5217,6 +5355,9 @@ public:
       timer_ =
         rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
     }
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("scan_timer");
+#endif
 
     // The voxel-capped /Laser_map is a coarse global map, not a live feed, so it
     // publishes slowly (default 0.2 Hz). Period is configurable via publish.map_period_sec.
@@ -5227,6 +5368,10 @@ public:
     auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(map_pub_period_sec * 1000.0));
     map_pub_timer_ = rclcpp::create_timer(
       this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
+#ifdef FASTLIO_TEST_HOOKS
+    effective_locals_for_test.value("publish.map_period_sec", map_pub_period_sec);
+    constructionStageForTest("map_timer");
+#endif
 
     map_save_srv_ = this->create_service<std_srvs::srv::Trigger>(
       "map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
@@ -5294,6 +5439,9 @@ public:
         this->get_logger(), "[PRIOR-MAP] waiting for /relocalization/result before loading %s", prior_map_pcd_.c_str());
     }
 
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("config_id");
+#endif
     if (reference_health_en) {
       reference_publication_guard.run(
         [&] {
@@ -5317,6 +5465,10 @@ public:
         disableReferencePublication);
     }
     RCLCPP_INFO(this->get_logger(), "Node init finished.");
+#ifdef FASTLIO_TEST_HOOKS
+    constructionStageForTest("constructed");
+    reportEffectiveForTest();
+#endif
   }
 
   ~LaserMappingNode()
@@ -5474,8 +5626,371 @@ private:
         "lost_recovery_stable_sec must be finite and positive (representable in ns); "
         "lost_recovery_en=true requires reanchor_total_timeout_sec > 0");
     }
+#ifdef FASTLIO_TEST_HOOKS
+    effective_locals_for_test.value("lost_recovery_en", enabled);
+    effective_locals_for_test.value("lost_recovery_stable_sec", stable_s);
+#endif
   }
 
+#ifdef FASTLIO_TEST_HOOKS
+  void constructionStageForTest(const char * stage)
+  {
+    if (fast_lio_test::afterConstructionStage)
+      fast_lio_test::afterConstructionStage(stage, this->list_parameters({}, 0).names);
+  }
+
+  // Parameter storage that outlives the constructor, one function per parameter domain, in declaration order
+  // (generated from the parameter inventory).
+  void effectiveOutputForTest(fast_lio_test::EffectiveRecorder & record)
+  {
+    record.value("publish.path_en", path_en);
+    record.value("publish.effect_map_en", effect_pub_en);
+    record.value("publish.map_en", map_pub_en);
+    record.value("publish.scan_publish_en", scan_pub_en);
+    record.value("publish.dense_publish_en", dense_pub_en);
+    record.value("publish.scan_bodyframe_pub_en", scan_body_pub_en);
+    record.value("publish.odom_frame_id", odom_frame_id);
+    record.value("publish.body_frame_id", body_frame_id);
+    record.value("health_pub_en", health_pub_en);
+    record.value("publish.frontend_observation", frontend_observation_en);
+    record.value("publish.reference_health", reference_health_en);
+    record.value("publish.frontend_clock_domain", frontend_clock_domain);
+  }
+  void effectiveMeasurementForTest(fast_lio_test::EffectiveRecorder & record)
+  {
+    record.value("max_iteration", NUM_MAX_ITERATIONS);
+    record.value("degeneracy_debug", degeneracy_debug);
+    record.value("degeneracy_spectrum_trace", degeneracy_spectrum_trace);
+    record.value("degeneracy_weighting_en", degeneracy_params.enable);
+    record.value("degeneracy_lambda_bad", degeneracy_params.lambda_bad);
+    record.value("degeneracy_lambda_good", degeneracy_params.lambda_good);
+    record.value("degeneracy_min_weight", degeneracy_params.min_weight);
+    record.value("degeneracy_lambda_abs_bad", degeneracy_params.lambda_abs_bad);
+    record.value("degeneracy_lambda_abs_good", degeneracy_params.lambda_abs_good);
+    record.value("degeneracy_hard_projection", degeneracy_params.hard_projection);
+    record.value("degeneracy_schur_en", degeneracy_params.schur_en);
+    record.value("degeneracy_schur_ridge", degeneracy_params.schur_ridge);
+    record.value("lidar_attitude_hold_en", attitude_hold_params.enabled);
+    record.value("corr_innov_gate_k", corr_gate.innovation_k);
+    record.value("corr_nn0_max", corr_gate.nn0_max);
+    record.value("corr_gate_mad_scale", corr_gate.mad_scale);
+    record.value("corr_gate_rot_sigma_floor_deg", corr_gate.rot_sigma_floor_deg);
+    record.value("corr_kernel", corr_kernel_str);
+    record.value("corr_kernel_mad_scale", corr_kernel_mad_scale);
+    record.value("corr_kernel_min_scale", corr_kernel_min_scale);
+    record.value("lidar_attitude_hold_far_frac", attitude_hold_params.far_frac_max);
+    record.value("lidar_attitude_hold_min_effct", attitude_hold_params.min_effct);
+    record.value("lidar_attitude_hold_max_s", attitude_hold_params.max_hold_s);
+    record.value("lidar_attitude_hold_max_scan_gap_s", attitude_hold_params.max_scan_gap_s);
+    record.value("lidar_attitude_hold_min_rp_info", lidar_attitude_hold_min_rp_info);
+    record.value("lidar_attitude_hold_z_weak", attitude_hold_params.z_weak_min);
+    record.value("lidar_consider_rp_en", rp_consider_params.enabled);
+    record.value("lidar_consider_rp_while_engulfed", rp_consider_params.while_engulfed);
+    record.value("lidar_consider_rp_post_release_s", rp_consider_params.post_release_s);
+    record.value("lidar_consider_rp_min_info", rp_consider_params.min_rp_info);
+    record.value("lidar_consider_rp_z_weak_min", rp_consider_params.z_weak_min);
+    record.value("lidar_consider_rp_max_s", rp_consider_params.max_consider_s);
+    record.value("canopy_near_range", canopy_near_range);
+    record.value("canopy_ground_z", canopy_ground_z);
+    record.value("canopy_ground_halfband", canopy_ground_halfband);
+    record.value("ground_recover_en", ground_recover_en);
+    record.value("ground_recover_scan_band", ground_recover_scan_band);
+    record.value("ground_recover_min_inliers", ground_recover_min_inliers);
+    record.value("ground_recover_max_residual", ground_recover_max_residual);
+    record.value("ground_recover_sector_tol", ground_recover_sector_tol);
+    record.value("ground_recover_max_rows", ground_recover_max_rows);
+    record.value("nn_refresh_gate_en", nn_refresh_gate_en);
+    record.value("nn_refresh_min_shift", nn_refresh_min_shift);
+    record.value("nn_refresh_ref_range", nn_refresh_ref_range);
+  }
+  void effectiveInputForTest(fast_lio_test::EffectiveRecorder & record)
+  {
+    record.value("max_buffered_scans", max_buffered_scans);
+    record.value("max_scan_backlog_sec", max_scan_backlog_sec);
+    record.value("max_imu_backlog_sec", max_imu_backlog_sec);
+    record.value("common.lid_topic", lid_topic);
+    record.value("common.imu_topic", imu_topic);
+    record.value("common.imu_input_type", imu_input_type);
+    record.value("common.imu_bias_topic", imu_bias_topic);
+    record.value("common.time_sync_en", time_sync_en);
+    record.value("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu);
+    record.value("common.imu_time_offset", imu_time_offset);
+    record.value("preprocess.blind", p_pre->blind);
+    record.value("preprocess.lidar_type", p_pre->lidar_type);
+    record.value("preprocess.scan_line", p_pre->N_SCANS);
+    record.value("preprocess.timestamp_unit", p_pre->time_unit);
+    record.value("preprocess.scan_rate", p_pre->SCAN_RATE);
+    record.value("preprocess.max_scan_duration_s", max_scan_duration_s);
+    record.value("point_filter_num", p_pre->point_filter_num);
+    record.value("feature_extract_enable", p_pre->feature_enabled);
+  }
+  void effectiveDownsampleForTest(fast_lio_test::EffectiveRecorder & record)
+  {
+    record.value("adaptive_downsample_en", adaptive_ds_params.enabled);
+    record.value("adaptive_downsample_budget_sec", adaptive_ds_params.budget_sec);
+    record.value("adaptive_downsample_release_sec", adaptive_ds_params.release_sec);
+    record.value("adaptive_downsample_step", adaptive_ds_params.step);
+    record.value("adaptive_downsample_max_voxel", adaptive_ds_params.max_voxel);
+    record.value("adaptive_downsample_raise_after", adaptive_ds_params.raise_after);
+    record.value("adaptive_downsample_lower_after", adaptive_ds_params.lower_after);
+  }
+  void effectiveConstraintsForTest(fast_lio_test::EffectiveRecorder & record)
+  {
+    record.value("planar_constraint_en", planar_constraint_en);
+    record.value("planar_constraint_noise", planar_constraint_noise);
+    record.value("planar_constraint_z_weak_thresh", planar_constraint_z_weak_thresh);
+    record.value("gravity_align_en", gravity_align_en);
+    record.value("gravity_align_noise", gravity_align_noise);
+    record.value("gravity_align_z_weak_thresh", gravity_align_z_weak_thresh);
+    record.value("gravity_align_accel_tol", gravity_align_accel_tol);
+    record.value("gravity_align_gyro_tol", gravity_align_gyro_tol);
+    record.value("gravity_align_window_s", gravity_align_window_s);
+    record.value("gravity_align_continuous", gravity_align_continuous);
+    record.value("gravity_align_hold_s", gravity_align_hold_s);
+    record.value("gravity_align_noise_degraded", gravity_align_noise_degraded);
+    record.value("gravity_align_mag_ref", gravity_align_mag_ref);
+    record.value("gravity_align_grav_leak", gravity_align_grav_leak);
+    record.value("gravity_align_grav_cap_deg", gravity_align_grav_cap_deg);
+    record.value("gravity_align_grav_freeze_degraded", gravity_align_grav_freeze_degraded);
+    record.value("gravity_align_lin_accel_comp", gravity_align_lin_accel_comp);
+    record.value("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale);
+    record.value("gravity_align_lin_accel_source", gravity_align_lin_accel_source);
+    record.value("gravity_align_withhold_blind_moving", gravity_align_withhold_blind_moving);
+    record.value("gravity_align_sigma_policy", gravity_align_sigma_policy);
+    record.value("gravity_align_noise_static", gravity_align_noise_static);
+    record.value("gravity_align_noise_moving", gravity_align_noise_moving);
+    record.value("gravity_align_leg_vel_sigma", gravity_align_leg_vel_sigma);
+    record.value("gravity_align_leg_edge_window_s", gravity_align_leg_edge_window_s);
+    record.value("gravity_align_leg_lever_arm", gravity_align_leg_lever_arm_vec);
+    record.value("wheel_odom_en", wheel_odom_en);
+    record.value("wheel_topic", wheel_topic);
+    record.value("wheel_speed_scale", wheel_speed_scale);
+    record.value("wheel_vel_noise_vx", wheel_vel_noise_vx);
+    record.value("wheel_vel_noise_vy", wheel_vel_noise_vy);
+    record.value("wheel_vel_noise_vz", wheel_vel_noise_vz);
+  }
+  void effectiveDiagnosticsForTest(fast_lio_test::EffectiveRecorder & record)
+  {
+    record.value("corr_dump_en", corr_dump_en);
+    record.value("corr_dump_windows", corr_dump_windows_str);
+    record.value("runtime_pos_log_enable", runtime_pos_log);
+    record.value("diagnostics.latency_enable", latency_diag_en);
+    record.value("diagnostics.latency_log_period_sec", latency_log_period_sec);
+    record.value("diagnostics.kalman_channel_enable", kalman_channel_diag_en);
+  }
+  void effectiveRecoveryForTest(fast_lio_test::EffectiveRecorder & record)
+  {
+    record.value("guard_vel_reset_sigma", guard_vel_reset_sigma);
+    record.value("zupt_vel_reset_sigma", zupt_vel_reset_sigma);
+    record.value("divergence_guard_en", divergence_guard_en);
+    record.value("divergence_guard_min_eff", divergence_guard_min_eff);
+    record.value("guard_engulf_en", guard_engulf_en);
+    record.value("guard_engulf_far_range", guard_engulf_far_range);
+    record.value("guard_engulf_far_frac_min", guard_engulf_far_frac_min);
+    record.value("guard_engulf_streak", guard_engulf_streak);
+    record.value("guard_engulf_far_frac_release", guard_engulf_far_frac_release);
+    record.value("guard_engulf_release_scans", guard_engulf_release_scans);
+    record.value("guard_release_leg_max_age_s", release_vel_params.leg_max_age_s);
+    record.value("guard_release_leg_sigma", release_vel_params.leg_sigma);
+    record.value("guard_release_keep_sigma", release_vel_params.keep_sigma);
+    record.value("guard_release_inflate_en", release_inflate_params.enabled);
+    record.value("guard_release_pos_sigma_min", release_inflate_params.pos_sigma_min);
+    record.value("guard_release_pos_sigma_rate", release_inflate_params.pos_sigma_rate);
+    record.value("guard_release_pos_sigma_max", release_inflate_params.pos_sigma_max);
+    record.value("guard_release_rp_sigma_deg", release_inflate_params.rp_sigma_min_deg);
+    record.value("guard_release_rp_sigma_rate_deg", release_inflate_params.rp_sigma_rate_deg);
+    record.value("guard_release_rp_sigma_max_deg", release_inflate_params.rp_sigma_max_deg);
+    record.value("guard_release_yaw_sigma_deg", release_inflate_params.yaw_sigma_deg);
+    record.value("guard_hole_en", guard_hole_en);
+    record.value("guard_hole_min_sec", guard_hole_min_sec);
+    record.value("guard_hole_max_accel", guard_hole_max_accel);
+    record.value("guard_hole_reanchor_pos", guard_hole_reanchor_pos);
+    record.value("divergence_guard_streak", divergence_guard_streak);
+    record.value("divergence_guard_max_speed", divergence_guard_max_speed);
+    record.value("zupt_en", zupt_en);
+    record.value("zupt_gyro_thresh", zupt_gyro_thresh);
+    record.value("zupt_acc_span_ratio", zupt_acc_span_ratio);
+    record.value("zupt_wheel_speed_thresh", zupt_wheel_speed_thresh);
+    record.value("zupt_wheel_max_age", zupt_wheel_max_age);
+    record.value("zupt_require_wheel", zupt_require_wheel);
+    record.value("zupt_anchor_trace_en", zupt_anchor_trace_en);
+    record.value("zupt_parked_hold_en", parked_hold_params.enabled);
+    record.value("zupt_parked_hold_scans", parked_hold_params.engage_scans);
+    record.value("zupt_hold_pos_noise", parked_hold_params.pos_noise);
+    record.value("zupt_hold_rot_noise", parked_hold_params.rot_noise);
+    record.value("zupt_hold_vel_noise", parked_hold_params.vel_noise);
+    record.value("zupt_hold_deadband_sigma", parked_hold_params.deadband_sigma);
+    record.value("zupt_anchor_confirm_scans", stationary_anchor_params.confirm_scans);
+    record.value("reanchor_en", reanchor_params.enabled);
+    record.value("reanchor_min_eff", reanchor_params.min_eff);
+    record.value("reanchor_max_res", reanchor_params.max_res);
+    record.value("reanchor_confirm_scans", reanchor_params.confirm_scans);
+    record.value("reanchor_timeout_sec", reanchor_params.timeout_sec);
+    record.value("reanchor_on_fail", reanchor_on_fail);
+    record.value("reanchor_max_res_ratio", reanchor_params.max_res_ratio);
+    record.value("reanchor_res_floor", reanchor_params.res_floor);
+    record.value("reanchor_min_eff_ratio", reanchor_params.min_eff_ratio);
+    record.value("reanchor_recovery_entry_view", reanchor_recovery_entry_view_);
+    record.value("runaway_watchdog_en", runaway_params.enabled);
+    record.value("runaway_parked_speed_thresh", runaway_params.parked_speed_thresh);
+    record.value("runaway_wheel_speed_margin", runaway_params.wheel_speed_margin);
+    record.value("runaway_hold_sec", runaway_params.hold_sec);
+    record.value("runaway_on_trip", runaway_on_trip);
+  }
+  void effectiveImuForTest(fast_lio_test::EffectiveRecorder & record)
+  {
+    record.value("imu_init_require_still", imu_init_require_still_);
+    record.value("imu_init_still_tol", imu_init_still_tol_);
+    record.value("imu_init_still_timeout_s", imu_init_still_timeout_s_);
+    record.value("imu_init_still_sustained_en", imu_init_static_params_.enabled);
+    record.value("imu_init_still_min_duration_s", imu_init_static_params_.minDurationS);
+    record.value("imu_init_still_min_samples", imu_init_static_params_.minSamples);
+    record.value("imu_init_still_gyro_rms_max", imu_init_static_params_.gyroRmsMax);
+    record.value("imu_init_still_gravity_ref", imu_init_static_params_.gravityRef);
+    record.value("imu_init_still_gravity_tol", imu_init_static_params_.gravityTol);
+    record.value("imu_init_still_max_gap_s", imu_init_static_params_.maxGapS);
+    record.value("mapping.gyr_cov", gyr_cov);
+    record.value("mapping.acc_cov", acc_cov);
+    record.value("mapping.b_gyr_cov", b_gyr_cov);
+    record.value("mapping.b_acc_cov", b_acc_cov);
+    record.value("imu_coverage.max_gap_s", p_imu->coverage_params.max_gap_s);
+    record.value("imu_coverage.max_extrapolation_s", p_imu->coverage_params.max_extrapolation_s);
+    record.value("imu_gap_prior_en", p_imu->gap_params.enabled);
+    record.value("imu_gap_min_s", p_imu->gap_params.min_gap_s);
+    record.value("imu_gap_accel_max", p_imu->gap_params.accel_max);
+    record.value("imu_gap_accel_max_z", p_imu->gap_params.accel_max_z);
+    record.value("imu_gap_verify_s", imu_gap_verify_s);
+    record.value("imu_gap_empty_scans", p_imu->gap_params.empty_scans);
+    record.value("mapping.extrinsic_est_en", extrinsic_est_en);
+    record.value("mapping.extrinsic_T", extrinT);
+    record.value("mapping.extrinsic_R", extrinR);
+  }
+  void effectiveMapForTest(fast_lio_test::EffectiveRecorder & record)
+  {
+    record.value("map_file_path", map_file_path);
+    record.value("filter_size_corner", filter_size_corner_min);
+    record.value("filter_size_surf", filter_size_surf_min);
+    record.value("filter_size_map", filter_size_map_min);
+    record.value("cube_side_length", cube_len);
+    record.value("mapping.det_range", DET_RANGE);
+    record.value("mapping.fov_degree", fov_deg);
+    record.value("mapping.map_insert_delay_scans", map_insert_delay_scans);
+    record.value("pcd_save.pcd_save_en", pcd_save_en);
+    record.value("pcd_save.interval", pcd_save_interval);
+    record.value("prior_map_pcd", prior_map_pcd_);
+    record.value("prior_map_pinned", prior_map_pinned_);
+    record.value("prior_map_voxel", prior_map_voxel_);
+    record.value("prior_map_freeze", prior_map_freeze_);
+    record.value("initial_pose", initial_pose_vec_);
+  }
+
+  // The state the constructor derives from the parameters, read from where it is applied.
+  void effectiveDerivedForTest(fast_lio_test::EffectiveRecorder & record)
+  {
+    record.value("derived:frontend_activation:frontend_idle_period_ns", frontend_idle_period_ns);
+    record.value("derived:frontend_activation:frontend_observation_en", frontend_observation_en);
+    record.value("derived:frontend_activation:reference_health_en", reference_health_en);
+    record.value("derived:frontend_activation:frontend_clock_domain", frontend_clock_domain);
+    record.bytes("derived:config_id:reference_contract_id", reference_contract_id);
+    record.bytes("derived:config_id:reference_config_id", reference_config_id);
+    record.value("derived:corr_kernel:corr_kernel", corr_kernel);
+    record.windows("derived:corr_dump:corr_dump_windows", corr_dump_windows);
+    record.matrix("derived:lever_arm:gravity_align_leg_lever_arm", gravity_align_leg_lever_arm);
+    record.value("derived:imu_static_limits:p_imu->init_require_still", p_imu->init_require_still);
+    record.value("derived:imu_static_limits:p_imu->init_still_tol", p_imu->init_still_tol);
+    record.value("derived:imu_static_limits:p_imu->init_still_timeout_s", p_imu->init_still_timeout_s);
+    const fast_lio::ImuStaticInitParams & init_static = p_imu->init_static_params;
+    record.value("derived:imu_static_limits:p_imu->init_static_params.enabled", init_static.enabled);
+    record.value("derived:imu_static_limits:p_imu->init_static_params.minDurationS", init_static.minDurationS);
+    record.value("derived:imu_static_limits:p_imu->init_static_params.minSamples", init_static.minSamples);
+    record.value("derived:imu_static_limits:p_imu->init_static_params.gyroRmsMax", init_static.gyroRmsMax);
+    record.value("derived:imu_static_limits:p_imu->init_static_params.gravityRef", init_static.gravityRef);
+    record.value("derived:imu_static_limits:p_imu->init_static_params.gravityTol", init_static.gravityTol);
+    record.value("derived:imu_static_limits:p_imu->init_static_params.maxGapS", init_static.maxGapS);
+    record.value("derived:release_source:release_vel_params.source", release_vel_params.source);
+    record.value("derived:reanchor_relative:reanchor_healthy_res.capacity", reanchor_healthy_res.capacityForTest());
+    record.value("derived:reanchor_relative:reanchor_healthy_res.min_count", reanchor_healthy_res.minCountForTest());
+    record.value("derived:reanchor_relative:reanchor_healthy_res.size", reanchor_healthy_res.size());
+    record.value("derived:reanchor_relative:reanchor_healthy_eff.capacity", reanchor_healthy_eff.capacityForTest());
+    record.value("derived:reanchor_relative:reanchor_healthy_eff.min_count", reanchor_healthy_eff.minCountForTest());
+    record.value("derived:reanchor_relative:reanchor_healthy_eff.size", reanchor_healthy_eff.size());
+    record.value("derived:recovery_budget:recovery_params.total_ns", recovery_params.total_ns);
+    record.value("derived:recovery_budget:recovery_params.stable_ns", recovery_params.stable_ns);
+    record.value("derived:runaway_derived:runaway_params.wheel_max_age", runaway_params.wheel_max_age);
+    record.value("derived:runaway_derived:runaway_params.wheel_moving_thresh", runaway_params.wheel_moving_thresh);
+    record.value("derived:data_dir:root_dir", root_dir);
+    record.value("derived:anchor_gap:stationary_anchor_params.max_scan_gap_ns",
+                 stationary_anchor_params.max_scan_gap_ns);
+    record.value("derived:imu_gap:p_imu->gap_params.rate_rp_max", p_imu->gap_params.rate_rp_max);
+    record.value("derived:imu_gap:p_imu->gap_params.rate_yaw_max", p_imu->gap_params.rate_yaw_max);
+    record.value("derived:runtime_log:p_imu->runtime_log_en", p_imu->runtime_log_en);
+#ifdef USE_IVOX
+    record.value("derived:ivox:ikdtree.res_", ikdtree.resolutionForTest());
+    record.value("derived:ivox:ikdtree.inv_res_", ikdtree.inverseResolutionForTest());
+    record.value("derived:ivox:ikdtree.per_voxel_cap_", ikdtree.voxelCapacityForTest());
+    record.value("derived:ivox:ikdtree.max_voxels_", ikdtree.maxVoxels());
+    record.offsets("derived:ivox:ikdtree.nbr_", ikdtree.neighborOffsetsForTest());
+#endif
+    record.value("derived:prior_startup:recovery_state.trust", recovery_state.trust);
+    record.value("derived:prior_startup:recovery_state.cause", recovery_state.cause);
+    record.value("derived:prior_startup:recovery_state.episode", recovery_state.episode);
+    record.value("derived:prior_startup:recovery_state.start_ns", recovery_state.start_ns);
+    record.value("derived:prior_startup:recovery_state.deadline_ns", recovery_state.deadline_ns);
+    record.value("derived:prior_startup:recovery_state.last_supported_end_ns", recovery_state.last_supported_end_ns);
+    record.value("derived:prior_startup:recovery_state.stable_begin_ns", recovery_state.stable_begin_ns);
+    record.value("derived:prior_startup:recovery_state.stable_last_scan", recovery_state.stable_last_scan);
+    record.value("derived:prior_startup:recovery_state.stable_generation", recovery_state.stable_generation);
+    record.value("derived:prior_startup:recovery_state.excluded_scan", recovery_state.excluded_scan);
+    record.value("derived:prior_startup:recovery_state.map_resets", recovery_state.map_resets);
+    record.value("derived:prior_startup:recovery_state.startup_configured", recovery_state.startup_configured);
+    record.value("derived:prior_startup:recovery_state.cold_start_eligible", recovery_state.cold_start_eligible);
+    record.value("derived:prior_startup:recovery_state.reference_initialized_once",
+                 recovery_state.reference_initialized_once);
+    record.value("derived:prior_alignment:prior_map_align_", prior_map_align_);
+    record.value("derived:prior_alignment:prior_map_pinned_", prior_map_pinned_);
+    record.value("derived:initial_pose_alias:initial_pose_full_rpy_override_", initial_pose_full_rpy_override_);
+    record.matrix("derived:wheel_extrinsic:R_robot_to_imu", R_robot_to_imu);
+    record.value("derived:fov:FOV_DEG", FOV_DEG);
+    record.value("derived:fov:HALF_FOV_COS", HALF_FOV_COS);
+    record.value("derived:filter_setters:downSizeFilterSurf.leaf", downSizeFilterSurf.leaf());
+    record.matrix("derived:filter_setters:downSizeFilterMap.leaf_size", downSizeFilterMap.getLeafSize());
+    record.matrix("derived:extrinsic_and_noise:Lidar_T_wrt_IMU", Lidar_T_wrt_IMU);
+    record.matrix("derived:extrinsic_and_noise:Lidar_R_wrt_IMU", Lidar_R_wrt_IMU);
+    record.matrix("derived:extrinsic_and_noise:p_imu->Lidar_T_wrt_IMU", p_imu->lidarTranslationForTest());
+    record.matrix("derived:extrinsic_and_noise:p_imu->Lidar_R_wrt_IMU", p_imu->lidarRotationForTest());
+    record.matrix("derived:extrinsic_and_noise:p_imu->cov_gyr_scale", p_imu->cov_gyr_scale);
+    record.matrix("derived:extrinsic_and_noise:p_imu->cov_acc_scale", p_imu->cov_acc_scale);
+    record.matrix("derived:extrinsic_and_noise:p_imu->cov_bias_gyr", p_imu->cov_bias_gyr);
+    record.matrix("derived:extrinsic_and_noise:p_imu->cov_bias_acc", p_imu->cov_bias_acc);
+    record.value("derived:iteration_count:kf.maximum_iter", kf.maximumIterationsForTest());
+    std::int64_t map_period_ns = 0;
+    if (map_pub_timer_ && rcl_timer_get_period(map_pub_timer_->get_timer_handle().get(), &map_period_ns) == RCL_RET_OK)
+      record.value("derived:map_timer:map_pub_timer_.period_ns", map_period_ns);
+    else
+      record.unavailable("derived:map_timer:map_pub_timer_.period_ns", "int64");
+    record.value("derived:lost_recovery:lost_recovery_params.enabled", lost_recovery_params.enabled);
+    record.value("derived:lost_recovery:lost_recovery_params.stable_ns", lost_recovery_params.stable_ns);
+  }
+
+  // Called once, as the constructor's last statement: a constructor that throws reports its stage events only.
+  void reportEffectiveForTest()
+  {
+    if (!fast_lio_test::afterConstruction)
+      return;
+    fast_lio_test::EffectiveRecorder record = effective_locals_for_test;
+    effectiveOutputForTest(record);
+    effectiveMeasurementForTest(record);
+    effectiveInputForTest(record);
+    effectiveDownsampleForTest(record);
+    effectiveConstraintsForTest(record);
+    effectiveDiagnosticsForTest(record);
+    effectiveRecoveryForTest(record);
+    effectiveImuForTest(record);
+    effectiveMapForTest(record);
+    effectiveDerivedForTest(record);
+    fast_lio_test::afterConstruction(record.values());
+  }
+#endif
   void observeLostRecovery(bool degraded, bool match_ok, std::int64_t begin_ns, std::int64_t end_ns)
   {
     if (!lost_recovery_params.enabled)
@@ -6358,6 +6873,10 @@ private:
       }
       kf.update_iterated_dyn_share_modified(
         LASER_POINT_COV, solve_H_time, kalman_channel_diag_en ? &lidarDiagnostics : nullptr);
+#ifdef FASTLIO_TEST_HOOKS
+      if (fast_lio_test::afterLidarUpdate)
+        fast_lio_test::afterLidarUpdate(lidar_end_time, fast_lio_test::filterSnapshot());
+#endif
       kf.clearConsiderRotation();  // never leaks into the gravity / planar / wheel / parked updates (update_simple)
 
       state_point = kf.get_x();

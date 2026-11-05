@@ -6,17 +6,25 @@
 // the configuration:
 //   - the configuration itself: the profile file (path in the package and sha256) and every override;
 //   - whether the constructor returned or threw, with the exception's type and text;
-//   - every line the constructor logged through rcutils at INFO or above, from the constructing thread;
+//   - every line the constructor logged through rcutils at INFO or above, from the constructing thread, and between
+//     them the constructor's stage boundaries (event.v1: the stage and how many, and which, parameters were declared
+//     by then), so a reordered declaration, validation or side effect shows;
 //   - for a constructed node, every declared parameter as the node's own parameter services report it: name, type,
 //     value and descriptor (read-only flag, description, constraints, ranges);
-//   - the outcome of a fixed set of runtime set requests, and the value each parameter has afterwards.
+//   - the outcome of a fixed set of runtime set requests, and the value each parameter has afterwards;
+//   - for a constructed node, the configuration in effect when the constructor returned (effective.v1): the storage
+//     of every declared front-end parameter and the state the constructor derived from them, read from where they
+//     are applied, with integers in decimal and floating values as their bit patterns.
+// The event.v1 and effective.v1 lines were added to records that existed before them without changing any other
+// line: removing every line whose first word is a ".v1" name gives the earlier record.
 // The record is compared, line for line and character for character, with the golden the same executable generated
 // from the base build (test/frontend_contract/README.md holds the command). Doubles are written with 17 significant
 // digits, which round-trips, and NaN with its bit pattern: the comparison is bitwise, with no tolerance. A
 // generation run records every case twice and writes a golden only when both records agree.
 //
 // Masked: the package's source directory in captured text (ROOT_DIR, written as <ROOT_DIR>/): the directory the
-// package was configured in differs between the cloud build and CI. Nothing else is masked. Not recorded: what the
+// package was configured in differs between the cloud build and CI. An effective text value that this masks is typed
+// string-masked, and the case's receipt keeps its raw bytes. Nothing else is masked. Not recorded: what the
 // constructor prints to std::cout, and log lines below INFO.
 //
 // The Defaults case stores its whole parameter table. Every other case stores only the parameter lines that differ
@@ -65,6 +73,8 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+
+#include "laser_mapping_test_hooks.hpp"
 
 namespace
 {
@@ -288,6 +298,7 @@ struct CapturedLog
   int severity;
   std::string logger;
   std::string text;
+  bool event = false;  // a constructor stage boundary: text is its whole record line
 };
 
 std::mutex g_log_mutex;
@@ -336,6 +347,25 @@ std::vector<CapturedLog> stopLogCapture()
   rcutils_logging_set_output_handler(g_previous_handler);
   return g_logs;
 }
+
+// A stage boundary of the constructor, in order with the lines it logged: the names declared by then, as a count and
+// the sha256 of the sorted names, one per line.
+void captureConstructionStage(const char * stage, const std::vector<std::string> & names)
+{
+  std::vector<std::string> sorted = names;
+  std::sort(sorted.begin(), sorted.end());
+  std::string joined;
+  for (const auto & name : sorted)
+    joined += name + '\n';
+  const std::string line = "event.v1 " + std::string(stage) + " declared=" + std::to_string(sorted.size()) +
+                           " names_sha256=" + sha256Hex(joined);
+  std::lock_guard<std::mutex> lock(g_log_mutex);
+  if (g_capturing && std::this_thread::get_id() == g_capture_thread)
+    g_logs.push_back({0, "", line, true});
+}
+
+// What the constructor reported as its last statement; nothing when it threw.
+std::optional<std::vector<fast_lio_test::EffectiveValue>> g_effective;
 
 // ---------------------------------------------------------------------------
 // Cases
@@ -446,11 +476,54 @@ void appendSets(std::ostringstream & record,
   }
 }
 
+bool writeFile(const std::string & directory, const std::string & name, const std::string & text);
+
+// The configuration the constructor reported, by name. Text is escaped and masked like every other captured text,
+// with its length; the raw bytes of a value the mask changed go to the case's receipt (CASE.effective_raw.tsv).
+void appendEffective(std::ostringstream & record, const std::string & case_name)
+{
+  if (!g_effective)
+    throw std::runtime_error("the constructor returned without reporting its effective configuration");
+  std::vector<fast_lio_test::EffectiveValue> values = *g_effective;
+  std::sort(
+    values.begin(), values.end(), [](const fast_lio_test::EffectiveValue & a, const fast_lio_test::EffectiveValue & b) {
+      return a.name < b.name;
+    });
+  for (std::size_t i = 1; i < values.size(); ++i) {
+    if (values[i].name == values[i - 1].name)
+      throw std::runtime_error("the effective configuration names " + values[i].name + " twice");
+  }
+  std::string raw;
+  record << "effective.v1.count " << values.size() << '\n';
+  for (const auto & entry : values) {
+    if (entry.name.empty() || entry.name.find_first_of(" \t\n") != std::string::npos)
+      throw std::runtime_error("effective value name '" + entry.name + "' is not one word");
+    if (!entry.text) {
+      record << "effective.v1 " << entry.name << ' ' << entry.type << ' ' << entry.value << '\n';
+      continue;
+    }
+    const std::string masked = mask(entry.value);
+    const bool changed = masked != entry.value;
+    record << "effective.v1 " << entry.name << ' ' << (changed ? "string-masked[" : "string[") << masked.size() << "] "
+           << quote(masked) << '\n';
+    if (changed)
+      raw +=
+        entry.name + '\t' + hex(reinterpret_cast<const unsigned char *>(entry.value.data()), entry.value.size()) + '\n';
+  }
+  if (!writeFile(std::string(FASTLIO_CONTRACT_RESULTS) + "/frontend_contract/" + kFixture,
+                 case_name + ".effective_raw.tsv",
+                 raw))
+    throw std::runtime_error("cannot write the raw effective text of " + case_name);
+}
+
 std::string recordCase(const ParameterCase & c)
 {
   // The node reads these at construction; the configuration under test is only what the case gives.
   for (const char * name : {"FLIO_ASYNC_MAP", "FLIO_OFFLINE_STEP", "FLIO_LIDAR_QDEPTH", "FLIO_IKD_PROFILE"})
     ::unsetenv(name);
+  const std::string raw_effective =
+    std::string(FASTLIO_CONTRACT_RESULTS) + "/frontend_contract/" + kFixture + "/" + c.name + ".effective_raw.tsv";
+  ::unlink(raw_effective.c_str());  // only a constructed node writes it again
   std::ostringstream record;
   record << "case " << c.name << '\n';
   if (c.params_file.empty()) {
@@ -482,6 +555,11 @@ std::string recordCase(const ParameterCase & c)
 
   std::optional<rclcpp_components::NodeInstanceWrapper> subject;
   std::string outcome;
+  g_effective.reset();
+  fast_lio_test::afterConstructionStage = captureConstructionStage;
+  fast_lio_test::afterConstruction = [](const std::vector<fast_lio_test::EffectiveValue> & values) {
+    g_effective = values;
+  };
   startLogCapture();
   try {
     subject.emplace(factory->create_node_instance(options));
@@ -492,9 +570,17 @@ std::string recordCase(const ParameterCase & c)
     outcome = "threw unknown";
   }
   const auto logs = stopLogCapture();
+  fast_lio_test::afterConstructionStage = nullptr;
+  fast_lio_test::afterConstruction = nullptr;
   record << "outcome " << outcome << '\n';
-  for (const auto & line : logs)
-    record << "log " << severityName(line.severity) << ' ' << line.logger << ' ' << quote(mask(line.text)) << '\n';
+  for (const auto & line : logs) {
+    if (line.event)
+      record << line.text << '\n';
+    else
+      record << "log " << severityName(line.severity) << ' ' << line.logger << ' ' << quote(mask(line.text)) << '\n';
+  }
+  if (!subject && g_effective)
+    throw std::runtime_error("a constructor that threw reported an effective configuration");
 
   if (subject) {
     auto observer = std::make_shared<rclcpp::Node>("frontend_parameter_contract_observer");
@@ -506,6 +592,7 @@ std::string recordCase(const ParameterCase & c)
       throw std::runtime_error("the node's parameter services never became available");
     appendTable(record, executor, *client);
     appendSets(record, executor, *client, c.sets);
+    appendEffective(record, c.name);
     executor.remove_node(observer);
     executor.remove_node(subject->get_node_base_interface());
     client.reset();
@@ -625,14 +712,16 @@ ChildRun runInChild(const std::function<std::string()> & body)
   return run;
 }
 
-// A record split around its parameter table: the lines before it (up to "parameters N"), the table by name, and the
-// lines after it.
+// A record split around its parameter table: the lines before it (up to "parameters N"), the table by name, the
+// lines after it, and the effective configuration by name.
 struct SplitRecord
 {
   std::vector<std::string> before;
   std::map<std::string, std::string> table;
   std::vector<std::string> absent;  // names a stored delta says the case does not have
   std::vector<std::string> after;
+  std::map<std::string, std::string> effective;
+  std::vector<std::string> effective_absent;  // effective names a stored delta says the case does not have
 };
 
 std::string parameterName(const std::string & line)
@@ -648,7 +737,11 @@ SplitRecord splitRecord(const std::string & text)
   for (const auto & line : splitLines(text)) {
     if (line.rfind("# ", 0) == 0)
       continue;  // a golden's header
-    if (line.rfind("param ", 0) == 0) {
+    if (line.rfind("effective.v1 ", 0) == 0) {
+      split.effective[parameterName(line)] = line;
+    } else if (line.rfind("effective_absent.v1 ", 0) == 0) {
+      split.effective_absent.push_back(line.substr(std::string("effective_absent.v1 ").size()));
+    } else if (line.rfind("param ", 0) == 0) {
       split.table[parameterName(line)] = line;
       seen_table = true;
     } else if (line.rfind("param_absent ", 0) == 0) {
@@ -675,33 +768,58 @@ std::string joinRecord(const SplitRecord & split)
     out += "param_absent " + name + '\n';
   for (const auto & line : split.after)
     out += line + '\n';
+  for (const auto & entry : split.effective)
+    out += entry.second + '\n';
+  for (const auto & name : split.effective_absent)
+    out += "effective_absent.v1 " + name + '\n';
   return out;
 }
 
-// What a case stores: its table as the lines that differ from the reference table.
-std::string toStored(const std::string & record, const std::map<std::string, std::string> & reference)
+// The lines of TABLE that differ from REFERENCE. A constructed node that lacks a line of the reference says so in
+// ABSENT; a node that was not constructed has no table at all.
+std::map<std::string, std::string> storedDelta(const std::map<std::string, std::string> & table,
+                                               const std::map<std::string, std::string> & reference,
+                                               std::vector<std::string> * absent)
 {
-  SplitRecord split = splitRecord(record);
   std::map<std::string, std::string> delta;
-  for (const auto & entry : split.table) {
+  for (const auto & entry : table) {
     const auto it = reference.find(entry.first);
     if (it == reference.end() || it->second != entry.second)
       delta.insert(entry);
   }
-  // A constructed node that lacks a parameter of the reference table says so; a node that was not constructed has
-  // no table at all.
-  if (!split.table.empty()) {
+  if (!table.empty()) {
     for (const auto & entry : reference)
-      if (split.table.count(entry.first) == 0)
-        split.absent.push_back(entry.first);
+      if (table.count(entry.first) == 0)
+        absent->push_back(entry.first);
   }
-  split.table = delta;
+  return delta;
+}
+
+// REFERENCE with a stored delta applied.
+std::map<std::string, std::string> appliedDelta(std::map<std::string, std::string> reference,
+                                                const std::map<std::string, std::string> & delta,
+                                                const std::vector<std::string> & absent)
+{
+  for (const auto & entry : delta)
+    reference[entry.first] = entry.second;
+  for (const auto & name : absent)
+    reference.erase(name);
+  return reference;
+}
+
+// What a case stores: its table and its effective configuration as the lines that differ from the reference's.
+std::string toStored(const std::string & record, const SplitRecord & reference)
+{
+  SplitRecord split = splitRecord(record);
+  split.table = storedDelta(split.table, reference.table, &split.absent);
+  split.effective = storedDelta(split.effective, reference.effective, &split.effective_absent);
   return joinRecord(split);
 }
 
 // What a stored case expands to: the reference table with the case's own lines applied. A record has a table when it
-// has the "parameters N" line; a case whose table equals the reference stores no table line at all.
-std::string expandStored(const std::string & stored, const std::map<std::string, std::string> & reference)
+// has the "parameters N" line, and an effective configuration when it has the "effective.v1.count N" line; a case
+// whose table or configuration equals the reference stores none of its lines.
+std::string expandStored(const std::string & stored, const SplitRecord & reference)
 {
   SplitRecord split = splitRecord(stored);
   const bool has_table = std::any_of(split.before.begin(), split.before.end(), [](const std::string & line) {
@@ -709,13 +827,15 @@ std::string expandStored(const std::string & stored, const std::map<std::string,
   });
   if (!has_table)
     return joinRecord(split);  // no table: the node was not constructed
-  std::map<std::string, std::string> table = reference;
-  for (const auto & entry : split.table)
-    table[entry.first] = entry.second;
-  for (const auto & name : split.absent)
-    table.erase(name);
-  split.table = table;
+  split.table = appliedDelta(reference.table, split.table, split.absent);
   split.absent.clear();
+  const bool has_effective = std::any_of(split.after.begin(), split.after.end(), [](const std::string & line) {
+    return line.rfind("effective.v1.count ", 0) == 0;
+  });
+  if (has_effective) {
+    split.effective = appliedDelta(reference.effective, split.effective, split.effective_absent);
+    split.effective_absent.clear();
+  }
   return joinRecord(split);
 }
 
@@ -830,6 +950,11 @@ void writeReceipt(const std::string & case_name,
                   const std::string & golden_path,
                   const std::string & golden_text)
 {
+  // NAME<TAB>hex of the raw bytes, for every effective text value the record writes masked (string-masked).
+  std::string raw_effective;
+  readFile(std::string(FASTLIO_CONTRACT_RESULTS) + "/frontend_contract/" + kFixture + "/" + case_name +
+             ".effective_raw.tsv",
+           &raw_effective);
   std::ostringstream out;
   out << "{\"fixture\":" << jsonString(kFixture) << ",\"case\":" << jsonString(case_name)
       << ",\"mode\":" << jsonString(mode) << ",\"arch\":" << jsonString(kArch)
@@ -842,7 +967,8 @@ void writeReceipt(const std::string & case_name,
       << ",\"golden_build\":" << jsonString(headerValue(golden_text, "build"))
       << ",\"result\":" << jsonString(comparison.result) << ",\"detail\":" << jsonString(comparison.detail)
       << ",\"first_difference_line\":" << comparison.line << ",\"expected\":" << jsonString(comparison.expected)
-      << ",\"actual\":" << jsonString(comparison.actual) << "}\n";
+      << ",\"actual\":" << jsonString(comparison.actual) << ",\"effective_masked_raw\":" << jsonString(raw_effective)
+      << "}\n";
   const std::string name = case_name + ".receipt.json";
   writeFile(std::string(FASTLIO_CONTRACT_RESULTS) + "/frontend_contract/" + kFixture, name, out.str());
   const std::string generate = goldenOut();
@@ -860,7 +986,7 @@ std::optional<std::string> & defaultsRecordCache()
 
 ParameterCase defaultsCase();
 
-std::map<std::string, std::string> referenceTable(const std::string & case_name, bool generate, std::string * error)
+SplitRecord referenceRecord(const std::string & case_name, bool generate, std::string * error)
 {
   if (case_name == kDefaultsCase)
     return {};
@@ -880,10 +1006,28 @@ std::map<std::string, std::string> referenceTable(const std::string & case_name,
     *error = "no Defaults golden to rebuild this case's table from: " + mask(goldenDir()) + "/defaults.golden";
     return {};
   }
-  return splitRecord(defaults).table;
+  return splitRecord(defaults);
 }
 
-void checkCase(const ParameterCase & c)
+// Every declared front-end parameter has an effective value, and every effective value that is not derived state
+// names a declared parameter. use_sim_time and qos_overrides.* belong to rclcpp, not to the front end.
+void expectEffectiveCovers(const std::string & case_name, const SplitRecord & record)
+{
+  for (const auto & entry : record.table) {
+    if (entry.first == "use_sim_time" || entry.first.rfind("qos_overrides.", 0) == 0)
+      continue;
+    EXPECT_EQ(record.effective.count(entry.first), 1u)
+      << case_name << ": the declared parameter " << entry.first << " has no effective value";
+  }
+  for (const auto & entry : record.effective) {
+    if (entry.first.rfind("derived:", 0) == 0)
+      continue;
+    EXPECT_EQ(record.table.count(entry.first), 1u)
+      << case_name << ": the effective value " << entry.first << " names no declared parameter";
+  }
+}
+
+void checkCase(const ParameterCase & c, std::string * record = nullptr)
 {
   const std::string generate = goldenOut();
   if (generate.empty() && std::string(kArch) != "x86_64") {
@@ -895,14 +1039,20 @@ void checkCase(const ParameterCase & c)
   ASSERT_TRUE(run.ok()) << c.name << ": " << run.describe();
   if (c.name == kDefaultsCase)
     defaultsRecordCache() = run.record;
+  if (record != nullptr)
+    *record = run.record;
 
   // The case reached what it is about: a constructed node or a refused configuration, and a profile that applied.
   const bool constructed = run.record.find("\noutcome constructed\n") != std::string::npos;
   EXPECT_EQ(constructed, c.expect == Expect::kConstructed)
     << c.name << " was meant to be " << (c.expect == Expect::kConstructed ? "constructed" : "refused") << ":\n"
     << run.record;
-  if (constructed)
+  if (constructed) {
     EXPECT_NE(run.record.find("\nparameters "), std::string::npos) << c.name << " has no parameter table";
+    EXPECT_NE(run.record.find("\neffective.v1.count "), std::string::npos)
+      << c.name << " has no effective configuration";
+    expectEffectiveCovers(c.name, splitRecord(run.record));
+  }
   for (const auto & applied : c.applied) {
     const std::string prefix = "param " + applied.first + " type=string value=" + applied.second + " ";
     EXPECT_NE(run.record.find(prefix), std::string::npos)
@@ -910,7 +1060,7 @@ void checkCase(const ParameterCase & c)
   }
 
   std::string error;
-  const auto reference = referenceTable(c.name, !generate.empty(), &error);
+  const SplitRecord reference = referenceRecord(c.name, !generate.empty(), &error);
   Comparison comparison;
   std::string golden_text;
   std::string golden_path = goldenDir() + "/" + c.name + ".golden";
@@ -989,6 +1139,25 @@ ParameterCase defaultsCase()
   return c;
 }
 
+// Typed outputs on, with the clock domain they require: the node creates both typed publishers and computes the
+// configuration ID its reference health messages carry.
+ParameterCase typedCase(ParameterCase c, const std::string & name)
+{
+  c.name = name;
+  setOverride(c, rclcpp::Parameter("publish.frontend_observation", true));
+  setOverride(c, rclcpp::Parameter("publish.reference_health", true));
+  setOverride(c, rclcpp::Parameter("publish.frontend_clock_domain", std::string("fixture")));
+  return c;
+}
+
+// The value of NAME's effective.v1 line in a record; empty when it has none. Only for values without spaces.
+std::string effectiveValue(const std::string & record, const std::string & name)
+{
+  const SplitRecord split = splitRecord(record);
+  const auto it = split.effective.find(name);
+  return it == split.effective.end() ? std::string() : it->second.substr(it->second.rfind(' ') + 1);
+}
+
 TEST(FrontendParameterContract, Defaults)
 {
   checkCase(defaultsCase());
@@ -1009,6 +1178,73 @@ TEST(FrontendParameterContract, ProfileXswHesai)
 TEST(FrontendParameterContract, ProfileGiant)
 {
   checkCase(profileCase("profile_giant", "config/giant.yaml", "/rs_velo/points"));
+}
+
+// The parent repository's other merged profiles, made the way the M20 snapshot was (test/frontend_contract/README.md
+// gives their sources, command and hashes). profile_giant and profile_xsw_hesai stay: they are this package's own
+// configuration files.
+TEST(FrontendParameterContract, MergedGiantAllpoint)
+{
+  checkCase(
+    profileCase("merged_giant_allpoint", "test/frontend_contract/giant_allpoint_laser_mapping.yaml", "/lio/points"));
+}
+
+TEST(FrontendParameterContract, MergedGiant)
+{
+  checkCase(profileCase("merged_giant", "test/frontend_contract/giant_laser_mapping.yaml", "/lio/points"));
+}
+
+TEST(FrontendParameterContract, MergedGiantHesaiFp)
+{
+  checkCase(
+    profileCase("merged_giant_hesai_fp", "test/frontend_contract/giant_hesai_fp_laser_mapping.yaml", "/lio/points"));
+}
+
+TEST(FrontendParameterContract, MergedM20BodyImu)
+{
+  checkCase(profileCase("merged_m20_bodyimu", "test/frontend_contract/m20_bodyimu_laser_mapping.yaml", "/lio/points"));
+}
+
+// The declared defaults and the five merged profiles with typed outputs on: the configuration ID each computes.
+TEST(FrontendParameterContract, TypedDefaults)
+{
+  checkCase(typedCase(overridesCase("typed_defaults", Expect::kConstructed), "typed_defaults"));
+}
+
+TEST(FrontendParameterContract, TypedProfileM20)
+{
+  checkCase(typedCase(profileCase("typed_profile_m20", "test/frontend_contract/m20_laser_mapping.yaml", "/lio/points"),
+                      "typed_profile_m20"));
+}
+
+TEST(FrontendParameterContract, TypedMergedGiantAllpoint)
+{
+  checkCase(typedCase(profileCase("typed_merged_giant_allpoint",
+                                  "test/frontend_contract/giant_allpoint_laser_mapping.yaml",
+                                  "/lio/points"),
+                      "typed_merged_giant_allpoint"));
+}
+
+TEST(FrontendParameterContract, TypedMergedGiant)
+{
+  checkCase(
+    typedCase(profileCase("typed_merged_giant", "test/frontend_contract/giant_laser_mapping.yaml", "/lio/points"),
+              "typed_merged_giant"));
+}
+
+TEST(FrontendParameterContract, TypedMergedGiantHesaiFp)
+{
+  checkCase(typedCase(profileCase("typed_merged_giant_hesai_fp",
+                                  "test/frontend_contract/giant_hesai_fp_laser_mapping.yaml",
+                                  "/lio/points"),
+                      "typed_merged_giant_hesai_fp"));
+}
+
+TEST(FrontendParameterContract, TypedMergedM20BodyImu)
+{
+  checkCase(typedCase(
+    profileCase("typed_merged_m20_bodyimu", "test/frontend_contract/m20_bodyimu_laser_mapping.yaml", "/lio/points"),
+    "typed_merged_m20_bodyimu"));
 }
 
 // initial_pose_full_rpy_override and its deprecated name initial_pose_apply_roll_pitch, alone and together.
@@ -1040,6 +1276,39 @@ TEST(FrontendParameterContract, AliasBothNamesDisagree)
   setOverride(c, rclcpp::Parameter("initial_pose_full_rpy_override", false));
   setOverride(c, rclcpp::Parameter("initial_pose_apply_roll_pitch", true));
   checkCase(c);
+}
+
+// The same four alias configurations with typed outputs on. The configuration ID hashes the parameter server's
+// values, not the effective configuration: all four give the same effective full-RPY override, the three different
+// pairs of server values three different IDs, and the same pair of values given through other overrides the same ID.
+TEST(FrontendParameterContract, TypedAliasConfigIds)
+{
+  const std::string config_id = "derived:config_id:reference_config_id";
+  const std::string override_rpy = "derived:initial_pose_alias:initial_pose_full_rpy_override_";
+  std::map<std::string, std::string> ids;
+  const auto run = [&](const std::string & name, const std::vector<rclcpp::Parameter> & aliases) {
+    ParameterCase c = typedCase(overridesCase(name, Expect::kConstructed), name);
+    for (const auto & alias : aliases)
+      setOverride(c, alias);
+    std::string record;
+    checkCase(c, &record);
+    EXPECT_EQ(effectiveValue(record, override_rpy), "1") << name;
+    ids[name] = effectiveValue(record, config_id);
+    EXPECT_EQ(ids[name].size(), 64u) << name << " recorded no configuration ID";
+    EXPECT_NE(ids[name], std::string(64, '0')) << name << " computed no configuration ID";
+  };
+  run("typed_alias_new_name_only", {rclcpp::Parameter("initial_pose_full_rpy_override", true)});
+  run("typed_alias_deprecated_name_only", {rclcpp::Parameter("initial_pose_apply_roll_pitch", true)});
+  run("typed_alias_both_names_set",
+      {rclcpp::Parameter("initial_pose_full_rpy_override", true),
+       rclcpp::Parameter("initial_pose_apply_roll_pitch", true)});
+  run("typed_alias_both_names_disagree",
+      {rclcpp::Parameter("initial_pose_full_rpy_override", false),
+       rclcpp::Parameter("initial_pose_apply_roll_pitch", true)});
+  EXPECT_NE(ids["typed_alias_new_name_only"], ids["typed_alias_deprecated_name_only"]);
+  EXPECT_NE(ids["typed_alias_new_name_only"], ids["typed_alias_both_names_set"]);
+  EXPECT_NE(ids["typed_alias_deprecated_name_only"], ids["typed_alias_both_names_set"]);
+  EXPECT_EQ(ids["typed_alias_deprecated_name_only"], ids["typed_alias_both_names_disagree"]);
 }
 
 // Type errors: an override whose type is not the declared one.
@@ -1206,6 +1475,25 @@ TEST(FrontendParameterContract, ReadOnlyWithObservation)
   setOverride(c, rclcpp::Parameter("publish.frontend_observation", true));
   setOverride(c, rclcpp::Parameter("publish.frontend_clock_domain", std::string("fixture")));
   c.sets = {rclcpp::Parameter("publish.reference_health", false)};
+  checkCase(c);
+}
+
+// Two invalid values in one configuration: the record shows which check refuses it, and the stages and lines the
+// constructor reached before it, so a check moved ahead of another or ahead of a side effect shows.
+TEST(FrontendParameterContract, TwoInvalidObservationThenBacklog)
+{
+  ParameterCase c = overridesCase("two_invalid_observation_then_backlog", Expect::kRejected);
+  setOverride(c, rclcpp::Parameter("publish.frontend_observation", true));
+  setOverride(c, rclcpp::Parameter("max_imu_backlog_sec", std::numeric_limits<double>::quiet_NaN()));
+  checkCase(c);
+}
+
+TEST(FrontendParameterContract, TwoInvalidLostRecoveryThenAnchor)
+{
+  ParameterCase c = overridesCase("two_invalid_lost_recovery_then_anchor", Expect::kRejected);
+  setOverride(c, rclcpp::Parameter("lost_recovery_en", true));
+  setOverride(c, rclcpp::Parameter("health_pub_en", false));
+  setOverride(c, rclcpp::Parameter("zupt_anchor_confirm_scans", 0));
   checkCase(c);
 }
 

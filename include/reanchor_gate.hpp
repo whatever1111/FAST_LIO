@@ -128,6 +128,10 @@ public:
   }
 
   std::size_t size() const { return values_.size(); }
+#ifdef FASTLIO_TEST_HOOKS
+  std::size_t capacityForTest() const { return capacity_; }
+  std::size_t minCountForTest() const { return min_count_; }
+#endif
 
   void clear()
   {

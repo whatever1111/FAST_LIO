@@ -1,0 +1,97 @@
+laser_mapping:
+  ros__parameters:
+    feature_extract_enable: false
+    point_filter_num: 3
+    max_iteration: 3
+    nn_refresh_gate_en: false
+    nn_refresh_min_shift: 0.05
+    nn_refresh_ref_range: 20.0
+    max_buffered_scans: 100
+    filter_size_surf: 0.5
+    filter_size_map: 0.5
+    cube_side_length: 1000.0
+    common:
+      lid_topic: /lio/points
+      imu_topic: /lio/imu
+      imu_input_type: standard
+      time_sync_en: false
+      time_offset_lidar_to_imu: 0.0
+      imu_time_offset: 0.0
+    preprocess:
+      lidar_type: 2
+      scan_line: 32
+      blind: 0.5
+      timestamp_unit: 0
+      scan_rate: 10
+    mapping:
+      acc_cov: 0.01
+      gyr_cov: 0.005
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      fov_degree: 360.0
+      det_range: 60.0
+      extrinsic_est_en: true
+      extrinsic_T:
+      - -8.88763
+      - -0.179893
+      - -2.934305
+      extrinsic_R:
+      - -0.002439
+      - 0.999832
+      - 0.01816
+      - -0.999916
+      - -0.002207
+      - -0.012775
+      - -0.012733
+      - -0.01819
+      - 0.999753
+    publish:
+      path_en: true
+      effect_map_en: false
+      map_en: false
+      map_period_sec: 5.0
+      scan_publish_en: true
+      dense_publish_en: false
+      scan_bodyframe_pub_en: true
+      odom_frame_id: lidar_odom
+      body_frame_id: body
+    prior_map_pcd: ''
+    initial_pose:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    prior_map_pinned: false
+    prior_map_align: as_delivered
+    prior_map_voxel: 0.0
+    prior_map_freeze: false
+    wheel_odom_en: false
+    wheel_topic: /lio/wheel_twist
+    wheel_speed_scale: 1.0
+    wheel_vel_noise_vx: 0.1
+    wheel_vel_noise_vy: 0.05
+    wheel_vel_noise_vz: 0.2
+    wheel_extrinsic_R:
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+    ground_recover_en: true
+    ground_recover_scan_band: 0.15
+    ground_recover_min_inliers: 100
+    ground_recover_max_residual: 1.0
+    ground_recover_max_rows: 4000
+    ground_recover_sector_tol: 0.25
+    canopy_near_range: 20.0
+    canopy_ground_z: -0.47
+    canopy_ground_halfband: 0.8
+    pcd_save:
+      pcd_save_en: false
+      interval: -1

@@ -20,9 +20,22 @@
 //   trace     every anchor and recovery trace line (zupt_anchor_trace_en), the destructor's counter summary
 //             included; the per-scan [ZUPT-ANCHOR-SCAN] line is left out, the record holds all of its fields;
 //   inputs    the input transaction after the slot: queued and refused messages, the fault and freeze latches and
-//             the filter's input end.
-// Doubles are written with 17 significant digits (round trip) and NaN with its bit pattern; a record is compared with
-// its golden line for line, character for character, with no tolerance anywhere.
+//             the filter's input end;
+// and, on lines whose first word is a `.v1` name (added to records that existed before them: removing these lines
+// gives each earlier record unchanged):
+//   h_matrix.v1       every H-model exit: the scan end, the validity, and the dimensions and SHA-256 of the Jacobian
+//                     rows and of the residuals handed to the filter, or none at the exit without a correspondence;
+//   filter_update.v1  the filter right after every iterated lidar update: each state component, the SHA-256 of the
+//                     23x23 error-state covariance and its diagonal;
+//   imu_retain.v1     an empty IMU window settled uncommitted: its batch, the samples it leaves queued and the FIFO
+//                     fault latch;
+//   identity.v1, frontend_observation.v1, reference_health.v1
+//                     the typed scenario only: the fixed activation identity with the contract and configuration IDs
+//                     the constructor computed, then every FrontendObservation and ReferenceHealth message received,
+//                     field by field, per topic in arrival order, after each slot's other lines.
+// Doubles are written with 17 significant digits (round trip) and NaN with its bit pattern; on the `.v1` lines every
+// double is its IEEE-754 bit pattern, and a SHA-256 covers a matrix's patterns row-major, eight little-endian bytes
+// each. A record is compared with its golden line for line, character for character, with no tolerance anywhere.
 //
 // What makes a record reproducible: the map worker is off (FLIO_ASYNC_MAP=0) except in the worker suite, OpenMP runs
 // one thread, and the scan path runs (the fixture waits for its timer to come due and lets the executor run it) after
@@ -31,14 +44,17 @@
 // the next scan, after it has joined the worker. A generation run records every scenario twice and writes a golden
 // only when both records agree.
 //
-// Masked: nothing. Not recorded: log output (its throttling runs on the wall clock), timing diagnostics, and the
-// typed FrontendObservation/ReferenceHealth outputs (left off: their identity is random per activation).
+// The typed outputs carry an activation identity the constructor draws at random and repeat the reference health on a
+// steady-clock throttle, so only the typed scenario turns them on: its hooks fix the identity, and the throttle reads a
+// fixture clock that a scan path run before any input starts and that advances 200 ms right before each slot's last
+// scan path run and nowhere else.
+//
+// Masked: nothing. Not recorded: log output (its throttling runs on the wall clock) and timing diagnostics.
 //
 // Every scenario counts the branches it went through; the receipt lists each branch, triggered or not, with its
-// count. A branch the scenario claims and did not reach fails it. Branches the existing hooks cannot reach are listed
-// in the receipt as suspended, with the hook S1 has to add to laserMapping.cpp and where. Where an existing suite
-// already asserts a branch's semantics, the receipt names it; this fixture records the branch's outputs bit for bit
-// and does not repeat those assertions.
+// count. A branch the scenario claims and did not reach fails it. Where an existing suite already asserts a branch's
+// semantics, the receipt names it; this fixture records the branch's outputs bit for bit and does not repeat those
+// assertions.
 //
 // The goldens apply to x86_64 only: on other architectures CMake registers the entries as skipped, and the
 // executable, run there in comparison mode, fails with that statement rather than pass.
@@ -65,9 +81,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fast_lio_interfaces/msg/frontend_observation.hpp>
+#include <fast_lio_interfaces/msg/reference_health.hpp>
 #include <fstream>
 #include <functional>
 #include <gtest/gtest.h>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -117,6 +136,14 @@ constexpr double kReceiptWaitSeconds = 5.0;
 constexpr std::int64_t kReceiptWaitNs = 5000000000;
 constexpr std::int64_t kScanPathPeriodNs = 10000000;  // the front end runs its scan path off a 100 Hz timer
 constexpr unsigned kChildAlarmSeconds = 600;
+
+// The typed scenario's activation identity, and the clock its reference repeat throttle (100 ms) reads.
+constexpr std::array<std::uint8_t, 16> kFixedInstance = {
+  0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+constexpr std::chrono::seconds kRepeatClockStart{1};
+constexpr std::chrono::milliseconds kRepeatClockStep{200};
+constexpr const char * kFrontendObservationTopic = "/lio_slam/frontend_observation";
+constexpr const char * kReferenceHealthTopic = "/lio_slam/reference_health";
 
 // test_anchor_lifecycle_node's F1 anchor, the parked pose 0.36 m from it, and its fixture velocity and covariance:
 // the stand-in for what registration produced, written before the anchor step.
@@ -224,6 +251,61 @@ std::string sha256Hex(const std::string & bytes)
   if (EVP_Digest(bytes.data(), bytes.size(), digest, &length, EVP_sha256(), nullptr) != 1)
     throw std::runtime_error("sha256 unavailable");
   return hex(digest, length);
+}
+
+// A double's IEEE-754 bit pattern: tells +0 from -0 and every NaN payload apart.
+std::string bits(double value)
+{
+  std::uint64_t pattern = 0;
+  std::memcpy(&pattern, &value, sizeof(pattern));
+  char text[24];
+  std::snprintf(text, sizeof(text), "0x%016llx", static_cast<unsigned long long>(pattern));
+  return text;
+}
+
+std::string bitsList(const double * values, std::size_t size)
+{
+  std::string out = "[";
+  for (std::size_t i = 0; i < size; ++i) {
+    if (i != 0)
+      out += ',';
+    out += bits(values[i]);
+  }
+  return out + "]";
+}
+
+std::string bitsList(std::initializer_list<double> values)
+{
+  return bitsList(values.begin(), values.size());
+}
+
+// SHA-256 over the values' bit patterns, eight little-endian bytes each, in the order given.
+std::string bitsDigest(const double * values, std::size_t size)
+{
+  std::string bytes;
+  bytes.reserve(size * 8);
+  for (std::size_t i = 0; i < size; ++i) {
+    std::uint64_t pattern = 0;
+    std::memcpy(&pattern, &values[i], sizeof(pattern));
+    for (int b = 0; b < 8; ++b)
+      bytes += static_cast<char>((pattern >> (8 * b)) & 0xffu);
+  }
+  return sha256Hex(bytes);
+}
+
+// The same over a matrix's coefficients, row-major; "none" for a matrix without a coefficient.
+template<class Derived>
+std::string matrixDigest(const Eigen::MatrixBase<Derived> & m)
+{
+  if (m.size() == 0)
+    return "none";
+  std::vector<double> rows;
+  rows.reserve(static_cast<std::size_t>(m.size()));
+  for (Eigen::Index r = 0; r < m.rows(); ++r) {
+    for (Eigen::Index c = 0; c < m.cols(); ++c)
+      rows.push_back(m(r, c));
+  }
+  return bitsDigest(rows.data(), rows.size());
 }
 
 bool readFile(const std::string & path, std::string * out)
@@ -355,6 +437,180 @@ void appendOdometry(std::vector<std::string> & out, const nav_msgs::msg::Odometr
   out.push_back("odom.twist_cov " + vec(m.twist.covariance));
 }
 
+// Every field of FrontendObservation, in declaration order (generated from its .msg file).
+std::string formatFrontendObservation(const fast_lio_interfaces::msg::FrontendObservation & m)
+{
+  std::string out = "frontend_observation.v1";
+  out += " schema_version=" + std::to_string(static_cast<unsigned long long>(m.schema_version));
+  out += " identity_version=" + std::to_string(static_cast<unsigned long long>(m.identity_version));
+  out += " has_source_instance=" + std::string(m.has_source_instance ? "1" : "0");
+  out += " source_instance=" + hex(m.source_instance.data(), m.source_instance.size());
+  out += " has_sample_sequence=" + std::string(m.has_sample_sequence ? "1" : "0");
+  out += " sample_sequence=" + std::to_string(static_cast<unsigned long long>(m.sample_sequence));
+  out += " has_observation_id=" + std::string(m.has_observation_id ? "1" : "0");
+  out += " observation_id=" + hex(m.observation_id.data(), m.observation_id.size());
+  out += " clock_domain=" + quote(m.clock_domain);
+  out += " has_input_stamp=" + std::string(m.has_input_stamp ? "1" : "0");
+  out += " input_stamp_ns=" + std::to_string(static_cast<long long>(m.input_stamp_ns));
+  out += " has_observation_stamp=" + std::string(m.has_observation_stamp ? "1" : "0");
+  out += " observation_stamp_ns=" + std::to_string(static_cast<long long>(m.observation_stamp_ns));
+  out += " has_effective_observation_stamp=" + std::string(m.has_effective_observation_stamp ? "1" : "0");
+  out += " effective_observation_stamp_ns=" + std::to_string(static_cast<long long>(m.effective_observation_stamp_ns));
+  out += " frame_id=" + quote(m.frame_id);
+  out += " child_frame_id=" + quote(m.child_frame_id);
+  out += " has_coordinate_epoch=" + std::string(m.has_coordinate_epoch ? "1" : "0");
+  out += " coordinate_epoch=" + std::to_string(static_cast<unsigned long long>(m.coordinate_epoch));
+  out += " has_pose=" + std::string(m.has_pose ? "1" : "0");
+  out += " pose.position=" + bitsList({m.pose.pose.position.x, m.pose.pose.position.y, m.pose.pose.position.z});
+  out +=
+    " pose.orientation_xyzw=" +
+    bitsList(
+      {m.pose.pose.orientation.x, m.pose.pose.orientation.y, m.pose.pose.orientation.z, m.pose.pose.orientation.w});
+  out += " pose.covariance=" + bitsList(m.pose.covariance.data(), m.pose.covariance.size());
+  out += " has_pose_covariance=" + std::string(m.has_pose_covariance ? "1" : "0");
+  out += " has_twist=" + std::string(m.has_twist ? "1" : "0");
+  out += " twist.linear=" + bitsList({m.twist.twist.linear.x, m.twist.twist.linear.y, m.twist.twist.linear.z});
+  out += " twist.angular=" + bitsList({m.twist.twist.angular.x, m.twist.twist.angular.y, m.twist.twist.angular.z});
+  out += " twist.covariance=" + bitsList(m.twist.covariance.data(), m.twist.covariance.size());
+  out += " has_twist_covariance=" + std::string(m.has_twist_covariance ? "1" : "0");
+  out += " output_validity=" + std::to_string(static_cast<unsigned long long>(m.output_validity));
+  out += " axis_validity_bits=" + std::to_string(static_cast<unsigned long long>(m.axis_validity_bits));
+  out += " estimator_state=" + std::to_string(static_cast<unsigned long long>(m.estimator_state));
+  out += " activity=" + std::to_string(static_cast<unsigned long long>(m.activity));
+  out += " fe_substate=" + std::to_string(static_cast<unsigned long long>(m.fe_substate));
+  out += " has_guard_reason_bits=" + std::string(m.has_guard_reason_bits ? "1" : "0");
+  out += " guard_reason_bits=" + std::to_string(static_cast<unsigned long long>(m.guard_reason_bits));
+  out += " has_health_flags=" + std::string(m.has_health_flags ? "1" : "0");
+  out += " health_flags=" + std::to_string(static_cast<unsigned long long>(m.health_flags));
+  out += " has_observability_along=" + std::string(m.has_observability_along ? "1" : "0");
+  out += " observability_along=" + bits(m.observability_along);
+  out += " has_effective_feature_count=" + std::string(m.has_effective_feature_count ? "1" : "0");
+  out += " effective_feature_count=" + std::to_string(static_cast<unsigned long long>(m.effective_feature_count));
+  out += " has_far_point_fraction=" + std::string(m.has_far_point_fraction ? "1" : "0");
+  out += " far_point_fraction=" + bits(m.far_point_fraction);
+  out += " has_mean_residual=" + std::string(m.has_mean_residual ? "1" : "0");
+  out += " mean_residual_m=" + bits(m.mean_residual_m);
+  out += " has_body_speed=" + std::string(m.has_body_speed ? "1" : "0");
+  out += " body_speed_mps=" + bits(m.body_speed_mps);
+  out += " has_gravity=" + std::string(m.has_gravity ? "1" : "0");
+  out += " gravity_world_mps2=" + bitsList(m.gravity_world_mps2.data(), m.gravity_world_mps2.size());
+  out += " has_input_sequence=" + std::string(m.has_input_sequence ? "1" : "0");
+  out += " input_sequence=" + std::to_string(static_cast<unsigned long long>(m.input_sequence));
+  out += " has_completion_sequence=" + std::string(m.has_completion_sequence ? "1" : "0");
+  out += " completion_sequence=" + std::to_string(static_cast<unsigned long long>(m.completion_sequence));
+  out += " has_output_sequence=" + std::string(m.has_output_sequence ? "1" : "0");
+  out += " output_sequence=" + std::to_string(static_cast<unsigned long long>(m.output_sequence));
+  out += " has_queue_count=" + std::string(m.has_queue_count ? "1" : "0");
+  out += " queue_count=" + std::to_string(static_cast<unsigned long long>(m.queue_count));
+  out += " has_dropped_count=" + std::string(m.has_dropped_count ? "1" : "0");
+  out += " dropped_count=" + std::to_string(static_cast<unsigned long long>(m.dropped_count));
+  return out;
+}
+
+// Every field of ReferenceHealth, in declaration order (generated from its .msg file).
+std::string formatReferenceHealth(const fast_lio_interfaces::msg::ReferenceHealth & m)
+{
+  std::string out = "reference_health.v1";
+  out += " schema_version=" + std::to_string(static_cast<unsigned long long>(m.schema_version));
+  out += " identity_version=" + std::to_string(static_cast<unsigned long long>(m.identity_version));
+  out += " has_source_instance=" + std::string(m.has_source_instance ? "1" : "0");
+  out += " source_instance=" + hex(m.source_instance.data(), m.source_instance.size());
+  out += " clock_domain=" + quote(m.clock_domain);
+  out += " frame_id=" + quote(m.frame_id);
+  out += " child_frame_id=" + quote(m.child_frame_id);
+  out += " has_coordinate_epoch=" + std::string(m.has_coordinate_epoch ? "1" : "0");
+  out += " coordinate_epoch=" + std::to_string(static_cast<unsigned long long>(m.coordinate_epoch));
+  out += " producer_contract_id=" + hex(m.producer_contract_id.data(), m.producer_contract_id.size());
+  out += " config_id=" + hex(m.config_id.data(), m.config_id.size());
+  out += " implemented_mask=" + std::to_string(static_cast<unsigned long long>(m.implemented_mask));
+  out += " enabled_policy_mask=" + std::to_string(static_cast<unsigned long long>(m.enabled_policy_mask));
+  out += " has_snapshot_sequence=" + std::string(m.has_snapshot_sequence ? "1" : "0");
+  out += " snapshot_sequence=" + std::to_string(static_cast<unsigned long long>(m.snapshot_sequence));
+  out += " has_state_revision=" + std::string(m.has_state_revision ? "1" : "0");
+  out += " state_revision=" + std::to_string(static_cast<unsigned long long>(m.state_revision));
+  out += " has_scan_sequence=" + std::string(m.has_scan_sequence ? "1" : "0");
+  out += " scan_sequence=" + std::to_string(static_cast<unsigned long long>(m.scan_sequence));
+  out += " has_observation_id=" + std::string(m.has_observation_id ? "1" : "0");
+  out += " observation_id=" + hex(m.observation_id.data(), m.observation_id.size());
+  out += " kind=" + std::to_string(static_cast<unsigned long long>(m.kind));
+  out += " has_evaluated_input=" + std::string(m.has_evaluated_input ? "1" : "0");
+  out += " evaluated_input_ns=" + std::to_string(static_cast<long long>(m.evaluated_input_ns));
+  out += " has_effective=" + std::string(m.has_effective ? "1" : "0");
+  out += " effective_ns=" + std::to_string(static_cast<long long>(m.effective_ns));
+  out += " has_state_valid_until=" + std::string(m.has_state_valid_until ? "1" : "0");
+  out += " state_valid_until_ns=" + std::to_string(static_cast<long long>(m.state_valid_until_ns));
+  out += " has_scan_begin=" + std::string(m.has_scan_begin ? "1" : "0");
+  out += " scan_begin_ns=" + std::to_string(static_cast<long long>(m.scan_begin_ns));
+  out += " has_scan_end=" + std::string(m.has_scan_end ? "1" : "0");
+  out += " scan_end_ns=" + std::to_string(static_cast<long long>(m.scan_end_ns));
+  out += " has_pose_binding=" + std::string(m.has_pose_binding ? "1" : "0");
+  out += " pose_binding=" + bitsList(m.pose_binding.data(), m.pose_binding.size());
+  out += " lifecycle=" + std::to_string(static_cast<unsigned long long>(m.lifecycle));
+  out += " startup_reference=" + std::to_string(static_cast<unsigned long long>(m.startup_reference));
+  out += " trust=" + std::to_string(static_cast<unsigned long long>(m.trust));
+  out += " local=" + std::to_string(static_cast<unsigned long long>(m.local));
+  out += " legacy_flags=" + std::to_string(static_cast<unsigned long long>(m.legacy_flags));
+  out += " has_raw_registration_degraded=" + std::string(m.has_raw_registration_degraded ? "1" : "0");
+  out += " raw_registration_degraded=" + std::string(m.raw_registration_degraded ? "1" : "0");
+  out += " reference_generation=" + std::to_string(static_cast<unsigned long long>(m.reference_generation));
+  out += " recovery_episode=" + std::to_string(static_cast<unsigned long long>(m.recovery_episode));
+  out += " has_qualified_event_sequence=" + std::string(m.has_qualified_event_sequence ? "1" : "0");
+  out += " qualified_event_sequence=" + std::to_string(static_cast<unsigned long long>(m.qualified_event_sequence));
+  out += " has_original_start=" + std::string(m.has_original_start ? "1" : "0");
+  out += " original_start_ns=" + std::to_string(static_cast<long long>(m.original_start_ns));
+  out += " has_original_deadline=" + std::string(m.has_original_deadline ? "1" : "0");
+  out += " original_deadline_ns=" + std::to_string(static_cast<long long>(m.original_deadline_ns));
+  out += " has_last_supported_end=" + std::string(m.has_last_supported_end ? "1" : "0");
+  out += " last_supported_end_ns=" + std::to_string(static_cast<long long>(m.last_supported_end_ns));
+  out += " present_mask=" + std::to_string(static_cast<unsigned long long>(m.present_mask));
+  out += " true_mask=" + std::to_string(static_cast<unsigned long long>(m.true_mask));
+  out += " has_negative_masks=" + std::string(m.has_negative_masks ? "1" : "0");
+  out += " cause_mask=" + std::to_string(static_cast<unsigned long long>(m.cause_mask));
+  out += " taint_mask=" + std::to_string(static_cast<unsigned long long>(m.taint_mask));
+  out += " hard_mask=" + std::to_string(static_cast<unsigned long long>(m.hard_mask));
+  out += " hr_witness_kind=" + std::to_string(static_cast<unsigned long long>(m.hr_witness_kind));
+  out += " has_hr_valid_until=" + std::string(m.has_hr_valid_until ? "1" : "0");
+  out += " hr_valid_until_ns=" + std::to_string(static_cast<long long>(m.hr_valid_until_ns));
+  out += " has_rw=" + std::string(m.has_rw ? "1" : "0");
+  out += " rw_contract=" + std::to_string(static_cast<unsigned long long>(m.rw_contract));
+  out += " has_raw_episode=" + std::string(m.has_raw_episode ? "1" : "0");
+  out += " raw_episode_id=" + std::to_string(static_cast<unsigned long long>(m.raw_episode_id));
+  out += " has_raw_start=" + std::string(m.has_raw_start ? "1" : "0");
+  out += " raw_start_ns=" + std::to_string(static_cast<long long>(m.raw_start_ns));
+  out += " has_rw_origin=" + std::string(m.has_rw_origin ? "1" : "0");
+  out += " origin_scan=" + std::to_string(static_cast<unsigned long long>(m.origin_scan));
+  out +=
+    " origin_reference_generation=" + std::to_string(static_cast<unsigned long long>(m.origin_reference_generation));
+  out += " has_frozen_residual=" + std::string(m.has_frozen_residual ? "1" : "0");
+  out += " frozen_residual_median=" + bits(m.frozen_residual_median);
+  out += " has_withdrawal_rearm=" + std::string(m.has_withdrawal_rearm ? "1" : "0");
+  out += " withdrawal_rearm_event=" + std::to_string(static_cast<unsigned long long>(m.withdrawal_rearm_event));
+  out += " has_rw_valid_until=" + std::string(m.has_rw_valid_until ? "1" : "0");
+  out += " rw_valid_until_ns=" + std::to_string(static_cast<long long>(m.rw_valid_until_ns));
+  out += " has_wheel_witness_epochs=" + std::string(m.has_wheel_witness_epochs ? "1" : "0");
+  out += " lower_wheel_witness_epoch=" + std::to_string(static_cast<unsigned long long>(m.lower_wheel_witness_epoch));
+  out += " upper_wheel_witness_epoch=" + std::to_string(static_cast<unsigned long long>(m.upper_wheel_witness_epoch));
+  out += " wheel_witness_kind=" + std::to_string(static_cast<unsigned long long>(m.wheel_witness_kind));
+  out += " has_support=" + std::string(m.has_support ? "1" : "0");
+  out += " support_contract=" + std::to_string(static_cast<unsigned long long>(m.support_contract));
+  out += " support_kind=" + std::to_string(static_cast<unsigned long long>(m.support_kind));
+  out += " has_support_seed=" + std::string(m.has_support_seed ? "1" : "0");
+  out += " support_seed_reference=" + std::to_string(static_cast<unsigned long long>(m.support_seed_reference));
+  out += " support_seed_scan=" + std::to_string(static_cast<unsigned long long>(m.support_seed_scan));
+  out += " support_seed_source=" + hex(m.support_seed_source.data(), m.support_seed_source.size());
+  out += " has_supported_through=" + std::string(m.has_supported_through ? "1" : "0");
+  out += " supported_through_ns=" + std::to_string(static_cast<long long>(m.supported_through_ns));
+  out += " has_first_loss=" + std::string(m.has_first_loss ? "1" : "0");
+  out += " first_loss_ns=" + std::to_string(static_cast<long long>(m.first_loss_ns));
+  out += " has_support_deadline=" + std::string(m.has_support_deadline ? "1" : "0");
+  out += " support_deadline_ns=" + std::to_string(static_cast<long long>(m.support_deadline_ns));
+  out += " has_proof_id=" + std::string(m.has_proof_id ? "1" : "0");
+  out += " proof_id=" + hex(m.proof_id.data(), m.proof_id.size());
+  out += " has_trajectory_id=" + std::string(m.has_trajectory_id ? "1" : "0");
+  out += " trajectory_id=" + hex(m.trajectory_id.data(), m.trajectory_id.size());
+  return out;
+}
+
 // The value of ` key=` in a trace line, or "" when the line has none.
 std::string valueOf(const std::string & line, const std::string & key)
 {
@@ -421,6 +677,7 @@ struct Scenario
 {
   std::string name;
   bool async_map = false;
+  bool typed = false;  // the typed outputs on, with the fixed activation identity and repeat clock
   std::map<std::string, rclcpp::Parameter> params;
   std::vector<Slot> slots;          // after the warm-up
   std::vector<std::string> claims;  // the branches the scenario exists to reach
@@ -502,7 +759,30 @@ Scenario matchScenario()
   append(s, 3, slot("moving", true, kGuardNatural));
   s.slots.push_back(slot("sparse_cloud", false, kGuardNatural, Cloud::kSparse));
   append(s, 4, slot("static", false, kGuardNatural));
-  s.claims = {"bootstrap", "imu_commit", "normal_match", "no_match", "early_exit_scan", "published", "odometry"};
+  s.claims = {"bootstrap",
+              "imu_commit",
+              "normal_match",
+              "no_match",
+              "early_exit_scan",
+              "published",
+              "odometry",
+              "h_matrix_values",
+              "full_state_and_covariance"};
+  return s;
+}
+
+// The match scenario with both typed outputs on: the record adds the fixed activation identity and every
+// FrontendObservation and ReferenceHealth message, the reference repeats included.
+Scenario typedMatchScenario()
+{
+  Scenario s = matchScenario();
+  s.name = "typed_match";
+  s.typed = true;
+  setParam(s, rclcpp::Parameter("publish.frontend_observation", true));
+  setParam(s, rclcpp::Parameter("publish.reference_health", true));
+  setParam(s, rclcpp::Parameter("publish.frontend_clock_domain", "fixture"));
+  s.claims.push_back("typed_outputs_with_fixed_identity");
+  s.claims.push_back("reference_repeat");
   return s;
 }
 
@@ -560,7 +840,7 @@ Scenario scanDropsScenario()
   s.slots.push_back(hole);
   s.slots.push_back(slot("empty_imu_window"));
   append(s, 3, slot("static"));
-  s.claims = {"invalid_scan", "nonadvancing_scan", "imu_retain_empty_window"};
+  s.claims = {"invalid_scan", "nonadvancing_scan", "imu_retain_empty_window", "imu_retain_hook_visible"};
   return s;
 }
 
@@ -697,11 +977,16 @@ constexpr Branch kBranches[] = {
    "IMU batches settled fatal",
    "test_ros_scan_bounds RosScanBounds.FatalTransactionRejectsRealInputsAndBoundsBothQueues"},
   {"imu_uncommitted_hook",
-   "IMU batches settled uncommitted through afterImuConsumption (see the suspended entries)",
+   "IMU batches settled uncommitted through afterImuConsumption (an empty window settles in sync_packages and reports "
+   "through afterEmptyImuWindow: imu_retain_hook_visible)",
    ""},
   {"imu_retain_empty_window",
    "records with outcome dropped_empty_imu: the borrowed prefix is settled uncommitted and stays in the buffer",
    "test_anchor_lifecycle_node AnchorLifecycleInputs.AnImuStretchNothingObservedEndsTheAnchorAndStartsTheRecovery"},
+  {"imu_retain_hook_visible",
+   "empty IMU windows afterEmptyImuWindow reported (imu_retain.v1): the batch settled uncommitted and the samples it "
+   "leaves queued",
+   ""},
   {"imu_not_processed", "records with outcome imu_not_processed", ""},
   {"imu_coverage_gap",
    "records with outcome imu_coverage_gap",
@@ -711,6 +996,16 @@ constexpr Branch kBranches[] = {
    "scans whose H-model iterations found at least one effective point",
    "test_h_model_scan_bounds HModelScanBounds.*"},
   {"no_match", "scans whose H-model iterations found no effective point", ""},
+  {"h_matrix_values",
+   "H-model exits whose Jacobian rows and residuals were recorded (h_matrix.v1 with at least one row)",
+   "test_h_model_scan_bounds HModelScanBounds.*"},
+  {"full_state_and_covariance",
+   "iterated lidar updates whose full state and covariance were recorded (filter_update.v1)",
+   ""},
+  {"typed_outputs_with_fixed_identity",
+   "FrontendObservation and ReferenceHealth messages received with the fixed activation identity (typed scenario)",
+   "test_anchor_lifecycle_node AnchorLifecycleReference.*"},
+  {"reference_repeat", "ReferenceHealth messages of KIND_STATE_REPEAT received (typed scenario)", ""},
   {"early_exit_scan",
    "records with outcome before_anchor_step",
    "test_anchor_lifecycle_node AnchorLifecycleEvidence.AScanThatLeavesBeforeTheAnchorStepEndsTheCandidate"},
@@ -750,40 +1045,6 @@ constexpr Branch kBranches[] = {
    "test_anchor_lifecycle_node AnchorLifecycleEntryView.*"},
 };
 
-// What the existing hooks cannot reach. Each entry names the hook S1 adds under FASTLIO_TEST_HOOKS and where; the
-// line numbers are those of laserMapping.cpp at fork base 0afda1d.
-struct Suspended
-{
-  const char * branch;
-  const char * missing;
-  const char * hook;
-};
-
-constexpr Suspended kSuspended[] = {
-  {"h_matrix_values",
-   "afterHModelRows reports row counts only: the measurement Jacobian rows (ekfom_data.h_x) and residuals "
-   "(ekfom_data.h) of each iteration are not reachable",
-   "afterHModelMatrices(const Eigen::MatrixXd & h_x, const Eigen::VectorXd & h, double lidar_end_time) in "
-   "h_share_model, right before 'solve_time += omp_get_wtime() - solve_start_;' (L4162), and with empty matrices at "
-   "the no-effective-point exit (L3947-3949)"},
-  {"full_state_and_covariance",
-   "the record has position, attitude, velocity and the 6x6 pose covariance around the anchor step, /Odometry the "
-   "6x6 pose covariance; the 23-dimensional state (extrinsics, biases, gravity) and the 23x23 P after the iterated "
-   "update are not reachable",
-   "afterLidarUpdate(const state_ikfom & x, const Eigen::Matrix<double, 23, 23> & P, double lidar_end_time) right "
-   "after kf.update_iterated_dyn_share_modified(...) (L6124-6125), before state_point = kf.get_x() (L6128)"},
-  {"typed_outputs_with_fixed_identity",
-   "FrontendObservation and ReferenceHealth carry the activation's random source instance (getrandom, L4347), and "
-   "the reference repeat runs on a steady-clock period (publishReferenceRepeat, L1782): no hook fixes either",
-   "overrideFrontendInstance(std::array<std::uint8_t, 16> & instance) after the getrandom loop (L4354), and a fixture "
-   "clock for publishReferenceRepeat (L1782); test_anchor_lifecycle_node asserts the typed outputs' semantics"},
-  {"imu_retain_hook_visible",
-   "an empty IMU window settles the borrowed prefix uncommitted in sync_packages without afterImuConsumption, so the "
-   "retained batch shows only as the record outcome dropped_empty_imu and in the input snapshot",
-   "afterImuConsumption(sequence, kUncommitted, reason, 0, pending, first_id) right after "
-   "imu_fifo_transaction.settle(..., ImuDisposition::kUncommitted) in sync_packages (L2702)"},
-};
-
 // ---------------------------------------------------------------------------
 // The child: one component activation, one scenario
 // ---------------------------------------------------------------------------
@@ -818,6 +1079,8 @@ public:
       options.use_intra_process_comms(true);
       options.parameter_overrides(overrides);
       subject_.emplace(factory_->create_node_instance(options));
+      if (scenario_.typed)
+        error = appendIdentity();
       rclcpp::NodeOptions observer_options;
       observer_options.use_intra_process_comms(true);
       observer_ = std::make_shared<rclcpp::Node>("frontend_pipeline_contract_observer", observer_options);
@@ -831,11 +1094,31 @@ public:
         [this](nav_msgs::msg::Odometry::ConstSharedPtr message) {
           odom_by_ms_[msKey(rclcpp::Time(message->header.stamp).seconds())] = *message;
         });
+      if (scenario_.typed) {
+        const auto typed_qos = rclcpp::QoS(rclcpp::KeepLast(1000)).best_effort();
+        frontend_sub_ = observer_->create_subscription<fast_lio_interfaces::msg::FrontendObservation>(
+          kFrontendObservationTopic,
+          typed_qos,
+          [this](fast_lio_interfaces::msg::FrontendObservation::ConstSharedPtr message) {
+            onFrontendObservation(*message);
+          });
+        reference_sub_ = observer_->create_subscription<fast_lio_interfaces::msg::ReferenceHealth>(
+          kReferenceHealthTopic, typed_qos, [this](fast_lio_interfaces::msg::ReferenceHealth::ConstSharedPtr message) {
+            onReferenceHealth(*message);
+          });
+      }
       executor_->add_node(subject_->get_node_base_interface());
       executor_->add_node(observer_);
-      if (!spinUntil([&] { return imu_->get_subscription_count() == 1 && lidar_->get_subscription_count() == 1; }))
+      if (!spinUntil([&] {
+            return imu_->get_subscription_count() == 1 && lidar_->get_subscription_count() == 1 &&
+                   (!scenario_.typed ||
+                    (frontend_sub_->get_publisher_count() == 1 && reference_sub_->get_publisher_count() == 1));
+          }))
         error = "front end subscriptions never matched";
     }
+    // The repeat throttle keeps the time of its first call: make that call before any input, at the clock's start.
+    if (error.empty() && scenario_.typed)
+      error = runScanPath("before the first input");
     if (error.empty())
       error = warmUp();
     for (std::size_t i = 0; error.empty() && i < scenario_.slots.size(); ++i) {
@@ -844,6 +1127,10 @@ public:
     }
     if (error.empty())
       error = settle(true);
+    if (error.empty() && scenario_.typed)
+      error = appendTyped();
+    if (error.empty() && scenario_.typed && (typed_frontend_total_ == 0 || typed_reference_total_ == 0))
+      error = "the typed scenario received no FrontendObservation or no ReferenceHealth";
     teardown();
     finish();
     return error;
@@ -967,6 +1254,55 @@ private:
       else
         it->second = std::max(it->second, effective);
     };
+    fast_lio_test::afterHModelMatrices =
+      [this](double end, bool valid, const Eigen::MatrixXd & h_x, const Eigen::VectorXd & h) {
+        std::ostringstream out;
+        out << "h_matrix.v1 end=" << bits(end) << " valid=" << (valid ? 1 : 0) << " h_x=" << h_x.rows() << 'x'
+            << h_x.cols() << " h_x_sha256=" << matrixDigest(h_x) << " h=" << h.rows()
+            << " h_sha256=" << matrixDigest(h);
+        if (note("afterHModelMatrices", out.str()) && h_x.rows() > 0)
+          ++counts_["h_matrix_values"];
+      };
+    fast_lio_test::afterLidarUpdate = [this](double end, const fast_lio_test::FilterSnapshot & s) {
+      constexpr std::size_t kDim = 23;
+      double diagonal[kDim];
+      for (std::size_t i = 0; i < kDim; ++i)
+        diagonal[i] = s.P[i * kDim + i];
+      std::ostringstream out;
+      out << "filter_update.v1 end=" << bits(end) << " pos=" << bitsList(s.pos, 3)
+          << " rot_xyzw=" << bitsList(s.rot_xyzw, 4) << " offset_R_L_I_xyzw=" << bitsList(s.offset_R_L_I_xyzw, 4)
+          << " offset_T_L_I=" << bitsList(s.offset_T_L_I, 3) << " vel=" << bitsList(s.vel, 3)
+          << " bg=" << bitsList(s.bg, 3) << " ba=" << bitsList(s.ba, 3) << " grav=" << bitsList(s.grav, 3)
+          << " P=23x23 P_sha256=" << bitsDigest(s.P, kDim * kDim) << " P_diag=" << bitsList(diagonal, kDim);
+      if (note("afterLidarUpdate", out.str()))
+        ++counts_["full_state_and_covariance"];
+    };
+    fast_lio_test::afterEmptyImuWindow =
+      [this](std::uint64_t sequence, std::size_t borrowed, std::size_t pending, std::uint64_t first, bool faulted) {
+        std::ostringstream out;
+        out << "imu_retain.v1 seq=" << sequence << " disposition=uncommitted reason=empty_window borrowed=" << borrowed
+            << " pending=" << pending << " first_queued_id=" << first << " faulted=" << (faulted ? 1 : 0);
+        if (note("afterEmptyImuWindow", out.str()))
+          ++counts_["imu_retain_hook_visible"];
+      };
+    // Installed only for the typed scenario: the activation identity, the repeat clock and the constructor's IDs.
+    if (scenario_.typed) {
+      fast_lio_test::overrideFrontendInstance = [](std::array<std::uint8_t, 16> & instance) {
+        instance = kFixedInstance;
+        return true;
+      };
+      fast_lio_test::referenceRepeatClock = [this] {
+        return repeat_clock_;
+      };
+      fast_lio_test::afterConstruction = [this](const std::vector<fast_lio_test::EffectiveValue> & values) {
+        for (const auto & value : values) {
+          if (value.name == "derived:config_id:reference_contract_id")
+            contract_id_ = value.value;
+          else if (value.name == "derived:config_id:reference_config_id")
+            config_id_ = value.value;
+        }
+      };
+    }
     fast_lio_test::overrideGuardDegraded = [this](double end) {
       const Slot * s = slotAt(end);
       const int forced = s == nullptr ? kGuardHealthy : s->guard;
@@ -1050,6 +1386,12 @@ private:
     fast_lio_test::afterImuConsumption = {};
     fast_lio_test::afterScanPrepared = {};
     fast_lio_test::afterHModelRows = {};
+    fast_lio_test::afterHModelMatrices = {};
+    fast_lio_test::afterLidarUpdate = {};
+    fast_lio_test::afterEmptyImuWindow = {};
+    fast_lio_test::overrideFrontendInstance = {};
+    fast_lio_test::referenceRepeatClock = {};
+    fast_lio_test::afterConstruction = {};
     fast_lio_test::overrideGuardDegraded = {};
     fast_lio_test::forceRunawayTrip = {};
     fast_lio_test::beforeAnchorStep = {};
@@ -1382,6 +1724,63 @@ private:
     }
   }
 
+  // The typed scenario's activation identity: the fixed instance and the IDs the constructor computed.
+  std::string appendIdentity()
+  {
+    if (contract_id_.empty() || config_id_.empty())
+      return "the constructor reported no contract or configuration ID";
+    stream_.push_back("identity.v1 source_instance=" + hex(kFixedInstance.data(), kFixedInstance.size()) +
+                      " producer_contract_id=" + contract_id_ + " config_id=" + config_id_);
+    return "";
+  }
+
+  void typedMismatch(const std::string & what)
+  {
+    if (typed_error_.empty())
+      typed_error_ = what;
+  }
+
+  void onFrontendObservation(const fast_lio_interfaces::msg::FrontendObservation & m)
+  {
+    if (!m.has_source_instance || m.source_instance != kFixedInstance)
+      typedMismatch("a FrontendObservation without the fixed source instance");
+    typed_frontend_.push_back(formatFrontendObservation(m));
+    ++typed_received_;
+  }
+
+  void onReferenceHealth(const fast_lio_interfaces::msg::ReferenceHealth & m)
+  {
+    if (!m.has_source_instance || m.source_instance != kFixedInstance)
+      typedMismatch("a ReferenceHealth without the fixed source instance");
+    if (hex(m.producer_contract_id.data(), m.producer_contract_id.size()) != contract_id_ ||
+        hex(m.config_id.data(), m.config_id.size()) != config_id_)
+      typedMismatch("a ReferenceHealth whose contract or configuration ID is not the constructor's");
+    if (m.kind == fast_lio_interfaces::msg::ReferenceHealth::KIND_STATE_REPEAT)
+      ++counts_["reference_repeat"];
+    typed_reference_.push_back(formatReferenceHealth(m));
+    ++typed_received_;
+  }
+
+  // Every typed message published so far, per topic in arrival order. Intra-process delivery waits for the executor:
+  // spin until a pass delivers nothing more.
+  std::string appendTyped()
+  {
+    for (std::uint64_t before = typed_received_ + 1; before != typed_received_;) {
+      before = typed_received_;
+      executor_->spin_some();
+    }
+    counts_["typed_outputs_with_fixed_identity"] += typed_frontend_.size() + typed_reference_.size();
+    typed_frontend_total_ += typed_frontend_.size();
+    typed_reference_total_ += typed_reference_.size();
+    for (auto & line : typed_frontend_)
+      stream_.push_back(std::move(line));
+    for (auto & line : typed_reference_)
+      stream_.push_back(std::move(line));
+    typed_frontend_.clear();
+    typed_reference_.clear();
+    return typed_error_;
+  }
+
   std::string runSlot(const Slot & s, bool next_moving)
   {
     const int index = static_cast<int>(slots_.size());
@@ -1420,6 +1819,9 @@ private:
       }
     }
     error = settle(false);
+    // The one reference repeat a slot can make falls on its last scan path run: nothing is left to take there.
+    if (error.empty() && scenario_.typed)
+      repeat_clock_ += kRepeatClockStep;
     if (error.empty())
       error = runScanPath("at the end of slot " + std::to_string(index));
     if (error.empty() && throw_next_imu_process_)
@@ -1427,6 +1829,11 @@ private:
     if (!error.empty())
       return error;
     appendArrivedOdometry();
+    if (scenario_.typed) {
+      error = appendTyped();
+      if (!error.empty())
+        return error;
+    }
     stream_.push_back(describeInputs());
     return "";
   }
@@ -1440,6 +1847,8 @@ private:
     scan_path_timer_.reset();
     subject_.reset();  // the destructor joins the node's workers and writes the counter summary through the hook
     clearHooks();
+    reference_sub_.reset();
+    frontend_sub_.reset();
     odom_.reset();
     imu_.reset();
     lidar_.reset();
@@ -1491,6 +1900,15 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_;
+  rclcpp::Subscription<fast_lio_interfaces::msg::FrontendObservation>::SharedPtr frontend_sub_;
+  rclcpp::Subscription<fast_lio_interfaces::msg::ReferenceHealth>::SharedPtr reference_sub_;
+  std::chrono::steady_clock::time_point repeat_clock_{kRepeatClockStart};
+  std::string contract_id_, config_id_;                        // hex, from the constructor's effective configuration
+  std::vector<std::string> typed_frontend_, typed_reference_;  // received since the last appendTyped
+  std::uint64_t typed_received_ = 0;
+  std::uint64_t typed_frontend_total_ = 0;
+  std::uint64_t typed_reference_total_ = 0;
+  std::string typed_error_;
   std::map<std::int64_t, nav_msgs::msg::Odometry> odom_by_ms_;
   std::vector<std::int64_t> published_ends_;  // ms keys of published records whose /Odometry is not in the record yet
   std::vector<Slot> slots_;                   // every slot run, the warm-up's included
@@ -1807,14 +2225,8 @@ void writeReceipt(const Scenario & scenario,
         << ",\"counted\":" << jsonString(branch.counted) << ",\"reference\":" << jsonString(branch.reference) << "}";
     first = false;
   }
-  out << "],\"suspended\":[";
-  first = true;
-  for (const auto & entry : kSuspended) {
-    out << (first ? "" : ",") << "{\"branch\":" << jsonString(entry.branch) << ",\"triggered\":false"
-        << ",\"missing\":" << jsonString(entry.missing) << ",\"hook\":" << jsonString(entry.hook) << "}";
-    first = false;
-  }
-  out << "],\"off_thread_hooks\":{";
+  // Every branch the hooks could not reach before is a counted branch above: none is suspended.
+  out << "],\"suspended\":[],\"off_thread_hooks\":{";
   first = true;
   for (const auto & entry : run.off_thread) {
     out << (first ? "" : ",") << jsonString(entry.first) << ':' << entry.second;
@@ -1902,6 +2314,11 @@ void checkScenario(const Scenario & scenario)
 TEST(FrontendPipelineContract, Match)
 {
   checkScenario(matchScenario());
+}
+
+TEST(FrontendPipelineContract, TypedMatch)
+{
+  checkScenario(typedMatchScenario());
 }
 
 TEST(FrontendPipelineContract, ParkedPriorAndReset)

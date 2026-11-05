@@ -20,7 +20,8 @@ Inputs and goldens of the two contract fixtures of the legacy front-end node (la
   scenario also records the measurement Jacobian and residuals of each iteration (`h_matrix.v1`), the filter state
   and covariance after each lidar update (`filter_update.v1`) and the IMU samples an empty scan leaves queued
   (`imu_retain.v1`); the typed scenario records both typed outputs, field by field, with a fixed instance and a
-  fixed repeat clock.
+  fixed repeat clock. The scenarios set `mapping.extrinsic_est_en` to true, which is off by default, so the recorded
+  Jacobian keeps its extrinsic columns.
 
 Lines whose first word is a `.v1` name (`event.v1`, `effective.v1`, `h_matrix.v1`, ...) were added to records
 that existed before them; removing them gives each earlier record unchanged.

@@ -36,7 +36,7 @@ struct ImuParameterSpecs
   const ParameterSpec<double> imu_gap_rate_yaw_max{"imu_gap_rate_yaw_max", 10.0, 10.0};
   const ParameterSpec<double> imu_gap_verify_s{"imu_gap_verify_s", 0.3, 0.3};
   const ParameterSpec<bool> imu_gap_empty_scans{"imu_gap_empty_scans", false, false};
-  const ParameterSpec<bool> mapping_extrinsic_est_en{"mapping.extrinsic_est_en", true, true};
+  const ParameterSpec<bool> mapping_extrinsic_est_en{"mapping.extrinsic_est_en", false, false};
   const ParameterSpec<std::vector<double>> mapping_extrinsic_T{
     "mapping.extrinsic_T", std::vector<double>(), std::vector<double>()};
   const ParameterSpec<std::vector<double>> mapping_extrinsic_R{

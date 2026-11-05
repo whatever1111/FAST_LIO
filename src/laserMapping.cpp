@@ -160,7 +160,7 @@ double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 double match_search_time = 0, match_nosearch_time = 0;
 int ekf_iters = 0, ekf_search_iters = 0;
 int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
-bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true;
+bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = false;
 bool ikd_profile = false;  // [ikd-profile] per-scan rebuild-split line, gated by env FLIO_IKD_PROFILE
 // Mapping pause/resume gate. Owned by PGO node (lio_slam_fastLioPGO publishes
 // /lio_slam/mapping_enabled with transient_local QoS); we mirror it here.

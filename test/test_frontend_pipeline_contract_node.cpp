@@ -719,7 +719,8 @@ void setPolicy(Scenario & scenario, double total, double stable)
   setParam(scenario, rclcpp::Parameter("reanchor_recovery_stable_sec", stable));
 }
 
-// test_anchor_lifecycle_node's base configuration, with the anchor trace on.
+// test_anchor_lifecycle_node's base configuration, with the anchor trace on, and online extrinsic estimation on: the
+// node defaults to off, and h_matrix.v1 and filter_update.v1 are to cover the extrinsic columns of H.
 Scenario baseScenario(const std::string & name)
 {
   Scenario s;
@@ -727,6 +728,7 @@ Scenario baseScenario(const std::string & name)
   for (const auto & p :
        {rclcpp::Parameter("mapping.extrinsic_T", std::vector<double>{0.0, 0.0, 0.0}),
         rclcpp::Parameter("mapping.extrinsic_R", std::vector<double>{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}),
+        rclcpp::Parameter("mapping.extrinsic_est_en", true),
         rclcpp::Parameter("common.lid_topic", kLidarTopic),
         rclcpp::Parameter("common.imu_topic", kImuTopic),
         rclcpp::Parameter("preprocess.lidar_type", 3),

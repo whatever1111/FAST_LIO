@@ -110,6 +110,7 @@
 #include "degeneracy_policy.hpp"
 #include "engulf_release.hpp"
 #include "frontend_observation.hpp"
+#include "frontend_parameters_ros.hpp"
 #include "gravity_align_kinematics.hpp"
 #include "imu_backlog_policy.hpp"
 #include "imu_gap_prior.hpp"
@@ -159,7 +160,7 @@ double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 double match_search_time = 0, match_nosearch_time = 0;
 int ekf_iters = 0, ekf_search_iters = 0;
 int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
-bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true;
 bool ikd_profile = false;  // [ikd-profile] per-scan rebuild-split line, gated by env FLIO_IKD_PROFILE
 // Mapping pause/resume gate. Owned by PGO node (lio_slam_fastLioPGO publishes
 // /lio_slam/mapping_enabled with transient_local QoS); we mirror it here.
@@ -186,7 +187,7 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = string(ROOT_DIR);
-string map_file_path, lid_topic, imu_topic, imu_input_type = "sensor_msgs", imu_bias_topic = "/fixposition/fpa/imubias";
+string map_file_path;
 
 // Frame ids stamped on everything this node publishes. The odom frame is the
 // origin of the local map: fixed at initialization, gravity-aligned, and free to
@@ -199,12 +200,10 @@ string body_frame_id = "body";
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
-double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
-double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
-double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
+double filter_size_map_min = 0;
+double cube_len = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
-int iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1,
-    pcd_index = 0;
+int iterCount = 0, feats_down_size = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 // Position-observability metric, refreshed each h_share_model call: eigenvalues
 // of the normal information matrix M = sum(n n^T) over the matched plane normals.
 // pos_obs_z_weak = |Z component| of the weakest eigenvector; →1 means Z is the
@@ -248,104 +247,21 @@ constexpr double kHealthSpeedGate = 0.2;  // m/s, same gate as the [SCAN] trace 
 double scan_obs_along = -1.0;
 double scan_body_speed = 0.0;
 
-// Planar-motion (zero body-vertical-velocity) soft constraint — the A'-2 fix.
-//   When LiDAR loses Z observability (pos_obs_z_weak high), the iEKF dumps the
-//   unexplained residual into the accel bias and the state flies off. This adds a
-//   soft pseudo-measurement "body-frame vertical velocity ≈ 0" (a ground-robot
-//   non-holonomic prior, like the wheel-odom update) that supplies the missing
-//   vertical information and bounds the runaway at its source.
-//   BODY frame → it does NOT fight legitimate slope motion: world-frame vertical
-//   velocity on a ramp comes from the robot's pitch (rotation state), not from
-//   body-frame vz. Gated on z_weak so it has zero effect when Z is well observed.
-bool planar_constraint_en = false;
-double planar_constraint_noise = 0.1;          // m/s, soft (larger = weaker prior)
-double planar_constraint_z_weak_thresh = 0.5;  // apply only when pos_obs_z_weak exceeds this
-
-// Gravity-alignment leveling prior (A1) — the ROOT-CAUSE fix for the iVox pitch-
-// coupled Z drift. The planar (body-vz≈0) constraint above pins a R↔vel CONSISTENCY
-// relation the iEKF already satisfies, so it carries no absolute-pitch information and
-// cannot catch a biased pitch (world-Z drift = forward_distance × sin(pitch_err)) —
-// proven by zero effect from 4× strengthening it. This supplies the missing ABSOLUTE
-// reference: when LiDAR Z is degenerate AND the IMU is in low-linear-accel motion
-// (|‖a‖−g| small), the accelerometer's specific-force direction IS world-up expressed
-// in the body frame. A soft pseudo-measurement pulls the grav-state up-axis onto it,
-// constraining roll/pitch only — yaw lies in the measurement null space (gravity is
-// yaw-invariant), so the LiDAR-excellent heading is never touched.
-bool gravity_align_en = false;
-double gravity_align_noise = 0.05;         // unit-vector (≈rad) std of the leveling prior
-double gravity_align_z_weak_thresh = 0.3;  // engage only when pos_obs_z_weak exceeds this
-double gravity_align_accel_tol = 0.05;     // |‖a‖−g|/g must be below this (low-linear-accel gate)
-double gravity_align_gyro_tol = 0.35;      // rad/s; skip during fast turns (lever-arm safety)
-// 2026-08-31 additions (m20_0831 doorway pitch anatomy) — all default-off:
-double gravity_align_window_s = 0.0;        // [L2] >0: measurement = window-mean specific force
-bool gravity_align_continuous = false;      // [L2] engage every scan (gates still apply)
-double gravity_align_hold_s = 0.0;          // [L1] hold the degraded-strength prior after a trigger
-double gravity_align_noise_degraded = 0.0;  // [L1] tighter sigma while triggered/held (0 = use base)
-double gravity_align_mag_ref = 0.0;         // magnitude-gate anchor; 0 = IMU-init g (biased if init in motion)
-double gravity_align_grav_leak = 1.0;       // [v4] per-engaged-scan multiplicative variance leak on the S2
-                                            // gravity block (fading memory); 1.0 = off
-// [v5] Freeze the S2 gravity state while the levelling prior runs at its
-// degraded strength (trigger or hold): only attitude takes the update then.
-// The leak makes the gravity block a fading-memory filter whose steady-state
-// gain is ~(leak-1) per engaged scan whatever the sigma (P* = (leak-1)·σ²), so
-// at 1.05 the gravity state is a ~2 s low-pass of the accelerometer direction
-// and inside blind re-anchor windows it swings 1.5-2° with the walking
-// dynamics while the vendor INS attitude stays put (m20 0825 133/151/164 s,
-// 0826 111/131 s; docs/PGO_LOOP_TUNING.md §7). The true vertical does not
-// change in those seconds; the attitude is what the degraded prior is for.
-bool gravity_align_grav_freeze_degraded = false;
 // [v5] Whether the last scan's levelling update ran at the degraded/held strength;
 // published in the health flags so a pose-graph consumer can leave those
 // keyframes' roll/pitch unpinned.
 bool gravity_align_degraded_active = false;
-// [v6] Kinematic compensation of the levelling measurement (gravity_align_kinematics.hpp):
-// f = dv_b/dt + ω×v_b − Rᵀg + b_a, and only the ω×v_b term was subtracted. The window mean
-// of dv_b/dt is (v_b(end) − v_b(start))/span — 4-7° of lean at a doorway stop/start on the
-// m20, taken as a 0.46° measurement (docs/PGO_LOOP_TUNING.md §7.3). With the option on the
-// term comes from the filter's own per-scan body-velocity history, the prior is withheld
-// while a velocity overwrite (reset/pin/clamp) lies inside the window, and the velocity
-// covariance at the window edges widens the measurement sigma (scale 0 = off).
-bool gravity_align_lin_accel_comp = false;
-double gravity_align_vel_sigma_scale = 0.0;
+// [v6] What the levelling compensation (FrontendParams::gravity_align_lin_accel_comp) keeps between scans.
 bool gravity_align_vel_overwritten = false;   // the state velocity was assigned outside an update since the last scan
 double gravity_align_prev_t = -1.0;           // previous scan's lidar_end_time (-1 = none yet)
 V3D gravity_align_prev_v_body = V3D::Zero();  // previous scan's body-frame velocity (posterior)
 double gravity_align_prev_var = 0.0;          // previous scan's velocity covariance trace
-// [v6] velocity source for the term: "leg" (default) takes the leg-odometry forward speed
-// (wheel_topic) averaged over the last gravity_align_leg_edge_window_s at each scan end,
-// moved to the IMU point over gravity_align_leg_lever_arm; "filter" takes the iEKF's own
-// velocity — which drifts with the attitude error where the LiDAR does not observe it and
-// then cancels the gravity leakage the prior exists to correct (m20 0831: +3° frame tilt).
-std::string gravity_align_lin_accel_source = "leg";
-double gravity_align_leg_vel_sigma = 0.15;     // m/s; gait residual of the edge mean while moving
-double gravity_align_leg_edge_window_s = 0.2;  // s; trailing mean at each scan end
-std::vector<double> gravity_align_leg_lever_arm_vec;
-V3D gravity_align_leg_lever_arm = V3D::Zero();  // m, IMU frame; IMU point minus the legs' reference point
 bool gravity_align_prev_edge_valid = false;
-// [v6] While the map is frozen (blind stretch) and the body moves, nothing observes the body's
-// acceleration: not the frozen-map near-field registration, not the legs at a threshold, not the
-// FP. The 1 s specific-force mean then leans 5-12° with the stop/start and no compensation can
-// remove it (docs/PGO_LOOP_TUNING.md §7.3-7.4). With this on the prior is withheld there; the
-// attitude rides on the gyro (0.1-1° over such a window) instead of being levelled onto acceleration.
-bool gravity_align_withhold_blind_moving = false;
-// [v7] What sigma describes (gravity_align_kinematics.hpp LevellingSigmaPolicy): "scene" is the legacy
-// rule above; "measurement" makes sigma the measurement's own error — noise_static at rest,
-// noise_moving while moving — and withholds the prior where the acceleration is unobservable
-// (map frozen and body moving); the attitude covariance decides the rest.
-std::string gravity_align_sigma_policy = "scene";
-double gravity_align_noise_static = 0.008;  // rad-equivalent; the specific-force mean is exact at rest (0.06° measured)
-double gravity_align_noise_moving = 0.045;  // ≈2.6°: the gait floor of a compensated 1 s mean while walking
 // [diag] the previous scan's final state, so the IMU propagation can be logged as its own channel
 state_ikfom kalman_last_final_state;
 bool kalman_last_final_valid = false;
 std::deque<std::pair<double, double>> gravity_align_leg_hist;  // (stamp, forward speed) under mtx_twist
 std::deque<std::pair<double, V3D>> gravity_align_gyro_hist;    // (stamp, raw body rate) scan-thread only
-double gravity_align_grav_cap_deg = 3.0;  // [v4] leak cap: grav tangent std ceiling (deg) — bounds how far
-                                          // the gravity state may be steered per run
-bool imu_init_require_still_ = false;     // quasi-static IMU-init gate (see IMU_Processing.hpp)
-double imu_init_still_tol_ = 0.03;
-double imu_init_still_timeout_s_ = 20.0;
-fast_lio::ImuStaticInitParams imu_init_static_params_;
 bool imu_init_degraded_warned_ = false;
 struct GravWinAgg
 {
@@ -357,20 +273,6 @@ struct GravWinAgg
 };
 std::deque<GravWinAgg> grav_win;  // scan-thread only
 double gravity_align_last_trig = -1e18;
-// [v8] Attitude hold (attitude_hold.hpp): scans registered against a frozen map (or, optionally,
-// near-field-only scans with no horizontal surface in view) may update translation and yaw but not
-// roll/pitch — the point-to-plane residuals carry no vertical information there and were tilting
-// the state 0.4-1.7° per scan (docs/PGO_LOOP_TUNING.md §7.5). Decided once per scan before the
-// update from the previous scan's guard verdicts and this scan's far-field share.
-// [diag] per-correspondence dump (corr_dump_en, corr_dump_windows "t1:t2,t3:t4" in lidar_end_time seconds):
-// inside a window every iEKF iteration writes one row per effective correspondence (every point on the
-// first iteration) to corr_dump.csv: the point in the IMU frame, the matched plane's normal, the signed
-// residual, the rotation Jacobian row before any hold projection, the nearest-map distances, the 5-NN
-// patch scatter eigenvalues, the point's in-plane offset from the patch, the view cosine and the
-// degeneracy weight. corr_iter.csv carries one row per iteration (hold verdict, roll/pitch information,
-// the vertical in the body frame), corr_scan.csv one row per scan (the applied rotation and translation,
-// the prior covariance diagonals) — the data a per-correspondence admission rule is designed from
-// (docs/PGO_LOOP_TUNING.md §7.7).
 // [v11] correspondence gate (correspondence_gate.hpp): a match is admitted only when its residual lies
 // within corr_innov_gate_k sigma of its own predicted variance H P Hᵀ + R (and, separately, when its
 // nearest map point is within corr_nn0_max). Both 0 = the legacy s > 0.9 test alone.
@@ -381,16 +283,13 @@ std::vector<double> gate_var, gate_nn0, gate_w, corr_weight;  // per point / per
 // [v11] optional robust kernel on the admitted rows (corr_kernel none|gm|cauchy): IRLS weight on the
 // squared residual with scale c = max(corr_kernel_mad_scale * scan scale, corr_kernel_min_scale); the row
 // and its residual are scaled by sqrt(w), i.e. R_i <- R / w.
-std::string corr_kernel_str = "none";
 int corr_kernel = 0;  // 0 none, 1 Geman-McClure, 2 Cauchy
 double corr_kernel_mad_scale = 3.0, corr_kernel_min_scale = 0.03;
-bool corr_dump_en = false;
-std::string corr_dump_windows_str;
-std::vector<std::pair<double, double>> corr_dump_windows;
+// The correspondence dump (FrontendParams::corr_dump_en describes it): its files and its per-scan state.
 std::ofstream fout_corr, fout_corr_iter, fout_corr_scan;
 bool corr_dump_scan_active = false;  // this scan lies inside a dump window (set before the update)
 int corr_dump_iter = 0;              // h_share_model calls so far on this scan
-fast_lio::AttitudeHoldParams attitude_hold_params;
+// Attitude hold (FrontendParams::attitude_hold is the policy): this scan's verdicts and the telemetry.
 bool lidar_attitude_hold_active = false;   // this scan's scene-rule verdict; read by h_share_model
 bool lidar_attitude_hold_allowed = false;  // release conditions satisfied this scan (starvation, age, holes)
 double lidar_attitude_hold_min_rp_info =
@@ -401,76 +300,20 @@ double lidar_rot_obs_rp_min = 0.0;             // telemetry: last scan's roll/pi
 int lidar_attitude_hold_scans = 0;             // telemetry
 double lidar_attitude_hold_since = -1.0;       // lidar_end_time when the current hold began (-1 = off)
 
-// Divergence guard (P1): when LiDAR correspondences collapse (scan starvation
-// under CPU/IO load, or feature-poor geometry), the iEKF runs on IMU
-// dead-reckoning and the state — especially Z — runs away to ±km and never
-// re-locks (scan leaves the map → permanent "No Effective Points"). This guard
-// detects the sustained collapse and BOUNDS the runaway: it pins body-vz≈0,
-// clamps an implausible body speed, freezes the map so dead-reckoned scans do
-// not corrupt it, and flags the odometry degraded. It is INERT in normal
-// operation (only fires after divergence_guard_streak consecutive scans whose
-// effective-point count falls below divergence_guard_min_eff). Recovery is
-// automatic: once correspondences return, the streak resets and the front end
-// re-locks against the (uncorrupted) map.
-bool divergence_guard_en = true;
-int divergence_guard_min_eff = 50;         // effct_feat_num below this = degenerate scan
-int divergence_guard_streak = 5;           // consecutive degenerate scans → enter degraded
-double divergence_guard_max_speed = 30.0;  // m/s; body-speed clamp while degraded (headroom over any platform speed)
-// Engulfment leading indicator (2026-08-14, m20_0814_degrade forensics): when a
-// low-mounted lidar wades into knee-high vegetation the FAR field vanishes from
-// the raw scan (healthy: ~50% of returns beyond guard_engulf_far_range; engulfed:
-// ~5%) BEFORE effct collapses. The last few "valid" updates on sub-metre grass
-// inject velocity/tilt (measured 2.14 m/s vs 0.5 m/s ground truth, 6° tilt)
-// and, worse, insert drifting garbage into the map for divergence_guard_streak
-// scans before the lagging effct-streak criterion freezes it — after which
-// re-lock is impossible (map poisoned) and survival is a scheduling coin-flip
-// (identical runs: clean vs km-runaway). Freezing the map on the SCAN-level
-// signal makes the guard leading instead of lagging. Computed on the raw
-// downsampled scan (a scene property, independent of matching outcome).
-bool guard_engulf_en = true;              // arm the far-field-collapse trigger
-double guard_engulf_far_range = 2.0;      // m; horizontal radius separating near/far
-double guard_engulf_far_frac_min = 0.15;  // enter when far-field fraction < this
-int guard_engulf_streak = 2;              // consecutive engulfed scans → degraded
-// Release hysteresis + velocity reset (m20_0814_degrade far_frac time series):
-// the brush is FOUR separate plunges (t≈146,165,175,191) with far_frac
-// hovering 0.04–0.39 on every shoulder. Instant release on one scan ≥ min
-// flaps on those shoulders and unfreezes the map for half-grass scans; and
-// whatever velocity the iEKF holds at release is unobserved IMU integration
-// (gravity-align saw 6–7° tilt), which then contaminates the inter-plunge
-// map before the next plunge — that is the run-to-run coin flip. So: release
-// only after guard_engulf_release_scans consecutive scans with far_frac ≥
-// guard_engulf_far_frac_release, and ZERO velocity at release so the next
-// good scans re-estimate it from correspondences instead of trusting the
-// blind stretch. Position/attitude/biases are kept.
-double guard_engulf_far_frac_release = 0.35;  // release needs far field this healthy
-int guard_engulf_release_scans = 5;           // ...for this many consecutive scans
+// Engulfment latch; FrontendParams documents the divergence guard and the engulfment release.
 int consec_engulf_clear = 0;                  // running healthy-scan streak while latched
 bool engulf_latched = false;                  // sticky engulfed state (entered, not yet released)
 double engulf_latch_time = -1.0;              // lidar_end_time of the scan that latched (blind duration at release)
-// Release policy (engulf_release.hpp): what velocity leaves the blind stretch and how much the pose's
-// covariance grows for it. Defaults reproduce the legacy "zero velocity, P untouched".
+// Release policy (engulf_release.hpp), its velocity side: what velocity leaves the blind stretch. The default
+// reproduces the legacy zero velocity; FrontendParams::release_inflate holds the covariance side.
 fast_lio::ReleaseVelocityParams release_vel_params;
-fast_lio::ReleaseInflationParams release_inflate_params;
 double engulf_release_time = -1.0;  // lidar_end_time of the last engulfment release
-// Consider update for roll/pitch (rp_consider.hpp): on the scans the policy names, the lidar update leaves the
-// horizontal rotation at the propagated (gyro) value and updates everything else with the full-P gain.
-fast_lio::RollPitchConsiderParams rp_consider_params;
+// Consider update for roll/pitch (FrontendParams::rp_consider is the policy): verdict and telemetry.
 bool rp_consider_active = false;  // this scan's verdict
 double rp_consider_since = -1.0;  // start of the current considering stretch
 int rp_consider_scans = 0;        // scans considered so far (telemetry)
 int rp_consider_indefinite = 0;   // considered scans whose prior P had a negative eigenvalue (telemetry)
-// Scan-hole guard: when the gap between consecutive processed scans exceeds
-// guard_hole_min_sec, the IMU-only propagation across the hole is replaced by
-// a bounded constant-velocity hold from the pre-hole state before the lidar
-// update runs. Measured on m20_0814_degrade with injected holes over open
-// ground: <=2 s holes recover cleanly, but a 5 s hole let the IMU-only
-// velocity reach 4.1 m/s (walking 1.8) and the position drift metres off the
-// map (effct 3400 -> 400) before the runaway reset — quadratic IMU divergence
-// that ground-only geometry cannot re-observe. Default OFF.
-bool guard_hole_en = false;
-double guard_hole_min_sec = 0.3;      // s; scan gap that counts as a hole (nominal 0.1)
-double guard_hole_max_accel = 1.0;    // m/s^2; |vel - vel_pre_hole| is capped at this * gap
-bool guard_hole_reanchor_pos = true;  // also reset pos to pos_pre + vel_pre * gap
+// Scan-hole guard state (FrontendParams::guard_hole_en describes the guard).
 double hole_last_scan_end = -1.0;
 V3D hole_vel_pre = V3D::Zero();
 V3D hole_pos_pre = V3D::Zero();
@@ -482,7 +325,7 @@ V3D hole_pos_pre = V3D::Zero();
 // there is nothing to dead-reckon: hold the last map-confirmed pose until
 // correspondences return. Evidence is deliberately independent of the pose
 // estimate, which is the thing under suspicion.
-bool zupt_en = true;
+// The hold is switched by FrontendParams::zupt_en.
 double zupt_gyro_thresh = 0.05;         // rad/s; max |omega| over the scan's IMU window
 double zupt_acc_span_ratio = 0.02;      // (max-min)|a| / mean|a| — free of the IMU's unit scale
 double zupt_wheel_speed_thresh = 0.05;  // m/s; wheel speed below this reads as parked
@@ -514,9 +357,7 @@ bool anchor_scan_evaluated = false;    // the scan being processed reached the a
 bool reanchor_lost_this_scan = false;  // the gate declared the scan being processed lost, whatever re-armed it since
 bool anchor_idle_path = false;         // inside the check every IMU sample the front end takes runs
 bool input_epoch_handled = false;
-// Parked hold (parked_hold.hpp): the same evidence, applied while the scan is
-// HEALTHY.
-fast_lio::ParkedHoldParams parked_hold_params;
+// Parked hold state (FrontendParams::parked_hold is the policy).
 fast_lio::ParkedHoldState parked_hold_state;
 // Stationary-anchor trace (anchor_trace.hpp specifies the format). Observation only: the estimator never reads
 // any of it back. Transition records and counters are always on; scan records need zupt_anchor_trace_en.
@@ -548,22 +389,8 @@ fast_lio::ReanchorGate reanchor_gate;
 constexpr std::size_t kReanchorHealthyMinScans = 20;
 fast_lio::HealthyScanWindow reanchor_healthy_res;
 fast_lio::HealthyScanWindow reanchor_healthy_eff;
-// What to do when verification never converges: "hold" keeps the map frozen and
-// the odometry flagged (an external relocalisation has to solve it), while
-// "reset_map" rebuilds the local map at the current pose — the robot keeps
-// working, having traded absolute anchoring for a live estimate.
-std::string reanchor_on_fail = "hold";
-// Runaway watchdog: the guard and the re-anchor gate both key off the scan, and
-// the worst drift keeps the scan looking healthy — the map is rebuilt around
-// the wrong pose every frame, so correspondences and residuals stay good while
-// the estimate walks away (dog 2: effct 2000-3500, res 0.026 m, 45 min at
-// 0.5 m/s, parked). Only evidence from outside the estimator can see that.
-fast_lio::RunawayParams runaway_params;
+// Runaway watchdog state (FrontendParams::runaway is the policy and runaway_on_trip its action).
 fast_lio::RunawayState runaway_state;
-// hold = flag it lost (map freezes, downstream stops consuming the pose),
-// reset_map = rebuild the local map here, fault_exit = die and let the
-// supervisor restart the pipeline.
-std::string runaway_on_trip = "hold";
 double scan_far_frac = 1.0;  // per-scan telemetry: fraction of raw points beyond far_range
 // [RES] telemetry: converged point-to-plane residual by body range bin (0-2,2-5,5-10,10-20,20-40,40+ m):
 // count and sum of squares from the last h_share_model call of the scan (degeneracy_debug only).
@@ -602,7 +429,7 @@ int canopy_ground_recovered = 0;           // diag: rows recovered last h_share 
 
 std::vector<std::uint8_t> point_selected_surf;
 bool lidar_pushed, flg_first_scan = true, flg_EKF_inited;
-bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool scan_pub_en = false, dense_pub_en = false;
 bool is_first_lidar = true;
 bool diag_first_lidar_cb_logged = false;
 bool diag_first_imu_cb_logged = false;
@@ -630,8 +457,6 @@ M3D nn_last_search_rot = M3D::Identity();
 bool nn_have_last_search = false;
 double nn_max_shift = 0.0;  // per-scan telemetry: largest would-be refresh shift (m)
 int nn_skips = 0;
-vector<double> extrinT(3, 0.0);
-vector<double> extrinR(9, 0.0);
 using SteadyClock = std::chrono::steady_clock;
 using SteadyTimePoint = std::chrono::time_point<SteadyClock>;
 
@@ -726,26 +551,16 @@ double max_scan_backlog_sec = 0.5;
 // of IMU sensor time and every sample from the oldest queued scan's begin on (imu_backlog_policy.hpp).
 double max_imu_backlog_sec = 10.0;
 std::uint64_t dropped_imu_backlog_total = 0;
-// 自适应降采样:单帧计算越过预算就把扫描体素调粗,让精度降级而不是延迟降级。
-// Adaptive downsampling: quality degrades instead of latency when a scan costs too much.
-fast_lio::AdaptiveDownsampleParams adaptive_ds_params;
+// Adaptive downsampling state (FrontendParams::adaptive_ds is the policy).
 fast_lio::AdaptiveDownsampleState adaptive_ds_state;
 size_t dropped_scan_total = 0;
 
 bool latency_diag_en = true;
 double latency_log_period_sec = 1.0;
-bool kalman_channel_diag_en = false;
 SteadyTimePoint current_lidar_receive_time;
 SteadyTimePoint last_latency_log_time;
 LatencyStats sensor_to_odom_latency_stats;
 
-bool wheel_odom_en = false;
-string wheel_topic = "/lio/twist";
-double wheel_speed_scale = 1.0;
-double wheel_vel_noise_vx = 0.10;
-double wheel_vel_noise_vy = 0.05;
-double wheel_vel_noise_vz = 0.10;
-M3D R_robot_to_imu = Eye3d;
 deque<Eigen::Vector3d> twist_buffer;
 mutex mtx_twist;
 
@@ -776,8 +591,6 @@ V3F XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0);
 V3F XAxisPoint_world(LIDAR_SP_LEN, 0.0, 0.0);
 V3D euler_cur;
 V3D position_last(Zero3d);
-V3D Lidar_T_wrt_IMU(Zero3d);
-M3D Lidar_R_wrt_IMU(Eye3d);
 
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
@@ -788,7 +601,7 @@ esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 // correlated with roll/pitch through the gravity leak of the blind stretch, so the first position
 // innovations after a release are explained as a roll error (docs/PGO_LOOP_TUNING.md §7.7). With a
 // sigma > 0 the assigned velocity gets that 1-σ and no cross terms; 0 keeps the legacy behaviour bit for bit.
-double guard_vel_reset_sigma = 0.0;  // m/s; a discarded velocity: engulfment release, hole clamp, runaway/parked
+// The sigma of a discarded velocity (engulfment release, hole clamp, runaway/parked) is in FrontendParams.
 double zupt_vel_reset_sigma = 0.0;   // m/s; a velocity zeroed on static evidence (ZUPT, parked hold)
 int vel_cov_resets = 0;
 inline void resetVelocityCovariance(double sigma_v)
@@ -2527,11 +2340,6 @@ void dropAnchorForLostImu(double end)
   dropStationaryAnchor(fast_lio::AnchorDrop::kImuCoverageGap, end);
   startUnobservedImuRecovery(fast_lio::RecoveryCause::kImuCoverageGap, end);
 }
-// IMU-gap prior (imu_gap_prior.hpp, p_imu->gap_params): the scan is propagated across the gap instead of
-// skipped, and an IMU interval longer than imu_gap_verify_s still sends the re-anchor gate to blind, so the map
-// stays frozen until the scans after the gap have re-registered against it — the protection the coverage skip
-// gave, without the lost motion.
-double imu_gap_verify_s = 0.3;
 std::uint64_t imu_gap_bridged_count = 0;
 void markImuGapBridged(double end)
 {
@@ -4293,749 +4101,83 @@ public:
 #ifdef FASTLIO_TEST_HOOKS
     effective_locals_for_test.clear();
 #endif
-    this->declare_parameter<bool>("publish.path_en", true);
-    this->declare_parameter<bool>("publish.effect_map_en", false);
-    this->declare_parameter<bool>("publish.map_en", false);
-    this->declare_parameter<double>("publish.map_period_sec", 5.0);  // /Laser_map publish period (s); 5s = 0.2Hz
-    this->declare_parameter<bool>("publish.scan_publish_en", true);
-    this->declare_parameter<bool>("publish.dense_publish_en", true);
-    this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
-    this->declare_parameter<string>("publish.odom_frame_id", "lidar_odom");
-    this->declare_parameter<string>("publish.body_frame_id", "body");
-    this->declare_parameter<int>("max_iteration", 4);
-    this->declare_parameter<int>("max_buffered_scans", 100);
-    this->declare_parameter<double>("max_scan_backlog_sec", 0.5);
-    // Bound on the IMU sensor time imu_buffer holds, in seconds behind the newest sample; must be finite, <= 0
-    // disables it. 10 s never binds on normal data: the four M20 regression bags hold at most 313 samples (~1.5 s)
-    // before the first scan and well under 1 s in steady state.
-    this->declare_parameter<double>("max_imu_backlog_sec", 10.0);
-    this->declare_parameter<bool>("adaptive_downsample_en", false);
-    this->declare_parameter<double>("adaptive_downsample_budget_sec", 0.06);
-    this->declare_parameter<double>("adaptive_downsample_release_sec", 0.035);
-    this->declare_parameter<double>("adaptive_downsample_step", 0.05);
-    this->declare_parameter<double>("adaptive_downsample_max_voxel", 0.5);
-    this->declare_parameter<int>("adaptive_downsample_raise_after", 5);
-    this->declare_parameter<int>("adaptive_downsample_lower_after", 100);
-    this->declare_parameter<bool>("degeneracy_debug", false);
-    this->declare_parameter<bool>("degeneracy_spectrum_trace", false);
-    // Subspace weighting of the LiDAR position update. The thresholds are SHARES of
-    // the scan's position information (the three normalised eigenvalues sum to 1), so
-    // they must stay well under 1/3 — see degeneracy_policy.hpp.
-    this->declare_parameter<bool>("degeneracy_weighting_en", false);
-    this->declare_parameter<double>("degeneracy_lambda_bad", 0.02);
-    this->declare_parameter<double>("degeneracy_lambda_good", 0.10);
-    this->declare_parameter<double>("degeneracy_min_weight", 0.0);
-    // Absolute test, in effective normals: scales with the downsample density, so it is
-    // a platform value. Compare against R / sigma_pos^2 — below that the propagated
-    // prior already outweighs the scan in that direction. 0/0 disables it.
-    this->declare_parameter<double>("degeneracy_lambda_abs_bad", 2.0);
-    this->declare_parameter<double>("degeneracy_lambda_abs_good", 20.0);
-    // Every weight 0 or 1: the only setting that is also an exact constrained solve.
-    this->declare_parameter<bool>("degeneracy_hard_projection", false);
-    // Judge the Schur complement, so a direction rotation can explain away is not
-    // counted as observed. Changes what both thresholds mean — recalibrate with them.
-    this->declare_parameter<bool>("degeneracy_schur_en", false);
-    this->declare_parameter<double>("degeneracy_schur_ridge", 1e-6);
-    this->declare_parameter<bool>("health_pub_en", true);
-    this->declare_parameter<bool>("planar_constraint_en", false);
-    this->declare_parameter<double>("planar_constraint_noise", 0.1);
-    this->declare_parameter<double>("planar_constraint_z_weak_thresh", 0.5);
-    this->declare_parameter<bool>("gravity_align_en", false);
-    this->declare_parameter<double>("gravity_align_noise", 0.05);
-    this->declare_parameter<double>("gravity_align_z_weak_thresh", 0.3);
-    this->declare_parameter<double>("gravity_align_accel_tol", 0.05);
-    this->declare_parameter<double>("gravity_align_gyro_tol", 0.35);
-    this->declare_parameter<double>("gravity_align_window_s", 0.0);
-    this->declare_parameter<bool>("gravity_align_continuous", false);
-    this->declare_parameter<double>("gravity_align_hold_s", 0.0);
-    this->declare_parameter<double>("gravity_align_noise_degraded", 0.0);
-    this->declare_parameter<double>("gravity_align_mag_ref", 0.0);
-    this->declare_parameter<double>("gravity_align_grav_leak", 1.0);
-    this->declare_parameter<double>("gravity_align_grav_cap_deg", 3.0);
-    this->declare_parameter<bool>("gravity_align_grav_freeze_degraded", false);
-    this->declare_parameter<bool>("lidar_attitude_hold_en", false);
-    this->declare_parameter<double>("corr_innov_gate_k", 0.0);
-    this->declare_parameter<double>("corr_nn0_max", 0.0);
-    this->declare_parameter<double>("corr_gate_mad_scale", 0.0);
-    this->declare_parameter<double>("corr_gate_rot_sigma_floor_deg", 0.0);
-    this->declare_parameter<std::string>("corr_kernel", "none");
-    this->declare_parameter<double>("corr_kernel_mad_scale", 3.0);
-    this->declare_parameter<double>("corr_kernel_min_scale", 0.03);
-    this->declare_parameter<bool>("corr_dump_en", false);
-    this->declare_parameter<std::string>("corr_dump_windows", "");
-    this->declare_parameter<double>("lidar_attitude_hold_far_frac", 0.0);
-    this->declare_parameter<int>("lidar_attitude_hold_min_effct", 100);
-    this->declare_parameter<double>("lidar_attitude_hold_max_s", 3.0);
-    this->declare_parameter<double>("lidar_attitude_hold_max_scan_gap_s", 0.3);
-    this->declare_parameter<double>("lidar_attitude_hold_min_rp_info", 0.0);
-    this->declare_parameter<double>("guard_vel_reset_sigma", 0.0);
-    this->declare_parameter<double>("zupt_vel_reset_sigma", 0.0);
-    this->declare_parameter<double>("lidar_attitude_hold_z_weak", 0.9);
-    this->declare_parameter<bool>("gravity_align_lin_accel_comp", false);
-    this->declare_parameter<double>("gravity_align_vel_sigma_scale", 0.0);
-    this->declare_parameter<std::string>("gravity_align_lin_accel_source", "leg");
-    this->declare_parameter<bool>("gravity_align_withhold_blind_moving", false);
-    this->declare_parameter<std::string>("gravity_align_sigma_policy", "scene");
-    this->declare_parameter<double>("gravity_align_noise_static", 0.008);
-    this->declare_parameter<double>("gravity_align_noise_moving", 0.045);
-    this->declare_parameter<double>("gravity_align_leg_vel_sigma", 0.15);
-    this->declare_parameter<double>("gravity_align_leg_edge_window_s", 0.2);
-    this->declare_parameter<std::vector<double>>("gravity_align_leg_lever_arm", std::vector<double>{0.0, 0.0, 0.0});
-    this->declare_parameter<bool>("imu_init_require_still", false);
-    this->declare_parameter<double>("imu_init_still_tol", 0.03);
-    this->declare_parameter<double>("imu_init_still_timeout_s", 20.0);
-    this->declare_parameter<bool>("imu_init_still_sustained_en", false);
-    this->declare_parameter<double>("imu_init_still_min_duration_s", 1.0);
-    this->declare_parameter<int>("imu_init_still_min_samples", 100);
-    this->declare_parameter<double>("imu_init_still_gyro_rms_max", 0.1);
-    this->declare_parameter<double>("imu_init_still_gravity_ref", 9.81);
-    this->declare_parameter<double>("imu_init_still_gravity_tol", 0.05);
-    this->declare_parameter<double>("imu_init_still_max_gap_s", 0.1);
-    this->declare_parameter<bool>("divergence_guard_en", true);
-    this->declare_parameter<int>("divergence_guard_min_eff", 50);
-    this->declare_parameter<bool>("guard_engulf_en", true);
-    this->declare_parameter<double>("guard_engulf_far_range", 2.0);
-    this->declare_parameter<double>("guard_engulf_far_frac_min", 0.15);
-    this->declare_parameter<int>("guard_engulf_streak", 2);
-    this->declare_parameter<double>("guard_engulf_far_frac_release", 0.35);
-    this->declare_parameter<int>("guard_engulf_release_scans", 5);
-    this->declare_parameter<std::string>("guard_release_vel_source", "zero");
-    this->declare_parameter<double>("guard_release_leg_max_age_s", 0.5);
-    this->declare_parameter<double>("guard_release_leg_sigma", 0.3);
-    this->declare_parameter<double>("guard_release_keep_sigma", 0.5);
-    this->declare_parameter<bool>("guard_release_inflate_en", false);
-    this->declare_parameter<double>("guard_release_pos_sigma_min", 0.1);
-    this->declare_parameter<double>("guard_release_pos_sigma_rate", 0.2);
-    this->declare_parameter<double>("guard_release_pos_sigma_max", 1.0);
-    this->declare_parameter<double>("guard_release_rp_sigma_deg", 0.5);
-    this->declare_parameter<double>("guard_release_rp_sigma_rate_deg", 0.3);
-    this->declare_parameter<double>("guard_release_rp_sigma_max_deg", 3.0);
-    this->declare_parameter<double>("guard_release_yaw_sigma_deg", 0.0);
-    this->declare_parameter<bool>("lidar_consider_rp_en", false);
-    this->declare_parameter<bool>("lidar_consider_rp_while_engulfed", true);
-    this->declare_parameter<double>("lidar_consider_rp_post_release_s", 0.0);
-    this->declare_parameter<double>("lidar_consider_rp_min_info", 0.0);
-    this->declare_parameter<double>("lidar_consider_rp_z_weak_min", 1.1);
-    this->declare_parameter<double>("lidar_consider_rp_max_s", 0.0);
-    this->declare_parameter<bool>("guard_hole_en", false);
-    this->declare_parameter<double>("guard_hole_min_sec", 0.3);
-    this->declare_parameter<double>("guard_hole_max_accel", 1.0);
-    this->declare_parameter<bool>("guard_hole_reanchor_pos", true);
-    this->declare_parameter<int>("divergence_guard_streak", 5);
-    this->declare_parameter<double>("divergence_guard_max_speed", 30.0);
-    this->declare_parameter<bool>("zupt_en", true);
-    this->declare_parameter<double>("zupt_gyro_thresh", 0.05);
-    this->declare_parameter<double>("zupt_acc_span_ratio", 0.02);
-    this->declare_parameter<double>("zupt_wheel_speed_thresh", 0.05);
-    this->declare_parameter<double>("zupt_wheel_max_age", 0.5);
-    this->declare_parameter<bool>("zupt_require_wheel", false);
-    this->declare_parameter<bool>("zupt_anchor_trace_en", false);
-    this->declare_parameter<bool>("zupt_parked_hold_en", false);
-    this->declare_parameter<int>("zupt_parked_hold_scans", 3);
-    this->declare_parameter<double>("zupt_hold_pos_noise", 0.05);
-    this->declare_parameter<double>("zupt_hold_rot_noise", 0.02);
-    this->declare_parameter<double>("zupt_hold_vel_noise", 0.05);
-    this->declare_parameter<double>("zupt_hold_deadband_sigma", 3.0);
-    this->declare_parameter<int>("zupt_anchor_confirm_scans", 3);
-    this->declare_parameter<double>("zupt_anchor_max_scan_gap_s", 0.0);
-    this->declare_parameter<bool>("reanchor_en", true);
-    this->declare_parameter<int>("reanchor_min_eff", 200);
-    this->declare_parameter<double>("reanchor_max_res", 0.10);
-    this->declare_parameter<int>("reanchor_confirm_scans", 3);
-    this->declare_parameter<double>("reanchor_timeout_sec", 5.0);
-    this->declare_parameter<std::string>("reanchor_on_fail", "hold");
-    this->declare_parameter<double>("reanchor_max_res_ratio", 0.0);
-    this->declare_parameter<double>("reanchor_res_floor", 0.04);
-    this->declare_parameter<double>("reanchor_min_eff_ratio", 0.0);
-    this->declare_parameter<int>("reanchor_healthy_window", 100);
-    this->declare_parameter<double>("reanchor_total_timeout_sec", 0.0);
-    this->declare_parameter<double>("reanchor_recovery_stable_sec", 1.0);
-    this->declare_parameter<bool>("reanchor_recovery_entry_view", false);
-    declareLostRecoveryParameters();
+    params_.declareFront(*this);
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("declare_front");
 #endif
-    frontend_observation_en = this->declare_parameter<bool>("publish.frontend_observation", false);
-    rcl_interfaces::msg::ParameterDescriptor referenceDescriptor;
-    referenceDescriptor.read_only = true;
-    reference_health_en = this->declare_parameter<bool>("publish.reference_health", false, referenceDescriptor);
-    frontend_clock_domain = this->declare_parameter<std::string>("publish.frontend_clock_domain", "");
-    const double frontendIdlePeriod = this->declare_parameter<double>("publish.frontend_idle_period_sec", 0.5);
-    if (reference_health_en && !frontend_observation_en)
-      throw std::invalid_argument("reference health requires publish.frontend_observation=true and its clock domain");
-    if (frontend_observation_en) {
-      if (!fast_lio::frontendIdentifier(frontend_clock_domain, 48) || !std::isfinite(frontendIdlePeriod) ||
-          frontendIdlePeriod < 1e-9 || frontendIdlePeriod > 3600.0) {
-        throw std::invalid_argument(
-          "frontend observation requires an explicit clock domain (1..48 bytes) and idle period 1ns..3600s");
-      }
-      frontend_idle_period_ns = static_cast<std::int64_t>(frontendIdlePeriod * 1e9);
-      frontend_progress = fast_lio::FrontendProgress{};
-      frontend_publication_guard = fast_lio::FrontendPublicationGuard{};
-      frontend_instance.fill(0);
-      std::size_t randomBytes = 0;
-      while (randomBytes < frontend_instance.size()) {
-        const auto count = getrandom(frontend_instance.data() + randomBytes, frontend_instance.size() - randomBytes, 0);
-        if (count < 0 && errno == EINTR)
-          continue;
-        if (count <= 0)
-          break;
-        randomBytes += static_cast<std::size_t>(count);
-      }
-      frontend_has_instance = randomBytes == frontend_instance.size();
+    params_.declareActivation(
+      *this, frontend_observation_en, reference_health_en, frontend_clock_domain, frontend_idle_period_ns);
+    if (frontend_observation_en)
+      startFrontendObservation();
 #ifdef FASTLIO_TEST_HOOKS
-      if (fast_lio_test::overrideFrontendInstance)
-        frontend_has_instance = fast_lio_test::overrideFrontendInstance(frontend_instance);
-#endif
-      if (!frontend_has_instance) {
-        frontend_instance.fill(0);
-        RCLCPP_ERROR(this->get_logger(), "Frontend activation UUID unavailable; typed identity remains unknown");
-      }
-      const auto frontendQos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
-      frontend_publisher = this->create_publisher<fast_lio_interfaces::msg::FrontendObservation>(
-        "/lio_slam/frontend_observation", frontendQos);
-      if (reference_health_en) {
-        reference_progress = fast_lio::ReferenceHealthProgress{};
-        reference_publication_guard = fast_lio::FrontendPublicationGuard{};
-        reference_publisher =
-          this->create_publisher<fast_lio_interfaces::msg::ReferenceHealth>("/lio_slam/reference_health", frontendQos);
-      }
-    }
-#ifdef FASTLIO_TEST_HOOKS
-    effective_locals_for_test.value("publish.frontend_idle_period_sec", frontendIdlePeriod);
     constructionStageForTest("typed_outputs");
 #endif
-    this->declare_parameter<bool>("runaway_watchdog_en", true);
-    this->declare_parameter<double>("runaway_parked_speed_thresh", 0.3);
-    this->declare_parameter<double>("runaway_wheel_speed_margin", 1.0);
-    this->declare_parameter<double>("runaway_hold_sec", 3.0);
-    this->declare_parameter<std::string>("runaway_on_trip", "hold");
-    this->declare_parameter<double>("canopy_near_range", 20.0);
-    this->declare_parameter<double>("canopy_ground_z", -0.47);
-    this->declare_parameter<double>("canopy_ground_halfband", 0.8);
-    this->declare_parameter<bool>("ground_recover_en", false);
-    this->declare_parameter<double>("ground_recover_scan_band", 0.15);
-    this->declare_parameter<int>("ground_recover_min_inliers", 100);
-    this->declare_parameter<double>("ground_recover_max_residual", 1.0);
-    this->declare_parameter<double>("ground_recover_sector_tol", 0.25);
-    this->declare_parameter<int>("ground_recover_max_rows", 4000);
-    this->declare_parameter<string>("map_file_path", "");
-    this->declare_parameter<string>("data_dir", "");
-    this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
-    this->declare_parameter<string>("common.imu_topic", "/livox/imu");
-    this->declare_parameter<string>("common.imu_input_type", "sensor_msgs");
-    this->declare_parameter<string>("common.imu_bias_topic", "/fixposition/fpa/imubias");
-    this->declare_parameter<bool>("common.time_sync_en", false);
-    this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
-    this->declare_parameter<double>("common.imu_time_offset", 0.0);
-    this->declare_parameter<double>("filter_size_corner", 0.5);
-    this->declare_parameter<double>("filter_size_surf", 0.5);
-    this->declare_parameter<double>("filter_size_map", 0.5);
-    this->declare_parameter<double>("cube_side_length", 200.);
-    this->declare_parameter<float>("mapping.det_range", 300.);
-    this->declare_parameter<double>("mapping.fov_degree", 180.);
-    this->declare_parameter<double>("mapping.gyr_cov", 0.1);
-    this->declare_parameter<double>("mapping.acc_cov", 0.1);
-    this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
-    this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
-    this->declare_parameter<double>("preprocess.blind", 0.01);
-    this->declare_parameter<int>("preprocess.lidar_type", AVIA);
-    this->declare_parameter<int>("preprocess.scan_line", 16);
-    this->declare_parameter<int>("preprocess.timestamp_unit", US);
-    this->declare_parameter<int>("preprocess.scan_rate", 10);
-    this->declare_parameter<double>("preprocess.max_scan_duration_s", 0.0);
-    this->declare_parameter<double>("imu_coverage.max_gap_s", 0.0);
-    this->declare_parameter<double>("imu_coverage.max_extrapolation_s", 0.0);
-    this->declare_parameter<bool>("imu_gap_prior_en", false);
-    this->declare_parameter<double>("imu_gap_min_s", 0.1);
-    this->declare_parameter<double>("imu_gap_accel_max", 1.0);
-    this->declare_parameter<double>("imu_gap_accel_max_z", 0.2);
-    this->declare_parameter<double>("imu_gap_rate_rp_max", 0.0);
-    this->declare_parameter<double>("imu_gap_rate_yaw_max", 10.0);
-    this->declare_parameter<double>("imu_gap_verify_s", 0.3);
-    this->declare_parameter<bool>("imu_gap_empty_scans", false);
-    this->declare_parameter<int>("point_filter_num", 2);
-    this->declare_parameter<bool>("nn_refresh_gate_en", false);
-    this->declare_parameter<double>("nn_refresh_min_shift", 0.0);
-    this->declare_parameter<double>("nn_refresh_ref_range", 20.0);
-    this->declare_parameter<bool>("feature_extract_enable", false);
-    this->declare_parameter<bool>("runtime_pos_log_enable", false);
-    this->declare_parameter<bool>("diagnostics.latency_enable", true);
-    this->declare_parameter<double>("diagnostics.latency_log_period_sec", 1.0);
-    this->declare_parameter<bool>("diagnostics.kalman_channel_enable", false);
-    this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
-    this->declare_parameter<int>("mapping.map_insert_delay_scans", 0);
-    this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
-    this->declare_parameter<int>("pcd_save.interval", -1);
-    this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
-    this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
-    this->declare_parameter<string>("prior_map_pcd", "");
-    // Pin the prior map into its own map-backend tier: it is not something this run learned,
-    // so nothing this run does — LRU eviction as the map fills, or the guard dropping a local
-    // map it can no longer register against — may take it away. Inert without prior_map_pcd,
-    // and bit-identical to the unpinned path until one of those two events happens.
-    //
-    // Off by default, and opt in per scene. On the 0831 lobby bag, forcing the guard to lose
-    // its re-registration ends the run 11.1 m from truth unpinned (the map goes 70023 -> 532
-    // points, so there is nothing left to re-register against) versus 1.5 m pinned, but the
-    // pinned run's worst mid-run excursion is larger (16.5 m vs 11.1 m): keeping a map to
-    // re-register against is not the same as knowing where in it you are, which is what
-    // relocalization decides. The pinned tier also cannot heal — the delivered map owns its
-    // cells for the whole run. iVox backend only (the ikd-Tree build has no tier to pin into).
-    this->declare_parameter<bool>("prior_map_pinned", false);
-    // prior_map_align — where the transform that puts the map into THIS run's frame
-    // comes from. The map is delivered in the frame of the run that built it, and that
-    // frame is not a property of the site: a different front-end binary, or the same one
-    // initialising two seconds later while the platform walks, defines a different one.
-    //   "as_delivered" (default) — the caller asserts the two frames coincide; the map is
-    //       added as it is, and initial_pose moves the filter's start pose within it.
-    //   "relocalization"         — nothing is loaded until /relocalization/result says
-    //       where the map is (T_map_lidar_odom); the map is then installed transformed
-    //       into the front end's own frame, and a later alignment replaces the whole tier.
-    // Measured on the 0831 lobby bag: the delivered map's frame sat 1.22 m / 3.4 deg from
-    // the replaying front end's, and loading it as delivered cost 0.253 -> 2.366 m of 2D
-    // error against RTK. Supplying that offset alone brought it back to 0.717 m.
-    this->declare_parameter<string>("prior_map_align", "as_delivered");
-    // Leaf the prior map is downsampled to. 0 = filter_size_map, the live map's dedup grid,
-    // which is what the map backend enforces anyway. A finer leaf survives that grid only
-    // where the live map is sparse, but it costs nothing to ask for: at 0.3 the prior map
-    // enters as one centroid per cell and the effective correspondence count per scan fell
-    // 25-38% on the 0831 bag (accuracy held there; a starved scene may not).
-    this->declare_parameter<double>("prior_map_voxel", 0.0);
-    // Stop growing the map once a prior map is installed (pure localization). Without this
-    // the map is neither: the prior owns its cells, live scans fill the gaps between them.
-    this->declare_parameter<bool>("prior_map_freeze", false);
-    this->declare_parameter<vector<double>>("initial_pose", vector<double>());
-    // initial_pose_full_rpy_override:
-    //   false (default) — inject only XYZ + yaw from initial_pose; keep
-    //     roll/pitch from the IMU-derived gravity-aligned current state.
-    //   true            — fully overwrite roll/pitch from initial_pose. The
-    //     caller MUST guarantee these match gravity (accel along -Z),
-    //     otherwise point cloud transforms will be incorrect.
-    this->declare_parameter<bool>("initial_pose_full_rpy_override", false);
-    // Deprecated alias for initial_pose_full_rpy_override. Kept for
-    // backward compatibility; will emit a warning if set to true.
-    this->declare_parameter<bool>("initial_pose_apply_roll_pitch", false);
-    this->declare_parameter<bool>("wheel_odom_en", false);
-    this->declare_parameter<string>("wheel_topic", "/lio/twist");
-    this->declare_parameter<double>("wheel_speed_scale", 1.0);
-    this->declare_parameter<double>("wheel_vel_noise_vx", 0.10);
-    this->declare_parameter<double>("wheel_vel_noise_vy", 0.05);
-    this->declare_parameter<double>("wheel_vel_noise_vz", 0.10);
-    this->declare_parameter<vector<double>>("wheel_extrinsic_R", vector<double>());
+    params_.declareBack(*this);
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("declare_back");
 #endif
-    this->get_parameter_or<bool>("publish.path_en", path_en, true);
-    this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
-    this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
-    this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
-    this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
-    this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
-    this->get_parameter_or<string>("publish.odom_frame_id", odom_frame_id, string("lidar_odom"));
-    this->get_parameter_or<string>("publish.body_frame_id", body_frame_id, string("body"));
-    this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
-    this->get_parameter_or<int>("max_buffered_scans", max_buffered_scans, 100);
-    this->get_parameter_or<double>("max_scan_backlog_sec", max_scan_backlog_sec, 0.5);
-    this->get_parameter_or<double>("max_imu_backlog_sec", max_imu_backlog_sec, 10.0);
-    if (!std::isfinite(max_imu_backlog_sec)) {
-      RCLCPP_FATAL(this->get_logger(),
-                   "max_imu_backlog_sec must be finite (<= 0 disables the bound), got %f",
-                   max_imu_backlog_sec);
-      throw std::invalid_argument("max_imu_backlog_sec must be finite");
-    }
-    if (!(max_imu_backlog_sec > 0.0)) {
-      RCLCPP_INFO(this->get_logger(),
-                  "[IMU-BACKLOG] max_imu_backlog_sec is %.3f: the IMU queue is not bounded",
-                  max_imu_backlog_sec);
-    }
-    this->get_parameter_or<bool>("adaptive_downsample_en", adaptive_ds_params.enabled, false);
-    this->get_parameter_or<double>("adaptive_downsample_budget_sec", adaptive_ds_params.budget_sec, 0.06);
-    this->get_parameter_or<double>("adaptive_downsample_release_sec", adaptive_ds_params.release_sec, 0.035);
-    this->get_parameter_or<double>("adaptive_downsample_step", adaptive_ds_params.step, 0.05);
-    this->get_parameter_or<double>("adaptive_downsample_max_voxel", adaptive_ds_params.max_voxel, 0.5);
-    this->get_parameter_or<int>("adaptive_downsample_raise_after", adaptive_ds_params.raise_after, 5);
-    this->get_parameter_or<int>("adaptive_downsample_lower_after", adaptive_ds_params.lower_after, 100);
-    this->get_parameter_or<bool>("degeneracy_debug", degeneracy_debug, false);
-    this->get_parameter_or<bool>("degeneracy_spectrum_trace", degeneracy_spectrum_trace, false);
-    this->get_parameter_or<bool>("degeneracy_weighting_en", degeneracy_params.enable, false);
-    this->get_parameter_or<double>("degeneracy_lambda_bad", degeneracy_params.lambda_bad, 0.02);
-    this->get_parameter_or<double>("degeneracy_lambda_good", degeneracy_params.lambda_good, 0.10);
-    this->get_parameter_or<double>("degeneracy_min_weight", degeneracy_params.min_weight, 0.0);
-    this->get_parameter_or<double>("degeneracy_lambda_abs_bad", degeneracy_params.lambda_abs_bad, 2.0);
-    this->get_parameter_or<double>("degeneracy_lambda_abs_good", degeneracy_params.lambda_abs_good, 20.0);
-    this->get_parameter_or<bool>("degeneracy_hard_projection", degeneracy_params.hard_projection, false);
-    this->get_parameter_or<bool>("degeneracy_schur_en", degeneracy_params.schur_en, false);
-    this->get_parameter_or<double>("degeneracy_schur_ridge", degeneracy_params.schur_ridge, 1e-6);
-    this->get_parameter_or<bool>("health_pub_en", health_pub_en, true);
-    this->get_parameter_or<bool>("planar_constraint_en", planar_constraint_en, false);
-    this->get_parameter_or<double>("planar_constraint_noise", planar_constraint_noise, 0.1);
-    this->get_parameter_or<double>("planar_constraint_z_weak_thresh", planar_constraint_z_weak_thresh, 0.5);
-    this->get_parameter_or<bool>("gravity_align_en", gravity_align_en, false);
-    this->get_parameter_or<double>("gravity_align_noise", gravity_align_noise, 0.05);
-    this->get_parameter_or<double>("gravity_align_z_weak_thresh", gravity_align_z_weak_thresh, 0.3);
-    this->get_parameter_or<double>("gravity_align_accel_tol", gravity_align_accel_tol, 0.05);
-    this->get_parameter_or<double>("gravity_align_gyro_tol", gravity_align_gyro_tol, 0.35);
-    this->get_parameter_or<double>("gravity_align_window_s", gravity_align_window_s, 0.0);
-    this->get_parameter_or<bool>("gravity_align_continuous", gravity_align_continuous, false);
-    this->get_parameter_or<double>("gravity_align_hold_s", gravity_align_hold_s, 0.0);
-    this->get_parameter_or<double>("gravity_align_noise_degraded", gravity_align_noise_degraded, 0.0);
-    this->get_parameter_or<double>("gravity_align_mag_ref", gravity_align_mag_ref, 0.0);
-    this->get_parameter_or<double>("gravity_align_grav_leak", gravity_align_grav_leak, 1.0);
-    this->get_parameter_or<double>("gravity_align_grav_cap_deg", gravity_align_grav_cap_deg, 3.0);
-    this->get_parameter_or<bool>("gravity_align_grav_freeze_degraded", gravity_align_grav_freeze_degraded, false);
-    this->get_parameter_or<bool>("lidar_attitude_hold_en", attitude_hold_params.enabled, false);
-    this->get_parameter_or<double>("corr_innov_gate_k", corr_gate.innovation_k, 0.0);
-    this->get_parameter_or<double>("corr_nn0_max", corr_gate.nn0_max, 0.0);
-    this->get_parameter_or<double>("corr_gate_mad_scale", corr_gate.mad_scale, 0.0);
-    this->get_parameter_or<double>("corr_gate_rot_sigma_floor_deg", corr_gate.rot_sigma_floor_deg, 0.0);
-    this->get_parameter_or<std::string>("corr_kernel", corr_kernel_str, std::string("none"));
-    this->get_parameter_or<double>("corr_kernel_mad_scale", corr_kernel_mad_scale, 3.0);
-    this->get_parameter_or<double>("corr_kernel_min_scale", corr_kernel_min_scale, 0.03);
-    corr_kernel = corr_kernel_str == "gm" ? 1 : corr_kernel_str == "cauchy" ? 2 : 0;
-    if (corr_kernel_str != "none" && corr_kernel == 0) {
-      RCLCPP_WARN(this->get_logger(), "corr_kernel '%s' unknown (none|gm|cauchy): kernel off", corr_kernel_str.c_str());
-    }
-    this->get_parameter_or<bool>("corr_dump_en", corr_dump_en, false);
-    this->get_parameter_or<std::string>("corr_dump_windows", corr_dump_windows_str, std::string(""));
-    if (corr_dump_en) {
-      std::stringstream ws(corr_dump_windows_str);
-      std::string item;
-      while (std::getline(ws, item, ',')) {
-        const auto colon = item.find(':');
-        if (colon == std::string::npos) {
-          continue;
-        }
-        corr_dump_windows.emplace_back(std::stod(item.substr(0, colon)), std::stod(item.substr(colon + 1)));
-      }
-      fout_corr.open(DEBUG_FILE_DIR("corr_dump.csv"), std::ios::out);
-      fout_corr << "t,iter,i,eff,range,bx,by,bz,nx,ny,nz,pd2,ax,ay,az,nn0,nn4,n_near,plane_ok,plane_rms,lam0,lam1,lam2,"
-                   "d_in,cosv,w,pz,px,py\n";
-      fout_corr_iter.open(DEBUG_FILE_DIR("corr_iter.csv"), std::ios::out);
-      fout_corr_iter << "t,iter,effct,held,rp_info,ux,uy,uz,searching,degen\n";
-      fout_corr_scan.open(DEBUG_FILE_DIR("corr_scan.csv"), std::ios::out);
-      fout_corr_scan << "t,tk,iters,effct,hold_scene,hold_info,rp_info,drot_x,drot_y,drot_z,dpos_x,dpos_y,dpos_z,"
-                        "far_frac,z_weak,P_rx,P_ry,P_rz,P_px,P_py,P_pz,dvel_x,dvel_y,dvel_z";
-      // the prior covariance over [pos(0-2), rot(3-5), vel(12-14)] as a 9x9 block, row-major: the exact
-      // iteration-0 update of pos/rot needs the pos-rot block, the vel rows show the blind-window coupling
-      for (int a = 0; a < 9; a++) {
-        for (int b = 0; b < 9; b++) {
-          fout_corr_scan << ",P" << a << b;
-        }
-      }
-      fout_corr_scan << "\n";
-      RCLCPP_INFO(this->get_logger(),
-                  "Correspondence dump enabled: %zu window(s) -> %s",
-                  corr_dump_windows.size(),
-                  DEBUG_FILE_DIR("corr_dump.csv").c_str());
-    }
-    this->get_parameter_or<double>("lidar_attitude_hold_far_frac", attitude_hold_params.far_frac_max, 0.0);
-    this->get_parameter_or<int>("lidar_attitude_hold_min_effct", attitude_hold_params.min_effct, 100);
-    this->get_parameter_or<double>("lidar_attitude_hold_max_s", attitude_hold_params.max_hold_s, 3.0);
-    this->get_parameter_or<double>("lidar_attitude_hold_max_scan_gap_s", attitude_hold_params.max_scan_gap_s, 0.3);
-    this->get_parameter_or<double>("lidar_attitude_hold_min_rp_info", lidar_attitude_hold_min_rp_info, 0.0);
-    this->get_parameter_or<double>("guard_vel_reset_sigma", guard_vel_reset_sigma, 0.0);
-    this->get_parameter_or<double>("zupt_vel_reset_sigma", zupt_vel_reset_sigma, 0.0);
-    this->get_parameter_or<double>("lidar_attitude_hold_z_weak", attitude_hold_params.z_weak_min, 0.9);
-    this->get_parameter_or<bool>("gravity_align_lin_accel_comp", gravity_align_lin_accel_comp, false);
-    this->get_parameter_or<double>("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale, 0.0);
-    this->get_parameter_or<std::string>(
-      "gravity_align_lin_accel_source", gravity_align_lin_accel_source, std::string("leg"));
-    this->get_parameter_or<bool>("gravity_align_withhold_blind_moving", gravity_align_withhold_blind_moving, false);
-    this->get_parameter_or<std::string>("gravity_align_sigma_policy", gravity_align_sigma_policy, std::string("scene"));
-    this->get_parameter_or<double>("gravity_align_noise_static", gravity_align_noise_static, 0.008);
-    this->get_parameter_or<double>("gravity_align_noise_moving", gravity_align_noise_moving, 0.045);
-    if (gravity_align_sigma_policy != "scene" && gravity_align_sigma_policy != "measurement") {
-      RCLCPP_FATAL(this->get_logger(),
-                   "gravity_align_sigma_policy must be 'scene' or 'measurement', got '%s'",
-                   gravity_align_sigma_policy.c_str());
-      throw std::invalid_argument("gravity_align_sigma_policy");
-    }
-    this->get_parameter_or<double>("gravity_align_leg_vel_sigma", gravity_align_leg_vel_sigma, 0.15);
-    this->get_parameter_or<double>("gravity_align_leg_edge_window_s", gravity_align_leg_edge_window_s, 0.2);
-    this->get_parameter_or<std::vector<double>>(
-      "gravity_align_leg_lever_arm", gravity_align_leg_lever_arm_vec, std::vector<double>{0.0, 0.0, 0.0});
-    if (gravity_align_leg_lever_arm_vec.size() != 3u) {
-      RCLCPP_FATAL(this->get_logger(),
-                   "gravity_align_leg_lever_arm must have exactly 3 elements, got %zu",
-                   gravity_align_leg_lever_arm_vec.size());
-      throw std::invalid_argument("gravity_align_leg_lever_arm size mismatch");
-    }
-    gravity_align_leg_lever_arm =
-      V3D(gravity_align_leg_lever_arm_vec[0], gravity_align_leg_lever_arm_vec[1], gravity_align_leg_lever_arm_vec[2]);
-    if (gravity_align_lin_accel_source != "leg" && gravity_align_lin_accel_source != "filter") {
-      RCLCPP_FATAL(this->get_logger(),
-                   "gravity_align_lin_accel_source must be 'leg' or 'filter', got '%s'",
-                   gravity_align_lin_accel_source.c_str());
-      throw std::invalid_argument("gravity_align_lin_accel_source");
-    }
-    this->get_parameter_or<bool>("imu_init_require_still", imu_init_require_still_, false);
-    this->get_parameter_or<double>("imu_init_still_tol", imu_init_still_tol_, 0.03);
-    this->get_parameter_or<double>("imu_init_still_timeout_s", imu_init_still_timeout_s_, 20.0);
-    this->get_parameter_or<bool>("imu_init_still_sustained_en", imu_init_static_params_.enabled, false);
-    this->get_parameter_or<double>("imu_init_still_min_duration_s", imu_init_static_params_.minDurationS, 1.0);
-    this->get_parameter_or<int>("imu_init_still_min_samples", imu_init_static_params_.minSamples, 100);
-    this->get_parameter_or<double>("imu_init_still_gyro_rms_max", imu_init_static_params_.gyroRmsMax, 0.1);
-    this->get_parameter_or<double>("imu_init_still_gravity_ref", imu_init_static_params_.gravityRef, 9.81);
-    this->get_parameter_or<double>("imu_init_still_gravity_tol", imu_init_static_params_.gravityTol, 0.05);
-    this->get_parameter_or<double>("imu_init_still_max_gap_s", imu_init_static_params_.maxGapS, 0.1);
-    if (!fast_lio::validImuStaticInitParams(imu_init_static_params_))
-      throw std::invalid_argument("imu_init_still sustained-window limits must be finite and positive");
-    if (fast_lio::imuStaticInitActive(imu_init_require_still_, imu_init_static_params_) &&
-        (!std::isfinite(imu_init_still_tol_) || imu_init_still_tol_ <= 0.0 ||
-         !std::isfinite(imu_init_still_timeout_s_) || imu_init_still_timeout_s_ <= 0.0))
-      throw std::invalid_argument("imu_init_still_tol and imu_init_still_timeout_s must be finite and positive");
-    if (imu_init_static_params_.enabled && !imu_init_require_still_)
-      RCLCPP_WARN(this->get_logger(), "imu_init_still_sustained_en requires imu_init_require_still; gate is inactive");
-    this->get_parameter_or<bool>("divergence_guard_en", divergence_guard_en, true);
-    this->get_parameter_or<int>("divergence_guard_min_eff", divergence_guard_min_eff, 50);
-    this->get_parameter_or<bool>("guard_engulf_en", guard_engulf_en, true);
-    this->get_parameter_or<double>("guard_engulf_far_range", guard_engulf_far_range, 2.0);
-    this->get_parameter_or<double>("guard_engulf_far_frac_min", guard_engulf_far_frac_min, 0.15);
-    this->get_parameter_or<int>("guard_engulf_streak", guard_engulf_streak, 2);
-    this->get_parameter_or<double>("guard_engulf_far_frac_release", guard_engulf_far_frac_release, 0.35);
-    this->get_parameter_or<int>("guard_engulf_release_scans", guard_engulf_release_scans, 5);
-    {
-      std::string release_source;
-      this->get_parameter_or<std::string>("guard_release_vel_source", release_source, "zero");
-      release_vel_params.source = release_source == "leg"    ? fast_lio::ReleaseVelocitySource::kLeg
-                                  : release_source == "keep" ? fast_lio::ReleaseVelocitySource::kKeep
-                                                             : fast_lio::ReleaseVelocitySource::kZero;
-      if (release_source != "leg" && release_source != "keep" && release_source != "zero") {
-        RCLCPP_WARN(this->get_logger(), "guard_release_vel_source '%s' unknown: using 'zero'", release_source.c_str());
-      }
-#ifdef FASTLIO_TEST_HOOKS
-      effective_locals_for_test.value("guard_release_vel_source", release_source);
-#endif
-    }
-    this->get_parameter_or<double>("guard_release_leg_max_age_s", release_vel_params.leg_max_age_s, 0.5);
-    this->get_parameter_or<double>("guard_release_leg_sigma", release_vel_params.leg_sigma, 0.3);
-    this->get_parameter_or<double>("guard_release_keep_sigma", release_vel_params.keep_sigma, 0.5);
-    this->get_parameter_or<bool>("guard_release_inflate_en", release_inflate_params.enabled, false);
-    this->get_parameter_or<double>("guard_release_pos_sigma_min", release_inflate_params.pos_sigma_min, 0.1);
-    this->get_parameter_or<double>("guard_release_pos_sigma_rate", release_inflate_params.pos_sigma_rate, 0.2);
-    this->get_parameter_or<double>("guard_release_pos_sigma_max", release_inflate_params.pos_sigma_max, 1.0);
-    this->get_parameter_or<double>("guard_release_rp_sigma_deg", release_inflate_params.rp_sigma_min_deg, 0.5);
-    this->get_parameter_or<double>("guard_release_rp_sigma_rate_deg", release_inflate_params.rp_sigma_rate_deg, 0.3);
-    this->get_parameter_or<double>("guard_release_rp_sigma_max_deg", release_inflate_params.rp_sigma_max_deg, 3.0);
-    this->get_parameter_or<double>("guard_release_yaw_sigma_deg", release_inflate_params.yaw_sigma_deg, 0.0);
-    this->get_parameter_or<bool>("lidar_consider_rp_en", rp_consider_params.enabled, false);
-    this->get_parameter_or<bool>("lidar_consider_rp_while_engulfed", rp_consider_params.while_engulfed, true);
-    this->get_parameter_or<double>("lidar_consider_rp_post_release_s", rp_consider_params.post_release_s, 0.0);
-    this->get_parameter_or<double>("lidar_consider_rp_min_info", rp_consider_params.min_rp_info, 0.0);
-    this->get_parameter_or<double>("lidar_consider_rp_z_weak_min", rp_consider_params.z_weak_min, 1.1);
-    this->get_parameter_or<double>("lidar_consider_rp_max_s", rp_consider_params.max_consider_s, 0.0);
-    if (rp_consider_params.enabled) {
-      RCLCPP_INFO(this->get_logger(),
-                  "[RP-CONSIDER] lidar update considers roll/pitch while engulfed=%d, %.1fs after a release, when the "
-                  "previous scan's roll/pitch information < %.0f or z_weak >= %.2f (cap %.1fs)",
-                  rp_consider_params.while_engulfed,
-                  rp_consider_params.post_release_s,
-                  rp_consider_params.min_rp_info,
-                  rp_consider_params.z_weak_min,
-                  rp_consider_params.max_consider_s);
-    }
-    this->get_parameter_or<bool>("guard_hole_en", guard_hole_en, false);
-    this->get_parameter_or<double>("guard_hole_min_sec", guard_hole_min_sec, 0.3);
-    this->get_parameter_or<double>("guard_hole_max_accel", guard_hole_max_accel, 1.0);
-    this->get_parameter_or<bool>("guard_hole_reanchor_pos", guard_hole_reanchor_pos, true);
-    this->get_parameter_or<int>("divergence_guard_streak", divergence_guard_streak, 5);
-    this->get_parameter_or<bool>("zupt_en", zupt_en, true);
-    this->get_parameter_or<double>("zupt_gyro_thresh", zupt_gyro_thresh, 0.05);
-    this->get_parameter_or<double>("zupt_acc_span_ratio", zupt_acc_span_ratio, 0.02);
-    this->get_parameter_or<double>("zupt_wheel_speed_thresh", zupt_wheel_speed_thresh, 0.05);
-    this->get_parameter_or<double>("zupt_wheel_max_age", zupt_wheel_max_age, 0.5);
-    this->get_parameter_or<bool>("zupt_require_wheel", zupt_require_wheel, false);
-    this->get_parameter_or<bool>("zupt_anchor_trace_en", zupt_anchor_trace_en, false);
-    this->get_parameter_or<bool>("zupt_parked_hold_en", parked_hold_params.enabled, false);
-    this->get_parameter_or<int>("zupt_parked_hold_scans", parked_hold_params.engage_scans, 3);
-    this->get_parameter_or<double>("zupt_hold_pos_noise", parked_hold_params.pos_noise, 0.05);
-    this->get_parameter_or<double>("zupt_hold_rot_noise", parked_hold_params.rot_noise, 0.02);
-    this->get_parameter_or<double>("zupt_hold_vel_noise", parked_hold_params.vel_noise, 0.05);
-    this->get_parameter_or<double>("zupt_hold_deadband_sigma", parked_hold_params.deadband_sigma, 3.0);
-    this->get_parameter_or<int>("zupt_anchor_confirm_scans", stationary_anchor_params.confirm_scans, 3);
-    double zupt_anchor_max_scan_gap_s = 0.0;
-    this->get_parameter_or<double>("zupt_anchor_max_scan_gap_s", zupt_anchor_max_scan_gap_s, 0.0);
-    this->get_parameter_or<bool>("reanchor_en", reanchor_params.enabled, true);
-    this->get_parameter_or<int>("reanchor_min_eff", reanchor_params.min_eff, 200);
-    this->get_parameter_or<double>("reanchor_max_res", reanchor_params.max_res, 0.10);
-    this->get_parameter_or<int>("reanchor_confirm_scans", reanchor_params.confirm_scans, 3);
-    this->get_parameter_or<double>("reanchor_timeout_sec", reanchor_params.timeout_sec, 5.0);
-    this->get_parameter_or<std::string>("reanchor_on_fail", reanchor_on_fail, std::string("hold"));
-    this->get_parameter_or<double>("reanchor_max_res_ratio", reanchor_params.max_res_ratio, 0.0);
-    this->get_parameter_or<double>("reanchor_res_floor", reanchor_params.res_floor, 0.04);
-    this->get_parameter_or<double>("reanchor_min_eff_ratio", reanchor_params.min_eff_ratio, 0.0);
-    int reanchor_healthy_window = 100;
-    this->get_parameter_or<int>("reanchor_healthy_window", reanchor_healthy_window, 100);
-    if (!std::isfinite(reanchor_params.max_res_ratio) || reanchor_params.max_res_ratio < 0.0 ||
-        !std::isfinite(reanchor_params.res_floor) || reanchor_params.res_floor < 0.0 ||
-        !std::isfinite(reanchor_params.min_eff_ratio) || reanchor_params.min_eff_ratio < 0.0 ||
-        reanchor_healthy_window < 1) {
-      RCLCPP_FATAL(this->get_logger(),
-                   "reanchor_max_res_ratio / reanchor_res_floor / reanchor_min_eff_ratio must be finite and "
-                   "nonnegative and reanchor_healthy_window at least 1");
-      throw std::invalid_argument("reanchor relative verification parameters");
-    }
-    double reanchor_total_timeout_sec = 0.0;
-    double reanchor_recovery_stable_sec = 1.0;
-    this->get_parameter_or<double>("reanchor_total_timeout_sec", reanchor_total_timeout_sec, 0.0);
-    this->get_parameter_or<double>("reanchor_recovery_stable_sec", reanchor_recovery_stable_sec, 1.0);
-    if (!fast_lio::resolveRecoveryParams(reanchor_total_timeout_sec, reanchor_recovery_stable_sec, &recovery_params)) {
-      RCLCPP_FATAL(this->get_logger(),
-                   "reanchor_total_timeout_sec must be finite and nonnegative (0 = off) and "
-                   "reanchor_recovery_stable_sec finite, positive and, with the total on, shorter than it");
-      throw std::invalid_argument("reanchor recovery budget parameters");
-    }
+    fast_lio::FrontendStartup startup;
+    params_.readOutputs(*this, startup, scan_pub_en, dense_pub_en, odom_frame_id, body_frame_id);
+    params_.readBacklog(*this, max_buffered_scans, max_scan_backlog_sec, max_imu_backlog_sec);
+    params_.readDownsampleAndDegeneracy(*this, degeneracy_debug, degeneracy_spectrum_trace, degeneracy_params);
+    params_.readConstraints(*this, health_pub_en);
+    params_.readCorrespondence(*this, corr_gate, corr_kernel, corr_kernel_mad_scale, corr_kernel_min_scale);
+    params_.readCorrespondenceDump(*this);
+    if (params_.values().corr_dump_en)
+      openCorrespondenceDump();
+    params_.readAttitudeAndGravity(*this, lidar_attitude_hold_min_rp_info, zupt_vel_reset_sigma);
+    params_.readImuInit(*this, startup);
+    params_.readGuards(*this, release_vel_params);
+    params_.readHoleAndZupt(*this,
+                            startup,
+                            zupt_gyro_thresh,
+                            zupt_acc_span_ratio,
+                            zupt_wheel_speed_thresh,
+                            zupt_wheel_max_age,
+                            zupt_require_wheel,
+                            zupt_anchor_trace_en,
+                            stationary_anchor_params);
+    params_.readReanchor(*this, startup, reanchor_params, recovery_params);
     reanchor_healthy_res =
-      fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
-    loadLostRecoveryParameters(reanchor_total_timeout_sec);
+      fast_lio::HealthyScanWindow(static_cast<std::size_t>(startup.reanchor_healthy_window), kReanchorHealthyMinScans);
+    params_.loadLostRecovery(*this, health_pub_en, startup.reanchor_total_timeout_sec, lost_recovery_params);
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("lost_recovery_loaded");
 #endif
-    loadRecoveryEntryView();
+    params_.loadRecoveryEntryView(*this);
     reanchor_healthy_eff =
-      fast_lio::HealthyScanWindow(static_cast<std::size_t>(reanchor_healthy_window), kReanchorHealthyMinScans);
+      fast_lio::HealthyScanWindow(static_cast<std::size_t>(startup.reanchor_healthy_window), kReanchorHealthyMinScans);
+    params_.readRunaway(*this, zupt_wheel_max_age, zupt_wheel_speed_thresh);
+    params_.readCanopyAndGround(*this,
+                                canopy_near_range,
+                                canopy_ground_z,
+                                canopy_ground_halfband,
+                                ground_recover_en,
+                                ground_recover_scan_band,
+                                ground_recover_min_inliers,
+                                ground_recover_max_residual,
+                                ground_recover_sector_tol,
+                                ground_recover_max_rows);
+    params_.readDataPaths(*this, map_file_path, root_dir);
 #ifdef FASTLIO_TEST_HOOKS
-    effective_locals_for_test.value("reanchor_healthy_window", reanchor_healthy_window);
-    effective_locals_for_test.value("reanchor_total_timeout_sec", reanchor_total_timeout_sec);
-    effective_locals_for_test.value("reanchor_recovery_stable_sec", reanchor_recovery_stable_sec);
-#endif
-    this->get_parameter_or<bool>("runaway_watchdog_en", runaway_params.enabled, true);
-    this->get_parameter_or<double>("runaway_parked_speed_thresh", runaway_params.parked_speed_thresh, 0.3);
-    this->get_parameter_or<double>("runaway_wheel_speed_margin", runaway_params.wheel_speed_margin, 1.0);
-    this->get_parameter_or<double>("runaway_hold_sec", runaway_params.hold_sec, 3.0);
-    this->get_parameter_or<std::string>("runaway_on_trip", runaway_on_trip, std::string("hold"));
-    runaway_params.wheel_max_age = zupt_wheel_max_age;
-    // 轮速要先自己报出运动,才有资格指认跑飞:恒 0 的速度源(m20 的 /lio/twist 是 GNSS
-    // 代理,拒止段整段读 0)否则会把正常行走判成跑飞。
-    runaway_params.wheel_moving_thresh = zupt_wheel_speed_thresh;
-    this->get_parameter_or<double>("divergence_guard_max_speed", divergence_guard_max_speed, 30.0);
-    this->get_parameter_or<double>("canopy_near_range", canopy_near_range, 20.0);
-    this->get_parameter_or<double>("canopy_ground_z", canopy_ground_z, -0.47);
-    this->get_parameter_or<double>("canopy_ground_halfband", canopy_ground_halfband, 0.8);
-    this->get_parameter_or<bool>("ground_recover_en", ground_recover_en, false);
-    this->get_parameter_or<double>("ground_recover_scan_band", ground_recover_scan_band, 0.15);
-    this->get_parameter_or<int>("ground_recover_min_inliers", ground_recover_min_inliers, 100);
-    this->get_parameter_or<double>("ground_recover_max_residual", ground_recover_max_residual, 1.0);
-    this->get_parameter_or<double>("ground_recover_sector_tol", ground_recover_sector_tol, 0.25);
-    this->get_parameter_or<int>("ground_recover_max_rows", ground_recover_max_rows, 4000);
-    this->get_parameter_or<string>("map_file_path", map_file_path, "");
-    string data_dir_param;
-    this->get_parameter_or<string>("data_dir", data_dir_param, "");
-    if (!data_dir_param.empty()) {
-      root_dir = data_dir_param;
-      if (root_dir.back() != '/')
-        root_dir += '/';
-    }
-#ifdef FASTLIO_TEST_HOOKS
-    effective_locals_for_test.value("data_dir", data_dir_param);
     constructionStageForTest("read_policies");
 #endif
-    this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
-    this->get_parameter_or<string>("common.imu_topic", imu_topic, "/livox/imu");
-    this->get_parameter_or<string>("common.imu_input_type", imu_input_type, string("sensor_msgs"));
-    this->get_parameter_or<string>("common.imu_bias_topic", imu_bias_topic, string("/fixposition/fpa/imubias"));
-    this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
-    this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
-    this->get_parameter_or<double>("common.imu_time_offset", imu_time_offset, 0.0);
-    this->get_parameter_or<double>("filter_size_corner", filter_size_corner_min, 0.5);
-    this->get_parameter_or<double>("filter_size_surf", filter_size_surf_min, 0.5);
-    this->get_parameter_or<double>("filter_size_map", filter_size_map_min, 0.5);
-    this->get_parameter_or<double>("cube_side_length", cube_len, 200.f);
-    this->get_parameter_or<float>("mapping.det_range", DET_RANGE, 300.f);
-    this->get_parameter_or<double>("mapping.fov_degree", fov_deg, 180.f);
-    this->get_parameter_or<double>("mapping.gyr_cov", gyr_cov, 0.1);
-    this->get_parameter_or<double>("mapping.acc_cov", acc_cov, 0.1);
-    this->get_parameter_or<double>("mapping.b_gyr_cov", b_gyr_cov, 0.0001);
-    this->get_parameter_or<double>("mapping.b_acc_cov", b_acc_cov, 0.0001);
-    this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
-    this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
-    this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
-    this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
-    this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
-    // The stationary anchor ends at any gap in the scan evidence longer than this bound (0 = three scan periods).
-    if (!fast_lio::anchorConfirmScansValid(stationary_anchor_params.confirm_scans) ||
-        !fast_lio::resolveAnchorScanGapNs(zupt_anchor_max_scan_gap_s,
-                                          static_cast<double>(p_pre->SCAN_RATE),
-                                          &stationary_anchor_params.max_scan_gap_ns)) {
-      RCLCPP_FATAL(this->get_logger(),
-                   "zupt_anchor_confirm_scans must be at least 1 and zupt_anchor_max_scan_gap_s finite and positive, "
-                   "or 0 with a finite positive preprocess.scan_rate");
-      throw std::invalid_argument("stationary anchor parameters");
-    }
-    RCLCPP_INFO(this->get_logger(),
-                "stationary anchor: confirm_scans=%d max_scan_gap_ns=%lld; recovery budget: total_ns=%lld "
-                "stable_ns=%lld (%s)",
-                stationary_anchor_params.confirm_scans,
-                static_cast<long long>(stationary_anchor_params.max_scan_gap_ns),
-                static_cast<long long>(recovery_params.total_ns),
-                static_cast<long long>(recovery_params.stable_ns),
-                recovery_params.enabled() ? "platform policy on" : "platform policy off");
+    params_.readInputs(*this, startup, time_sync_en, time_diff_lidar_to_imu, imu_time_offset);
+    params_.readMapAndNoise(*this, startup, filter_size_map_min, cube_len, DET_RANGE);
+    params_.readPreprocess(*this, p_pre->blind, p_pre->lidar_type, p_pre->N_SCANS, p_pre->time_unit, p_pre->SCAN_RATE);
+    params_.resolveAnchorGap(*this, startup, p_pre->SCAN_RATE, stationary_anchor_params, recovery_params);
 #ifdef FASTLIO_TEST_HOOKS
-    effective_locals_for_test.value("zupt_anchor_max_scan_gap_s", zupt_anchor_max_scan_gap_s);
     constructionStageForTest("anchor_gap_resolved");
 #endif
-    this->get_parameter_or<double>("preprocess.max_scan_duration_s", max_scan_duration_s, 0.0);
-    this->get_parameter_or<double>("imu_coverage.max_gap_s", p_imu->coverage_params.max_gap_s, 0.0);
-    this->get_parameter_or<double>("imu_coverage.max_extrapolation_s", p_imu->coverage_params.max_extrapolation_s, 0.0);
-    if (!std::isfinite(p_imu->coverage_params.max_gap_s) || p_imu->coverage_params.max_gap_s < 0.0 ||
-        !std::isfinite(p_imu->coverage_params.max_extrapolation_s) || p_imu->coverage_params.max_extrapolation_s < 0.0)
-      throw std::invalid_argument("imu_coverage limits must be finite and nonnegative");
-    if ((p_imu->coverage_params.max_gap_s > 0.0 || p_imu->coverage_params.max_extrapolation_s > 0.0) &&
-        !reanchor_params.enabled)
-      throw std::invalid_argument("imu_coverage requires reanchor_en for recovery against the frozen map");
-    {
-      this->get_parameter_or<bool>("imu_gap_prior_en", p_imu->gap_params.enabled, false);
-      this->get_parameter_or<double>("imu_gap_min_s", p_imu->gap_params.min_gap_s, 0.1);
-      this->get_parameter_or<double>("imu_gap_accel_max", p_imu->gap_params.accel_max, 1.0);
-      this->get_parameter_or<double>("imu_gap_accel_max_z", p_imu->gap_params.accel_max_z, 0.2);
-      double rate_rp_deg = 0.0;
-      double rate_yaw_deg = 10.0;
-      this->get_parameter_or<double>("imu_gap_rate_rp_max", rate_rp_deg, 0.0);
-      this->get_parameter_or<double>("imu_gap_rate_yaw_max", rate_yaw_deg, 10.0);
-      p_imu->gap_params.rate_rp_max = rate_rp_deg * fast_lio::kImuGapDegToRad;
-      p_imu->gap_params.rate_yaw_max = rate_yaw_deg * fast_lio::kImuGapDegToRad;
-      this->get_parameter_or<double>("imu_gap_verify_s", imu_gap_verify_s, 0.3);
-      this->get_parameter_or<bool>("imu_gap_empty_scans", p_imu->gap_params.empty_scans, false);
-      if (p_imu->gap_params.enabled && (!fast_lio::imuGapPriorParamsValid(p_imu->gap_params) ||
-                                        !std::isfinite(imu_gap_verify_s) || imu_gap_verify_s < 0.0)) {
-        RCLCPP_FATAL(this->get_logger(),
-                     "imu_gap_min_s must be positive and imu_gap_accel_max(_z), imu_gap_rate_*_max and "
-                     "imu_gap_verify_s finite and nonnegative");
-        throw std::invalid_argument("imu_gap_* parameters");
-      }
-      if (p_imu->gap_params.enabled) {
-        RCLCPP_INFO(this->get_logger(),
-                    "[IMU-GAP] prior on: IMU intervals > %.3fs up to imu_coverage.max_gap_s %.2fs are bridged "
-                    "(gyro average, velocity held; 1-sigma accel %.2f / %.2f m/s^2 horizontal / vertical, rate "
-                    "roll/pitch %.1f yaw %.1f deg/s), scans without IMU samples %s; gaps > %.2fs are re-verified "
-                    "against the frozen map",
-                    p_imu->gap_params.min_gap_s,
-                    p_imu->coverage_params.max_gap_s,
-                    p_imu->gap_params.accel_max,
-                    p_imu->gap_params.accel_max_z,
-                    rate_rp_deg,
-                    rate_yaw_deg,
-                    p_imu->gap_params.empty_scans ? "carried" : "dropped",
-                    imu_gap_verify_s);
-        if (!(p_imu->coverage_params.max_gap_s > 0.0)) {
-          RCLCPP_WARN(this->get_logger(),
-                      "[IMU-GAP] imu_coverage.max_gap_s is 0: gaps of any length are bridged by dead reckoning");
-        }
-      }
-#ifdef FASTLIO_TEST_HOOKS
-      effective_locals_for_test.value("imu_gap_rate_rp_max", rate_rp_deg);
-      effective_locals_for_test.value("imu_gap_rate_yaw_max", rate_yaw_deg);
-#endif
-    }
-    if (!std::isfinite(max_scan_duration_s) || max_scan_duration_s < 0.0)
-      throw std::invalid_argument("preprocess.max_scan_duration_s must be finite and nonnegative");
-    this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
-    this->get_parameter_or<bool>("nn_refresh_gate_en", nn_refresh_gate_en, false);
-    this->get_parameter_or<double>("nn_refresh_min_shift", nn_refresh_min_shift, 0.0);
-    this->get_parameter_or<double>("nn_refresh_ref_range", nn_refresh_ref_range, 20.0);
-    this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
-    this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
+    params_.readImuCoverage(
+      *this, max_scan_duration_s, p_imu->coverage_params, p_imu->gap_params, reanchor_params.enabled);
+    params_.readFeatureInputs(*this,
+                              p_pre->point_filter_num,
+                              nn_refresh_gate_en,
+                              nn_refresh_min_shift,
+                              nn_refresh_ref_range,
+                              p_pre->feature_enabled,
+                              runtime_pos_log);
     p_imu->runtime_log_en = runtime_pos_log;                // mirror to ImuProcess so Log/imu.txt is written
     ikd_profile = (getenv("FLIO_IKD_PROFILE") != nullptr);  // [ikd-profile] opt-in via env
     {
@@ -5044,121 +4186,38 @@ public:
         async_map_en = false;
     }
 #ifdef USE_IVOX
-    {  // option B: iVox map backend. nearby_type MUST be >=18 (Phase-0: NEARBY6 inadequate).
-      // res=0.5 NN voxels give the best probe NN-agreement (99.9%, tightest normals);
-      // a GLOBAL fine-grid dedup (= filter_size_map) keeps the map at ikd-Tree's 542k.
-      const double ivox_res = this->declare_parameter<double>("ivox_grid_resolution", 0.5);
-      const int ivox_nearby = this->declare_parameter<int>("ivox_nearby_type", 26);
-      const int ivox_vcap = this->declare_parameter<int>("ivox_voxel_capacity", 50);
-      const int ivox_maxvox = this->declare_parameter<int>("ivox_max_voxels", 5000000);
-      if (ivox_maxvox < 0) {
-        RCLCPP_FATAL(this->get_logger(), "ivox_max_voxels must be nonnegative (0 uses 5000000); got %d", ivox_maxvox);
-        throw std::invalid_argument("ivox_max_voxels must be nonnegative");
-      }
-      ikdtree.Init(static_cast<float>(ivox_res), ivox_nearby, ivox_vcap, static_cast<std::size_t>(ivox_maxvox));
+    {  // option B: iVox map backend (its parameters and their notes: frontend_parameter_specs_map.hpp)
+      const fast_lio::IvoxDeclaredValues ivox = params_.declareIvox(*this);
+      ikdtree.Init(static_cast<float>(ivox.grid_resolution),
+                   ivox.nearby_type,
+                   ivox.voxel_capacity,
+                   static_cast<std::size_t>(ivox.max_voxels));
       RCLCPP_INFO(this->get_logger(),
                   "[IVOX] map backend = iVox (res=%.2f nearby=%d voxel_cap=%d max_voxels=%d)",
-                  ivox_res,
-                  ivox_nearby,
-                  ivox_vcap,
-                  ivox_maxvox);
-#ifdef FASTLIO_TEST_HOOKS
-      effective_locals_for_test.value("ivox_grid_resolution", ivox_res);
-      effective_locals_for_test.value("ivox_nearby_type", ivox_nearby);
-      effective_locals_for_test.value("ivox_voxel_capacity", ivox_vcap);
-      effective_locals_for_test.value("ivox_max_voxels", ivox_maxvox);
-#endif
+                  ivox.grid_resolution,
+                  ivox.nearby_type,
+                  ivox.voxel_capacity,
+                  ivox.max_voxels);
     }
 #endif
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("map_backend");
 #endif
-    this->get_parameter_or<bool>("diagnostics.latency_enable", latency_diag_en, true);
-    this->get_parameter_or<double>("diagnostics.latency_log_period_sec", latency_log_period_sec, 1.0);
-    this->get_parameter_or<bool>("diagnostics.kalman_channel_enable", kalman_channel_diag_en, false);
-    this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
-    this->get_parameter_or<int>("mapping.map_insert_delay_scans", map_insert_delay_scans, 0);
-    if (map_insert_delay_scans > 0) {
-      RCLCPP_WARN(this->get_logger(), "[MAP] deterministic insertion lag: %d scan(s)", map_insert_delay_scans);
-    }
-    this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
-    this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
-    this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
-    this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
-    this->get_parameter_or<string>("prior_map_pcd", prior_map_pcd_, string(""));
+    params_.readDiagnosticsAndMapSave(*this,
+                                      startup,
+                                      latency_diag_en,
+                                      latency_log_period_sec,
+                                      extrinsic_est_en,
+                                      map_insert_delay_scans,
+                                      pcd_save_en,
+                                      pcd_save_interval);
+    params_.readPriorMapPath(*this, prior_map_pcd_);
     // Recovery episodes wait for the first local reference only in a fresh process that builds its local map from
     // its own scans. Decided here, once, from the configured parameter and before any input: the prior-map paths
     // clear prior_map_pcd_ later, which grants nothing.
     fast_lio::configureRecoveryStartup(&recovery_state, prior_map_pcd_.empty());
-    this->get_parameter_or<bool>("prior_map_pinned", prior_map_pinned_, false);
-    this->get_parameter_or<double>("prior_map_voxel", prior_map_voxel_, 0.0);
-    this->get_parameter_or<bool>("prior_map_freeze", prior_map_freeze_, false);
-    {
-      string align_name;
-      this->get_parameter_or<string>("prior_map_align", align_name, string("as_delivered"));
-      if (!fast_lio::parsePriorMapAlign(align_name, &prior_map_align_)) {
-        RCLCPP_ERROR(this->get_logger(),
-                     "prior_map_align='%s' is not a known value (as_delivered | relocalization) - "
-                     "loading the map as delivered",
-                     align_name.c_str());
-      }
-      if (prior_map_align_ == fast_lio::PriorMapAlign::kRelocalization) {
-#ifdef USE_IVOX
-        // The map has to be replaceable as a unit when a better alignment arrives, which is
-        // what the pinned tier is: forcing it here rather than asking the operator to set two
-        // parameters that only work together.
-        prior_map_pinned_ = true;
-        RCLCPP_INFO(this->get_logger(),
-                    "prior_map_align=relocalization: the map waits for /relocalization/result and is "
-                    "installed transformed into this run's frame (pinned tier, replaced on realignment)");
-#else
-        prior_map_align_ = fast_lio::PriorMapAlign::kAsDelivered;
-        RCLCPP_ERROR(this->get_logger(),
-                     "prior_map_align=relocalization needs the iVox backend (it replaces a pinned tier); "
-                     "this build uses ikd-Tree - loading the map as delivered instead");
-#endif
-      }
-#ifdef FASTLIO_TEST_HOOKS
-      effective_locals_for_test.value("prior_map_align", align_name);
-#endif
-    }
-    this->get_parameter_or<vector<double>>("initial_pose", initial_pose_vec_, vector<double>());
-    {
-      bool full_rpy_override = false;
-      bool legacy_apply_rp = false;
-      this->get_parameter_or<bool>("initial_pose_full_rpy_override", full_rpy_override, false);
-      this->get_parameter_or<bool>("initial_pose_apply_roll_pitch", legacy_apply_rp, false);
-      if (legacy_apply_rp) {
-        RCLCPP_WARN(this->get_logger(),
-                    "Parameter 'initial_pose_apply_roll_pitch' is deprecated; "
-                    "use 'initial_pose_full_rpy_override' instead.");
-      }
-      initial_pose_full_rpy_override_ = full_rpy_override || legacy_apply_rp;
-      if (initial_pose_full_rpy_override_) {
-        RCLCPP_WARN(this->get_logger(),
-                    "initial_pose_full_rpy_override=true: overriding IMU-aligned "
-                    "roll/pitch with values from initial_pose. Caller must ensure "
-                    "these match gravity (accel along -Z), else point cloud "
-                    "transforms will be incorrect.");
-      }
-#ifdef FASTLIO_TEST_HOOKS
-      effective_locals_for_test.value("initial_pose_full_rpy_override", full_rpy_override);
-      effective_locals_for_test.value("initial_pose_apply_roll_pitch", legacy_apply_rp);
-#endif
-    }
-    this->get_parameter_or<bool>("wheel_odom_en", wheel_odom_en, false);
-    this->get_parameter_or<string>("wheel_topic", wheel_topic, string("/lio/twist"));
-    this->get_parameter_or<double>("wheel_speed_scale", wheel_speed_scale, 1.0);
-    this->get_parameter_or<double>("wheel_vel_noise_vx", wheel_vel_noise_vx, 0.10);
-    this->get_parameter_or<double>("wheel_vel_noise_vy", wheel_vel_noise_vy, 0.05);
-    this->get_parameter_or<double>("wheel_vel_noise_vz", wheel_vel_noise_vz, 0.10);
-    vector<double> wext;
-    this->get_parameter_or<vector<double>>("wheel_extrinsic_R", wext, vector<double>());
-    if (wext.size() == 9)
-      R_robot_to_imu = Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(wext.data());
-#ifdef FASTLIO_TEST_HOOKS
-    effective_locals_for_test.value("wheel_extrinsic_R", wext);
-#endif
+    params_.readPriorMapAndPose(*this);
+    params_.readWheel(*this, startup);
     RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("read_inputs");
@@ -5172,125 +4231,40 @@ public:
     // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0,
     // aver_time_solve = 0, aver_time_const_H_time = 0; bool flg_EKF_converged, EKF_stop_flg = 0;
 
-    FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
-    HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
+    const double FOV_DEG = (startup.fov_deg + 10.0) > 179.9 ? 179.9 : (startup.fov_deg + 10.0);
+    [[maybe_unused]] const double HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
 
     _featsArray.reset(new PointCloudXYZI());
 
-    downSizeFilterSurf.setLeaf(filter_size_surf_min);
+    downSizeFilterSurf.setLeaf(params_.values().filter_size_surf_min);
     downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
 
-    Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
-    Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
-    p_imu->init_require_still = imu_init_require_still_;
-    p_imu->init_still_tol = imu_init_still_tol_;
-    p_imu->init_still_timeout_s = imu_init_still_timeout_s_;
-    p_imu->init_static_params = imu_init_static_params_;
+    V3D Lidar_T_wrt_IMU(Zero3d);
+    M3D Lidar_R_wrt_IMU(Eye3d);
+    Lidar_T_wrt_IMU << VEC_FROM_ARRAY(startup.extrinT);
+    Lidar_R_wrt_IMU << MAT_FROM_ARRAY(startup.extrinR);
+    p_imu->init_require_still = startup.imu_init_require_still;
+    p_imu->init_still_tol = startup.imu_init_still_tol;
+    p_imu->init_still_timeout_s = startup.imu_init_still_timeout_s;
+    p_imu->init_static_params = startup.imu_init_static_params;
     p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
-    p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
-    p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
-    p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
-    p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    p_imu->set_gyr_cov(V3D(startup.gyr_cov, startup.gyr_cov, startup.gyr_cov));
+    p_imu->set_acc_cov(V3D(startup.acc_cov, startup.acc_cov, startup.acc_cov));
+    p_imu->set_gyr_bias_cov(V3D(startup.b_gyr_cov, startup.b_gyr_cov, startup.b_gyr_cov));
+    p_imu->set_acc_bias_cov(V3D(startup.b_acc_cov, startup.b_acc_cov, startup.b_acc_cov));
 
     fill(epsi, epsi + 23, 0.001);
-    kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+    kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, startup.num_max_iterations, epsi);
 #ifdef FASTLIO_TEST_HOOKS
+    effective_locals_for_test.value("derived:fov:FOV_DEG", FOV_DEG);
+    effective_locals_for_test.value("derived:fov:HALF_FOV_COS", HALF_FOV_COS);
+    effective_locals_for_test.matrix("derived:extrinsic_and_noise:Lidar_T_wrt_IMU", Lidar_T_wrt_IMU);
+    effective_locals_for_test.matrix("derived:extrinsic_and_noise:Lidar_R_wrt_IMU", Lidar_R_wrt_IMU);
     constructionStageForTest("filter_init");
 #endif
 
-    /*** debug record ***/
-    if (runtime_pos_log) {
-      const string pos_log_dir = root_dir + "/Log/pos_log.txt";
-      positionLog_ = FileHandle(std::fopen(pos_log_dir.c_str(), "w"));
-      if (!positionLog_) {
-        RCLCPP_WARN(this->get_logger(), "Position logging disabled: failed to open %s", pos_log_dir.c_str());
-      }
-    }
-
-    // ofstream fout_pre, fout_out, fout_dbg;
-    fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);
-    fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), ios::out);
-    fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"), ios::out);
-    fout_jump.open(DEBUG_FILE_DIR("jump_diag.txt"), ios::out);
-    if (kalman_channel_diag_en) {
-      fout_kalman.open(DEBUG_FILE_DIR("kalman_channels.csv"), ios::out);
-      fout_kalman << "schema_version,scan_index,time,channel,valid,converged,iterations,measurement_dim,"
-                  << "residual_norm,weighted_residual_squared,effct_feat_num,res_mean,pos_obs_eig_min,"
-                  << "pos_obs_eig_max,pos_obs_z_weak,z0,z1,z2,h0,h1,h2,"
-                  << "dx_pos_x,dx_pos_y,dx_pos_z,dx_rot_x,dx_rot_y,dx_rot_z,"
-                  << "dx_ext_rot_x,dx_ext_rot_y,dx_ext_rot_z,dx_ext_t_x,dx_ext_t_y,dx_ext_t_z,"
-                  << "dx_vel_x,dx_vel_y,dx_vel_z,dx_bg_x,dx_bg_y,dx_bg_z,dx_ba_x,dx_ba_y,dx_ba_z,"
-                  << "dx_grav_t0,dx_grav_t1,dpos_x,dpos_y,dpos_z,dvel_x,dvel_y,dvel_z,"
-                  << "dba_x,dba_y,dba_z,dgrav_x,dgrav_y,dgrav_z,"
-                  << "gain_rot,gain_vel,gain_ba,gain_grav,projection_rot,projection_vel,projection_ba,projection_grav,"
-                  << "p_grav_pos,p_grav_rot,p_grav_vel,p_grav_ba,p_ba_pos,p_ba_rot,p_ba_vel,"
-                  << "p_grav_diag0_before,p_grav_diag1_before,p_grav_diag0_after,p_grav_diag1_after,"
-                  << "p_ba_x_before,p_ba_y_before,p_ba_z_before,p_ba_x_after,p_ba_y_after,p_ba_z_after,"
-                  << "drot_x,drot_y,drot_z,rot_obs_rp_min\n";
-      RCLCPP_INFO(this->get_logger(),
-                  "Kalman channel diagnostics enabled: %s (schema v1)",
-                  DEBUG_FILE_DIR("kalman_channels.csv").c_str());
-    }
-    if (fout_pre && fout_out)
-      cout << "~~~~" << ROOT_DIR << " file opened" << endl;
-    else
-      cout << "~~~~" << ROOT_DIR << " doesn't exist" << endl;
-
-    /*** ROS subscribe initialization ***/
-    if (p_pre->lidar_type == AVIA) {
-      sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
-    } else if (p_pre->lidar_type == ALLPOINT) {
-      // /pre/all_point is published RELIABLE with fixed 8MB messages; a small
-      // reliable KeepLast queue matches the bag publisher and bounds memory
-      // (a few buffered scans) while avoiding silent drops of whole scans.
-      rclcpp::QoS shm_qos(rclcpp::KeepLast(5));
-      sub_pcl_shm_ =
-        this->create_subscription<shm_msgs::msg::PointCloud8mAndPose>(lid_topic, shm_qos, shm_allpoint_cbk);
-      RCLCPP_INFO(
-        this->get_logger(), "shm allpoint mode: subscribing %s (shm_msgs/PointCloud8mAndPose)", lid_topic.c_str());
-    } else {
-      // Diagnostic knob (env FLIO_LIDAR_QDEPTH): a deep best-effort LiDAR queue so
-      // the single-thread executor's processing spikes buffer scans instead of
-      // dropping them. Eliminating real-time scan drops makes the front-end process
-      // an identical scan sequence every run — required to turn the metastable bag2
-      // raw-Z into a repeatable, measurable metric. Unset → SensorDataQoS (depth 5),
-      // the production default. best_effort stays compatible with the bag publisher.
-      const char * qd = std::getenv("FLIO_LIDAR_QDEPTH");
-      const int qdepth = (qd && std::atoi(qd) > 0) ? std::atoi(qd) : 0;
-      // Default RELIABLE KeepLast(5) to MATCH the lidar_adapter publisher
-      // (it publishes canonical /lio/points reliable so no 8MB scan is silently
-      // dropped). The matched reliable+volatile+keep_last pair is also what lets
-      // the intra-process manager do the zero-copy unique_ptr handoff when this
-      // node is co-composed with the adapter. FLIO_LIDAR_QDEPTH keeps the
-      // best-effort deep-queue diagnostic override.
-      rclcpp::QoS pc_qos = qdepth > 0 ? rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(qdepth))).best_effort()
-                                      : rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
-      sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, pc_qos, standard_pcl_cbk);
-    }
-    if (imu_input_type == "fixposition_fpa") {
-      auto imu_qos = rclcpp::SensorDataQoS();
-      sub_imu_fpa_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImu>(imu_topic, imu_qos, imu_fpa_cbk);
-      sub_imu_bias_ =
-        this->create_subscription<fixposition_driver_msgs::msg::FpaImubias>(imu_bias_topic, imu_qos, imu_bias_cbk);
-      RCLCPP_INFO(this->get_logger(),
-                  "Fixposition IMU direct mode: topic=%s bias_topic=%s imu_time_offset=%.3f",
-                  imu_topic.c_str(),
-                  imu_bias_topic.c_str(),
-                  imu_time_offset);
-    } else {
-      sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 1000, imu_cbk);
-      RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", imu_topic.c_str());
-    }
-    if (wheel_odom_en || zupt_en || parked_hold_params.enabled) {
-      sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(wheel_topic, 2000, twist_cbk);
-      RCLCPP_INFO(this->get_logger(),
-                  "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s, parked hold %s)",
-                  wheel_topic.c_str(),
-                  wheel_speed_scale,
-                  wheel_odom_en ? "on" : "off",
-                  zupt_en ? "on" : "off",
-                  parked_hold_params.enabled ? "on" : "off");
-    }
+    openDebugRecords();
+    subscribeInputs(startup);
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("subscriptions");
 #endif
@@ -5361,15 +4335,11 @@ public:
 
     // The voxel-capped /Laser_map is a coarse global map, not a live feed, so it
     // publishes slowly (default 0.2 Hz). Period is configurable via publish.map_period_sec.
-    double map_pub_period_sec = 5.0;
-    this->get_parameter_or<double>("publish.map_period_sec", map_pub_period_sec, 5.0);
-    if (map_pub_period_sec <= 0.0)
-      map_pub_period_sec = 5.0;
+    const double map_pub_period_sec = params_.readMapPeriod(*this);
     auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(map_pub_period_sec * 1000.0));
     map_pub_timer_ = rclcpp::create_timer(
       this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 #ifdef FASTLIO_TEST_HOOKS
-    effective_locals_for_test.value("publish.map_period_sec", map_pub_period_sec);
     constructionStageForTest("map_timer");
 #endif
 
@@ -5386,58 +4356,7 @@ public:
       RCLCPP_INFO(this->get_logger(), "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0).");
     }
 
-    // Mapping pause/resume: latched (transient_local) subscription so we
-    // pick up the most recent state even if PGO published before we
-    // started.  The PGO node is the sole publisher; we only read.
-    auto mapping_qos = rclcpp::QoS(1).transient_local();
-    // transient_local durability is incompatible with intra-process comms, which
-    // this node enables for the point-cloud zero-copy path. This latched gate is a
-    // tiny, low-rate Bool from the (separate-process) PGO node, so force it onto the
-    // normal inter-process path; node-level intra-process stays on for /lio/points.
-    rclcpp::SubscriptionOptions mapping_sub_opts;
-    mapping_sub_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
-    mapping_enabled_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-      "/lio_slam/mapping_enabled",
-      mapping_qos,
-      [this](std_msgs::msg::Bool::SharedPtr msg) {
-        const bool prev = mapping_enabled.exchange(msg->data, std::memory_order_relaxed);
-        if (prev != msg->data) {
-          RCLCPP_WARN(this->get_logger(),
-                      "[MAPPING] %s — ikd-tree updates %s.",
-                      msg->data ? "RESUMED" : "PAUSED",
-                      msg->data ? "re-enabled" : "suspended");
-        }
-      },
-      mapping_sub_opts);
-
-    // Where the prior map is, in this run's frame. The relocalization node answers that
-    // question and nothing else can: the map's own frame belongs to the run that built it.
-    // Latched, because the answer usually predates nothing — it arrives once, seconds in,
-    // and a subscriber that joined late still needs it.
-    if (!prior_map_pcd_.empty() && prior_map_align_ == fast_lio::PriorMapAlign::kRelocalization) {
-      rclcpp::SubscriptionOptions align_sub_opts;
-      align_sub_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
-      prior_map_align_sub_ = this->create_subscription<geometry_msgs::msg::TransformStamped>(
-        "/relocalization/result",
-        rclcpp::QoS(1).transient_local(),
-        [this](geometry_msgs::msg::TransformStamped::SharedPtr msg) {
-          const auto & q = msg->transform.rotation;
-          const auto & t = msg->transform.translation;
-          Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
-          T.linear() = Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized().toRotationMatrix();
-          T.translation() = Eigen::Vector3d(t.x, t.y, t.z);
-          if (!T.matrix().allFinite()) {
-            RCLCPP_ERROR(this->get_logger(), "[PRIOR-MAP] relocalization result is not finite - ignored");
-            return;
-          }
-          std::lock_guard<std::mutex> lk(prior_map_align_mtx_);
-          prior_map_pending_T_ = T;
-          prior_map_pending_ = true;
-        },
-        align_sub_opts);
-      RCLCPP_INFO(
-        this->get_logger(), "[PRIOR-MAP] waiting for /relocalization/result before loading %s", prior_map_pcd_.c_str());
-    }
+    subscribeMappingGates();
 
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("config_id");
@@ -5561,7 +4480,7 @@ private:
                           const V3D & measurement,
                           const V3D & prediction)
   {
-    if (!kalman_channel_diag_en || !fout_kalman.is_open())
+    if (!params_.values().kalman_channel_diag_en || !fout_kalman.is_open())
       return;
 
     const V3D dpos = after.pos - before.pos;
@@ -5604,32 +4523,223 @@ private:
     fout_kalman.flush();
   }
 
-  void declareLostRecoveryParameters()
+  // The typed observation outputs, once publish.frontend_observation has been declared on and validated.
+  void startFrontendObservation()
   {
-    rcl_interfaces::msg::ParameterDescriptor descriptor;
-    descriptor.read_only = true;
-    this->declare_parameter<bool>("lost_recovery_en", false, descriptor);
-    this->declare_parameter<double>("lost_recovery_stable_sec", 2.0, descriptor);
+    frontend_progress = fast_lio::FrontendProgress{};
+    frontend_publication_guard = fast_lio::FrontendPublicationGuard{};
+    frontend_instance.fill(0);
+    std::size_t randomBytes = 0;
+    while (randomBytes < frontend_instance.size()) {
+      const auto count = getrandom(frontend_instance.data() + randomBytes, frontend_instance.size() - randomBytes, 0);
+      if (count < 0 && errno == EINTR)
+        continue;
+      if (count <= 0)
+        break;
+      randomBytes += static_cast<std::size_t>(count);
+    }
+    frontend_has_instance = randomBytes == frontend_instance.size();
+#ifdef FASTLIO_TEST_HOOKS
+    if (fast_lio_test::overrideFrontendInstance)
+      frontend_has_instance = fast_lio_test::overrideFrontendInstance(frontend_instance);
+#endif
+    if (!frontend_has_instance) {
+      frontend_instance.fill(0);
+      RCLCPP_ERROR(this->get_logger(), "Frontend activation UUID unavailable; typed identity remains unknown");
+    }
+    const auto frontendQos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
+    frontend_publisher = this->create_publisher<fast_lio_interfaces::msg::FrontendObservation>(
+      "/lio_slam/frontend_observation", frontendQos);
+    if (reference_health_en) {
+      reference_progress = fast_lio::ReferenceHealthProgress{};
+      reference_publication_guard = fast_lio::FrontendPublicationGuard{};
+      reference_publisher =
+        this->create_publisher<fast_lio_interfaces::msg::ReferenceHealth>("/lio_slam/reference_health", frontendQos);
+    }
   }
 
-  void loadLostRecoveryParameters(double total_s)
+  void openCorrespondenceDump()
   {
-    const bool enabled = this->get_parameter("lost_recovery_en").as_bool();
-    const double stable_s = this->get_parameter("lost_recovery_stable_sec").as_double();
-    if (enabled && !health_pub_en) {
-      throw std::invalid_argument(
-        "lost_recovery_en=true requires health_pub_en=true "
-        "(the coordinate epoch is published in the /Odometry health block)");
+    fout_corr.open(DEBUG_FILE_DIR("corr_dump.csv"), std::ios::out);
+    fout_corr << "t,iter,i,eff,range,bx,by,bz,nx,ny,nz,pd2,ax,ay,az,nn0,nn4,n_near,plane_ok,plane_rms,lam0,lam1,lam2,"
+                 "d_in,cosv,w,pz,px,py\n";
+    fout_corr_iter.open(DEBUG_FILE_DIR("corr_iter.csv"), std::ios::out);
+    fout_corr_iter << "t,iter,effct,held,rp_info,ux,uy,uz,searching,degen\n";
+    fout_corr_scan.open(DEBUG_FILE_DIR("corr_scan.csv"), std::ios::out);
+    fout_corr_scan << "t,tk,iters,effct,hold_scene,hold_info,rp_info,drot_x,drot_y,drot_z,dpos_x,dpos_y,dpos_z,"
+                      "far_frac,z_weak,P_rx,P_ry,P_rz,P_px,P_py,P_pz,dvel_x,dvel_y,dvel_z";
+    // the prior covariance over [pos(0-2), rot(3-5), vel(12-14)] as a 9x9 block, row-major: the exact
+    // iteration-0 update of pos/rot needs the pos-rot block, the vel rows show the blind-window coupling
+    for (int a = 0; a < 9; a++) {
+      for (int b = 0; b < 9; b++) {
+        fout_corr_scan << ",P" << a << b;
+      }
     }
-    if (!fast_lio::resolveLostRecoveryParams(enabled, stable_s, total_s, &lost_recovery_params)) {
-      throw std::invalid_argument(
-        "lost_recovery_stable_sec must be finite and positive (representable in ns); "
-        "lost_recovery_en=true requires reanchor_total_timeout_sec > 0");
+    fout_corr_scan << "\n";
+    RCLCPP_INFO(this->get_logger(),
+                "Correspondence dump enabled: %zu window(s) -> %s",
+                params_.values().corr_dump_windows.size(),
+                DEBUG_FILE_DIR("corr_dump.csv").c_str());
+  }
+
+  void openDebugRecords()
+  {
+    /*** debug record ***/
+    if (runtime_pos_log) {
+      const string pos_log_dir = root_dir + "/Log/pos_log.txt";
+      positionLog_ = FileHandle(std::fopen(pos_log_dir.c_str(), "w"));
+      if (!positionLog_) {
+        RCLCPP_WARN(this->get_logger(), "Position logging disabled: failed to open %s", pos_log_dir.c_str());
+      }
     }
-#ifdef FASTLIO_TEST_HOOKS
-    effective_locals_for_test.value("lost_recovery_en", enabled);
-    effective_locals_for_test.value("lost_recovery_stable_sec", stable_s);
-#endif
+
+    // ofstream fout_pre, fout_out, fout_dbg;
+    fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);
+    fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), ios::out);
+    fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"), ios::out);
+    fout_jump.open(DEBUG_FILE_DIR("jump_diag.txt"), ios::out);
+    if (params_.values().kalman_channel_diag_en) {
+      fout_kalman.open(DEBUG_FILE_DIR("kalman_channels.csv"), ios::out);
+      fout_kalman << "schema_version,scan_index,time,channel,valid,converged,iterations,measurement_dim,"
+                  << "residual_norm,weighted_residual_squared,effct_feat_num,res_mean,pos_obs_eig_min,"
+                  << "pos_obs_eig_max,pos_obs_z_weak,z0,z1,z2,h0,h1,h2,"
+                  << "dx_pos_x,dx_pos_y,dx_pos_z,dx_rot_x,dx_rot_y,dx_rot_z,"
+                  << "dx_ext_rot_x,dx_ext_rot_y,dx_ext_rot_z,dx_ext_t_x,dx_ext_t_y,dx_ext_t_z,"
+                  << "dx_vel_x,dx_vel_y,dx_vel_z,dx_bg_x,dx_bg_y,dx_bg_z,dx_ba_x,dx_ba_y,dx_ba_z,"
+                  << "dx_grav_t0,dx_grav_t1,dpos_x,dpos_y,dpos_z,dvel_x,dvel_y,dvel_z,"
+                  << "dba_x,dba_y,dba_z,dgrav_x,dgrav_y,dgrav_z,"
+                  << "gain_rot,gain_vel,gain_ba,gain_grav,projection_rot,projection_vel,projection_ba,projection_grav,"
+                  << "p_grav_pos,p_grav_rot,p_grav_vel,p_grav_ba,p_ba_pos,p_ba_rot,p_ba_vel,"
+                  << "p_grav_diag0_before,p_grav_diag1_before,p_grav_diag0_after,p_grav_diag1_after,"
+                  << "p_ba_x_before,p_ba_y_before,p_ba_z_before,p_ba_x_after,p_ba_y_after,p_ba_z_after,"
+                  << "drot_x,drot_y,drot_z,rot_obs_rp_min\n";
+      RCLCPP_INFO(this->get_logger(),
+                  "Kalman channel diagnostics enabled: %s (schema v1)",
+                  DEBUG_FILE_DIR("kalman_channels.csv").c_str());
+    }
+    if (fout_pre && fout_out)
+      cout << "~~~~" << ROOT_DIR << " file opened" << endl;
+    else
+      cout << "~~~~" << ROOT_DIR << " doesn't exist" << endl;
+  }
+
+  void subscribeInputs(const fast_lio::FrontendStartup & startup)
+  {
+    /*** ROS subscribe initialization ***/
+    if (p_pre->lidar_type == AVIA) {
+      sub_pcl_livox_ =
+        this->create_subscription<livox_ros_driver2::msg::CustomMsg>(startup.lid_topic, 20, livox_pcl_cbk);
+    } else if (p_pre->lidar_type == ALLPOINT) {
+      // /pre/all_point is published RELIABLE with fixed 8MB messages; a small
+      // reliable KeepLast queue matches the bag publisher and bounds memory
+      // (a few buffered scans) while avoiding silent drops of whole scans.
+      rclcpp::QoS shm_qos(rclcpp::KeepLast(5));
+      sub_pcl_shm_ =
+        this->create_subscription<shm_msgs::msg::PointCloud8mAndPose>(startup.lid_topic, shm_qos, shm_allpoint_cbk);
+      RCLCPP_INFO(this->get_logger(),
+                  "shm allpoint mode: subscribing %s (shm_msgs/PointCloud8mAndPose)",
+                  startup.lid_topic.c_str());
+    } else {
+      // Diagnostic knob (env FLIO_LIDAR_QDEPTH): a deep best-effort LiDAR queue so
+      // the single-thread executor's processing spikes buffer scans instead of
+      // dropping them. Eliminating real-time scan drops makes the front-end process
+      // an identical scan sequence every run — required to turn the metastable bag2
+      // raw-Z into a repeatable, measurable metric. Unset → SensorDataQoS (depth 5),
+      // the production default. best_effort stays compatible with the bag publisher.
+      const char * qd = std::getenv("FLIO_LIDAR_QDEPTH");
+      const int qdepth = (qd && std::atoi(qd) > 0) ? std::atoi(qd) : 0;
+      // Default RELIABLE KeepLast(5) to MATCH the lidar_adapter publisher
+      // (it publishes canonical /lio/points reliable so no 8MB scan is silently
+      // dropped). The matched reliable+volatile+keep_last pair is also what lets
+      // the intra-process manager do the zero-copy unique_ptr handoff when this
+      // node is co-composed with the adapter. FLIO_LIDAR_QDEPTH keeps the
+      // best-effort deep-queue diagnostic override.
+      rclcpp::QoS pc_qos = qdepth > 0 ? rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(qdepth))).best_effort()
+                                      : rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
+      sub_pcl_pc_ =
+        this->create_subscription<sensor_msgs::msg::PointCloud2>(startup.lid_topic, pc_qos, standard_pcl_cbk);
+    }
+    if (startup.imu_input_type == "fixposition_fpa") {
+      auto imu_qos = rclcpp::SensorDataQoS();
+      sub_imu_fpa_ =
+        this->create_subscription<fixposition_driver_msgs::msg::FpaImu>(startup.imu_topic, imu_qos, imu_fpa_cbk);
+      sub_imu_bias_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImubias>(
+        startup.imu_bias_topic, imu_qos, imu_bias_cbk);
+      RCLCPP_INFO(this->get_logger(),
+                  "Fixposition IMU direct mode: topic=%s bias_topic=%s imu_time_offset=%.3f",
+                  startup.imu_topic.c_str(),
+                  startup.imu_bias_topic.c_str(),
+                  imu_time_offset);
+    } else {
+      sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(startup.imu_topic, 1000, imu_cbk);
+      RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", startup.imu_topic.c_str());
+    }
+    if (params_.values().wheel_odom_en || params_.values().zupt_en || params_.values().parked_hold.enabled) {
+      sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(startup.wheel_topic, 2000, twist_cbk);
+      RCLCPP_INFO(this->get_logger(),
+                  "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s, parked hold %s)",
+                  startup.wheel_topic.c_str(),
+                  params_.values().wheel_speed_scale,
+                  params_.values().wheel_odom_en ? "on" : "off",
+                  params_.values().zupt_en ? "on" : "off",
+                  params_.values().parked_hold.enabled ? "on" : "off");
+    }
+  }
+
+  void subscribeMappingGates()
+  {
+    // Mapping pause/resume: latched (transient_local) subscription so we
+    // pick up the most recent state even if PGO published before we
+    // started.  The PGO node is the sole publisher; we only read.
+    auto mapping_qos = rclcpp::QoS(1).transient_local();
+    // transient_local durability is incompatible with intra-process comms, which
+    // this node enables for the point-cloud zero-copy path. This latched gate is a
+    // tiny, low-rate Bool from the (separate-process) PGO node, so force it onto the
+    // normal inter-process path; node-level intra-process stays on for /lio/points.
+    rclcpp::SubscriptionOptions mapping_sub_opts;
+    mapping_sub_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+    mapping_enabled_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+      "/lio_slam/mapping_enabled",
+      mapping_qos,
+      [this](std_msgs::msg::Bool::SharedPtr msg) {
+        const bool prev = mapping_enabled.exchange(msg->data, std::memory_order_relaxed);
+        if (prev != msg->data) {
+          RCLCPP_WARN(this->get_logger(),
+                      "[MAPPING] %s — ikd-tree updates %s.",
+                      msg->data ? "RESUMED" : "PAUSED",
+                      msg->data ? "re-enabled" : "suspended");
+        }
+      },
+      mapping_sub_opts);
+
+    // Where the prior map is, in this run's frame. The relocalization node answers that
+    // question and nothing else can: the map's own frame belongs to the run that built it.
+    // Latched, because the answer usually predates nothing — it arrives once, seconds in,
+    // and a subscriber that joined late still needs it.
+    if (!prior_map_pcd_.empty() && params_.values().prior_map_align == fast_lio::PriorMapAlign::kRelocalization) {
+      rclcpp::SubscriptionOptions align_sub_opts;
+      align_sub_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+      prior_map_align_sub_ = this->create_subscription<geometry_msgs::msg::TransformStamped>(
+        "/relocalization/result",
+        rclcpp::QoS(1).transient_local(),
+        [this](geometry_msgs::msg::TransformStamped::SharedPtr msg) {
+          const auto & q = msg->transform.rotation;
+          const auto & t = msg->transform.translation;
+          Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+          T.linear() = Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized().toRotationMatrix();
+          T.translation() = Eigen::Vector3d(t.x, t.y, t.z);
+          if (!T.matrix().allFinite()) {
+            RCLCPP_ERROR(this->get_logger(), "[PRIOR-MAP] relocalization result is not finite - ignored");
+            return;
+          }
+          std::lock_guard<std::mutex> lk(prior_map_align_mtx_);
+          prior_map_pending_T_ = T;
+          prior_map_pending_ = true;
+        },
+        align_sub_opts);
+      RCLCPP_INFO(
+        this->get_logger(), "[PRIOR-MAP] waiting for /relocalization/result before loading %s", prior_map_pcd_.c_str());
+    }
   }
 
 #ifdef FASTLIO_TEST_HOOKS
@@ -5643,12 +4753,12 @@ private:
   // (generated from the parameter inventory).
   void effectiveOutputForTest(fast_lio_test::EffectiveRecorder & record)
   {
-    record.value("publish.path_en", path_en);
-    record.value("publish.effect_map_en", effect_pub_en);
-    record.value("publish.map_en", map_pub_en);
+    record.value("publish.path_en", params_.values().path_en);
+    record.value("publish.effect_map_en", params_.values().effect_pub_en);
+    record.value("publish.map_en", params_.values().map_pub_en);
     record.value("publish.scan_publish_en", scan_pub_en);
     record.value("publish.dense_publish_en", dense_pub_en);
-    record.value("publish.scan_bodyframe_pub_en", scan_body_pub_en);
+    record.value("publish.scan_bodyframe_pub_en", params_.values().scan_body_pub_en);
     record.value("publish.odom_frame_id", odom_frame_id);
     record.value("publish.body_frame_id", body_frame_id);
     record.value("health_pub_en", health_pub_en);
@@ -5658,7 +4768,6 @@ private:
   }
   void effectiveMeasurementForTest(fast_lio_test::EffectiveRecorder & record)
   {
-    record.value("max_iteration", NUM_MAX_ITERATIONS);
     record.value("degeneracy_debug", degeneracy_debug);
     record.value("degeneracy_spectrum_trace", degeneracy_spectrum_trace);
     record.value("degeneracy_weighting_en", degeneracy_params.enable);
@@ -5670,26 +4779,25 @@ private:
     record.value("degeneracy_hard_projection", degeneracy_params.hard_projection);
     record.value("degeneracy_schur_en", degeneracy_params.schur_en);
     record.value("degeneracy_schur_ridge", degeneracy_params.schur_ridge);
-    record.value("lidar_attitude_hold_en", attitude_hold_params.enabled);
+    record.value("lidar_attitude_hold_en", params_.values().attitude_hold.enabled);
     record.value("corr_innov_gate_k", corr_gate.innovation_k);
     record.value("corr_nn0_max", corr_gate.nn0_max);
     record.value("corr_gate_mad_scale", corr_gate.mad_scale);
     record.value("corr_gate_rot_sigma_floor_deg", corr_gate.rot_sigma_floor_deg);
-    record.value("corr_kernel", corr_kernel_str);
     record.value("corr_kernel_mad_scale", corr_kernel_mad_scale);
     record.value("corr_kernel_min_scale", corr_kernel_min_scale);
-    record.value("lidar_attitude_hold_far_frac", attitude_hold_params.far_frac_max);
-    record.value("lidar_attitude_hold_min_effct", attitude_hold_params.min_effct);
-    record.value("lidar_attitude_hold_max_s", attitude_hold_params.max_hold_s);
-    record.value("lidar_attitude_hold_max_scan_gap_s", attitude_hold_params.max_scan_gap_s);
+    record.value("lidar_attitude_hold_far_frac", params_.values().attitude_hold.far_frac_max);
+    record.value("lidar_attitude_hold_min_effct", params_.values().attitude_hold.min_effct);
+    record.value("lidar_attitude_hold_max_s", params_.values().attitude_hold.max_hold_s);
+    record.value("lidar_attitude_hold_max_scan_gap_s", params_.values().attitude_hold.max_scan_gap_s);
     record.value("lidar_attitude_hold_min_rp_info", lidar_attitude_hold_min_rp_info);
-    record.value("lidar_attitude_hold_z_weak", attitude_hold_params.z_weak_min);
-    record.value("lidar_consider_rp_en", rp_consider_params.enabled);
-    record.value("lidar_consider_rp_while_engulfed", rp_consider_params.while_engulfed);
-    record.value("lidar_consider_rp_post_release_s", rp_consider_params.post_release_s);
-    record.value("lidar_consider_rp_min_info", rp_consider_params.min_rp_info);
-    record.value("lidar_consider_rp_z_weak_min", rp_consider_params.z_weak_min);
-    record.value("lidar_consider_rp_max_s", rp_consider_params.max_consider_s);
+    record.value("lidar_attitude_hold_z_weak", params_.values().attitude_hold.z_weak_min);
+    record.value("lidar_consider_rp_en", params_.values().rp_consider.enabled);
+    record.value("lidar_consider_rp_while_engulfed", params_.values().rp_consider.while_engulfed);
+    record.value("lidar_consider_rp_post_release_s", params_.values().rp_consider.post_release_s);
+    record.value("lidar_consider_rp_min_info", params_.values().rp_consider.min_rp_info);
+    record.value("lidar_consider_rp_z_weak_min", params_.values().rp_consider.z_weak_min);
+    record.value("lidar_consider_rp_max_s", params_.values().rp_consider.max_consider_s);
     record.value("canopy_near_range", canopy_near_range);
     record.value("canopy_ground_z", canopy_ground_z);
     record.value("canopy_ground_halfband", canopy_ground_halfband);
@@ -5708,10 +4816,6 @@ private:
     record.value("max_buffered_scans", max_buffered_scans);
     record.value("max_scan_backlog_sec", max_scan_backlog_sec);
     record.value("max_imu_backlog_sec", max_imu_backlog_sec);
-    record.value("common.lid_topic", lid_topic);
-    record.value("common.imu_topic", imu_topic);
-    record.value("common.imu_input_type", imu_input_type);
-    record.value("common.imu_bias_topic", imu_bias_topic);
     record.value("common.time_sync_en", time_sync_en);
     record.value("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu);
     record.value("common.imu_time_offset", imu_time_offset);
@@ -5726,162 +4830,141 @@ private:
   }
   void effectiveDownsampleForTest(fast_lio_test::EffectiveRecorder & record)
   {
-    record.value("adaptive_downsample_en", adaptive_ds_params.enabled);
-    record.value("adaptive_downsample_budget_sec", adaptive_ds_params.budget_sec);
-    record.value("adaptive_downsample_release_sec", adaptive_ds_params.release_sec);
-    record.value("adaptive_downsample_step", adaptive_ds_params.step);
-    record.value("adaptive_downsample_max_voxel", adaptive_ds_params.max_voxel);
-    record.value("adaptive_downsample_raise_after", adaptive_ds_params.raise_after);
-    record.value("adaptive_downsample_lower_after", adaptive_ds_params.lower_after);
+    record.value("adaptive_downsample_en", params_.values().adaptive_ds.enabled);
+    record.value("adaptive_downsample_budget_sec", params_.values().adaptive_ds.budget_sec);
+    record.value("adaptive_downsample_release_sec", params_.values().adaptive_ds.release_sec);
+    record.value("adaptive_downsample_step", params_.values().adaptive_ds.step);
+    record.value("adaptive_downsample_max_voxel", params_.values().adaptive_ds.max_voxel);
+    record.value("adaptive_downsample_raise_after", params_.values().adaptive_ds.raise_after);
+    record.value("adaptive_downsample_lower_after", params_.values().adaptive_ds.lower_after);
   }
   void effectiveConstraintsForTest(fast_lio_test::EffectiveRecorder & record)
   {
-    record.value("planar_constraint_en", planar_constraint_en);
-    record.value("planar_constraint_noise", planar_constraint_noise);
-    record.value("planar_constraint_z_weak_thresh", planar_constraint_z_weak_thresh);
-    record.value("gravity_align_en", gravity_align_en);
-    record.value("gravity_align_noise", gravity_align_noise);
-    record.value("gravity_align_z_weak_thresh", gravity_align_z_weak_thresh);
-    record.value("gravity_align_accel_tol", gravity_align_accel_tol);
-    record.value("gravity_align_gyro_tol", gravity_align_gyro_tol);
-    record.value("gravity_align_window_s", gravity_align_window_s);
-    record.value("gravity_align_continuous", gravity_align_continuous);
-    record.value("gravity_align_hold_s", gravity_align_hold_s);
-    record.value("gravity_align_noise_degraded", gravity_align_noise_degraded);
-    record.value("gravity_align_mag_ref", gravity_align_mag_ref);
-    record.value("gravity_align_grav_leak", gravity_align_grav_leak);
-    record.value("gravity_align_grav_cap_deg", gravity_align_grav_cap_deg);
-    record.value("gravity_align_grav_freeze_degraded", gravity_align_grav_freeze_degraded);
-    record.value("gravity_align_lin_accel_comp", gravity_align_lin_accel_comp);
-    record.value("gravity_align_vel_sigma_scale", gravity_align_vel_sigma_scale);
-    record.value("gravity_align_lin_accel_source", gravity_align_lin_accel_source);
-    record.value("gravity_align_withhold_blind_moving", gravity_align_withhold_blind_moving);
-    record.value("gravity_align_sigma_policy", gravity_align_sigma_policy);
-    record.value("gravity_align_noise_static", gravity_align_noise_static);
-    record.value("gravity_align_noise_moving", gravity_align_noise_moving);
-    record.value("gravity_align_leg_vel_sigma", gravity_align_leg_vel_sigma);
-    record.value("gravity_align_leg_edge_window_s", gravity_align_leg_edge_window_s);
-    record.value("gravity_align_leg_lever_arm", gravity_align_leg_lever_arm_vec);
-    record.value("wheel_odom_en", wheel_odom_en);
-    record.value("wheel_topic", wheel_topic);
-    record.value("wheel_speed_scale", wheel_speed_scale);
-    record.value("wheel_vel_noise_vx", wheel_vel_noise_vx);
-    record.value("wheel_vel_noise_vy", wheel_vel_noise_vy);
-    record.value("wheel_vel_noise_vz", wheel_vel_noise_vz);
+    record.value("planar_constraint_en", params_.values().planar_constraint_en);
+    record.value("planar_constraint_noise", params_.values().planar_constraint_noise);
+    record.value("planar_constraint_z_weak_thresh", params_.values().planar_constraint_z_weak_thresh);
+    record.value("gravity_align_en", params_.values().gravity_align_en);
+    record.value("gravity_align_noise", params_.values().gravity_align_noise);
+    record.value("gravity_align_z_weak_thresh", params_.values().gravity_align_z_weak_thresh);
+    record.value("gravity_align_accel_tol", params_.values().gravity_align_accel_tol);
+    record.value("gravity_align_gyro_tol", params_.values().gravity_align_gyro_tol);
+    record.value("gravity_align_window_s", params_.values().gravity_align_window_s);
+    record.value("gravity_align_continuous", params_.values().gravity_align_continuous);
+    record.value("gravity_align_hold_s", params_.values().gravity_align_hold_s);
+    record.value("gravity_align_noise_degraded", params_.values().gravity_align_noise_degraded);
+    record.value("gravity_align_mag_ref", params_.values().gravity_align_mag_ref);
+    record.value("gravity_align_grav_leak", params_.values().gravity_align_grav_leak);
+    record.value("gravity_align_grav_cap_deg", params_.values().gravity_align_grav_cap_deg);
+    record.value("gravity_align_grav_freeze_degraded", params_.values().gravity_align_grav_freeze_degraded);
+    record.value("gravity_align_lin_accel_comp", params_.values().gravity_align_lin_accel_comp);
+    record.value("gravity_align_vel_sigma_scale", params_.values().gravity_align_vel_sigma_scale);
+    record.value("gravity_align_lin_accel_source", params_.values().gravity_align_lin_accel_source);
+    record.value("gravity_align_withhold_blind_moving", params_.values().gravity_align_withhold_blind_moving);
+    record.value("gravity_align_sigma_policy", params_.values().gravity_align_sigma_policy);
+    record.value("gravity_align_noise_static", params_.values().gravity_align_noise_static);
+    record.value("gravity_align_noise_moving", params_.values().gravity_align_noise_moving);
+    record.value("gravity_align_leg_vel_sigma", params_.values().gravity_align_leg_vel_sigma);
+    record.value("gravity_align_leg_edge_window_s", params_.values().gravity_align_leg_edge_window_s);
+    record.value("wheel_odom_en", params_.values().wheel_odom_en);
+    record.value("wheel_speed_scale", params_.values().wheel_speed_scale);
+    record.value("wheel_vel_noise_vx", params_.values().wheel_vel_noise_vx);
+    record.value("wheel_vel_noise_vy", params_.values().wheel_vel_noise_vy);
+    record.value("wheel_vel_noise_vz", params_.values().wheel_vel_noise_vz);
   }
   void effectiveDiagnosticsForTest(fast_lio_test::EffectiveRecorder & record)
   {
-    record.value("corr_dump_en", corr_dump_en);
-    record.value("corr_dump_windows", corr_dump_windows_str);
+    record.value("corr_dump_en", params_.values().corr_dump_en);
     record.value("runtime_pos_log_enable", runtime_pos_log);
     record.value("diagnostics.latency_enable", latency_diag_en);
     record.value("diagnostics.latency_log_period_sec", latency_log_period_sec);
-    record.value("diagnostics.kalman_channel_enable", kalman_channel_diag_en);
+    record.value("diagnostics.kalman_channel_enable", params_.values().kalman_channel_diag_en);
   }
   void effectiveRecoveryForTest(fast_lio_test::EffectiveRecorder & record)
   {
-    record.value("guard_vel_reset_sigma", guard_vel_reset_sigma);
+    record.value("guard_vel_reset_sigma", params_.values().guard_vel_reset_sigma);
     record.value("zupt_vel_reset_sigma", zupt_vel_reset_sigma);
-    record.value("divergence_guard_en", divergence_guard_en);
-    record.value("divergence_guard_min_eff", divergence_guard_min_eff);
-    record.value("guard_engulf_en", guard_engulf_en);
-    record.value("guard_engulf_far_range", guard_engulf_far_range);
-    record.value("guard_engulf_far_frac_min", guard_engulf_far_frac_min);
-    record.value("guard_engulf_streak", guard_engulf_streak);
-    record.value("guard_engulf_far_frac_release", guard_engulf_far_frac_release);
-    record.value("guard_engulf_release_scans", guard_engulf_release_scans);
+    record.value("divergence_guard_en", params_.values().divergence_guard_en);
+    record.value("divergence_guard_min_eff", params_.values().divergence_guard_min_eff);
+    record.value("guard_engulf_en", params_.values().guard_engulf_en);
+    record.value("guard_engulf_far_range", params_.values().guard_engulf_far_range);
+    record.value("guard_engulf_far_frac_min", params_.values().guard_engulf_far_frac_min);
+    record.value("guard_engulf_streak", params_.values().guard_engulf_streak);
+    record.value("guard_engulf_far_frac_release", params_.values().guard_engulf_far_frac_release);
+    record.value("guard_engulf_release_scans", params_.values().guard_engulf_release_scans);
     record.value("guard_release_leg_max_age_s", release_vel_params.leg_max_age_s);
     record.value("guard_release_leg_sigma", release_vel_params.leg_sigma);
     record.value("guard_release_keep_sigma", release_vel_params.keep_sigma);
-    record.value("guard_release_inflate_en", release_inflate_params.enabled);
-    record.value("guard_release_pos_sigma_min", release_inflate_params.pos_sigma_min);
-    record.value("guard_release_pos_sigma_rate", release_inflate_params.pos_sigma_rate);
-    record.value("guard_release_pos_sigma_max", release_inflate_params.pos_sigma_max);
-    record.value("guard_release_rp_sigma_deg", release_inflate_params.rp_sigma_min_deg);
-    record.value("guard_release_rp_sigma_rate_deg", release_inflate_params.rp_sigma_rate_deg);
-    record.value("guard_release_rp_sigma_max_deg", release_inflate_params.rp_sigma_max_deg);
-    record.value("guard_release_yaw_sigma_deg", release_inflate_params.yaw_sigma_deg);
-    record.value("guard_hole_en", guard_hole_en);
-    record.value("guard_hole_min_sec", guard_hole_min_sec);
-    record.value("guard_hole_max_accel", guard_hole_max_accel);
-    record.value("guard_hole_reanchor_pos", guard_hole_reanchor_pos);
-    record.value("divergence_guard_streak", divergence_guard_streak);
-    record.value("divergence_guard_max_speed", divergence_guard_max_speed);
-    record.value("zupt_en", zupt_en);
+    record.value("guard_release_inflate_en", params_.values().release_inflate.enabled);
+    record.value("guard_release_pos_sigma_min", params_.values().release_inflate.pos_sigma_min);
+    record.value("guard_release_pos_sigma_rate", params_.values().release_inflate.pos_sigma_rate);
+    record.value("guard_release_pos_sigma_max", params_.values().release_inflate.pos_sigma_max);
+    record.value("guard_release_rp_sigma_deg", params_.values().release_inflate.rp_sigma_min_deg);
+    record.value("guard_release_rp_sigma_rate_deg", params_.values().release_inflate.rp_sigma_rate_deg);
+    record.value("guard_release_rp_sigma_max_deg", params_.values().release_inflate.rp_sigma_max_deg);
+    record.value("guard_release_yaw_sigma_deg", params_.values().release_inflate.yaw_sigma_deg);
+    record.value("guard_hole_en", params_.values().guard_hole_en);
+    record.value("guard_hole_min_sec", params_.values().guard_hole_min_sec);
+    record.value("guard_hole_max_accel", params_.values().guard_hole_max_accel);
+    record.value("guard_hole_reanchor_pos", params_.values().guard_hole_reanchor_pos);
+    record.value("divergence_guard_streak", params_.values().divergence_guard_streak);
+    record.value("divergence_guard_max_speed", params_.values().divergence_guard_max_speed);
+    record.value("zupt_en", params_.values().zupt_en);
     record.value("zupt_gyro_thresh", zupt_gyro_thresh);
     record.value("zupt_acc_span_ratio", zupt_acc_span_ratio);
     record.value("zupt_wheel_speed_thresh", zupt_wheel_speed_thresh);
     record.value("zupt_wheel_max_age", zupt_wheel_max_age);
     record.value("zupt_require_wheel", zupt_require_wheel);
     record.value("zupt_anchor_trace_en", zupt_anchor_trace_en);
-    record.value("zupt_parked_hold_en", parked_hold_params.enabled);
-    record.value("zupt_parked_hold_scans", parked_hold_params.engage_scans);
-    record.value("zupt_hold_pos_noise", parked_hold_params.pos_noise);
-    record.value("zupt_hold_rot_noise", parked_hold_params.rot_noise);
-    record.value("zupt_hold_vel_noise", parked_hold_params.vel_noise);
-    record.value("zupt_hold_deadband_sigma", parked_hold_params.deadband_sigma);
+    record.value("zupt_parked_hold_en", params_.values().parked_hold.enabled);
+    record.value("zupt_parked_hold_scans", params_.values().parked_hold.engage_scans);
+    record.value("zupt_hold_pos_noise", params_.values().parked_hold.pos_noise);
+    record.value("zupt_hold_rot_noise", params_.values().parked_hold.rot_noise);
+    record.value("zupt_hold_vel_noise", params_.values().parked_hold.vel_noise);
+    record.value("zupt_hold_deadband_sigma", params_.values().parked_hold.deadband_sigma);
     record.value("zupt_anchor_confirm_scans", stationary_anchor_params.confirm_scans);
     record.value("reanchor_en", reanchor_params.enabled);
     record.value("reanchor_min_eff", reanchor_params.min_eff);
     record.value("reanchor_max_res", reanchor_params.max_res);
     record.value("reanchor_confirm_scans", reanchor_params.confirm_scans);
     record.value("reanchor_timeout_sec", reanchor_params.timeout_sec);
-    record.value("reanchor_on_fail", reanchor_on_fail);
+    record.value("reanchor_on_fail", params_.values().reanchor_on_fail);
     record.value("reanchor_max_res_ratio", reanchor_params.max_res_ratio);
     record.value("reanchor_res_floor", reanchor_params.res_floor);
     record.value("reanchor_min_eff_ratio", reanchor_params.min_eff_ratio);
-    record.value("reanchor_recovery_entry_view", reanchor_recovery_entry_view_);
-    record.value("runaway_watchdog_en", runaway_params.enabled);
-    record.value("runaway_parked_speed_thresh", runaway_params.parked_speed_thresh);
-    record.value("runaway_wheel_speed_margin", runaway_params.wheel_speed_margin);
-    record.value("runaway_hold_sec", runaway_params.hold_sec);
-    record.value("runaway_on_trip", runaway_on_trip);
+    record.value("reanchor_recovery_entry_view", params_.values().reanchor_recovery_entry_view);
+    record.value("runaway_watchdog_en", params_.values().runaway.enabled);
+    record.value("runaway_parked_speed_thresh", params_.values().runaway.parked_speed_thresh);
+    record.value("runaway_wheel_speed_margin", params_.values().runaway.wheel_speed_margin);
+    record.value("runaway_hold_sec", params_.values().runaway.hold_sec);
+    record.value("runaway_on_trip", params_.values().runaway_on_trip);
   }
   void effectiveImuForTest(fast_lio_test::EffectiveRecorder & record)
   {
-    record.value("imu_init_require_still", imu_init_require_still_);
-    record.value("imu_init_still_tol", imu_init_still_tol_);
-    record.value("imu_init_still_timeout_s", imu_init_still_timeout_s_);
-    record.value("imu_init_still_sustained_en", imu_init_static_params_.enabled);
-    record.value("imu_init_still_min_duration_s", imu_init_static_params_.minDurationS);
-    record.value("imu_init_still_min_samples", imu_init_static_params_.minSamples);
-    record.value("imu_init_still_gyro_rms_max", imu_init_static_params_.gyroRmsMax);
-    record.value("imu_init_still_gravity_ref", imu_init_static_params_.gravityRef);
-    record.value("imu_init_still_gravity_tol", imu_init_static_params_.gravityTol);
-    record.value("imu_init_still_max_gap_s", imu_init_static_params_.maxGapS);
-    record.value("mapping.gyr_cov", gyr_cov);
-    record.value("mapping.acc_cov", acc_cov);
-    record.value("mapping.b_gyr_cov", b_gyr_cov);
-    record.value("mapping.b_acc_cov", b_acc_cov);
     record.value("imu_coverage.max_gap_s", p_imu->coverage_params.max_gap_s);
     record.value("imu_coverage.max_extrapolation_s", p_imu->coverage_params.max_extrapolation_s);
     record.value("imu_gap_prior_en", p_imu->gap_params.enabled);
     record.value("imu_gap_min_s", p_imu->gap_params.min_gap_s);
     record.value("imu_gap_accel_max", p_imu->gap_params.accel_max);
     record.value("imu_gap_accel_max_z", p_imu->gap_params.accel_max_z);
-    record.value("imu_gap_verify_s", imu_gap_verify_s);
+    record.value("imu_gap_verify_s", params_.values().imu_gap_verify_s);
     record.value("imu_gap_empty_scans", p_imu->gap_params.empty_scans);
     record.value("mapping.extrinsic_est_en", extrinsic_est_en);
-    record.value("mapping.extrinsic_T", extrinT);
-    record.value("mapping.extrinsic_R", extrinR);
   }
   void effectiveMapForTest(fast_lio_test::EffectiveRecorder & record)
   {
     record.value("map_file_path", map_file_path);
-    record.value("filter_size_corner", filter_size_corner_min);
-    record.value("filter_size_surf", filter_size_surf_min);
+    record.value("filter_size_surf", params_.values().filter_size_surf_min);
     record.value("filter_size_map", filter_size_map_min);
     record.value("cube_side_length", cube_len);
     record.value("mapping.det_range", DET_RANGE);
-    record.value("mapping.fov_degree", fov_deg);
     record.value("mapping.map_insert_delay_scans", map_insert_delay_scans);
     record.value("pcd_save.pcd_save_en", pcd_save_en);
     record.value("pcd_save.interval", pcd_save_interval);
     record.value("prior_map_pcd", prior_map_pcd_);
-    record.value("prior_map_pinned", prior_map_pinned_);
-    record.value("prior_map_voxel", prior_map_voxel_);
-    record.value("prior_map_freeze", prior_map_freeze_);
-    record.value("initial_pose", initial_pose_vec_);
+    record.value("prior_map_pinned", params_.values().prior_map_pinned);
+    record.value("prior_map_voxel", params_.values().prior_map_voxel);
+    record.value("prior_map_freeze", params_.values().prior_map_freeze);
+    record.value("initial_pose", params_.values().initial_pose_vec);
   }
 
   // The state the constructor derives from the parameters, read from where it is applied.
@@ -5894,8 +4977,8 @@ private:
     record.bytes("derived:config_id:reference_contract_id", reference_contract_id);
     record.bytes("derived:config_id:reference_config_id", reference_config_id);
     record.value("derived:corr_kernel:corr_kernel", corr_kernel);
-    record.windows("derived:corr_dump:corr_dump_windows", corr_dump_windows);
-    record.matrix("derived:lever_arm:gravity_align_leg_lever_arm", gravity_align_leg_lever_arm);
+    record.windows("derived:corr_dump:corr_dump_windows", params_.values().corr_dump_windows);
+    record.matrix("derived:lever_arm:gravity_align_leg_lever_arm", params_.values().gravity_align_leg_lever_arm);
     record.value("derived:imu_static_limits:p_imu->init_require_still", p_imu->init_require_still);
     record.value("derived:imu_static_limits:p_imu->init_still_tol", p_imu->init_still_tol);
     record.value("derived:imu_static_limits:p_imu->init_still_timeout_s", p_imu->init_still_timeout_s);
@@ -5916,8 +4999,9 @@ private:
     record.value("derived:reanchor_relative:reanchor_healthy_eff.size", reanchor_healthy_eff.size());
     record.value("derived:recovery_budget:recovery_params.total_ns", recovery_params.total_ns);
     record.value("derived:recovery_budget:recovery_params.stable_ns", recovery_params.stable_ns);
-    record.value("derived:runaway_derived:runaway_params.wheel_max_age", runaway_params.wheel_max_age);
-    record.value("derived:runaway_derived:runaway_params.wheel_moving_thresh", runaway_params.wheel_moving_thresh);
+    record.value("derived:runaway_derived:runaway_params.wheel_max_age", params_.values().runaway.wheel_max_age);
+    record.value("derived:runaway_derived:runaway_params.wheel_moving_thresh",
+                 params_.values().runaway.wheel_moving_thresh);
     record.value("derived:data_dir:root_dir", root_dir);
     record.value("derived:anchor_gap:stationary_anchor_params.max_scan_gap_ns",
                  stationary_anchor_params.max_scan_gap_ns);
@@ -5946,16 +5030,13 @@ private:
     record.value("derived:prior_startup:recovery_state.cold_start_eligible", recovery_state.cold_start_eligible);
     record.value("derived:prior_startup:recovery_state.reference_initialized_once",
                  recovery_state.reference_initialized_once);
-    record.value("derived:prior_alignment:prior_map_align_", prior_map_align_);
-    record.value("derived:prior_alignment:prior_map_pinned_", prior_map_pinned_);
-    record.value("derived:initial_pose_alias:initial_pose_full_rpy_override_", initial_pose_full_rpy_override_);
-    record.matrix("derived:wheel_extrinsic:R_robot_to_imu", R_robot_to_imu);
-    record.value("derived:fov:FOV_DEG", FOV_DEG);
-    record.value("derived:fov:HALF_FOV_COS", HALF_FOV_COS);
+    record.value("derived:prior_alignment:prior_map_align_", params_.values().prior_map_align);
+    record.value("derived:prior_alignment:prior_map_pinned_", params_.values().prior_map_pinned);
+    record.value("derived:initial_pose_alias:initial_pose_full_rpy_override_",
+                 params_.values().initial_pose_full_rpy_override);
+    record.matrix("derived:wheel_extrinsic:R_robot_to_imu", params_.values().R_robot_to_imu);
     record.value("derived:filter_setters:downSizeFilterSurf.leaf", downSizeFilterSurf.leaf());
     record.matrix("derived:filter_setters:downSizeFilterMap.leaf_size", downSizeFilterMap.getLeafSize());
-    record.matrix("derived:extrinsic_and_noise:Lidar_T_wrt_IMU", Lidar_T_wrt_IMU);
-    record.matrix("derived:extrinsic_and_noise:Lidar_R_wrt_IMU", Lidar_R_wrt_IMU);
     record.matrix("derived:extrinsic_and_noise:p_imu->Lidar_T_wrt_IMU", p_imu->lidarTranslationForTest());
     record.matrix("derived:extrinsic_and_noise:p_imu->Lidar_R_wrt_IMU", p_imu->lidarRotationForTest());
     record.matrix("derived:extrinsic_and_noise:p_imu->cov_gyr_scale", p_imu->cov_gyr_scale);
@@ -5978,6 +5059,7 @@ private:
     if (!fast_lio_test::afterConstruction)
       return;
     fast_lio_test::EffectiveRecorder record = effective_locals_for_test;
+    record.append(params_.localsForTest());
     effectiveOutputForTest(record);
     effectiveMeasurementForTest(record);
     effectiveInputForTest(record);
@@ -6049,19 +5131,6 @@ private:
     }
   }
 
-  // reanchor_recovery_entry_view: a pending recovery is qualified against the map it began with, iVox's entry
-  // view, and its scans keep going into the map; off, the map stays frozen until the recovery ends.
-  void loadRecoveryEntryView()
-  {
-    this->get_parameter_or<bool>("reanchor_recovery_entry_view", reanchor_recovery_entry_view_, false);
-#ifndef USE_IVOX
-    if (reanchor_recovery_entry_view_) {
-      RCLCPP_FATAL(this->get_logger(), "reanchor_recovery_entry_view needs the iVox map backend (USE_IVOX)");
-      throw std::invalid_argument("reanchor_recovery_entry_view needs the iVox map backend");
-    }
-#endif
-  }
-
   /// Opens the entry view once per pending recovery and closes it when the recovery is no longer pending.
   /// Called from the scan loop only, after joinMapAdd() and before this scan's map insertion, so that neither
   /// overlaps an addition. A recovery begun elsewhere (the IMU callback, the coverage checks before the join)
@@ -6072,7 +5141,7 @@ private:
     const bool pending = recovery_state.trust == fast_lio::RecoveryTrust::kPending;
     if (!pending && ikdtree.entryViewActive())
       ikdtree.EndEntryView();
-    if (reanchor_recovery_entry_view_ && pending && entry_view_round_ != recovery_state.episode) {
+    if (params_.values().reanchor_recovery_entry_view && pending && entry_view_round_ != recovery_state.episode) {
       entry_view_round_ = recovery_state.episode;
       ikdtree.BeginEntryView();
     }
@@ -6082,7 +5151,7 @@ private:
   bool recoveryEntryViewServes() const
   {
 #ifdef USE_IVOX
-    return reanchor_recovery_entry_view_ && recovery_state.trust == fast_lio::RecoveryTrust::kPending &&
+    return params_.values().reanchor_recovery_entry_view && recovery_state.trust == fast_lio::RecoveryTrust::kPending &&
            ikdtree.entryViewActive();
 #else
     return false;
@@ -6155,7 +5224,8 @@ private:
       fast_lio::traceNs(lidar_end_time));
     int map_before = 0;
     const bool kept_prior = rebuildLocalMapStorage(map_before);
-    const auto prior = fast_lio::priorMapAfterReset(prior_map_installed_, kept_prior, prior_map_freeze_);
+    const auto prior =
+      fast_lio::priorMapAfterReset(prior_map_installed_, kept_prior, params_.values().prior_map_freeze);
 #ifdef FASTLIO_TEST_HOOKS
     if (fast_lio_test::afterPriorMapReset)
       fast_lio_test::afterPriorMapReset(prior_map_installed_,
@@ -6221,6 +5291,7 @@ private:
 
   void timer_callback()
   {
+    const fast_lio::FrontendParams & p = params_.values();
     const bool ready = sync_packages(Measures);
     publishPendingReference();  // sync's drop path has released mtx_buffer
     if (!ready) {
@@ -6361,7 +5432,7 @@ private:
                      static_cast<unsigned long>(imu_gap_bridged_count));
         // The IMU interval, not the stretch this scan bridged: a dropout carried through several empty scans is
         // bridged 0.1 s at a time.
-        const bool verify = gaps.longest_interval_s > imu_gap_verify_s;
+        const bool verify = gaps.longest_interval_s > p.imu_gap_verify_s;
         if (verify) {
           markImuGapBridged(Measures.lidar_end_time);
         }
@@ -6386,21 +5457,21 @@ private:
       }
 
       /*** Scan-hole guard: bound the IMU-only excursion across a gap ***/
-      if (guard_hole_en && flg_EKF_inited && hole_last_scan_end > 0.0) {
+      if (p.guard_hole_en && flg_EKF_inited && hole_last_scan_end > 0.0) {
         const double gap = Measures.lidar_beg_time - hole_last_scan_end;
-        if (gap > guard_hole_min_sec) {
+        if (gap > p.guard_hole_min_sec) {
           state_ikfom st = kf.get_x();
           const double spd_imu = st.vel.norm();
           const V3D dv = st.vel - hole_vel_pre;
-          const double dv_max = guard_hole_max_accel * gap;
+          const double dv_max = p.guard_hole_max_accel * gap;
           const double dv_n = dv.norm();
           if (dv_n > dv_max) {
             st.vel = hole_vel_pre + dv * (dv_max / dv_n);
             gravity_align_vel_overwritten = true;
-            resetVelocityCovariance(guard_vel_reset_sigma);
+            resetVelocityCovariance(p.guard_vel_reset_sigma);
           }
           const V3D pos_imu = st.pos;
-          if (guard_hole_reanchor_pos) {
+          if (p.guard_hole_reanchor_pos) {
             st.pos = hole_pos_pre + hole_vel_pre * gap;
           }
           kf.change_x(st);
@@ -6414,7 +5485,7 @@ private:
                       spd_imu,
                       hole_vel_pre.norm(),
                       state_point.vel.norm(),
-                      guard_hole_reanchor_pos ? (pos_imu - state_point.pos).norm() : 0.0,
+                      p.guard_hole_reanchor_pos ? (pos_imu - state_point.pos).norm() : 0.0,
                       p_imu->gap_summary.gaps > 0 ? " (IMU gap bridged, velocity held across it)" : "");
         }
       }
@@ -6488,7 +5559,7 @@ private:
       /*** Engulfment telemetry: far-field fraction of the raw downsampled scan ***/
       if (feats_down_size > 0) {
         int far_cnt = 0;
-        const double far_r2 = guard_engulf_far_range * guard_engulf_far_range;
+        const double far_r2 = p.guard_engulf_far_range * p.guard_engulf_far_range;
         for (int i = 0; i < feats_down_size; i++) {
           const PointType & pb = feats_down_body->points[i];
           if (pb.x * pb.x + pb.y * pb.y > far_r2)
@@ -6511,17 +5582,17 @@ private:
             //    initial_pose places the filter's start inside the MAP's frame, which only
             //    means anything when that frame is this run's. On the relocalization path
             //    the map moves to the front end instead, so the start pose stays untouched.
-            if (prior_map_align_ == fast_lio::PriorMapAlign::kAsDelivered) {
+            if (p.prior_map_align == fast_lio::PriorMapAlign::kAsDelivered) {
               state_ikfom new_state = kf.get_x();
               const Eigen::Quaterniond q_current(new_state.rot.matrix());
               const Eigen::Vector3d current_rpy = q_current.toRotationMatrix().eulerAngles(0, 1, 2);
               const auto injection = fast_lio::resolveInitialPose(
-                initial_pose_vec_, initial_pose_full_rpy_override_, current_rpy.x(), current_rpy.y());
-              if (!injection.valid && !initial_pose_vec_.empty()) {
+                p.initial_pose_vec, p.initial_pose_full_rpy_override, current_rpy.x(), current_rpy.y());
+              if (!injection.valid && !p.initial_pose_vec.empty()) {
                 RCLCPP_ERROR(this->get_logger(),
                              "initial_pose is unusable (%zu element(s), need %zu finite: x,y,z,roll,pitch,yaw) - "
                              "loading the prior map at the filter's own pose instead",
-                             initial_pose_vec_.size(),
+                             p.initial_pose_vec.size(),
                              fast_lio::kInitialPoseSize);
               }
               if (injection.valid) {
@@ -6536,7 +5607,7 @@ private:
                             injection.position.y(),
                             injection.position.z(),
                             injection.applied_yaw_rad * 180.0 / M_PI,
-                            initial_pose_full_rpy_override_ ? "true" : "false");
+                            p.initial_pose_full_rpy_override ? "true" : "false");
               }
             }
 
@@ -6574,7 +5645,7 @@ private:
               }
 
               // 3. Downsample prior map
-              const double prior_leaf = fast_lio::priorMapLeaf(prior_map_voxel_, filter_size_map_min);
+              const double prior_leaf = fast_lio::priorMapLeaf(p.prior_map_voxel, filter_size_map_min);
               pcl::VoxelGrid<PointType> voxel;
               voxel.setLeafSize(
                 static_cast<float>(prior_leaf), static_cast<float>(prior_leaf), static_cast<float>(prior_leaf));
@@ -6599,7 +5670,7 @@ private:
               //    On the relocalization path nothing goes in yet: the map is held in its own
               //    frame until an alignment says where to put it (installPriorMap below).
               size_t map_points = 0;
-              if (prior_map_align_ == fast_lio::PriorMapAlign::kRelocalization) {
+              if (p.prior_map_align == fast_lio::PriorMapAlign::kRelocalization) {
                 prior_map_ds_ = prior_ds;
                 ikdtree.Build(feats_down_world->points);
                 anchorTraceMapUpdated();
@@ -6620,7 +5691,7 @@ private:
                 rclcpp::shutdown();
                 return;
               }
-              if (prior_map_pinned_) {
+              if (p.prior_map_pinned) {
                 ikdtree.AddPinnedPoints(prior_ds->points);
                 ikdtree.Add_Points(feats_down_world->points, true);
                 map_points = static_cast<size_t>(ikdtree.size());
@@ -6754,7 +5825,7 @@ private:
 
       /*** iterated state estimation ***/
       const auto state_before_update = state_point;
-      if (kalman_channel_diag_en && kalman_last_final_valid) {
+      if (p.kalman_channel_diag_en && kalman_last_final_valid) {
         // the IMU propagation from the previous scan's final state to this scan's prior, as its own channel
         EkfUpdateDiagnostics propagationDiagnostics;
         writeKalmanChannel("propagation",
@@ -6781,10 +5852,10 @@ private:
         hold_in.scan_gap_s = hole_last_scan_end > 0.0 ? Measures.lidar_beg_time - hole_last_scan_end : 0.1;
         hold_in.far_frac = scan_far_frac;
         hold_in.z_weak_prev = pos_obs_z_weak;
-        lidar_attitude_hold_active = fast_lio::holdAttitudeThisScan(attitude_hold_params, hold_in);
+        lidar_attitude_hold_active = fast_lio::holdAttitudeThisScan(p.attitude_hold, hold_in);
         fast_lio::AttitudeHoldInputs allowed_in = hold_in;
         allowed_in.engulf_latched = true;  // the release conditions alone: would a latch be honoured?
-        lidar_attitude_hold_allowed = fast_lio::holdAttitudeThisScan(attitude_hold_params, allowed_in);
+        lidar_attitude_hold_allowed = fast_lio::holdAttitudeThisScan(p.attitude_hold, allowed_in);
         lidar_attitude_hold_info_active = false;
       }
       if (lidar_attitude_hold_active) {
@@ -6806,8 +5877,8 @@ private:
       }
       corr_dump_scan_active = false;
       corr_dump_iter = 0;
-      if (corr_dump_en && fout_corr.is_open()) {
-        for (const auto & w : corr_dump_windows) {
+      if (p.corr_dump_en && fout_corr.is_open()) {
+        for (const auto & w : p.corr_dump_windows) {
           if (lidar_end_time >= w.first && lidar_end_time <= w.second) {
             corr_dump_scan_active = true;
             break;
@@ -6816,7 +5887,7 @@ private:
       }
       EkfUpdateDiagnostics lidarDiagnostics;
       Eigen::Matrix<double, 23, 23> lidarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
-      if (kalman_channel_diag_en || corr_dump_scan_active || reanchor_recovery_entry_view_)
+      if (p.kalman_channel_diag_en || corr_dump_scan_active || p.reanchor_recovery_entry_view)
         lidarCovarianceBefore = kf.get_P();
       {
         // Consider roll/pitch on this scan? Decided from what the previous scan left (its roll/pitch information
@@ -6827,7 +5898,7 @@ private:
         consider_in.rp_info_prev = lidar_rot_obs_rp_min;
         consider_in.z_weak_prev = pos_obs_z_weak;
         consider_in.consider_age_s = rp_consider_since >= 0.0 ? lidar_end_time - rp_consider_since : 0.0;
-        rp_consider_active = fast_lio::considerRollPitchThisScan(rp_consider_params, consider_in);
+        rp_consider_active = fast_lio::considerRollPitchThisScan(p.rp_consider, consider_in);
         if (rp_consider_active) {
           const V3D grav_w(state_point.grav[0], state_point.grav[1], state_point.grav[2]);
           const V3D up_body = state_point.rot.toRotationMatrix().transpose() * (-grav_w.normalized());
@@ -6872,7 +5943,7 @@ private:
         }
       }
       kf.update_iterated_dyn_share_modified(
-        LASER_POINT_COV, solve_H_time, kalman_channel_diag_en ? &lidarDiagnostics : nullptr);
+        LASER_POINT_COV, solve_H_time, p.kalman_channel_diag_en ? &lidarDiagnostics : nullptr);
 #ifdef FASTLIO_TEST_HOOKS
       if (fast_lio_test::afterLidarUpdate)
         fast_lio_test::afterLidarUpdate(lidar_end_time, fast_lio_test::filterSnapshot());
@@ -6900,7 +5971,7 @@ private:
                              scan_far_frac,
                              lidar_attitude_hold_scans);
       }
-      if (kalman_channel_diag_en) {
+      if (p.kalman_channel_diag_en) {
         writeKalmanChannel(
           "lidar", state_before_update, state_point, lidarCovarianceBefore, lidarDiagnostics, Zero3d, Zero3d);
       }
@@ -6972,8 +6043,8 @@ private:
                              degeneracy_scans_total,
                              mean_w,
                              degeneracy_point_weighted,
-                             planar_constraint_en ? "on" : "OFF",
-                             zupt_en ? "on" : "OFF");
+                             p.planar_constraint_en ? "on" : "OFF",
+                             p.zupt_en ? "on" : "OFF");
       }
 
       /*** Divergence guard (P1) — two independent divergence signals:
@@ -6993,36 +6064,36 @@ private:
       flio_degraded_odom = false;
       bool flio_vel_runaway = false;
       bool flio_engulfed = false;
-      if (divergence_guard_en) {
-        if (effct_feat_num < divergence_guard_min_eff)
+      if (p.divergence_guard_en) {
+        if (effct_feat_num < p.divergence_guard_min_eff)
           ++consec_low_eff;
         else
           consec_low_eff = 0;
-        flio_vel_runaway = (state_point.vel.norm() > divergence_guard_max_speed);
+        flio_vel_runaway = (state_point.vel.norm() > p.divergence_guard_max_speed);
         if (reference_health_en && flio_vel_runaway)
           reference_progress.negative(1u << 10, 1u << 4);  // the actual pre-clamp fact
-        if (reference_health_en && consec_low_eff >= divergence_guard_streak)
+        if (reference_health_en && consec_low_eff >= p.divergence_guard_streak)
           reference_progress.negative(1u << 11, 1u << 7);
         // (3) engulfment: far field collapsed in the raw scan — leading indicator
         //     (fires before effct starves; see guard_engulf_en block comment).
-        if (guard_engulf_en) {
-          if (scan_far_frac < guard_engulf_far_frac_min)
+        if (p.guard_engulf_en) {
+          if (scan_far_frac < p.guard_engulf_far_frac_min)
             ++consec_engulf;
           else
             consec_engulf = 0;
           if (!engulf_latched) {
-            if (consec_engulf >= guard_engulf_streak) {
+            if (consec_engulf >= p.guard_engulf_streak) {
               engulf_latched = true;
               consec_engulf_clear = 0;
               engulf_latch_time = lidar_end_time;
             }
           } else {
             // Latched: release only on a SUSTAINED healthy far field (hysteresis).
-            if (scan_far_frac >= guard_engulf_far_frac_release)
+            if (scan_far_frac >= p.guard_engulf_far_frac_release)
               ++consec_engulf_clear;
             else
               consec_engulf_clear = 0;
-            if (consec_engulf_clear >= guard_engulf_release_scans) {
+            if (consec_engulf_clear >= p.guard_engulf_release_scans) {
               engulf_latched = false;
               consec_engulf = 0;
               // The blind stretch's velocity: the legacy policy discards it (see block comment); the release
@@ -7036,8 +6107,8 @@ private:
                 leg_v = last_twist_v_body;
                 leg_age = last_twist_stamp > 0.0 ? lidar_end_time - last_twist_stamp : -1.0;
               }
-              release_vel_params.zero_sigma = guard_vel_reset_sigma;
-              release_vel_params.max_speed = divergence_guard_max_speed;
+              release_vel_params.zero_sigma = p.guard_vel_reset_sigma;
+              release_vel_params.max_speed = p.divergence_guard_max_speed;
               const auto rel =
                 fast_lio::releaseVelocity(st.vel, st.rot.toRotationMatrix(), leg_v, leg_age, release_vel_params);
               st.vel = rel.velocity;
@@ -7050,11 +6121,11 @@ private:
               const double blind_s = engulf_latch_time > 0.0 ? lidar_end_time - engulf_latch_time : 0.0;
               engulf_release_time = lidar_end_time;
               bool inflated = false;
-              if (release_inflate_params.enabled) {
+              if (p.release_inflate.enabled) {
                 auto P = kf.get_P();
                 const V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);
                 const V3D up_body = st.rot.toRotationMatrix().transpose() * (-grav_w.normalized());
-                inflated = fast_lio::inflateReleaseCovariance(P, blind_s, up_body, release_inflate_params);
+                inflated = fast_lio::inflateReleaseCovariance(P, blind_s, up_body, p.release_inflate);
                 if (inflated) {
                   kf.change_P(P);
                 }
@@ -7064,7 +6135,7 @@ private:
                           "[DIVERGENCE-GUARD] engulfment released (far_frac=%.2f for %d scans, blind %.1fs): "
                           "map unfrozen, velocity %s (%.2f m/s, sigma %.2f)%s",
                           scan_far_frac,
-                          guard_engulf_release_scans,
+                          p.guard_engulf_release_scans,
                           blind_s,
                           rel.used == fast_lio::ReleaseVelocitySource::kLeg    ? "from legs"
                           : rel.used == fast_lio::ReleaseVelocitySource::kKeep ? "kept"
@@ -7078,7 +6149,7 @@ private:
         }
       }
       const bool flio_in_degraded = guardVerdictForTest(
-        divergence_guard_en && (consec_low_eff >= divergence_guard_streak || flio_vel_runaway || flio_engulfed));
+        p.divergence_guard_en && (consec_low_eff >= p.divergence_guard_streak || flio_vel_runaway || flio_engulfed));
 
       /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
        *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll
@@ -7105,27 +6176,27 @@ private:
        *   (skew(g_body) sends a yaw-axis δθ to 0), so the LiDAR-excellent
        *   heading is untouched. h(x)=Rᵀ·u_world, right-perturbation
        *   R=R̂·Exp(δθ) ⇒ ∂h/∂δθ=skew(g_body), same form as planar/wheel. ***/
-      if (gravity_align_en && !Measures.imu.empty()) {
+      if (p.gravity_align_en && !Measures.imu.empty()) {
         const double g_raw = p_imu->gravity_norm();  // gravity magnitude, raw units
         state_ikfom st = kf.get_x();
         M3D Rw = st.rot.toRotationMatrix();
         const V3D bg_now(st.bg[0], st.bg[1], st.bg[2]);
         const V3D v_body_now = Rw.transpose() * st.vel;                         // velocity in IMU frame
         const bool body_static_now = body_is_static(Measures, lidar_end_time);  // one verdict for this block
-        const bool sigma_by_measurement = gravity_align_sigma_policy == "measurement";
+        const bool sigma_by_measurement = p.gravity_align_sigma_policy == "measurement";
         // [v6] velocity covariance trace at this scan's end (the compensation sigma's input)
-        const double vel_var_now = gravity_align_vel_sigma_scale > 0.0 ? kf.get_P().block<3, 3>(12, 12).trace() : 0.0;
+        const double vel_var_now = p.gravity_align_vel_sigma_scale > 0.0 ? kf.get_P().block<3, 3>(12, 12).trace() : 0.0;
         // [L2] per-scan aggregate of kinematically-compensated specific force
         // (centripetal ω×v_body subtracted per sample — transport theorem; the
         // scan-end velocity serves every sample, walking-speed error << gates).
-        if (gravity_align_window_s > 0.0) {
+        if (p.gravity_align_window_s > 0.0) {
           GravWinAgg agg{lidar_end_time, Eigen::Vector3d::Zero(), 0, 0.0};
           // [v6] this scan's IMU span runs from the previous scan's end to this one's;
           // the body velocity at both edges is what the linear-acceleration term needs.
           V3D v_edge = v_body_now;
           double var_edge = vel_var_now;
           bool edge_valid = !gravity_align_vel_overwritten;
-          if (gravity_align_lin_accel_comp && gravity_align_lin_accel_source == "leg") {
+          if (p.gravity_align_lin_accel_comp && p.gravity_align_lin_accel_source == "leg") {
             // trailing edge means of the leg forward speed and the body rate over the same span
             for (const auto & imu : Measures.imu) {
               gravity_align_gyro_hist.emplace_back(
@@ -7136,7 +6207,7 @@ private:
                                                         gravity_align_gyro_hist.size() > 1000)) {
               gravity_align_gyro_hist.pop_front();
             }
-            const double t_lo = lidar_end_time - gravity_align_leg_edge_window_s;
+            const double t_lo = lidar_end_time - p.gravity_align_leg_edge_window_s;
             double vx_sum = 0.0;
             int n_leg = 0;
             {
@@ -7156,14 +6227,14 @@ private:
                 ++n_w;
               }
             }
-            const double vx_mean = n_leg > 0 ? vx_sum / double(n_leg) * wheel_speed_scale : 0.0;
+            const double vx_mean = n_leg > 0 ? vx_sum / double(n_leg) * p.wheel_speed_scale : 0.0;
             V3D w_mean = V3D::Zero();
             if (n_w > 0) {
               w_mean = w_sum / double(n_w) - bg_now;
             }
             edge_valid = fast_lio::legEdgeValid(n_leg, vx_mean, body_static_now);
-            v_edge = fast_lio::legEdgeVelocity(vx_mean, R_robot_to_imu, w_mean, gravity_align_leg_lever_arm);
-            var_edge = fast_lio::legEdgeVariance(vx_mean, body_static_now, gravity_align_leg_vel_sigma);
+            v_edge = fast_lio::legEdgeVelocity(vx_mean, p.R_robot_to_imu, w_mean, p.gravity_align_leg_lever_arm);
+            var_edge = fast_lio::legEdgeVariance(vx_mean, body_static_now, p.gravity_align_leg_vel_sigma);
           }
           agg.edge.t_start = gravity_align_prev_t;
           agg.edge.t_end = lidar_end_time;
@@ -7182,7 +6253,7 @@ private:
             V3D w_i(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z);
             // per-SAMPLE gyro filter: one spike must not disqualify the scan
             // (measured: scan-level max|ω| gating killed 18-23 % of scans).
-            if (w_i.norm() > gravity_align_gyro_tol) {
+            if (w_i.norm() > p.gravity_align_gyro_tol) {
               continue;
             }
             agg.sum += a_i - (w_i - bg_now).cross(v_body_now) * (g_raw / G_m_s2);
@@ -7190,26 +6261,26 @@ private:
           }
           grav_win.push_back(agg);
           while (!grav_win.empty() &&
-                 (grav_win.front().t < lidar_end_time - gravity_align_window_s || grav_win.size() > 100)) {
+                 (grav_win.front().t < lidar_end_time - p.gravity_align_window_s || grav_win.size() > 100)) {
             grav_win.pop_front();
           }
         }
         // Engagement: legacy trigger, [L1] hold hysteresis, [L2] continuous.
-        const bool ga_trig = pos_obs_z_weak > gravity_align_z_weak_thresh || flio_in_degraded;
+        const bool ga_trig = pos_obs_z_weak > p.gravity_align_z_weak_thresh || flio_in_degraded;
         if (ga_trig) {
           gravity_align_last_trig = lidar_end_time;
         }
-        const bool ga_held =
-          gravity_align_hold_s > 0.0 && !ga_trig && lidar_end_time - gravity_align_last_trig <= gravity_align_hold_s;
+        const bool ga_held = p.gravity_align_hold_s > 0.0 && !ga_trig &&
+                             lidar_end_time - gravity_align_last_trig <= p.gravity_align_hold_s;
         gravity_align_degraded_active =
-          !sigma_by_measurement && (ga_trig || ga_held) && gravity_align_noise_degraded > 0.0;
-        if (ga_trig || ga_held || gravity_align_continuous) {
+          !sigma_by_measurement && (ga_trig || ga_held) && p.gravity_align_noise_degraded > 0.0;
+        if (ga_trig || ga_held || p.gravity_align_continuous) {
           // Measurement vector: window mean ([L2]) or legacy last-sample.
           V3D f_meas = V3D::Zero();
           double win_span = 0.0;
           int win_n = 0;
           fast_lio::LinearAccelerationTerm lin_term;  // [v6] invalid unless the option is on and the window is clean
-          if (gravity_align_window_s > 0.0) {
+          if (p.gravity_align_window_s > 0.0) {
             double t_old = lidar_end_time;
             bool overwritten = false;
             for (const auto & a : grav_win) {
@@ -7228,13 +6299,13 @@ private:
             // [v6] window-mean linear acceleration from the velocity history: (v_b(end) − v_b(start))/span,
             // raw accelerometer units like the ω×v term. A window with an overwritten velocity has no
             // derivative — the term is invalid and the prior is withheld below.
-            if (gravity_align_lin_accel_comp && !grav_win.empty()) {
-              const bool leg_source = gravity_align_lin_accel_source == "leg";
+            if (p.gravity_align_lin_accel_comp && !grav_win.empty()) {
+              const bool leg_source = p.gravity_align_lin_accel_source == "leg";
               lin_term = fast_lio::linearAccelerationTerm(grav_win.front().edge,
                                                           grav_win.back().edge,
                                                           leg_source ? false : overwritten,
                                                           G_m_s2,
-                                                          gravity_align_vel_sigma_scale);
+                                                          p.gravity_align_vel_sigma_scale);
               if (lin_term.valid) {
                 f_meas -= lin_term.accel * (g_raw / G_m_s2);
               }
@@ -7244,7 +6315,7 @@ private:
             V3D a_raw(
               imu_last->linear_acceleration.x, imu_last->linear_acceleration.y, imu_last->linear_acceleration.z);
             V3D w_raw(imu_last->angular_velocity.x, imu_last->angular_velocity.y, imu_last->angular_velocity.z);
-            if (w_raw.norm() <= gravity_align_gyro_tol) {
+            if (w_raw.norm() <= p.gravity_align_gyro_tol) {
               f_meas = a_raw - (w_raw - bg_now).cross(v_body_now) * (g_raw / G_m_s2);
               win_n = 1;
               win_span = 1.0;
@@ -7256,18 +6327,18 @@ private:
           // is gravity_align_mag_ref when set: the IMU-init g estimate is biased
           // when the bag/robot starts IN MOTION (m20_0831: init while walking →
           // the 5 % gate rejected nearly every honest window, 9/2569 engaged).
-          const double g_ref = gravity_align_mag_ref > 1e-3 ? gravity_align_mag_ref : g_raw;
+          const double g_ref = p.gravity_align_mag_ref > 1e-3 ? p.gravity_align_mag_ref : g_raw;
           const bool span_ok =
-            gravity_align_window_s <= 0.0 || (win_span >= 0.7 * gravity_align_window_s && win_n >= 20);
+            p.gravity_align_window_s <= 0.0 || (win_span >= 0.7 * p.gravity_align_window_s && win_n >= 20);
           // [v6] with the compensation on, a window whose velocity history is broken cannot be levelled to.
           // A platform with no leg stream at all keeps the legacy measurement (the stream, not an edge, is absent).
-          const bool leg_stream_alive = gravity_align_lin_accel_source != "leg" ||
+          const bool leg_stream_alive = p.gravity_align_lin_accel_source != "leg" ||
                                         (last_twist_stamp > 0.0 && lidar_end_time - last_twist_stamp < 1.0);
           const bool lin_ok =
-            !gravity_align_lin_accel_comp || gravity_align_window_s <= 0.0 || lin_term.valid || !leg_stream_alive;
+            !p.gravity_align_lin_accel_comp || p.gravity_align_window_s <= 0.0 || lin_term.valid || !leg_stream_alive;
           // [v6] blind stretch with the body moving: the acceleration is unobservable, so is the vertical
           const bool blind_moving =
-            (gravity_align_withhold_blind_moving || sigma_by_measurement) && flio_in_degraded && !body_static_now;
+            (p.gravity_align_withhold_blind_moving || sigma_by_measurement) && flio_in_degraded && !body_static_now;
           if (degeneracy_debug && blind_moving) {
             std::cerr << "[GALIGN] withheld: blind stretch, body moving" << std::endl;
           }
@@ -7275,7 +6346,7 @@ private:
             std::cerr << "[GALIGN] withheld: velocity overwritten inside the window" << std::endl;
           }
           if (g_ref > 1e-3 && win_n > 0 && a_norm > 1e-6 && span_ok && lin_ok && !blind_moving &&
-              std::abs(a_norm - g_ref) <= gravity_align_accel_tol * g_ref) {
+              std::abs(a_norm - g_ref) <= p.gravity_align_accel_tol * g_ref) {
             V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
             V3D u_world = -grav_w.normalized();              // world up (unit)
             V3D g_body = Rw.transpose() * u_world;           // predicted up in body (unit)
@@ -7286,7 +6357,7 @@ private:
               H.block<3, 3>(0, 3) = skew_sym_mat(g_body);  // ∂h/∂(rot); yaw in null space
               // [v5] degraded/held strength is an attitude measure; the gravity
               // state neither takes the residual nor leaks while it is in force.
-              const bool grav_frozen = gravity_align_grav_freeze_degraded && (ga_trig || ga_held);
+              const bool grav_frozen = p.gravity_align_grav_freeze_degraded && (ga_trig || ga_held);
               // [v4] gravity-state observability: h = Rᵀ·(−g/‖g‖) also depends on the
               // S2 gravity state — without these two columns a motion-biased gravity
               // INIT is permanently unobservable (m20_0831: the bag starts walking →
@@ -7309,10 +6380,10 @@ private:
               // grav variance collapses and even a correct H routes nothing into it.
               // Gentle multiplicative leak (congruence row/col scaling — correlations
               // and PSD preserved, no covariance shock) capped at (3°)².
-              if (gravity_align_grav_leak > 1.0 && !grav_frozen) {
-                const double kGravVarCap = std::pow(gravity_align_grav_cap_deg * M_PI / 180.0, 2);
+              if (p.gravity_align_grav_leak > 1.0 && !grav_frozen) {
+                const double kGravVarCap = std::pow(p.gravity_align_grav_cap_deg * M_PI / 180.0, 2);
                 auto Pg = kf.get_P();
-                const double lam = std::sqrt(gravity_align_grav_leak);
+                const double lam = std::sqrt(p.gravity_align_grav_leak);
                 bool leaked = false;
                 for (int i = 21; i <= 22; i++) {
                   if (Pg(i, i) < kGravVarCap) {
@@ -7330,22 +6401,22 @@ private:
                                                               : fast_lio::LevellingSigmaPolicy::kScene,
                                          ga_trig || ga_held,
                                          body_static_now,
-                                         gravity_align_noise,
-                                         gravity_align_noise_degraded,
-                                         gravity_align_noise_static,
-                                         gravity_align_noise_moving);
+                                         p.gravity_align_noise,
+                                         p.gravity_align_noise_degraded,
+                                         p.gravity_align_noise_static,
+                                         p.gravity_align_noise_moving);
               // [v6] the compensation's own uncertainty widens the measurement (quadrature)
               const double n2 = sigma * sigma + (lin_term.valid ? lin_term.sigma * lin_term.sigma : 0.0);
               Eigen::Vector3d R_diag(n2, n2, n2);
               EkfUpdateDiagnostics gravityDiagnostics;
               Eigen::Matrix<double, 23, 23> gravityCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
-              if (kalman_channel_diag_en)
+              if (p.kalman_channel_diag_en)
                 gravityCovarianceBefore = kf.get_P();
               if (degeneracy_debug) {
                 V3D tilt = g_body.cross(m_body);  // axis*sin(angle), body frame
                 const double ang_deg = std::asin(std::min(1.0, tilt.norm())) * 57.2958;
                 V3D eul_before = SO3ToEuler(st.rot);  // degrees
-                kf.update_simple(H, residual, R_diag, kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
+                kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
                 state_point = kf.get_x();
                 V3D eul_after = SO3ToEuler(state_point.rot);
                 V3D deul = eul_after - eul_before;
@@ -7357,10 +6428,10 @@ private:
                           << " dRPY_deg=[" << deul.x() << "," << deul.y() << "," << deul.z() << "]"
                           << " posZ=" << state_point.pos[2] << "m" << std::endl;
               } else {
-                kf.update_simple(H, residual, R_diag, kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
+                kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
                 state_point = kf.get_x();
               }
-              if (kalman_channel_diag_en) {
+              if (p.kalman_channel_diag_en) {
                 writeKalmanChannel(
                   "gravity", st, state_point, gravityCovarianceBefore, gravityDiagnostics, m_body, g_body);
               }
@@ -7378,7 +6449,7 @@ private:
        *   robot's pitch (rotation state), not by body-frame vz. This supplies
        *   the missing vertical information that the degenerate iEKF otherwise
        *   dumps into the accel bias, flying the state off (bag2 km-runaway). ***/
-      if (planar_constraint_en && (pos_obs_z_weak > planar_constraint_z_weak_thresh || flio_in_degraded)) {
+      if (p.planar_constraint_en && (pos_obs_z_weak > p.planar_constraint_z_weak_thresh || flio_in_degraded)) {
         state_ikfom st = kf.get_x();
         M3D Rw = st.rot.toRotationMatrix();
         V3D v_body = Rw.transpose() * st.vel;  // velocity in IMU/body frame
@@ -7388,14 +6459,14 @@ private:
         Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
         H.block<3, 3>(0, 3) = skew_sym_mat(v_body);  // dh/d(rot)
         H.block<3, 3>(0, 12) = Rw.transpose();       // dh/d(vel)
-        Eigen::Vector3d R_diag(1e6, 1e6, planar_constraint_noise * planar_constraint_noise);
+        Eigen::Vector3d R_diag(1e6, 1e6, p.planar_constraint_noise * p.planar_constraint_noise);
         EkfUpdateDiagnostics planarDiagnostics;
         Eigen::Matrix<double, 23, 23> planarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
-        if (kalman_channel_diag_en)
+        if (p.kalman_channel_diag_en)
           planarCovarianceBefore = kf.get_P();
-        kf.update_simple(H, residual, R_diag, kalman_channel_diag_en ? &planarDiagnostics : nullptr);
+        kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &planarDiagnostics : nullptr);
         state_point = kf.get_x();
-        if (kalman_channel_diag_en) {
+        if (p.kalman_channel_diag_en) {
           writeKalmanChannel("planar", st, state_point, planarCovarianceBefore, planarDiagnostics, Zero3d, v_body);
         }
       }
@@ -7466,8 +6537,8 @@ private:
                      reanchor_params.timeout_sec,
                      effct_feat_num,
                      res_mean_last,
-                     reanchor_on_fail.c_str());
-        if (reanchor_on_fail == "reset_map") {
+                     p.reanchor_on_fail.c_str());
+        if (p.reanchor_on_fail == "reset_map") {
           if (!rebuildLocalMap("REANCHOR"))
             return;
         }
@@ -7537,8 +6608,7 @@ private:
       // streak and its engagement end with the anchor (releaseAnchorHolds), and
       // the prior below needs the anchor usable on this very scan. Counted
       // before the records of this step are written, so they include the scan.
-      const auto parked =
-        fast_lio::updateParkedHold(&parked_hold_state, anchor_step.parked_evidence, parked_hold_params);
+      const auto parked = fast_lio::updateParkedHold(&parked_hold_state, anchor_step.parked_evidence, p.parked_hold);
       if (anchor_step.started) {
         // A candidate carries the pose of its first scan: the platform has not
         // moved since, so a later scan adds no information, only the chance of a
@@ -7559,11 +6629,11 @@ private:
         anchor_scan_record.usable = anchor_step.usable;
       fast_lio::ZuptPolicyInputs zupt_in;
       zupt_in.scan_degraded = reanchor.degraded;
-      zupt_in.zupt_enabled = zupt_en;
+      zupt_in.zupt_enabled = p.zupt_en;
       zupt_in.anchor_valid = anchor_step.usable;
       zupt_in.body_static = body_static;
       zupt_in.speed = kf.get_x().vel.norm();
-      zupt_in.max_speed = divergence_guard_max_speed;
+      zupt_in.max_speed = p.divergence_guard_max_speed;
       const fast_lio::ZuptDecision zupt_verdict = fast_lio::decideZupt(zupt_in);
       if (parked.just_engaged) {
         anchorTransition(
@@ -7653,9 +6723,9 @@ private:
                              : reanchor_gate.state == fast_lio::ReanchorState::kLost    ? "LOST"
                              : reanchor_gate.state == fast_lio::ReanchorState::kBlind   ? "blind"
                                                                                         : "ok",
-                             divergence_guard_max_speed,
-                             planar_constraint_en ? "pinned" : "OFF",
-                             gravity_align_en ? "on" : "OFF",
+                             p.divergence_guard_max_speed,
+                             p.planar_constraint_en ? "pinned" : "OFF",
+                             p.gravity_align_en ? "on" : "OFF",
                              state_point.pos[2],
                              state_point.vel.norm());
       } else {
@@ -7710,9 +6780,9 @@ private:
           const state_ikfom stp = kf.get_x();
           const M3D est_rot = stp.rot.toRotationMatrix();
           const M3D anchor_rot = zupt_anchor_rot.toRotationMatrix();
-          if (fast_lio::parkedHoldShouldApply(zupt_anchor_pos, anchor_rot, stp.pos, est_rot, parked_hold_params)) {
-            const auto hold = fast_lio::parkedHoldMeasurement(
-              zupt_anchor_pos, anchor_rot, stp.pos, est_rot, stp.vel, parked_hold_params);
+          if (fast_lio::parkedHoldShouldApply(zupt_anchor_pos, anchor_rot, stp.pos, est_rot, p.parked_hold)) {
+            const auto hold =
+              fast_lio::parkedHoldMeasurement(zupt_anchor_pos, anchor_rot, stp.pos, est_rot, stp.vel, p.parked_hold);
             if (anchor_scan_record_open) {
               anchor_scan_record.parked_applied = true;
               anchorTraceAction(anchor_scan_record.action, stationary_anchor.id);
@@ -7742,7 +6812,7 @@ private:
        *   Compare the estimate against the only sources outside it — the wheels
        *   and the IMU's static verdict — and act when they contradict it for
        *   long enough that noise cannot explain it. ***/
-      if (runaway_params.enabled) {
+      if (p.runaway.enabled) {
         double wheel_stamp = -1.0;
         double wheel_speed = 0.0;
         {
@@ -7752,7 +6822,7 @@ private:
         }
         const double wheel_age = wheel_stamp > 0.0 ? std::fabs(lidar_end_time - wheel_stamp) : -1.0;
         const auto runaway = runawayVerdictForTest(fast_lio::updateRunawayWatchdog(
-          &runaway_state, lidar_end_time, state_point.vel.norm(), body_static, wheel_age, wheel_speed, runaway_params));
+          &runaway_state, lidar_end_time, state_point.vel.norm(), body_static, wheel_age, wheel_speed, p.runaway));
         if (runaway.tripped) {
           frontend_runaway = true;
           if (anchor_scan_record_open)
@@ -7767,11 +6837,11 @@ private:
                        effct_feat_num,
                        res_mean_last,
                        runaway_state.trips,
-                       runaway_on_trip.c_str());
+                       p.runaway_on_trip.c_str());
           // A reset and a hold both end the anchor below, within the scan whose anchor step may just have pinned
           // to it or pulled toward it. That write goes first: what is cleared, rebuilt around and published is
           // the state the scan has without the anchor. The verdict stands as it was reached.
-          if (runaway_on_trip != "fault_exit")
+          if (p.runaway_on_trip != "fault_exit")
             takeBackAnchorWrite();
           // Clear what tripped it. A kParked trip says the velocity is phantom,
           // and rebuilding the map around a state that still carries it re-arms
@@ -7783,13 +6853,13 @@ private:
             st.vel.setZero();
             gravity_align_vel_overwritten = true;
             kf.change_x(st);
-            resetVelocityCovariance(guard_vel_reset_sigma);
+            resetVelocityCovariance(p.guard_vel_reset_sigma);
             state_point = kf.get_x();
           }
-          if (runaway_on_trip == "reset_map") {
+          if (p.runaway_on_trip == "reset_map") {
             if (!rebuildLocalMap("RUNAWAY"))
               return;
-          } else if (runaway_on_trip == "fault_exit") {
+          } else if (p.runaway_on_trip == "fault_exit") {
             RCLCPP_FATAL(this->get_logger(),
                          "[RUNAWAY] exiting so the supervisor can restart the pipeline (runaway_on_trip=fault_exit)");
             rclcpp::shutdown();
@@ -7919,7 +6989,7 @@ private:
       }
 
       /*** Wheel velocity update (after ICP, constrains along-track drift) ***/
-      if (wheel_odom_en) {
+      if (p.wheel_odom_en) {
         Eigen::Vector3d twist_v;
         bool have_twist = false;
         {
@@ -7933,16 +7003,16 @@ private:
         // Belt and braces: twist_cbk already refuses non-finite samples, but one
         // NaN reaching update_simple poisons every state and never leaves.
         if (have_twist && fast_lio::wheelSampleIsEvidence(twist_v(0), twist_v(1), twist_v(2)) &&
-            std::isfinite(wheel_speed_scale)) {
+            std::isfinite(p.wheel_speed_scale)) {
           state_ikfom st = kf.get_x();
           M3D Rw = st.rot.toRotationMatrix();     // R_{world←IMU}
-          M3D Re_T = R_robot_to_imu.transpose();  // R_{robot←IMU}
+          M3D Re_T = p.R_robot_to_imu.transpose();  // R_{robot←IMU}
           V3D v_imu = Rw.transpose() * st.vel;    // vel in IMU frame
 
           // Predicted: h(x) = R_ext^T * R_w^T * vel (robot frame)
           V3D h_pred = Re_T * v_imu;
           // Measured: z = [vx*scale, 0, 0] (non-holonomic: vy=vz=0)
-          V3D z_meas(twist_v(0) * wheel_speed_scale, 0.0, 0.0);
+          V3D z_meas(twist_v(0) * p.wheel_speed_scale, 0.0, 0.0);
           V3D residual = z_meas - h_pred;
 
           // Jacobian H (3×23): non-zero at rot(3-5) and vel(12-14)
@@ -7951,17 +7021,17 @@ private:
           H.block<3, 3>(0, 12) = Re_T * Rw.transpose();      // dh/d(vel)
 
           // Diagonal noise variances
-          Eigen::Vector3d R_diag(wheel_vel_noise_vx * wheel_vel_noise_vx,
-                                 wheel_vel_noise_vy * wheel_vel_noise_vy,
-                                 wheel_vel_noise_vz * wheel_vel_noise_vz);
+          Eigen::Vector3d R_diag(p.wheel_vel_noise_vx * p.wheel_vel_noise_vx,
+                                 p.wheel_vel_noise_vy * p.wheel_vel_noise_vy,
+                                 p.wheel_vel_noise_vz * p.wheel_vel_noise_vz);
 
           EkfUpdateDiagnostics wheelDiagnostics;
           Eigen::Matrix<double, 23, 23> wheelCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
-          if (kalman_channel_diag_en)
+          if (p.kalman_channel_diag_en)
             wheelCovarianceBefore = kf.get_P();
-          kf.update_simple(H, residual, R_diag, kalman_channel_diag_en ? &wheelDiagnostics : nullptr);
+          kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &wheelDiagnostics : nullptr);
           state_point = kf.get_x();  // re-read corrected state
-          if (kalman_channel_diag_en) {
+          if (p.kalman_channel_diag_en) {
             writeKalmanChannel("wheel", st, state_point, wheelCovarianceBefore, wheelDiagnostics, z_meas, h_pred);
           }
         }
@@ -8024,7 +7094,7 @@ private:
       // localization — the delivered map is the only map, and live scans stop being added
       // to it. Without it the map is neither: the prior owns the cells it covers and live
       // scans fill the gaps between them.
-      const bool frozen_by_prior = prior_map_freeze_ && prior_map_installed_;
+      const bool frozen_by_prior = p.prior_map_freeze && prior_map_installed_;
       if (mapping_enabled.load(std::memory_order_relaxed) && !flio_map_frozen && !frozen_by_prior) {
         map_incremental();
         anchorTraceMapUpdated();
@@ -8035,17 +7105,16 @@ private:
       // 超预算就把扫描体素调粗:点少了、精度略降,但成本回到扫描周期以内。
       // Per-scan compute (queue wait excluded) drives the voxel: over budget costs points,
       // not latency.
-      if (adaptive_ds_params.enabled) {
+      if (p.adaptive_ds.enabled) {
         const double scan_cost = t5 - t0;
-        if (fast_lio::updateAdaptiveDownsample(
-              &adaptive_ds_state, scan_cost, filter_size_surf_min, adaptive_ds_params)) {
+        if (fast_lio::updateAdaptiveDownsample(&adaptive_ds_state, scan_cost, p.filter_size_surf_min, p.adaptive_ds)) {
           const float leaf = static_cast<float>(adaptive_ds_state.voxel);
           downSizeFilterSurf.setLeaf(leaf);
           RCLCPP_WARN(this->get_logger(),
                       "[ADAPTIVE-DS] scan voxel %.2f m (cost %.0f ms vs budget %.0f ms; %u up / %u down)",
                       adaptive_ds_state.voxel,
                       scan_cost * 1e3,
-                      adaptive_ds_params.budget_sec * 1e3,
+                      p.adaptive_ds.budget_sec * 1e3,
                       adaptive_ds_state.raises,
                       adaptive_ds_state.lowers);
         }
@@ -8102,13 +7171,13 @@ private:
       }
 
       /******* Publish points *******/
-      if (path_en)
+      if (p.path_en)
         publish_path(pubPath_);
       if (scan_pub_en)
         publish_frame_world(pubLaserCloudFull_);
-      if (scan_pub_en && scan_body_pub_en)
+      if (scan_pub_en && p.scan_body_pub_en)
         publish_frame_body(pubLaserCloudFull_body_);
-      if (effect_pub_en)
+      if (p.effect_pub_en)
         publish_effect_world(pubLaserCloudEffect_);
       // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
@@ -8308,7 +7377,7 @@ private:
     // publish_map() flattens the ikd-tree (a tree read). This 1 Hz timer shares the
     // single executor thread with timer_callback, so it can fire BETWEEN scans while
     // the off-thread Add is in flight — join first to keep the single-operator invariant.
-    if (map_pub_en) {
+    if (params_.values().map_pub_en) {
       if (async_map_en)
         joinMapAdd();
       publish_map(pubLaserCloudMap_);
@@ -8353,7 +7422,7 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mapping_enabled_sub_;
 
-  bool effect_pub_en = false, map_pub_en = false;
+  fast_lio::FrontendParameters params_;  // the configuration the constructor read; node methods use values()
   int effect_feat_num = 0, frame_num = 0;
   double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0,
                          aver_time_solve = 0, aver_time_const_H_time = 0;
@@ -8365,10 +7434,6 @@ private:
 
   std::string prior_map_pcd_;
   std::size_t last_reported_evicted_voxels = 0;  // last value the capacity WARN reported
-  bool prior_map_pinned_ = false;                // prior map goes into its own non-evictable tier
-  double prior_map_voxel_ = 0.0;                 // leaf the prior map is downsampled to (0 = filter_size_map)
-  bool prior_map_freeze_ = false;                // stop growing the map once a prior map is installed
-  fast_lio::PriorMapAlign prior_map_align_ = fast_lio::PriorMapAlign::kAsDelivered;
   /// Downsampled prior map, held in ITS OWN (delivered) frame so a later, better alignment
   /// can re-transform the same points instead of compounding onto the last one. Only filled
   /// on the relocalization path; empty and freed on the as-delivered path.
@@ -8383,10 +7448,7 @@ private:
   bool prior_map_installed_ = false;
   unsigned prior_map_installs_ = 0;
   rclcpp::Subscription<geometry_msgs::msg::TransformStamped>::SharedPtr prior_map_align_sub_;
-  std::vector<double> initial_pose_vec_;
-  bool initial_pose_full_rpy_override_ = false;
-  bool reanchor_recovery_entry_view_ = false;  // qualify a pending recovery against its entry view
-  std::uint64_t entry_view_round_ = 0;         // the recovery episode the entry view was last opened for
+  std::uint64_t entry_view_round_ = 0;  // the recovery episode the entry view was last opened for
 };
 
 #ifndef FASTLIO_AS_COMPONENT

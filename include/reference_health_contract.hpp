@@ -199,6 +199,12 @@ inline bool referenceHealthEncodingValid(const ReferenceHealthSnapshot & value)
       (value.taintMask & ~value.causeMask) != 0 || (value.hardMask & ~kReferenceHardKnown) != 0 || value.hasRw ||
       value.hasSupport)
     return false;
+  // Every state takes effect at a stated time and is leased from its evaluated input for at most kReferenceLeaseNs.
+  if (!value.hasEvaluatedInput || !value.hasEffective || !value.hasStateValidUntil ||
+      value.stateValidUntilNs < value.evaluatedInputNs ||
+      static_cast<std::uint64_t>(value.stateValidUntilNs) - static_cast<std::uint64_t>(value.evaluatedInputNs) >
+        static_cast<std::uint64_t>(kReferenceLeaseNs))
+    return false;
   const auto lifecycle = value.startupReference == 1 ? 1 : value.startupReference == 2 ? 2 : 0;
   if (value.lifecycle != lifecycle || ((value.trueMask & 1u) != 0) != (value.lifecycle == 2) ||
       ((value.trueMask & 2u) != 0) != (value.trust == 1) || ((value.trueMask & 128u) != 0) != (value.local == 1))

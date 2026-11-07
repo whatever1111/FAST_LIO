@@ -57,6 +57,21 @@ TEST(ReferenceHealthContract, IndependentWireLiterals)
   }
 }
 
+TEST(ReferenceHealthContract, IndependentTimeLiterals)
+{
+  for (const auto & literal : reference_health_literals::kTimeVectors) {
+    SCOPED_TRACE(literal.name);
+    auto value = scanValue();
+    value.hasEvaluatedInput = literal.evaluated;
+    value.hasEffective = literal.effective;
+    value.hasStateValidUntil = literal.validUntil;
+    value.evaluatedInputNs = literal.evaluatedNs;
+    value.effectiveNs = literal.effectiveNs;
+    value.stateValidUntilNs = literal.validUntilNs;
+    EXPECT_EQ(fast_lio::referenceHealthEncodingValid(value), literal.valid);
+  }
+}
+
 TEST(ReferenceHealthContract, StartupIsReadOnlyAndNeverInferredFromTrustOrGeneration)
 {
   fast_lio::RecoveryState recovery;

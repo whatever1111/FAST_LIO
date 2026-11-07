@@ -39,4 +39,23 @@ inline constexpr Vector kVectors[] = {
   {"pending-cannot-hold", 1, 2, 2, 2, 2, 0, 3, 143, 1, true, false},
   {"pending-cannot-normal", 1, 2, 2, 2, 1, 1, 0, 143, 137, true, false},
 };
+
+// Time fields of an otherwise valid snapshot. Every state carries all three, and its lease runs from the evaluated
+// input for at most 200 ms. A vector that drops a field keeps the complete vector's values.
+struct TimeVector
+{
+  const char * name;
+  bool evaluated, effective, validUntil;
+  std::int64_t evaluatedNs, effectiveNs, validUntilNs;
+  bool valid;
+};
+inline constexpr TimeVector kTimeVectors[] = {
+  {"complete", true, true, true, 1100000000, 1100000000, 1250000000, true},
+  {"no-effective", true, false, true, 1100000000, 1100000000, 1250000000, false},
+  {"no-evaluated-input", false, true, true, 1100000000, 1100000000, 1250000000, false},
+  {"no-valid-until", true, true, false, 1100000000, 1100000000, 1250000000, false},
+  {"lease-exactly-200ms", true, true, true, 1100000000, 1100000000, 1300000000, true},
+  {"lease-200ms-and-1ns", true, true, true, 1100000000, 1100000000, 1300000001, false},
+  {"valid-until-before-evaluated", true, true, true, 1100000000, 1100000000, 1099999999, false},
+};
 }  // namespace reference_health_literals

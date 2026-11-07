@@ -35,6 +35,22 @@ inline std::int64_t referenceUntil(std::int64_t stamp)
                                                                               : stamp + kReferenceLeaseNs;
 }
 
+// The time a settled state takes effect. A pose-bound scan takes effect at its scan's end and has no effective time
+// without one. A pose-less event takes effect at its scan's end when it has one; otherwise, as between scans or for a
+// scan dropped without usable timing, it takes effect at the evaluated input, and without that it has none.
+inline bool referenceEffective(bool poseBound,
+                               bool scanEndKnown,
+                               std::int64_t scanEndNs,
+                               bool hasEvaluatedInput,
+                               std::int64_t evaluatedInputNs,
+                               std::int64_t & effectiveNs)
+{
+  const bool atEnd = scanEndKnown;
+  const bool atInput = !scanEndKnown && !poseBound && hasEvaluatedInput;
+  effectiveNs = atEnd ? scanEndNs : atInput ? evaluatedInputNs : 0;
+  return atEnd || atInput;
+}
+
 // These are explicit wire encodings, not casts of the zero-based policy enums.
 inline std::uint8_t referenceStartupWire(StartupReference phase)
 {

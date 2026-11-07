@@ -1441,11 +1441,10 @@ FinalFrontendSnapshot captureFinalFrontend(bool completed, bool scanEvent, doubl
     value.hasEvaluatedInput = true;
     value.evaluatedInputNs = imuProgressNs;
   }
-  value.hasEffective =
-    scanEvent ? anchor_scan_record.end_ns >= 0 && fast_lio::frontendSecondsStamp(eventTime, value.effectiveNs)
-              : value.hasEvaluatedInput;
-  if (!scanEvent && value.hasEffective)
-    value.effectiveNs = value.evaluatedInputNs;
+  std::int64_t endNs = 0;
+  const bool endKnown = scanEvent && anchor_scan_record.end_ns >= 0 && fast_lio::frontendSecondsStamp(eventTime, endNs);
+  value.hasEffective = fast_lio::referenceEffective(
+    completed, endKnown, endNs, value.hasEvaluatedInput, value.evaluatedInputNs, value.effectiveNs);
   value.hasStateValidUntil = value.hasEvaluatedInput;
   value.stateValidUntilNs = value.hasStateValidUntil ? fast_lio::referenceUntil(value.evaluatedInputNs) : 0;
   value.hasScanSequence = scanEvent && anchor_scan_record.scan_seq != 0;

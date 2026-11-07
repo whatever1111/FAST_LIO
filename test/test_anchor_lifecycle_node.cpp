@@ -76,6 +76,7 @@
 #include "odom_covariance_contract.hpp"
 #include "preprocess.h"
 #include "reanchor_gate.hpp"
+#include "reference_health_contract.hpp"
 
 namespace
 {
@@ -1565,6 +1566,99 @@ private:
   std::size_t offset_ = 0;
 };
 
+// The producer contract the consumer accepts (lio_slam_core::kFeReferenceContractId).
+constexpr std::array<std::uint8_t, 32> kConsumerReferenceContractId{
+  0x7f, 0x76, 0xd4, 0x7e, 0x6a, 0x3b, 0x97, 0x25, 0x3e, 0x1d, 0x11, 0xc9, 0xfe, 0x21, 0x87, 0x1a,
+  0x0f, 0xe9, 0xf7, 0x23, 0xb7, 0x49, 0xc0, 0xbd, 0x0a, 0xd8, 0x94, 0xd8, 0x40, 0x54, 0xde, 0x06};
+
+template<std::size_t N>
+bool anyNonzero(const std::array<std::uint8_t, N> & bytes)
+{
+  return std::any_of(bytes.begin(), bytes.end(), [](std::uint8_t byte) { return byte != 0; });
+}
+
+// Every structural rule of the consumer's decoder (lio_slam_core::decodeFeReferenceEvidence), applied to a message as
+// it arrived. This package cannot link that decoder: the rules it shares with the producer's validator go through
+// referenceHealthEncodingValid, which the shared wire literals pin to the decoder, and the rest are spelled out here.
+void expectDecodable(const fast_lio_interfaces::msg::ReferenceHealth & value)
+{
+  SCOPED_TRACE("R1 snapshot " + std::to_string(value.snapshot_sequence) + " kind " + std::to_string(value.kind) +
+               " scan " + std::to_string(value.scan_sequence));
+  fast_lio::ReferenceHealthSnapshot shared;
+  shared.schemaVersion = value.schema_version;
+  shared.identityVersion = value.identity_version;
+  shared.implementedMask = value.implemented_mask;
+  shared.enabledPolicyMask = value.enabled_policy_mask;
+  shared.kind = value.kind;
+  shared.hasEvaluatedInput = value.has_evaluated_input;
+  shared.evaluatedInputNs = value.evaluated_input_ns;
+  shared.hasEffective = value.has_effective;
+  shared.effectiveNs = value.effective_ns;
+  shared.hasStateValidUntil = value.has_state_valid_until;
+  shared.stateValidUntilNs = value.state_valid_until_ns;
+  shared.hasPoseBinding = value.has_pose_binding;
+  shared.pose = value.pose_binding;
+  shared.lifecycle = value.lifecycle;
+  shared.startupReference = value.startup_reference;
+  shared.trust = value.trust;
+  shared.local = value.local;
+  shared.legacyFlags = value.legacy_flags;
+  shared.hasRawRegistrationDegraded = value.has_raw_registration_degraded;
+  shared.rawRegistrationDegraded = value.raw_registration_degraded;
+  shared.presentMask = value.present_mask;
+  shared.trueMask = value.true_mask;
+  shared.causeMask = value.cause_mask;
+  shared.taintMask = value.taint_mask;
+  shared.hardMask = value.hard_mask;
+  shared.hrWitnessKind = value.hr_witness_kind;
+  shared.hasRw = value.has_rw;
+  shared.hasSupport = value.has_support;
+  EXPECT_TRUE(fast_lio::referenceHealthEncodingValid(shared));
+  EXPECT_NE(value.enabled_policy_mask & 1u, 0u);
+  EXPECT_TRUE(value.has_negative_masks);
+  EXPECT_FALSE(value.has_rw || value.has_raw_episode || value.has_raw_start || value.has_rw_origin ||
+               value.has_frozen_residual || value.has_withdrawal_rearm || value.has_rw_valid_until ||
+               value.has_wheel_witness_epochs || value.has_support || value.has_support_seed ||
+               value.has_supported_through || value.has_first_loss || value.has_support_deadline ||
+               value.has_proof_id || value.has_trajectory_id);
+  EXPECT_TRUE(value.has_source_instance && anyNonzero(value.source_instance));
+  EXPECT_TRUE(value.has_coordinate_epoch);
+  EXPECT_TRUE(fast_lio::frontendIdentifier(value.clock_domain, 48));
+  EXPECT_TRUE(fast_lio::frontendIdentifier(value.frame_id, 64));
+  EXPECT_TRUE(fast_lio::frontendIdentifier(value.child_frame_id, 64));
+  EXPECT_EQ(value.producer_contract_id, kConsumerReferenceContractId);
+  EXPECT_TRUE(anyNonzero(value.config_id));
+  EXPECT_TRUE(value.has_snapshot_sequence && value.snapshot_sequence != 0);
+  EXPECT_TRUE(value.has_state_revision && value.state_revision != 0);
+  EXPECT_TRUE(value.has_qualified_event_sequence);
+  if (value.kind == 1) {
+    EXPECT_TRUE(value.has_scan_sequence && value.scan_sequence != 0);
+    EXPECT_TRUE(value.has_scan_begin && value.has_scan_end);
+    EXPECT_GE(value.scan_end_ns, value.scan_begin_ns);
+    EXPECT_TRUE(value.has_observation_id && anyNonzero(value.observation_id));
+    EXPECT_TRUE(value.has_raw_registration_degraded);
+  } else {
+    EXPECT_FALSE(value.has_observation_id);
+  }
+  if ((value.true_mask & 12u) != 0) {
+    EXPECT_EQ(value.taint_mask, 0u);
+    EXPECT_NE(value.enabled_policy_mask & 4u, 0u);
+  }
+  EXPECT_EQ(value.has_hr_valid_until, value.hr_witness_kind != 0);
+  if (value.hr_witness_kind != 0) {
+    EXPECT_GE(value.hr_valid_until_ns, value.scan_end_ns);
+    EXPECT_LE(static_cast<std::uint64_t>(value.hr_valid_until_ns) - static_cast<std::uint64_t>(value.scan_end_ns),
+              static_cast<std::uint64_t>(fast_lio::kReferenceLeaseNs));
+  }
+}
+
+// An IMU clock stepped back past the rollback limit faults the input epoch: from then on the front end states, on
+// purpose, a context it no longer knows, and the consumer refuses that until a restart.
+bool faultsInputEpoch(const Scenario & scenario)
+{
+  return std::any_of(scenario.steps.begin(), scenario.steps.end(), [](const Step & step) { return step.clock_back; });
+}
+
 ChildResult runScenario(const Scenario & scenario)
 {
   ChildResult result;
@@ -1728,6 +1822,12 @@ ChildResult runScenario(const Scenario & scenario)
   if (!reader.take(&result.reference_publishers_before, sizeof(result.reference_publishers_before)) ||
       !reader.take(&result.reference_publishers_after, sizeof(result.reference_publishers_after)))
     result.error = "child publisher graph counts truncated";
+  // Every R1 message a scenario receives, a StateRepeat included, is one the consumer can decode.
+  if (scenario.reference && !faultsInputEpoch(scenario)) {
+    SCOPED_TRACE("scenario " + scenario.name);
+    for (const auto & value : result.references)
+      expectDecodable(value);
+  }
   return result;
 }
 
@@ -6950,6 +7050,13 @@ TEST(AnchorLifecycleReference, DroppedScansSettleNoPoseNegativeFacts)
         // Invalid timing and duplicate/old scans are not new effective input.
         EXPECT_EQ(value->taint_mask, 0u);
         EXPECT_EQ(value->hard_mask, 0u);
+      }
+      if (test.outcome == Outcome::kDroppedInvalidTime) {
+        // Without usable timing the scan has no end; like an event between scans it takes effect at the evaluated
+        // input.
+        EXPECT_FALSE(value->has_scan_end);
+        EXPECT_TRUE(value->has_effective);
+        EXPECT_EQ(value->effective_ns, value->evaluated_input_ns);
       }
     }
     EXPECT_GT(matched, 0u);

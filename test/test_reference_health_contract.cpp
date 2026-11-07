@@ -72,6 +72,34 @@ TEST(ReferenceHealthContract, IndependentTimeLiterals)
   }
 }
 
+TEST(ReferenceHealthContract, EffectiveTimeIsTheScanEndOrTheEvaluatedInput)
+{
+  constexpr std::int64_t kEnd = 1100000000;
+  constexpr std::int64_t kInput = 1150000000;
+  struct Row
+  {
+    const char * event;
+    bool poseBound, endKnown, hasInput;
+    bool effective;
+    std::int64_t effectiveNs;
+  };
+  const Row rows[] = {
+    {"pose-bound scan", true, true, true, true, kEnd},
+    {"pose-bound scan without a representable end", true, false, true, false, 0},
+    {"pose-less scan event with a representable end", false, true, true, true, kEnd},
+    {"pose-less scan event without a representable end", false, false, true, true, kInput},
+    {"event between scans", false, false, true, true, kInput},
+    {"no evaluated input", false, false, false, false, 0},
+  };
+  for (const auto & row : rows) {
+    SCOPED_TRACE(row.event);
+    std::int64_t effectiveNs = -1;
+    EXPECT_EQ(fast_lio::referenceEffective(row.poseBound, row.endKnown, kEnd, row.hasInput, kInput, effectiveNs),
+              row.effective);
+    EXPECT_EQ(effectiveNs, row.effectiveNs);
+  }
+}
+
 TEST(ReferenceHealthContract, StartupIsReadOnlyAndNeverInferredFromTrustOrGeneration)
 {
   fast_lio::RecoveryState recovery;

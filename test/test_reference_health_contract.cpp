@@ -100,6 +100,13 @@ TEST(ReferenceHealthContract, EffectiveTimeIsTheScanEndOrTheEvaluatedInput)
   }
 }
 
+TEST(ReferenceHealthContract, PoseBoundScanBeginsNoLaterThanItEnds)
+{
+  constexpr std::int64_t kEnd = 1100000000;
+  EXPECT_EQ(fast_lio::referenceScanBegin(true, kEnd + 128, kEnd), kEnd);
+  EXPECT_EQ(fast_lio::referenceScanBegin(true, kEnd - 1, kEnd), kEnd - 1);
+}
+
 TEST(ReferenceHealthContract, StartupIsReadOnlyAndNeverInferredFromTrustOrGeneration)
 {
   fast_lio::RecoveryState recovery;

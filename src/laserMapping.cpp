@@ -1449,11 +1449,12 @@ FinalFrontendSnapshot captureFinalFrontend(bool completed, bool scanEvent, doubl
   value.stateValidUntilNs = value.hasStateValidUntil ? fast_lio::referenceUntil(value.evaluatedInputNs) : 0;
   value.hasScanSequence = scanEvent && anchor_scan_record.scan_seq != 0;
   value.scanSequence = value.hasScanSequence ? anchor_scan_record.scan_seq : 0;
-  value.hasScanBegin = scanEvent && anchor_scan_record.beg_ns >= 0;
-  value.scanBeginNs = value.hasScanBegin ? anchor_scan_record.beg_ns : 0;
   value.hasScanEnd = scanEvent && anchor_scan_record.end_ns >= 0;
   // Pose association uses the exact legacy stamp conversion, not traceNs's rounded ns.
   value.scanEndNs = completed ? final.poseStamp : value.hasScanEnd ? anchor_scan_record.end_ns : 0;
+  value.hasScanBegin = scanEvent && anchor_scan_record.beg_ns >= 0;
+  value.scanBeginNs =
+    value.hasScanBegin ? fast_lio::referenceScanBegin(completed, anchor_scan_record.beg_ns, value.scanEndNs) : 0;
   const fast_lio::ReferenceScanFacts scan{completed,
                                           facts.initialized,
                                           flio_degraded_odom,

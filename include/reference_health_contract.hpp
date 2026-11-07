@@ -1,6 +1,7 @@
 // R1-OBS-1: observation only. RecoveryState remains the sole reference FSM.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -49,6 +50,13 @@ inline bool referenceEffective(bool poseBound,
   const bool atInput = !scanEndKnown && !poseBound && hasEvaluatedInput;
   effectiveNs = atEnd ? scanEndNs : atInput ? evaluatedInputNs : 0;
   return atEnd || atInput;
+}
+
+// A pose-bound scan ends at its legacy stamp, which truncates, while its begin is the trace's rounded ns. A scan
+// shorter than that rounding could begin after it ends, so its begin is held at its end.
+inline std::int64_t referenceScanBegin(bool poseBound, std::int64_t scanBeginNs, std::int64_t scanEndNs)
+{
+  return poseBound ? std::min(scanBeginNs, scanEndNs) : scanBeginNs;
 }
 
 // These are explicit wire encodings, not casts of the zero-based policy enums.

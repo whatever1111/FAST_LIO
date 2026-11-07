@@ -29,6 +29,16 @@
 //                     23x23 error-state covariance and its diagonal;
 //   imu_retain.v1     an empty IMU window settled uncommitted: its batch, the samples it leaves queued and the FIFO
 //                     fault latch;
+//   h_select.v1       every H-model call right after compaction: the scan end and the call, the search the filter
+//                     asked for and whether the call searched (the refresh gate skips a search the state has not
+//                     moved enough for), the gate's refusals and the scan's robust residual scale, the rows the ground
+//                     recovery added, and the SHA-256 of the selection in point order, of the kept points' residuals
+//                     and of the rows' points, normals, residuals and kernel weights;
+//   h_exit.v1         every H-model exit: validity and rows, the mean residual, the rows' position information, the
+//                     attitude hold's verdicts and the roll/pitch information, the subspace weighting's verdict,
+//                     spectrum and dose, and whether the call appended to the correspondence dump;
+//   h_dump.v1         the correspondence dump scenario only, at its end: each dump file's size, lines and SHA-256 (the
+//                     test build writes the files to the scenario's result directory);
 //   identity.v1, frontend_observation.v1, reference_health.v1
 //                     the typed scenario only: the fixed activation identity with the contract and configuration IDs
 //                     the constructor computed, then every FrontendObservation and ReferenceHealth message received,
@@ -36,6 +46,11 @@
 // Doubles are written with 17 significant digits (round trip) and NaN with its bit pattern; on the `.v1` lines every
 // double is its IEEE-754 bit pattern, and a SHA-256 covers a matrix's patterns row-major, eight little-endian bytes
 // each. A record is compared with its golden line for line, character for character, with no tolerance anywhere.
+//
+// The measurement scenarios (h_*, laserMapping S2) turn on the H-model branches the default configuration leaves off,
+// each on a synthetic scene built to reach it: three tilted walls 4-6 m away, near ground with clutter below walls, a
+// corridor with a patch across its end. A scene's points sit on a fixed grid and move along their surface normals by
+// noise drawn from the scan's start time, new in every scan and the same in every run.
 //
 // What makes a record reproducible: the map worker is off (FLIO_ASYNC_MAP=0) except in the worker suite, OpenMP runs
 // one thread, and the scan path runs (the fixture waits for its timer to come due and lets the executor run it) after
@@ -622,17 +637,90 @@ std::string valueOf(const std::string & line, const std::string & key)
   return line.substr(start, line.find(' ', start) - start);
 }
 
+// bitsDigest over the values, or "none" without one.
+std::string valuesDigest(const std::vector<double> & values)
+{
+  return values.empty() ? std::string("none") : bitsDigest(values.data(), values.size());
+}
+
+// The h_select.v1 line of one H-model call. The selection is digested as one byte per point (1: the point has a row),
+// the residuals as the kept points' |residual| in point order; a refused or unmatched point's entries are stale and
+// left out. `weighted` returns the rows whose kernel weight is below 1.
+std::string formatSelection(const fast_lio_test::HModelSelection & s, std::size_t * weighted)
+{
+  const std::size_t points = s.points > 0 ? static_cast<std::size_t>(s.points) : 0u;
+  std::string flags;
+  std::vector<double> residuals;
+  std::size_t selected = 0;
+  if (s.selected != nullptr) {
+    for (std::size_t i = 0; i < points; ++i) {
+      const bool kept = s.selected[i] != 0;
+      flags += kept ? '\1' : '\0';
+      if (!kept)
+        continue;
+      ++selected;
+      if (s.residuals != nullptr)
+        residuals.push_back(static_cast<double>(s.residuals[i]));
+    }
+  }
+  std::vector<double> row_points, row_normals, row_residuals, row_weights;
+  *weighted = 0;
+  for (const auto & row : s.rows) {
+    for (int d = 0; d < 3; ++d) {
+      row_points.push_back(static_cast<double>(row.point[d]));
+      row_normals.push_back(static_cast<double>(row.normal[d]));
+    }
+    row_residuals.push_back(static_cast<double>(row.residual));
+    row_weights.push_back(row.weight);
+    if (row.weight < 1.0)
+      ++*weighted;
+  }
+  std::ostringstream out;
+  out << "h_select.v1 end=" << bits(s.scan_end) << " call=" << s.call << " requested=" << (s.search_requested ? 1 : 0)
+      << " searched=" << (s.searched ? 1 : 0) << " refresh_skips=" << s.refresh_skips
+      << " refresh_max_shift=" << bits(s.refresh_max_shift) << " points=" << s.points << " selected=" << selected
+      << " selected_sha256=" << (flags.empty() ? std::string("none") : sha256Hex(flags))
+      << " residuals_sha256=" << valuesDigest(residuals) << " gate_rejected=" << s.gate_rejected
+      << " gate_scan_sigma=" << bits(s.gate_scan_sigma) << " ground_rows=" << s.ground_rows << " rows=" << s.rows.size()
+      << " rows_weighted=" << *weighted << " row_points_sha256=" << valuesDigest(row_points)
+      << " row_normals_sha256=" << valuesDigest(row_normals) << " row_residuals_sha256=" << valuesDigest(row_residuals)
+      << " row_weights_sha256=" << valuesDigest(row_weights);
+  return out.str();
+}
+
+// The h_exit.v1 line of one H-model exit.
+std::string formatExit(const fast_lio_test::HModelExit & e)
+{
+  std::ostringstream out;
+  out << "h_exit.v1 end=" << bits(e.scan_end) << " call=" << e.call << " valid=" << (e.valid ? 1 : 0)
+      << " effective=" << e.effective << " mean_residual=" << bits(e.mean_residual)
+      << " pos_eig=" << bitsList({e.pos_eig_min, e.pos_eig_max}) << " z_weak=" << bits(e.pos_z_weak)
+      << " hold_scene=" << (e.hold_scene ? 1 : 0) << " hold_allowed=" << (e.hold_allowed ? 1 : 0)
+      << " hold_rows=" << (e.hold_rows ? 1 : 0) << " hold_info=" << (e.hold_info ? 1 : 0)
+      << " rp_info_min=" << bits(e.rp_info_min) << " rp_consider=" << (e.rp_consider ? 1 : 0)
+      << " degeneracy_engaged=" << (e.degeneracy_engaged ? 1 : 0)
+      << " degeneracy_shares=" << bitsList(e.degeneracy_shares, 3)
+      << " degeneracy_lambdas=" << bitsList(e.degeneracy_lambdas, 3)
+      << " degeneracy_weights=" << bitsList(e.degeneracy_weights, 3)
+      << " degeneracy_weighted_points=" << e.degeneracy_weighted_points
+      << " degeneracy_weight_sum=" << bits(e.degeneracy_weight_sum) << " dump_written=" << (e.dump_written ? 1 : 0);
+  return out.str();
+}
+
 // ---------------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------------
 
 enum class Cloud : std::uint8_t
 {
-  kDense,   // the fixture's plane, 2000 points over the scan
-  kFar,     // the same plane 30 m further along x: no map neighbour for any point
-  kSparse,  // three points: too few to register, the scan leaves before the anchor step
-  kEmpty,   // no point: no scan timing
-  kNone,    // no scan this period
+  kDense,     // the fixture's plane, 2000 points over the scan
+  kFar,       // the same plane 30 m further along x: no map neighbour for any point
+  kSparse,    // three points: too few to register, the scan leaves before the anchor step
+  kEmpty,     // no point: no scan timing
+  kNone,      // no scan this period
+  kRoom,      // three steep, tilted, non-parallel walls 4-6 m away: every position and attitude direction observed
+  kGround,    // the ground 0.8 m below, a third of it clutter 0.2-0.5 m high, and the room's walls above it
+  kCorridor,  // two parallel walls 3.2 m apart and a small patch across its end: nothing vertical, little along it
 };
 
 const char * cloudName(Cloud cloud)
@@ -648,8 +736,142 @@ const char * cloudName(Cloud cloud)
       return "empty";
     case Cloud::kNone:
       return "none";
+    case Cloud::kRoom:
+      return "room";
+    case Cloud::kGround:
+      return "ground";
+    case Cloud::kCorridor:
+      return "corridor";
   }
   return "unknown";
+}
+
+using Point3 = std::array<float, 3>;
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kSurfaceNoise = 0.004;      // m: the largest offset along a surface normal, new in every scan
+constexpr double kOutlierOffset = 0.17;      // m along the normal: past the gate, within the plane test at 4-7 m
+constexpr double kOutlierShare = 0.05;       // of an outlier scan's points, a different set in every scan
+constexpr double kGroundZ = -0.8;            // m: the ground under the sensor
+constexpr double kClutterShare = 1.0 / 3.0;  // of the ground points, the same ones in every scan
+constexpr int kSparseRingStride = 3;         // in the quadrant x < 0 <= y only every third ground ring
+
+// A number in [0, 1) fixed by (a, b, salt): splitmix64 of their combination.
+double hashUnit(std::uint64_t a, std::uint64_t b, std::uint64_t salt)
+{
+  std::uint64_t z = a * 0x9e3779b97f4a7c15ULL + b * 0xbf58476d1ce4e5b9ULL + salt * 0x94d049bb133111ebULL;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+  z ^= z >> 31;
+  return static_cast<double>(z >> 11) * (1.0 / 9007199254740992.0);
+}
+
+// A rectangle on a plane: its normal points along `azimuth` and `tilt` above the horizontal, its centre lies
+// `distance` from the sensor along `azimuth` at sensor height; `columns` points across `half_width` either way along
+// the horizontal tangent, `rows` from `v_min` to `v_max` along the up-slope tangent.
+struct Patch
+{
+  double azimuth_deg;
+  double tilt_deg;
+  double distance;
+  double half_width;
+  double v_min;
+  double v_max;
+  int columns;
+  int rows;
+};
+
+constexpr Patch kRoomWalls[] = {{0.0, 20.0, 4.0, 2.4, -1.2, 1.8, 29, 23},
+                                {125.0, -15.0, 5.0, 2.4, -1.2, 1.8, 29, 23},
+                                {235.0, 25.0, 6.0, 2.4, -1.2, 1.8, 29, 23}};
+// The same walls from 0.2 m above the sensor up: none of their points is a ground candidate.
+constexpr Patch kGroundWalls[] = {{0.0, 20.0, 4.0, 2.4, 0.25, 1.8, 20, 12},
+                                  {125.0, -15.0, 5.0, 2.4, 0.25, 1.8, 20, 12},
+                                  {235.0, 25.0, 6.0, 2.4, 0.25, 1.8, 20, 12}};
+
+double surfaceNoise(std::int64_t seed, std::size_t index)
+{
+  return kSurfaceNoise * (2.0 * hashUnit(static_cast<std::uint64_t>(seed), index, 1) - 1.0);
+}
+
+void appendPatch(std::vector<Point3> & out, const Patch & patch, std::int64_t seed, bool outliers)
+{
+  const double phi = patch.azimuth_deg * kPi / 180.0;
+  const double theta = patch.tilt_deg * kPi / 180.0;
+  const double cp = std::cos(phi), sp = std::sin(phi), ct = std::cos(theta), st = std::sin(theta);
+  const double normal[3] = {ct * cp, ct * sp, st};
+  const double across[3] = {-sp, cp, 0.0};
+  const double up[3] = {-st * cp, -st * sp, ct};
+  const double centre[3] = {patch.distance * cp, patch.distance * sp, 0.0};
+  for (int r = 0; r < patch.rows; ++r) {
+    for (int c = 0; c < patch.columns; ++c) {
+      const std::size_t index = out.size();
+      const double u = -patch.half_width + 2.0 * patch.half_width * c / (patch.columns - 1);
+      const double v = patch.v_min + (patch.v_max - patch.v_min) * r / (patch.rows - 1);
+      double along = surfaceNoise(seed, index);
+      if (outliers && hashUnit(static_cast<std::uint64_t>(seed), index, 4) < kOutlierShare)
+        along += kOutlierOffset;
+      Point3 point;
+      for (int d = 0; d < 3; ++d)
+        point[d] = static_cast<float>(centre[d] + u * across[d] + v * up[d] + along * normal[d]);
+      out.push_back(point);
+    }
+  }
+}
+
+// The points of a measurement scene for the scan that starts at `seed` ms; `outliers` moves about one point in 20 of
+// the room off its wall.
+std::vector<Point3> scenePoints(Cloud kind, std::int64_t seed, bool outliers)
+{
+  std::vector<Point3> out;
+  if (kind == Cloud::kRoom) {
+    for (const auto & wall : kRoomWalls)
+      appendPatch(out, wall, seed, outliers);
+  } else if (kind == Cloud::kGround) {
+    // Rings 1-5 m out, a point every 0.25 m along each. The two angular sectors of the quadrant x < 0 <= y have too
+    // few ground candidates for a fit of their own and take the whole scan's ground plane; the other six fit their
+    // own.
+    for (int ring = 0; ring <= 16; ++ring) {
+      const double radius = 1.0 + 0.25 * ring;
+      const int count = static_cast<int>(std::lround(2.0 * kPi * radius / 0.25));
+      for (int k = 0; k < count; ++k) {
+        const double angle = 2.0 * kPi * (k + 0.5 * (ring % 2)) / count;
+        const auto x = static_cast<float>(radius * std::cos(angle));
+        const auto y = static_cast<float>(radius * std::sin(angle));
+        if (x < 0.0f && y >= 0.0f && ring % kSparseRingStride != 0)
+          continue;
+        const std::size_t index = out.size();
+        double z = kGroundZ + surfaceNoise(seed, index);
+        const auto r = static_cast<std::uint64_t>(ring), j = static_cast<std::uint64_t>(k);
+        if (hashUnit(r, j, 2) < kClutterShare)
+          z = kGroundZ + 0.2 + 0.3 * hashUnit(r, j, 3);
+        out.push_back({x, y, static_cast<float>(z)});
+      }
+    }
+    for (const auto & wall : kGroundWalls)
+      appendPatch(out, wall, seed, false);
+  } else if (kind == Cloud::kCorridor) {
+    // The walls 12 m long and 2.4 m high; the patch, 4 x 3 points 0.15 m apart, 0.5 m past the walls' end.
+    for (const double side : {1.6, -1.6}) {
+      for (int r = 0; r < 20; ++r) {
+        for (int c = 0; c < 50; ++c) {
+          const std::size_t index = out.size();
+          out.push_back({static_cast<float>(-6.0 + 12.0 * c / 49),
+                         static_cast<float>(side + surfaceNoise(seed, index)),
+                         static_cast<float>(-0.8 + 2.4 * r / 19)});
+        }
+      }
+    }
+    for (int r = 0; r < 3; ++r) {
+      for (int c = 0; c < 4; ++c) {
+        const std::size_t index = out.size();
+        out.push_back({static_cast<float>(6.5 + surfaceNoise(seed, index)),
+                       static_cast<float>(-0.225 + 0.15 * c),
+                       static_cast<float>(0.25 + 0.15 * r)});
+      }
+    }
+  }
+  return out;
 }
 
 // One scan period.
@@ -671,6 +893,7 @@ struct Slot
   bool clock_back = false;  // an IMU sample stamped 1.5 s before the newest one precedes the scan: an epoch fault
   int repeat = 0;           // > 0: the cloud of the scan this many slots back is sent once more instead of a new one
   bool refused = false;     // the node refuses this slot's cloud where it arrives: it leaves no record
+  bool outliers = false;    // a room cloud with about one point in 20 moved off its wall
 };
 
 struct Scenario
@@ -678,6 +901,8 @@ struct Scenario
   std::string name;
   bool async_map = false;
   bool typed = false;  // the typed outputs on, with the fixed activation identity and repeat clock
+  Cloud warm_up = Cloud::kDense;  // the cloud the warm-up scans carry: the scene the map starts from
+  bool dump = false;  // the correspondence dump goes to the scenario's result directory; h_dump.v1 records its files
   std::map<std::string, rclcpp::Parameter> params;
   std::vector<Slot> slots;          // after the warm-up
   std::vector<std::string> claims;  // the branches the scenario exists to reach
@@ -958,6 +1183,197 @@ Scenario entryViewScenario()
   return s;
 }
 
+// The measurement scenarios (laserMapping S2): every branch of the H-model the default configuration leaves off, on
+// a scene that reaches it. Each starts from the base configuration with its scene as the warm-up's cloud; their
+// slots leave the guard its own verdict.
+Scenario measurementScenario(const std::string & name, Cloud scene)
+{
+  Scenario s = baseScenario(name);
+  s.warm_up = scene;
+  return s;
+}
+
+Slot sceneSlot(Cloud cloud, bool moving = false)
+{
+  const std::string name = cloudName(cloud);
+  return slot(moving ? name + "_moving" : name, moving, kGuardNatural, cloud);
+}
+
+Slot outlierSlot()
+{
+  Slot s = slot("room_outliers", false, kGuardNatural, Cloud::kRoom);
+  s.outliers = true;
+  return s;
+}
+
+// The correspondence gate's innovation test (corr_innov_gate_k, scaled by the larger of the pose's projected sigma,
+// its rotation floored, and the scan's robust residual scale): two scans with about one room point in 20 moved 0.17 m
+// off its wall, which the plane test keeps and the gate refuses.
+Scenario gateInnovationScenario()
+{
+  Scenario s = measurementScenario("h_gate_innov", Cloud::kRoom);
+  setParam(s, rclcpp::Parameter("corr_innov_gate_k", 1.0));
+  setParam(s, rclcpp::Parameter("corr_gate_mad_scale", 1.0));
+  setParam(s, rclcpp::Parameter("corr_gate_rot_sigma_floor_deg", 0.3));
+  append(s, 3, sceneSlot(Cloud::kRoom));
+  append(s, 2, outlierSlot());
+  append(s, 2, sceneSlot(Cloud::kRoom));
+  s.claims = {"h_gate_rejected"};
+  return s;
+}
+
+// The gate's nearest-neighbour bound (corr_nn0_max) alone: the map holds the scene's first scan, so a point's nearest
+// map neighbour is its own earlier copy, which the per-scan noise puts up to 8 mm away; the bound refuses the points
+// farther than 5 mm from it.
+Scenario gateNearestScenario()
+{
+  Scenario s = measurementScenario("h_gate_nn0", Cloud::kRoom);
+  setParam(s, rclcpp::Parameter("corr_nn0_max", 0.005));
+  append(s, 5, sceneSlot(Cloud::kRoom));
+  s.claims = {"h_gate_rejected"};
+  return s;
+}
+
+// A robust kernel on the rows (corr_kernel, its scale the larger of corr_kernel_mad_scale times the scan's residual
+// scale and corr_kernel_min_scale): every row with a residual is weighted below 1, the outliers far below.
+Scenario kernelScenario(const std::string & name, const char * kernel)
+{
+  Scenario s = measurementScenario(name, Cloud::kRoom);
+  setParam(s, rclcpp::Parameter("corr_kernel", kernel));
+  append(s, 3, sceneSlot(Cloud::kRoom));
+  append(s, 2, outlierSlot());
+  append(s, 2, sceneSlot(Cloud::kRoom));
+  s.claims = {"h_kernel_weighted"};
+  return s;
+}
+
+// The neighbour refresh gate (nn_refresh_gate_en): on parked scans the iteration that asks for a new search after
+// converging has hardly moved, and the gate skips the search; the turning scans need iterations that do not converge,
+// which reuse the cached planes without asking.
+Scenario refreshScenario()
+{
+  Scenario s = measurementScenario("h_nn_refresh", Cloud::kRoom);
+  setParam(s, rclcpp::Parameter("nn_refresh_gate_en", true));
+  setParam(s, rclcpp::Parameter("nn_refresh_min_shift", 0.05));
+  append(s, 4, sceneSlot(Cloud::kRoom));
+  append(s, 3, sceneSlot(Cloud::kRoom, true));
+  append(s, 3, sceneSlot(Cloud::kRoom));
+  s.claims = {"h_nn_skip", "h_nn_reuse"};
+  return s;
+}
+
+// The ground recovery (ground_recover_en): the plane test refuses ground points whose neighbourhood holds clutter, and
+// the recovery adds them back as rows against the ground fitted in their sector (the whole scan's ground in the two
+// sparse sectors).
+Scenario groundScenario()
+{
+  Scenario s = measurementScenario("h_ground_recovery", Cloud::kGround);
+  setParam(s, rclcpp::Parameter("ground_recover_en", true));
+  setParam(s, rclcpp::Parameter("canopy_ground_z", kGroundZ));
+  setParam(s, rclcpp::Parameter("canopy_ground_halfband", 0.6));
+  setParam(s, rclcpp::Parameter("ground_recover_min_inliers", 75));
+  append(s, 8, sceneSlot(Cloud::kGround));
+  s.claims = {"h_ground_rows"};
+  return s;
+}
+
+// The subspace weighting (degeneracy_weighting_en) on the corridor, judged on the Schur complement over the rotation
+// columns, with the residual histogram and the spectrum trace on: the vertical gets no weight, the direction along the
+// corridor, seen only by the end patch, a partial one, and every row a weight from its normal.
+Scenario degeneracyScenario()
+{
+  Scenario s = measurementScenario("h_degeneracy", Cloud::kCorridor);
+  setParam(s, rclcpp::Parameter("degeneracy_weighting_en", true));
+  setParam(s, rclcpp::Parameter("degeneracy_schur_en", true));
+  setParam(s, rclcpp::Parameter("degeneracy_debug", true));
+  setParam(s, rclcpp::Parameter("degeneracy_spectrum_trace", true));
+  append(s, 8, sceneSlot(Cloud::kCorridor));
+  s.claims = {"h_degeneracy_weighted"};
+  return s;
+}
+
+// The attitude hold (lidar_attitude_hold_en; it rules out online extrinsic estimation). Its scene rule holds a room
+// scan after a room scan, whose weakest position direction is near vertical (z_weak about 0.9 > 0.5); the information
+// rule holds the fixture's plane, whose roll/pitch information (about 30) is below 300, where the room's (about 3000)
+// is not. The first plane scan matches nothing and goes into the map; the far scan matches nothing and releases the
+// hold on the next scan.
+Scenario attitudeHoldScenario()
+{
+  Scenario s = measurementScenario("h_attitude_hold", Cloud::kRoom);
+  setParam(s, rclcpp::Parameter("mapping.extrinsic_est_en", false));
+  setParam(s, rclcpp::Parameter("lidar_attitude_hold_en", true));
+  setParam(s, rclcpp::Parameter("lidar_attitude_hold_far_frac", 2.0));
+  setParam(s, rclcpp::Parameter("lidar_attitude_hold_z_weak", 0.5));
+  setParam(s, rclcpp::Parameter("lidar_attitude_hold_min_rp_info", 300.0));
+  append(s, 3, sceneSlot(Cloud::kRoom));
+  append(s, 4, sceneSlot(Cloud::kDense));
+  append(s, 3, sceneSlot(Cloud::kRoom));
+  s.slots.push_back(sceneSlot(Cloud::kFar));
+  append(s, 2, sceneSlot(Cloud::kRoom));
+  s.claims = {"h_hold_rows", "h_hold_info"};
+  return s;
+}
+
+// Online extrinsic estimation on and off (mapping.extrinsic_est_en): the rows' extrinsic columns filled or zero.
+Scenario extrinsicScenario(const std::string & name, bool estimate)
+{
+  Scenario s = measurementScenario(name, Cloud::kRoom);
+  setParam(s, rclcpp::Parameter("mapping.extrinsic_est_en", estimate));
+  append(s, 6, sceneSlot(Cloud::kRoom));
+  s.claims = {estimate ? "h_extrinsic_rows" : "h_extrinsic_fixed"};
+  return s;
+}
+
+// The correspondence dump (corr_dump_en) over the window that holds the scan ending at 1.55 s, written to the
+// scenario's result directory; h_dump.v1 records the three files.
+Scenario dumpScenario()
+{
+  Scenario s = measurementScenario("h_dump", Cloud::kRoom);
+  s.dump = true;
+  setParam(s, rclcpp::Parameter("corr_dump_en", true));
+  setParam(s, rclcpp::Parameter("corr_dump_windows", "1.52:1.58"));
+  append(s, 8, sceneSlot(Cloud::kRoom));
+  s.claims = {"h_dump_written"};
+  return s;
+}
+
+// The H-model keys of config/profiles/m20 (three iterations, the refresh gate, the correspondence gate, the
+// degeneracy thresholds with the weighting off, roll/pitch considered after a scan with little roll/pitch information,
+// extrinsic estimation off) on parked and turning room scans; the fixture's plane, matched once it is in the map,
+// leaves too little roll/pitch information for the next scan.
+Scenario m20Scenario()
+{
+  Scenario s = measurementScenario("h_m20", Cloud::kRoom);
+  for (const auto & p : {rclcpp::Parameter("max_iteration", 3),
+                         rclcpp::Parameter("nn_refresh_gate_en", true),
+                         rclcpp::Parameter("nn_refresh_min_shift", 0.05),
+                         rclcpp::Parameter("degeneracy_lambda_bad", 0.05),
+                         rclcpp::Parameter("degeneracy_lambda_good", 0.30),
+                         rclcpp::Parameter("degeneracy_lambda_abs_bad", 6.0),
+                         rclcpp::Parameter("degeneracy_lambda_abs_good", 30.0),
+                         rclcpp::Parameter("degeneracy_schur_en", true),
+                         rclcpp::Parameter("degeneracy_schur_ridge", 1.0e-6),
+                         rclcpp::Parameter("degeneracy_hard_projection", true),
+                         rclcpp::Parameter("degeneracy_min_weight", 0.0),
+                         rclcpp::Parameter("degeneracy_weighting_en", false),
+                         rclcpp::Parameter("corr_innov_gate_k", 2.5),
+                         rclcpp::Parameter("corr_gate_mad_scale", 1.0),
+                         rclcpp::Parameter("corr_gate_rot_sigma_floor_deg", 0.3),
+                         rclcpp::Parameter("lidar_consider_rp_en", true),
+                         rclcpp::Parameter("lidar_consider_rp_post_release_s", 2.5),
+                         rclcpp::Parameter("lidar_consider_rp_min_info", 1500.0),
+                         rclcpp::Parameter("mapping.extrinsic_est_en", false)}) {
+    setParam(s, p);
+  }
+  append(s, 3, sceneSlot(Cloud::kRoom));
+  append(s, 3, sceneSlot(Cloud::kRoom, true));
+  append(s, 2, sceneSlot(Cloud::kRoom));
+  append(s, 3, sceneSlot(Cloud::kDense));
+  append(s, 2, sceneSlot(Cloud::kRoom));
+  s.claims = {"normal_match", "h_nn_skip", "h_rp_consider"};
+  return s;
+}
+
 // ---------------------------------------------------------------------------
 // Branches
 // ---------------------------------------------------------------------------
@@ -1045,11 +1461,46 @@ constexpr Branch kBranches[] = {
    "records of scans still Pending after the recovery step whose points went into the map "
    "(reanchor_recovery_entry_view)",
    "test_anchor_lifecycle_node AnchorLifecycleEntryView.*"},
+  {"h_gate_rejected",
+   "H-model calls whose correspondence gate refused at least one match (h_select.v1 gate_rejected > 0)",
+   "test_correspondence_gate CorrespondenceGate.*"},
+  {"h_kernel_weighted",
+   "H-model calls with a row whose robust kernel weight is below 1 (h_select.v1 rows_weighted > 0)",
+   "test_correspondence_gate CorrespondenceGate.KernelWeightsAreOneAtZeroAndDecayWithTheResidual; "
+   "test_correspondence_compaction CorrespondenceCompaction.*"},
+  {"h_nn_skip", "H-model calls whose requested neighbour search the refresh gate skipped (nn_refresh_gate_en)", ""},
+  {"h_nn_reuse",
+   "H-model calls that kept the cached planes because the filter asked for no search (an unconverged iteration)",
+   "test_cached_plane CachedPlane.*"},
+  {"h_ground_rows", "H-model calls to which the ground recovery added rows (ground_recover_en)", ""},
+  {"h_degeneracy_weighted",
+   "H-model calls with rows whose subspace weighting scaled at least one of them (degeneracy_weighting_en)",
+   "test_degeneracy_policy DegeneracyPolicy.*; test_degeneracy_policy DegeneracyWeight.*; "
+   "test_degeneracy_policy SchurComplement.*"},
+  {"h_hold_rows",
+   "H-model calls with rows whose rotation rows the attitude hold's scene rule restricted to yaw",
+   "test_attitude_hold AttitudeHold.*"},
+  {"h_hold_info",
+   "H-model calls with rows whose rotation rows the information rule alone restricted to yaw "
+   "(lidar_attitude_hold_min_rp_info)",
+   "test_attitude_hold AttitudeHold.RollPitchInformationSeparatesFloorFromNearWall"},
+  {"h_rp_consider",
+   "H-model calls with rows on scans whose update leaves roll/pitch to the gyro (lidar_consider_rp_en)",
+   "test_rp_consider ConsiderPolicy.*; test_rp_consider_filter ConsiderFilter.*"},
+  {"h_extrinsic_rows",
+   "H-model exits with rows whose extrinsic columns are filled (mapping.extrinsic_est_en true)",
+   ""},
+  {"h_extrinsic_fixed",
+   "H-model exits with rows whose extrinsic columns are all zero (mapping.extrinsic_est_en false)",
+   ""},
+  {"h_dump_written", "H-model calls that appended to the correspondence dump (corr_dump_en, in a dump window)", ""},
 };
 
 // ---------------------------------------------------------------------------
 // The child: one component activation, one scenario
 // ---------------------------------------------------------------------------
+
+bool makeDirectories(const std::string & path);
 
 class PipelineRunner
 {
@@ -1071,6 +1522,13 @@ public:
     std::string error;
     if (std::find(names.begin(), names.end(), kLaserMappingFactory) == names.end())
       error = "LaserMappingNode factory not found";
+    // The constructor opens the dump files: their directory exists before it runs.
+    if (error.empty() && scenario_.dump) {
+      dump_dir_ =
+        std::string(FASTLIO_CONTRACT_RESULTS) + "/frontend_contract/" + kFixture + "/" + scenario_.name + ".dump";
+      if (!makeDirectories(dump_dir_))
+        error = "cannot create the correspondence dump directory " + dump_dir_;
+    }
     if (error.empty()) {
       factory_ = loader_->createInstance<rclcpp_components::NodeFactory>(kLaserMappingFactory);
       installHooks();
@@ -1262,9 +1720,45 @@ private:
         out << "h_matrix.v1 end=" << bits(end) << " valid=" << (valid ? 1 : 0) << " h_x=" << h_x.rows() << 'x'
             << h_x.cols() << " h_x_sha256=" << matrixDigest(h_x) << " h=" << h.rows()
             << " h_sha256=" << matrixDigest(h);
-        if (note("afterHModelMatrices", out.str()) && h_x.rows() > 0)
-          ++counts_["h_matrix_values"];
+        if (!note("afterHModelMatrices", out.str()) || h_x.rows() == 0)
+          return;
+        ++counts_["h_matrix_values"];
+        // Columns 6-11: the extrinsic rotation and translation.
+        const bool extrinsic = h_x.cols() >= 12 && (h_x.middleCols(6, 6).array() != 0.0).any();
+        ++counts_[extrinsic ? "h_extrinsic_rows" : "h_extrinsic_fixed"];
       };
+    fast_lio_test::afterHModelSelection = [this](const fast_lio_test::HModelSelection & s) {
+      std::size_t weighted = 0;
+      if (!note("afterHModelSelection", formatSelection(s, &weighted)))
+        return;
+      if (s.gate_rejected > 0)
+        ++counts_["h_gate_rejected"];
+      if (weighted > 0)
+        ++counts_["h_kernel_weighted"];
+      if (s.search_requested && !s.searched)
+        ++counts_["h_nn_skip"];
+      if (!s.search_requested)
+        ++counts_["h_nn_reuse"];
+      if (s.ground_rows > 0)
+        ++counts_["h_ground_rows"];
+    };
+    fast_lio_test::afterHModelExit = [this](const fast_lio_test::HModelExit & e) {
+      if (!note("afterHModelExit", formatExit(e)))
+        return;
+      // The weighted-row count runs since construction: a call weighted rows when it rose.
+      if (e.valid && e.degeneracy_engaged && e.degeneracy_weighted_points > degeneracy_weighted_seen_)
+        ++counts_["h_degeneracy_weighted"];
+      degeneracy_weighted_seen_ = e.degeneracy_weighted_points;
+      if (e.valid && e.hold_rows && e.hold_scene)
+        ++counts_["h_hold_rows"];
+      if (e.valid && e.hold_rows && e.hold_info && !e.hold_scene)
+        ++counts_["h_hold_info"];
+      if (e.valid && e.rp_consider)
+        ++counts_["h_rp_consider"];
+      if (e.dump_written)
+        ++counts_["h_dump_written"];
+    };
+    fast_lio_test::correspondenceDumpDir = dump_dir_;
     fast_lio_test::afterLidarUpdate = [this](double end, const fast_lio_test::FilterSnapshot & s) {
       constexpr std::size_t kDim = 23;
       double diagonal[kDim];
@@ -1389,6 +1883,9 @@ private:
     fast_lio_test::afterScanPrepared = {};
     fast_lio_test::afterHModelRows = {};
     fast_lio_test::afterHModelMatrices = {};
+    fast_lio_test::afterHModelSelection = {};
+    fast_lio_test::afterHModelExit = {};
+    fast_lio_test::correspondenceDumpDir.clear();
     fast_lio_test::afterLidarUpdate = {};
     fast_lio_test::afterEmptyImuWindow = {};
     fast_lio_test::overrideFrontendInstance = {};
@@ -1590,11 +2087,16 @@ private:
     return "";
   }
 
-  void sendLidar(double start, Cloud kind)
+  // One scan's cloud, its points spread evenly over the scan time. A measurement scene's noise follows the scan's
+  // start, so a repeated scan carries the same points.
+  void sendLidar(double start, Cloud kind, bool outliers)
   {
-    const std::size_t points = kind == Cloud::kDense || kind == Cloud::kFar ? kScanPoints
-                               : kind == Cloud::kSparse                     ? 3u
-                                                                            : 0u;
+    const bool scene = kind == Cloud::kRoom || kind == Cloud::kGround || kind == Cloud::kCorridor;
+    const std::vector<Point3> scene_points = scene ? scenePoints(kind, msKey(start), outliers) : std::vector<Point3>();
+    const std::size_t points = scene                                          ? scene_points.size()
+                               : kind == Cloud::kDense || kind == Cloud::kFar ? kScanPoints
+                               : kind == Cloud::kSparse                       ? 3u
+                                                                              : 0u;
     const float offset = kind == Cloud::kFar ? kFarOffset : 0.0f;
     const auto length_ns = static_cast<std::uint64_t>(std::llround(kScanLength * 1e9));
     pcl::PointCloud<ouster_ros::Point> cloud;
@@ -1602,9 +2104,15 @@ private:
     for (std::size_t i = 0; i < points; ++i) {
       auto & point = cloud[i];
       point = ouster_ros::Point{};
-      point.x = 10.0f + offset + static_cast<float>(i % 317) * 0.01f;
-      point.y = -1.6f + static_cast<float>(i / 317) * 0.01f;
-      point.z = 1.0f;
+      if (scene) {
+        point.x = scene_points[i][0];
+        point.y = scene_points[i][1];
+        point.z = scene_points[i][2];
+      } else {
+        point.x = 10.0f + offset + static_cast<float>(i % 317) * 0.01f;
+        point.y = -1.6f + static_cast<float>(i / 317) * 0.01f;
+        point.z = 1.0f;
+      }
       point.intensity = 1.0f;
       point.t = static_cast<std::uint32_t>(i * length_ns / (points - 1));
     }
@@ -1661,7 +2169,8 @@ private:
 
   std::string warmUp()
   {
-    const Slot warm = slot("warm_up");
+    Slot warm = slot("warm_up");
+    warm.cloud = scenario_.warm_up;
     int published = 0;
     for (int i = 0; i < kWarmupMaxScans && published < kWarmupPublished; ++i) {
       const std::size_t before = records_.size();
@@ -1696,6 +2205,8 @@ private:
       out << " repeat=" << s.repeat;
     if (s.refused)
       out << " refused";
+    if (s.outliers)
+      out << " outliers";
     return out.str();
   }
 
@@ -1810,7 +2321,7 @@ private:
       const int cloud_scan = scan - s.repeat;
       const std::uint64_t after_seq = s.repeat > 0 && !records_.empty() ? records_.back().scan_seq : 0u;
       throw_next_imu_process_ = s.imu_throw;
-      sendLidar(scanStart(cloud_scan), s.cloud);
+      sendLidar(scanStart(cloud_scan), s.cloud, s.outliers);
       if (!s.refused) {
         pending_.push_back({cloud_scan, index, s.cloud != Cloud::kEmpty, after_seq});
       } else if (!spinUntil([&] { return fast_lio_test::inspectImuInput().rejectedLidar > refused_before; },
@@ -1861,6 +2372,22 @@ private:
     rclcpp::shutdown();
   }
 
+  // The correspondence dump's files as the scan path left them: it flushes them after every scan in a window.
+  void appendDumpFiles()
+  {
+    for (const char * name : {"corr_dump.csv", "corr_iter.csv", "corr_scan.csv"}) {
+      std::string text;
+      std::ostringstream out;
+      out << "h_dump.v1 file=" << name;
+      if (readFile(dump_dir_ + "/" + name, &text))
+        out << " bytes=" << text.size() << " lines=" << std::count(text.begin(), text.end(), '\n')
+            << " sha256=" << sha256Hex(text);
+      else
+        out << " missing";
+      stream_.push_back(out.str());
+    }
+  }
+
   // What the record ends with, and the counts the counter summary holds.
   void finish()
   {
@@ -1875,6 +2402,8 @@ private:
       counts_["async_map_add"] = adds;
     }
     stream_.push_back(out.str());
+    if (scenario_.dump)
+      appendDumpFiles();
     const std::pair<const char *, const char *> summary[] = {{"created", "anchor_created"},
                                                              {"pin_applied", "anchor_pin"},
                                                              {"parked_prior_applied", "parked_prior"},
@@ -1926,6 +2455,8 @@ private:
   std::vector<std::string> stream_;
   std::map<std::string, std::uint64_t> counts_;
   std::map<std::int64_t, int> h_max_effective_;  // by scan end: the most effective points of an H-model iteration
+  long degeneracy_weighted_seen_ = 0;            // the subspace weighting's weighted-row count at the last H exit
+  std::string dump_dir_;                         // the correspondence dump's directory (dump scenario only)
   std::string counters_line_;
   bool throw_next_imu_process_ = false;
   std::atomic<std::uint64_t> map_adds_{0};
@@ -2361,6 +2892,66 @@ TEST(FrontendPipelineContract, InputEpoch)
 TEST(FrontendPipelineContract, EntryViewMovingRecovery)
 {
   checkScenario(entryViewScenario());
+}
+
+TEST(FrontendPipelineContract, MeasurementGateInnovation)
+{
+  checkScenario(gateInnovationScenario());
+}
+
+TEST(FrontendPipelineContract, MeasurementGateNearestNeighbour)
+{
+  checkScenario(gateNearestScenario());
+}
+
+TEST(FrontendPipelineContract, MeasurementKernelGemanMcClure)
+{
+  checkScenario(kernelScenario("h_kernel_gm", "gm"));
+}
+
+TEST(FrontendPipelineContract, MeasurementKernelCauchy)
+{
+  checkScenario(kernelScenario("h_kernel_cauchy", "cauchy"));
+}
+
+TEST(FrontendPipelineContract, MeasurementNeighbourRefresh)
+{
+  checkScenario(refreshScenario());
+}
+
+TEST(FrontendPipelineContract, MeasurementGroundRecovery)
+{
+  checkScenario(groundScenario());
+}
+
+TEST(FrontendPipelineContract, MeasurementDegeneracyWeighting)
+{
+  checkScenario(degeneracyScenario());
+}
+
+TEST(FrontendPipelineContract, MeasurementAttitudeHold)
+{
+  checkScenario(attitudeHoldScenario());
+}
+
+TEST(FrontendPipelineContract, MeasurementExtrinsicEstimationOn)
+{
+  checkScenario(extrinsicScenario("h_extrinsic_on", true));
+}
+
+TEST(FrontendPipelineContract, MeasurementExtrinsicEstimationOff)
+{
+  checkScenario(extrinsicScenario("h_extrinsic_off", false));
+}
+
+TEST(FrontendPipelineContract, MeasurementCorrespondenceDump)
+{
+  checkScenario(dumpScenario());
+}
+
+TEST(FrontendPipelineContract, MeasurementM20Profile)
+{
+  checkScenario(m20Scenario());
 }
 
 // The worker suite is what the front-end ThreadSanitizer phase runs. Here: the map worker and the reset that joins it.

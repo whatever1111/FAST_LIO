@@ -2662,6 +2662,9 @@ std::function<bool(std::array<std::uint8_t, 16> &)> overrideFrontendInstance;
 std::function<std::chrono::steady_clock::time_point()> referenceRepeatClock;
 std::function<void(const char *, const std::vector<std::string> &)> afterConstructionStage;
 std::function<void(const std::vector<EffectiveValue> &)> afterConstruction;
+std::function<void(const HModelSelection &)> afterHModelSelection;
+std::function<void(const HModelExit &)> afterHModelExit;
+std::string correspondenceDumpDir;
 
 FilterSnapshot filterSnapshot()
 {
@@ -2712,6 +2715,75 @@ int reconfirmLastImuBatch()
   std::lock_guard<std::mutex> lock(mtx_buffer);
   return static_cast<int>(
     imu_fifo_transaction.settle(imu_buffer, last_imu_token_for_test, fast_lio::ImuDisposition::kCommitted));
+}
+
+// The H-model call in progress, right after compaction.
+static void reportHModelSelection(bool search_requested, bool searched)
+{
+  HModelSelection selection;
+  selection.scan_end = lidar_end_time;
+  selection.call = ekf_iters;
+  selection.search_requested = search_requested;
+  selection.searched = searched;
+  selection.refresh_skips = nn_skips;
+  selection.refresh_max_shift = nn_max_shift;
+  selection.points = feats_down_size;
+  selection.selected = point_selected_surf.data();
+  selection.residuals = res_last.data();
+  selection.gate_rejected = corr_gate_rejected.load(std::memory_order_relaxed);
+  selection.gate_scan_sigma = corr_gate_scan_sigma;
+  selection.ground_rows = canopy_ground_recovered;
+  selection.rows.resize(static_cast<std::size_t>(std::max(effct_feat_num, 0)));
+  for (std::size_t i = 0; i < selection.rows.size(); ++i) {
+    const PointType & point = laserCloudOri->points[i];
+    const PointType & normal = corr_normvect->points[i];
+    HModelRow & row = selection.rows[i];
+    row.point[0] = point.x;
+    row.point[1] = point.y;
+    row.point[2] = point.z;
+    row.normal[0] = normal.x;
+    row.normal[1] = normal.y;
+    row.normal[2] = normal.z;
+    row.residual = normal.intensity;
+    row.weight = corr_weight[i];
+  }
+  afterHModelSelection(selection);
+}
+
+// The H-model call's exit. `hold_rows`: the call restricted its rotation rows to yaw (false without rows).
+static HModelExit hModelExit(bool valid, bool hold_rows)
+{
+  HModelExit out;
+  out.scan_end = lidar_end_time;
+  out.call = ekf_iters;
+  out.valid = valid;
+  out.effective = effct_feat_num;
+  out.mean_residual = res_mean_last;
+  out.pos_eig_min = pos_obs_eig_min;
+  out.pos_eig_max = pos_obs_eig_max;
+  out.pos_z_weak = pos_obs_z_weak;
+  out.hold_scene = lidar_attitude_hold_active;
+  out.hold_allowed = lidar_attitude_hold_allowed;
+  out.hold_rows = hold_rows;
+  out.hold_info = lidar_attitude_hold_info_active;
+  out.rp_info_min = lidar_rot_obs_rp_min;
+  out.rp_consider = rp_consider_active;
+  out.degeneracy_engaged = degeneracy_last.engaged;
+  for (int i = 0; i < 3; ++i) {
+    out.degeneracy_shares[i] = degeneracy_last.lambda_norm(i);
+    out.degeneracy_lambdas[i] = degeneracy_last.lambda_abs(i);
+    out.degeneracy_weights[i] = degeneracy_last.weights(i);
+  }
+  out.degeneracy_weighted_points = degeneracy_point_weighted;
+  out.degeneracy_weight_sum = degeneracy_point_weight_sum;
+  out.dump_written = valid && corr_dump_scan_active && fout_corr.is_open();
+  return out;
+}
+
+// A correspondence dump file: in correspondenceDumpDir when it is set, in the package's Log/ directory otherwise.
+static std::string correspondenceDumpFile(const char * name)
+{
+  return correspondenceDumpDir.empty() ? DEBUG_FILE_DIR(name) : correspondenceDumpDir + "/" + name;
 }
 }  // namespace fast_lio_test
 
@@ -3846,6 +3918,8 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterHModelRows)
     fast_lio_test::afterHModelRows(static_cast<std::size_t>(feats_down_size), lidar_end_time, effct_feat_num);
+  if (fast_lio_test::afterHModelSelection)
+    fast_lio_test::reportHModelSelection(ekfom_data.converge, searching);
 #endif
 
   // Position-observability metric (degeneracy detector): eigenvalues of the
@@ -3872,6 +3946,8 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
 #ifdef FASTLIO_TEST_HOOKS
     if (fast_lio_test::afterHModelMatrices)
       fast_lio_test::afterHModelMatrices(lidar_end_time, ekfom_data.valid, Eigen::MatrixXd(), Eigen::VectorXd());
+    if (fast_lio_test::afterHModelExit)
+      fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(ekfom_data.valid, false));
 #endif
     return;
   }
@@ -4089,6 +4165,8 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterHModelMatrices)
     fast_lio_test::afterHModelMatrices(lidar_end_time, ekfom_data.valid, ekfom_data.h_x, ekfom_data.h);
+  if (fast_lio_test::afterHModelExit)
+    fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(ekfom_data.valid, hold_rows));
 #endif
   solve_time += omp_get_wtime() - solve_start_;
 }
@@ -4558,6 +4636,12 @@ private:
     }
   }
 
+#ifdef FASTLIO_TEST_HOOKS
+// A fixture's correspondenceDumpDir replaces Log/: a test build may run on a read-only source tree.
+#pragma push_macro("DEBUG_FILE_DIR")
+#undef DEBUG_FILE_DIR
+#define DEBUG_FILE_DIR(name) fast_lio_test::correspondenceDumpFile(name)
+#endif
   void openCorrespondenceDump()
   {
     fout_corr.open(DEBUG_FILE_DIR("corr_dump.csv"), std::ios::out);
@@ -4581,6 +4665,9 @@ private:
                 params_.values().corr_dump_windows.size(),
                 DEBUG_FILE_DIR("corr_dump.csv").c_str());
   }
+#ifdef FASTLIO_TEST_HOOKS
+#pragma pop_macro("DEBUG_FILE_DIR")
+#endif
 
   void openDebugRecords()
   {

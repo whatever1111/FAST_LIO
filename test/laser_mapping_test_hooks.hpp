@@ -69,6 +69,69 @@ extern std::function<void(double, bool)> afterMapInsertion;
 /// no correspondence is left).
 extern std::function<void(double, bool, const Eigen::MatrixXd &, const Eigen::VectorXd &)> afterHModelMatrices;
 
+/// One row the H-model hands to the filter, in the filter's order: the body-frame point, the world-frame plane
+/// normal, the signed point-to-plane residual the row is built from, and the kernel weight (1 without a kernel).
+struct HModelRow
+{
+  float point[3];
+  float normal[3];
+  float residual;
+  double weight;
+};
+
+/// One H-model call's correspondences right after compaction: the search decision, the selection in point order,
+/// what the gate, the kernel and the ground recovery did, and the rows.
+struct HModelSelection
+{
+  double scan_end = 0.0;
+  int call = 0;                             ///< H-model calls on this scan so far, this one included
+  bool search_requested = false;            ///< the filter asked for a neighbour search
+  bool searched = false;                    ///< this call searched; false: it used the cached planes
+  int refresh_skips = 0;                    ///< requested searches the refresh gate skipped on this scan so far
+  double refresh_max_shift = 0.0;           ///< the largest refresh shift on this scan so far (m)
+  int points = 0;                           ///< downsampled scan points
+  const std::uint8_t * selected = nullptr;  ///< `points` flags: the point has a row
+  const float * residuals = nullptr;        ///< `points` values, read where the point has a row: |residual|
+  int gate_rejected = 0;                    ///< points the correspondence gate refused
+  double gate_scan_sigma = 0.0;             ///< the scan's robust residual scale (0 when no gate or kernel uses it)
+  int ground_rows = 0;                      ///< rows the ground recovery added
+  std::vector<HModelRow> rows;
+};
+
+/// One H-model call's exit, with rows or without them. The values a call without rows does not compute are the
+/// ones the previous call left.
+struct HModelExit
+{
+  double scan_end = 0.0;
+  int call = 0;
+  bool valid = false;               ///< rows went to the filter
+  int effective = 0;                ///< rows
+  double mean_residual = 0.0;       ///< mean |residual| of the rows
+  double pos_eig_min = 0.0;         ///< the rows' position information sum(n n^T): smallest eigenvalue
+  double pos_eig_max = 0.0;         ///< largest eigenvalue
+  double pos_z_weak = 0.0;          ///< |z| of the weakest direction
+  bool hold_scene = false;          ///< the scan's attitude hold verdict from its scene
+  bool hold_allowed = false;        ///< the hold's release conditions alone
+  bool hold_rows = false;           ///< this call restricted its rotation rows to yaw (false without rows)
+  bool hold_info = false;           ///< the information rule has held the attitude on this scan
+  double rp_info_min = 0.0;         ///< roll/pitch information of the rows
+  bool rp_consider = false;         ///< the scan's update leaves roll/pitch to the gyro (lidar_consider_rp_en)
+  bool degeneracy_engaged = false;  ///< the subspace weighting held back a position direction
+  double degeneracy_shares[3] = {0.0, 0.0, 0.0};   ///< its eigenvalue shares, ascending
+  double degeneracy_lambdas[3] = {0.0, 0.0, 0.0};  ///< its raw eigenvalues
+  double degeneracy_weights[3] = {0.0, 0.0, 0.0};  ///< its weight per direction
+  long degeneracy_weighted_points = 0;             ///< rows the weighting scaled since construction
+  double degeneracy_weight_sum = 0.0;              ///< the sum of their weights
+  bool dump_written = false;                       ///< this call appended to the correspondence dump
+};
+/// Every H-model call right after afterHModelRows.
+extern std::function<void(const HModelSelection &)> afterHModelSelection;
+/// Every H-model exit, right after afterHModelMatrices.
+extern std::function<void(const HModelExit &)> afterHModelExit;
+/// The directory the correspondence dump writes its files to; empty: the package's Log/ directory. The constructor
+/// opens the files: set it before.
+extern std::string correspondenceDumpDir;
+
 /// The filter right after the iterated lidar update: the full state and the error-state covariance (row-major).
 struct FilterSnapshot
 {

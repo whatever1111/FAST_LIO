@@ -22,7 +22,20 @@ Inputs and goldens of the two contract fixtures of the legacy front-end node (la
   and covariance after each lidar update (`filter_update.v1`) and the IMU samples an empty scan leaves queued
   (`imu_retain.v1`); the typed scenario records both typed outputs, field by field, with a fixed instance and a
   fixed repeat clock. The scenarios set `mapping.extrinsic_est_en` to true, which is off by default, so the recorded
-  Jacobian keeps its extrinsic columns.
+  Jacobian keeps its extrinsic columns; `h_attitude_hold`, `h_extrinsic_off` and `h_m20` set it false.
+  The measurement scenarios (`h_*`, laserMapping S2) turn on the H-model branches the default configuration leaves
+  off, each on a synthetic scene that reaches it (three tilted walls, near ground with clutter, a corridor with a
+  patch across its end): the correspondence gate's innovation test (`h_gate_innov`) and nearest-neighbour bound
+  (`h_gate_nn0`), the Geman-McClure and Cauchy kernels (`h_kernel_gm`, `h_kernel_cauchy`), the neighbour refresh
+  gate's skip and the reuse of the cached planes (`h_nn_refresh`), the ground recovery with sector and whole-scan
+  planes (`h_ground_recovery`), the subspace weighting on the Schur complement with its diagnostics
+  (`h_degeneracy`), the attitude hold's scene and information rules (`h_attitude_hold`), online extrinsic
+  estimation on and off (`h_extrinsic_on`, `h_extrinsic_off`), the correspondence dump (`h_dump`) and the H-model
+  keys of the M20 profile with roll/pitch considered (`h_m20`). Every scenario records each H-model call's
+  correspondence selection (`h_select.v1`: the search decision, the gate, kernel and ground recovery counts, and
+  digests of the selection, the residuals and the rows) and its exit (`h_exit.v1`: position information, the
+  hold's verdicts, roll/pitch information and consideration, the subspace weighting); the dump scenario records
+  its three files (`h_dump.v1`), which the test build writes to the scenario's result directory.
 
 Lines whose first word is a `.v1` name (`event.v1`, `effective.v1`, `h_matrix.v1`, ...) were added to records
 that existed before them; removing them gives each earlier record unchanged.

@@ -106,7 +106,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 ament_export_dependencies(rosidl_default_runtime)
 
 add_executable(fastlio_mapping src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp
-  src/frontend_parameters_ros.cpp)
+  src/frontend_parameters_ros.cpp src/frontend_measurement.cpp)
 target_include_directories(fastlio_mapping PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -152,7 +152,7 @@ ament_target_dependencies(fastlio_mapping ${dependencies})
 # globals are safe because exactly ONE LaserMappingNode is ever loaded.
 add_library(fastlio_mapping_component SHARED
   src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp
-  src/frontend_parameters_ros.cpp)
+  src/frontend_parameters_ros.cpp src/frontend_measurement.cpp)
 target_compile_definitions(fastlio_mapping_component PRIVATE FASTLIO_AS_COMPONENT)
 target_include_directories(fastlio_mapping_component PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -246,7 +246,7 @@ if(BUILD_TESTING)
     # third heavy compilation after BOTH normal production targets finish.
     add_library(fastlio_mapping_test_component SHARED
       src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp
-      src/frontend_parameters_ros.cpp)
+      src/frontend_parameters_ros.cpp src/frontend_measurement.cpp)
     target_compile_definitions(fastlio_mapping_test_component PRIVATE
       FASTLIO_AS_COMPONENT FASTLIO_TEST_HOOKS USE_IVOX)
     target_include_directories(fastlio_mapping_test_component PRIVATE

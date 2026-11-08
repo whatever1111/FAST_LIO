@@ -41,6 +41,7 @@
 #include <Eigen/Sparse>
 
 #include <cstdlib>
+#include <stdexcept>
 #include <vector>
 
 #include "../mtk/build_manifold.hpp"
@@ -135,6 +136,8 @@ public:
   // typedef Eigen::Matrix<scalar_type, Eigen::Dynamic, 1> measurementModel_dyn_share(state &,
   // dyn_share_datastruct<scalar_type> &);
   typedef void measurementModel_dyn_share(state &, dyn_share_datastruct<scalar_type> &);
+  // The same model bound to an object: the filter hands back the context it was given at init_dyn_share_context.
+  typedef void measurementModelContext_dyn_share(void *, state &, dyn_share_datastruct<scalar_type> &);
   typedef Eigen::Matrix<scalar_type, l, n> measurementMatrix1(state &, bool &);
   typedef Eigen::Matrix<scalar_type, Eigen::Dynamic, n> measurementMatrix1_dyn(state &, bool &);
   typedef Eigen::Matrix<scalar_type, l, measurement_noise_dof> measurementMatrix2(state &, bool &);
@@ -295,6 +298,8 @@ public:
     f_x = f_x_in;
     f_w = f_w_in;
     h_dyn_share = h_dyn_share_in;
+    h_dyn_share_context_ = nullptr;
+    h_context_ = nullptr;
 
     maximum_iter = maximum_iteration;
     for (int i = 0; i < n; i++) {
@@ -304,6 +309,32 @@ public:
     x_.build_S2_state();
     x_.build_SO3_state();
     x_.build_vect_state();
+  }
+
+  // init_dyn_share for a model bound to an object: both dyn_share updates call h_in(context, x, data). The two
+  // entries exclude each other, the later one replaces the earlier. The filter does not own the context; whoever
+  // binds it clears it with clear_dyn_share_context() before the context goes away.
+  void init_dyn_share_context(processModel f_in,
+                              processMatrix1 f_x_in,
+                              processMatrix2 f_w_in,
+                              measurementModelContext_dyn_share h_in,
+                              void * context,
+                              int maximum_iteration,
+                              scalar_type limit_vector[n])
+  {
+    if (h_in == nullptr || context == nullptr) {
+      throw std::invalid_argument("init_dyn_share_context needs a measurement model and its context");
+    }
+    init_dyn_share(f_in, f_x_in, f_w_in, nullptr, maximum_iteration, limit_vector);
+    h_dyn_share_context_ = h_in;
+    h_context_ = context;
+  }
+
+  // Forgets the bound context. No measurement model is bound afterwards until the next init.
+  void clear_dyn_share_context()
+  {
+    h_dyn_share_context_ = nullptr;
+    h_context_ = nullptr;
   }
 
   // receive system-specific models and their differentions
@@ -1025,7 +1056,7 @@ public:
     int dof_Measurement_noise;
     for (int i = -1; i < maximum_iter; i++) {
       dyn_share.valid = true;
-      h_dyn_share(x_, dyn_share);
+      evaluate_dyn_share(x_, dyn_share);
       // Matrix<scalar_type, Eigen::Dynamic, 1> h = h_dyn_share (x_,  dyn_share);
       Matrix<scalar_type, Eigen::Dynamic, 1> z = dyn_share.z;
       Matrix<scalar_type, Eigen::Dynamic, 1> h = dyn_share.h;
@@ -1624,7 +1655,7 @@ public:
     vectorized_state dx_new = vectorized_state::Zero();
     for (int i = -1; i < maximum_iter; i++) {
       dyn_share.valid = true;
-      h_dyn_share(x_, dyn_share);
+      evaluate_dyn_share(x_, dyn_share);
 
       if (!dyn_share.valid) {
         continue;
@@ -2136,6 +2167,18 @@ private:
   bool consider_rot_en_ = false;
   int consider_rot_index_ = -1;
   Eigen::Matrix<scalar_type, 3, 3> consider_rot_keep_ = Eigen::Matrix<scalar_type, 3, 3>::Identity();
+  measurementModelContext_dyn_share * h_dyn_share_context_ = nullptr;
+  void * h_context_ = nullptr;
+
+  // The bound dyn_share model, through whichever init entry bound it.
+  void evaluate_dyn_share(state & x, dyn_share_datastruct<scalar_type> & data)
+  {
+    if (h_dyn_share_context_ != nullptr) {
+      h_dyn_share_context_(h_context_, x, data);
+      return;
+    }
+    h_dyn_share(x, data);
+  }
 
   template<typename T>
   T check_safe_update(T _temp_vec)

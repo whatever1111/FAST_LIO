@@ -1,12 +1,17 @@
 // The consider update on the real estimator: a synthetic point-to-plane scene (floor + walls) whose residuals ask
 // for a pitch correction. Plain, the iterated update recovers the pose; with the rotation considered, roll/pitch
 // stay at the propagated value, the position still updates, and the roll/pitch variance is kept.
-#include <gtest/gtest.h>
-#include <omp.h>
-
+// The same scene drives the filter's two dyn_share entries side by side: a model bound with a context
+// (init_dyn_share_context) must be called, and leave the filter, exactly as the plain entry does.
 #include <Eigen/Dense>
 
 #include <cmath>
+#include <cstring>
+#include <gtest/gtest.h>
+#include <omp.h>
+#include <stdexcept>
+#include <string>
+#include <typeinfo>
 #include <vector>
 
 #include "rp_consider.hpp"
@@ -73,10 +78,104 @@ void sceneModel(state_ikfom & s, esekfom::dyn_share_datastruct<double> & data)
   data.valid = true;
 }
 
+struct ModelFailure : std::runtime_error
+{
+  using std::runtime_error::runtime_error;
+};
+
+// The calls a recorded scene model answered, and the faults it injects.
+struct ModelCalls
+{
+  struct Call
+  {
+    bool converge;  // the filter's flag on entry
+    bool valid;     // the model's answer
+    bool operator==(const Call & other) const { return converge == other.converge && valid == other.valid; }
+  };
+  std::vector<Call> calls;
+  bool full_form = false;  // answer in update_iterated_dyn_share's form: z - h, h_x over the whole state, h_v, R
+  int invalid_call = -1;   // this call answers valid = false
+  int throwing_call = -1;  // this call throws ModelFailure instead
+};
+
+void recordedModel(ModelCalls & record, state_ikfom & s, esekfom::dyn_share_datastruct<double> & data)
+{
+  const int call = static_cast<int>(record.calls.size());
+  if (call == record.throwing_call) {
+    throw ModelFailure("scene model failed on call " + std::to_string(call));
+  }
+  sceneModel(s, data);
+  if (record.full_form) {
+    const Eigen::Index rows = data.h.size();
+    Eigen::MatrixXd h_x = Eigen::MatrixXd::Zero(rows, state_ikfom::DOF);
+    h_x.leftCols(data.h_x.cols()) = data.h_x;
+    data.h_x = h_x;
+    data.z = data.h;
+    data.h = Eigen::VectorXd::Zero(rows);
+    data.h_v = Eigen::MatrixXd::Identity(rows, rows);
+    data.R = Eigen::MatrixXd::Identity(rows, rows) * 0.001;
+  }
+  data.valid = call != record.invalid_call;
+  record.calls.push_back({data.converge, data.valid});
+}
+
+ModelCalls * g_plain_calls = nullptr;  // the plain entry passes no context: its model finds the record here
+
+void plainRecordedModel(state_ikfom & s, esekfom::dyn_share_datastruct<double> & data)
+{
+  recordedModel(*g_plain_calls, s, data);
+}
+
+void contextRecordedModel(void * context, state_ikfom & s, esekfom::dyn_share_datastruct<double> & data)
+{
+  recordedModel(*static_cast<ModelCalls *>(context), s, data);
+}
+
+// Every double of the filter's state and covariance, in a fixed order.
+std::vector<double> filterBits(const Filter & filter)
+{
+  const state_ikfom & x = filter.get_x();
+  std::vector<double> bits;
+  const auto append = [&bits](const double * values, long count) {
+    bits.insert(bits.end(), values, values + count);
+  };
+  append(x.pos.data(), 3);
+  append(x.rot.coeffs().data(), 4);
+  append(x.offset_R_L_I.coeffs().data(), 4);
+  append(x.offset_T_L_I.data(), 3);
+  append(x.vel.data(), 3);
+  append(x.bg.data(), 3);
+  append(x.ba.data(), 3);
+  append(x.grav.get_vect().data(), 3);
+  append(filter.get_P().data(), filter.get_P().size());
+  return bits;
+}
+
+::testing::AssertionResult sameBits(const std::vector<double> & a, const std::vector<double> & b)
+{
+  if (a.size() != b.size()) {
+    return ::testing::AssertionFailure() << "sizes " << a.size() << " and " << b.size();
+  }
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (std::memcmp(&a[i], &b[i], sizeof(double)) != 0) {
+      return ::testing::AssertionFailure() << "value " << i << " differs: " << a[i] << " and " << b[i];
+    }
+  }
+  return ::testing::AssertionSuccess();
+}
+
 Eigen::Vector3d rollPitchYaw(const Eigen::Matrix3d & R)
 {
   return Eigen::Vector3d(std::atan2(R(2, 1), R(2, 2)), -std::asin(R(2, 0)), std::atan2(R(1, 0), R(0, 0)));
 }
+
+// How a fixture binds the scene to its filter.
+enum class Binding
+{
+  kScene,            // init_dyn_share(sceneModel)
+  kRecordedPlain,    // init_dyn_share(plainRecordedModel), recording into the fixture's calls
+  kRecordedContext,  // init_dyn_share_context(contextRecordedModel) with the fixture's calls as the context
+};
 
 struct Fixture
 {
@@ -87,14 +186,22 @@ struct Fixture
   Scene scene;
   double pitch_prior = 0.02;
   Eigen::Vector3d up_body = Eigen::Vector3d::UnitZ();  // the body-frame vertical of the prior attitude
+  ModelCalls calls;
+  double epsilon[23];
 
-  Fixture()
+  explicit Fixture(Binding binding = Binding::kScene)
   {
     scene = makeScene(R_true, t_true);
     g_scene = &scene;
-    double epsilon[23];
     std::fill(std::begin(epsilon), std::end(epsilon), 0.001);
-    filter.init_dyn_share(get_f, df_dx, df_dw, sceneModel, 6, epsilon);
+    if (binding == Binding::kScene) {
+      filter.init_dyn_share(get_f, df_dx, df_dw, sceneModel, 6, epsilon);
+    } else if (binding == Binding::kRecordedPlain) {
+      g_plain_calls = &calls;
+      filter.init_dyn_share(get_f, df_dx, df_dw, plainRecordedModel, 6, epsilon);
+    } else {
+      filter.init_dyn_share_context(get_f, df_dx, df_dw, contextRecordedModel, &calls, 6, epsilon);
+    }
     state_ikfom x = filter.get_x();
     x.pos = t_true + Eigen::Vector3d(0.05, -0.03, 0.02);
     x.rot = SO3(Eigen::AngleAxisd(pitch_prior, Eigen::Vector3d::UnitY()).toRotationMatrix());
@@ -216,4 +323,122 @@ TEST(ConsiderFilter, HundredsOfConsideredUpdatesKeepTheCovarianceDefiniteAndTheS
   const Filter::cov P = f.filter.get_P();
   EXPECT_GT(P(4, 4), 1e-4 * 0.9);
   EXPECT_LT(P(0, 0), 1.0);
+}
+
+// Runs one dyn_share update: update_iterated_dyn_share for a full-form model, the modified one otherwise.
+void dynShareUpdate(Fixture & f)
+{
+  double solve_time = 0.0;
+  if (f.calls.full_form) {
+    f.filter.update_iterated_dyn_share();
+  } else {
+    f.filter.update_iterated_dyn_share_modified(0.001, solve_time);
+  }
+}
+
+TEST(DynShareContext, CallsTheModelInThePlainEntrysSequence)
+{
+  for (const bool full_form : {false, true}) {
+    Fixture plain(Binding::kRecordedPlain);
+    Fixture context(Binding::kRecordedContext);
+    for (Fixture * f : {&plain, &context}) {
+      f->calls.full_form = full_form;
+      f->calls.invalid_call = 1;  // the filter skips this iteration and evaluates the same state again
+      dynShareUpdate(*f);
+    }
+    ASSERT_GE(plain.calls.calls.size(), 3u) << "full form " << full_form;
+    EXPECT_FALSE(plain.calls.calls[1].valid);
+    EXPECT_EQ(plain.calls.calls, context.calls.calls) << "full form " << full_form;
+  }
+}
+
+TEST(DynShareContext, LeavesTheStateAndCovarianceBitForBit)
+{
+  Fixture plain(Binding::kRecordedPlain);
+  Fixture context(Binding::kRecordedContext);
+  const std::vector<double> start = filterBits(plain.filter);
+  ASSERT_TRUE(sameBits(start, filterBits(context.filter)));
+  input_ikfom in;
+  in.acc = Eigen::Vector3d(0.0, 0.0, 9.81);
+  Eigen::Matrix<double, 12, 12> Q = Eigen::Matrix<double, 12, 12>::Identity() * 1e-4;
+  double dt = 0.005;
+  for (int cycle = 0; cycle < 6; ++cycle) {
+    in.gyro = Eigen::Vector3d(0.02 * std::sin(0.3 * cycle), 0.03 * std::cos(0.2 * cycle), 0.05);
+    for (Fixture * f : {&plain, &context}) {
+      f->calls.full_form = cycle % 2 == 1;  // the two dyn_share updates in turn
+      for (int step = 0; step < 20; ++step) {
+        f->filter.predict(dt, Q, in);
+      }
+      dynShareUpdate(*f);
+    }
+    ASSERT_TRUE(plain.filter.get_P().allFinite()) << "cycle " << cycle;
+    ASSERT_TRUE(sameBits(filterBits(plain.filter), filterBits(context.filter))) << "cycle " << cycle;
+  }
+  EXPECT_EQ(plain.calls.calls, context.calls.calls);
+  EXPECT_FALSE(sameBits(start, filterBits(plain.filter)));  // the updates did move the filter
+}
+
+TEST(DynShareContext, PassesAModelExceptionThroughUnchanged)
+{
+  for (const bool full_form : {false, true}) {
+    Fixture plain(Binding::kRecordedPlain);
+    Fixture context(Binding::kRecordedContext);
+    std::vector<const std::type_info *> types;
+    std::vector<std::string> messages;
+    for (Fixture * f : {&plain, &context}) {
+      f->calls.full_form = full_form;
+      f->calls.throwing_call = 1;  // after one evaluated iteration
+      try {
+        dynShareUpdate(*f);
+        ADD_FAILURE() << "no exception, full form " << full_form;
+      } catch (const std::exception & e) {
+        types.push_back(&typeid(e));
+        messages.push_back(e.what());
+      }
+    }
+    ASSERT_EQ(types.size(), 2u);
+    EXPECT_TRUE(*types[0] == typeid(ModelFailure)) << types[0]->name();
+    EXPECT_TRUE(*types[1] == typeid(ModelFailure)) << types[1]->name();
+    EXPECT_EQ(messages[0], "scene model failed on call 1");
+    EXPECT_EQ(messages[1], messages[0]);
+    EXPECT_EQ(plain.calls.calls, context.calls.calls);
+    EXPECT_TRUE(sameBits(filterBits(plain.filter), filterBits(context.filter))) << "full form " << full_form;
+  }
+}
+
+TEST(DynShareContext, SwitchesBindingsAndRejectsANullContext)
+{
+  Fixture f(Binding::kRecordedPlain);
+  ModelCalls first;
+  ModelCalls second;
+  dynShareUpdate(f);
+  const std::size_t plain_calls = f.calls.calls.size();
+  EXPECT_GT(plain_calls, 0u);
+
+  f.filter.init_dyn_share_context(get_f, df_dx, df_dw, contextRecordedModel, &first, 6, f.epsilon);
+  dynShareUpdate(f);
+  const std::size_t first_calls = first.calls.size();
+  EXPECT_GT(first_calls, 0u);
+  EXPECT_EQ(f.calls.calls.size(), plain_calls);  // the context entry replaced the plain model
+
+  f.filter.clear_dyn_share_context();
+  f.filter.init_dyn_share_context(get_f, df_dx, df_dw, contextRecordedModel, &second, 6, f.epsilon);
+  dynShareUpdate(f);
+  const std::size_t second_calls = second.calls.size();
+  EXPECT_GT(second_calls, 0u);
+  EXPECT_EQ(first.calls.size(), first_calls);  // a cleared context is not called again
+
+  f.filter.init_dyn_share(get_f, df_dx, df_dw, plainRecordedModel, 6, f.epsilon);
+  dynShareUpdate(f);
+  EXPECT_GT(f.calls.calls.size(), plain_calls);  // the plain entry replaced the context
+  EXPECT_EQ(second.calls.size(), second_calls);
+
+  EXPECT_THROW(f.filter.init_dyn_share_context(get_f, df_dx, df_dw, contextRecordedModel, nullptr, 6, f.epsilon),
+               std::invalid_argument);
+  EXPECT_THROW(f.filter.init_dyn_share_context(get_f, df_dx, df_dw, nullptr, &first, 6, f.epsilon),
+               std::invalid_argument);
+  const std::size_t before_rejected = f.calls.calls.size();
+  dynShareUpdate(f);
+  EXPECT_GT(f.calls.calls.size(), before_rejected);  // a rejected bind leaves the bound model in place
+  EXPECT_EQ(first.calls.size(), first_calls);
 }

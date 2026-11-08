@@ -131,7 +131,6 @@
 #include "zupt_policy.hpp"
 
 #define INIT_TIME (0.1)
-#define LASER_POINT_COV (0.001)
 #define MAXN (fast_lio::kTimingLogCapacity)
 #define PUBFRAME_PERIOD (20)
 
@@ -580,11 +579,6 @@ pcl::VoxelGrid<PointType> downSizeFilterMap;
 // drop-in for the hot-path API (Add_Points / Nearest_Search / Build / size / validnum /
 // set_downsample_param / Delete_Point_Boxes-as-noop), so the call sites below are unchanged;
 // only the init check, the dead flatten block, and the constructor Init are #ifdef'd.
-#ifdef USE_IVOX
-using MapBackend = lio_ivox::IVox<PointType>;
-#else
-using MapBackend = KD_TREE<PointType>;
-#endif
 MapBackend ikdtree;
 
 V3F XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0);

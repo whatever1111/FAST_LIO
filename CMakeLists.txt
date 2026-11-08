@@ -564,6 +564,12 @@ ${sanitizer_tests}
   if(TARGET test_normal_noise_floor)
     target_include_directories(test_normal_noise_floor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
+  # Pure header, Eigen only: the wheel-speed samples, the per-scan speed fit and the
+  # wheel update's measurement model.
+  ament_add_gtest(test_wheel_measurement test/test_wheel_measurement.cpp)
+  if(TARGET test_wheel_measurement)
+    target_include_directories(test_wheel_measurement PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
   # Pure header, no PCL: one representative per occupied voxel, in one pass.
   ament_add_gtest(test_voxel_downsample test/test_voxel_downsample.cpp)
   if(TARGET test_voxel_downsample)

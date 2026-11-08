@@ -31,17 +31,31 @@
 // to the position columns of the measurement Jacobian: a zero gain removes the direction
 // from every row exactly, not down to some epsilon.
 //
+// The residual has to follow. Rows whose position columns are H_t G but whose residual
+// still answers to H_t make the iterated update correct the mean with g_k lambda_k while
+// the covariance takes g_k^2 lambda_k, and with a wide prior the iterations oscillate
+// apart. So the residual is first shifted by what the removed information reads: the
+// scan's least-squares position reading, rotation profiled out, times (I - G). The rows
+// then form a linear model of their own, which the update solves in one step and absorbs
+// with g_k^2 lambda_k for mean and covariance alike (applyFloorProjection).
+//
 // Pure C++ + Eigen. No ROS.
 
 #pragma once
 
+#include <Eigen/Cholesky>
 #include <Eigen/Core>
+#include <Eigen/Eigenvalues>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <optional>
+#include <stdexcept>
+#include <vector>
 
+#include "degeneracy_policy.hpp"
 #include "plane_fit.hpp"
 
 namespace fast_lio
@@ -184,6 +198,153 @@ inline std::optional<double> zFromFalseKeepRate(double alpha)
     return std::nullopt;
   }
   return z;
+}
+
+/// The residual shift d that goes with the projection G = V diag(g) V^T:
+///
+///     d = V coef,  coef_k = (1 - g_k) beta_k / lambda_k,  beta = V^T b_eff,
+///     b_eff = b_t - M_tr (M_rr + (ridge trace(M_rr) / 3) I)^-1 b_r,
+///
+/// with b_t = H_t^T h and b_r = H_r^T h from the unprojected position columns and the
+/// unshifted residual, M_tr and M_rr the blocks given to schurPositionInformation, and
+/// ridge as given to it (b_eff = b_t when trace(M_rr) <= 0, as M_eff = H_tt there). V and
+/// lambda are M_eff's eigenvectors and ascending eigenvalues, g the keep gains, rows the
+/// scan's row count N. h - H_t d then has the profiled information vector
+/// b_eff - M_eff d = V diag(g) beta: nothing along a removed direction, g_k beta_k along a
+/// partly kept one, so the update corrects with the information it is told about.
+///
+/// A kept direction (g_k == 1.0) is not shifted, so a scan without floor keeps its
+/// residual bit for bit; neither is a direction with no information above the rank
+/// tolerance eps N lambda_max (fitPlane's rule), where beta_k / lambda_k is rounding over
+/// rounding. Any non-finite input, or rows < 0, gives the zero vector: the residual stays.
+inline Eigen::Vector3d floorResidualShift(const Eigen::Matrix3d & eigenvectors,
+                                          const Eigen::Vector3d & lambda,
+                                          const Eigen::Vector3d & gains,
+                                          const Eigen::Vector3d & b_t,
+                                          const Eigen::Vector3d & b_r,
+                                          const Eigen::Matrix3d & M_tr,
+                                          const Eigen::Matrix3d & M_rr,
+                                          double ridge,
+                                          int rows)
+{
+  const Eigen::Vector3d none = Eigen::Vector3d::Zero();
+  if (!eigenvectors.allFinite() || !lambda.allFinite() || !gains.allFinite() || !b_t.allFinite() || !b_r.allFinite() ||
+      !M_tr.allFinite() || !M_rr.allFinite() || !std::isfinite(ridge) || rows < 0) {
+    return none;
+  }
+  Eigen::Vector3d b_eff = b_t;
+  const double trace_rr = M_rr.trace();
+  if (trace_rr > 0.0) {
+    const Eigen::Matrix3d rr = M_rr + std::max(ridge, 0.0) * trace_rr / 3.0 * Eigen::Matrix3d::Identity();
+    const Eigen::Vector3d coupled = M_tr * rr.ldlt().solve(b_r);
+    // schurPositionInformation leaves M_eff = H_tt when its product is not finite; so does this.
+    if (coupled.allFinite()) {
+      b_eff -= coupled;
+    }
+  }
+  const Eigen::Vector3d beta = eigenvectors.transpose() * b_eff;
+  const double rank_tolerance = std::numeric_limits<double>::epsilon() * rows * lambda.maxCoeff();
+  Eigen::Vector3d coef = Eigen::Vector3d::Zero();
+  for (int k = 0; k < 3; ++k) {
+    if (gains(k) == 1.0 || !(lambda(k) > 0.0) || !(lambda(k) > rank_tolerance)) {
+      continue;
+    }
+    coef(k) = (1.0 - gains(k)) * beta(k) / lambda(k);
+  }
+  if ((coef.array() == 0.0).all()) {
+    return none;
+  }
+  const Eigen::Vector3d shift = eigenvectors * coef;
+  return shift.allFinite() ? shift : none;
+}
+
+/// What applyFloorProjection did to one linearisation of the scan's rows. With valid
+/// false nothing was done, and the fields say so: gains one, shift zero.
+struct FloorProjectionResult
+{
+  bool valid = false;
+  Eigen::Vector3d lambda = Eigen::Vector3d::Zero();            ///< M_eff's eigenvalues, ascending
+  Eigen::Matrix3d eigenvectors = Eigen::Matrix3d::Identity();  ///< column k belongs to lambda(k)
+  Eigen::Vector3d noise_floor = Eigen::Vector3d::Zero();       ///< f, kappa included
+  Eigen::Vector3d gains = Eigen::Vector3d::Ones();             ///< g
+  Eigen::Vector3d shift = Eigen::Vector3d::Zero();             ///< d, in the position frame
+  int points = 0;
+  int points_without_covariance = 0;
+};
+
+/// The floor projection on one linearisation of the scan's point-to-plane rows. From
+/// the rows as built (h_x N x 12: position columns 0-2, rotation 3-5, extrinsics 6-11):
+///
+///   1. M_tt, M_tr, M_rr from the position and rotation columns;
+///   2. M_eff = schurPositionInformation(M_tt, M_tr, M_rr, ridge), its V and lambda;
+///   3. the floor f from each row's weight and normal covariance, g, G;
+///   4. d = floorResidualShift(...) from H_t^T h and H_r^T h;
+///   5. h <- h - H_t d, then h_x.leftCols(3) <- H_t G.
+///
+/// The shift comes first because both use the position columns the rows came with; the
+/// rotation and extrinsic columns are not touched. The rows and the linearisation point
+/// move between iterations of the update, so this runs on every one of them. weights[i]
+/// is the weight row i already carries (applied to its h_x row and h); a row whose weight
+/// or covariance is missing or not finite stays out of the floor and is counted.
+///
+/// h_x must be N x 12 with h, weights and normal_cov of length N; anything else is a
+/// programming error and throws std::invalid_argument. Non-finite rows, a parameter set
+/// outside its range (alpha in (0, 0.5); kappa, rel_uncertainty and ridge finite, kappa
+/// and rel_uncertainty >= 0) or a failed eigen decomposition leave the rows as they are
+/// and return valid false. When every gain is exactly one (no floor anywhere) h and h_x
+/// stay bit for bit.
+inline FloorProjectionResult applyFloorProjection(Eigen::Ref<Eigen::MatrixXd> h_x,
+                                                  Eigen::Ref<Eigen::VectorXd> h,
+                                                  const std::vector<double> & weights,
+                                                  const std::vector<std::optional<Eigen::Matrix3d>> & normal_cov,
+                                                  const FloorParams & params,
+                                                  double ridge)
+{
+  const Eigen::Index rows = h_x.rows();
+  if (h_x.cols() != 12 || h.size() != rows || static_cast<Eigen::Index>(weights.size()) != rows ||
+      static_cast<Eigen::Index>(normal_cov.size()) != rows) {
+    throw std::invalid_argument("applyFloorProjection: h_x must be N x 12, h, weights and normal_cov of length N");
+  }
+  FloorProjectionResult result;
+  const std::optional<double> z_alpha = zFromFalseKeepRate(params.alpha);
+  if (!z_alpha || !std::isfinite(params.kappa) || !(params.kappa >= 0.0) || !std::isfinite(params.rel_uncertainty) ||
+      !(params.rel_uncertainty >= 0.0) || !std::isfinite(ridge) || !h_x.allFinite() || !h.allFinite()) {
+    return result;
+  }
+  const Eigen::MatrixXd H_t = h_x.leftCols(3);
+  const Eigen::MatrixXd H_r = h_x.middleCols(3, 3);
+  const Eigen::Matrix3d M_tt = H_t.transpose() * H_t;
+  const Eigen::Matrix3d M_tr = H_t.transpose() * H_r;
+  const Eigen::Matrix3d M_rr = H_r.transpose() * H_r;
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(schurPositionInformation(M_tt, M_tr, M_rr, ridge));
+  if (solver.info() != Eigen::Success || !solver.eigenvalues().allFinite() || !solver.eigenvectors().allFinite()) {
+    return result;
+  }
+  DirectionFloorAccumulator accumulator(solver.eigenvectors());
+  for (std::size_t i = 0; i < weights.size(); ++i) {
+    accumulator.add(weights[i], normal_cov[i]);
+  }
+  const Eigen::Vector3d noise_floor = accumulator.floor(params.kappa);
+  const Eigen::Vector3d gains = floorKeepGains(solver.eigenvalues(), noise_floor, *z_alpha, params.rel_uncertainty);
+  const Eigen::Vector3d b_t = H_t.transpose() * h;
+  const Eigen::Vector3d b_r = H_r.transpose() * h;
+  const Eigen::Vector3d shift = floorResidualShift(
+    solver.eigenvectors(), solver.eigenvalues(), gains, b_t, b_r, M_tr, M_rr, ridge, static_cast<int>(rows));
+  if (!(shift.array() == 0.0).all()) {
+    h -= H_t * shift;
+  }
+  if (!(gains.array() == 1.0).all()) {
+    h_x.leftCols(3) = H_t * projectionFromGains(solver.eigenvectors(), gains);
+  }
+  result.valid = true;
+  result.lambda = solver.eigenvalues();
+  result.eigenvectors = solver.eigenvectors();
+  result.noise_floor = noise_floor;
+  result.gains = gains;
+  result.shift = shift;
+  result.points = accumulator.points();
+  result.points_without_covariance = accumulator.pointsWithoutCovariance();
+  return result;
 }
 
 }  // namespace fast_lio

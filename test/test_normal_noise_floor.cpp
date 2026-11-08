@@ -1,23 +1,31 @@
 // test_normal_noise_floor.cpp — the per-point normal covariance, the scan's floor, the keep
-// gains and the projection built from them (normal_noise_floor.hpp).
+// gains, the projection built from them and the residual shift that goes with it
+// (normal_noise_floor.hpp).
 
 #include <Eigen/Dense>
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <gtest/gtest.h>
 #include <limits>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
+#include "degeneracy_policy.hpp"
 #include "normal_noise_floor.hpp"
 #include "plane_fit.hpp"
 
+using fast_lio::applyFloorProjection;
 using fast_lio::DirectionFloorAccumulator;
 using fast_lio::floorKeepGains;
 using fast_lio::FloorParams;
+using fast_lio::FloorProjectionResult;
+using fast_lio::floorResidualShift;
 using fast_lio::PlaneFitEigen;
 using fast_lio::planeNormalCovariance;
 using fast_lio::projectionFromGains;
@@ -29,6 +37,8 @@ constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 constexpr double kInf = std::numeric_limits<double>::infinity();
 // z(1e-3) of the design (A.3); the margin factor 1 + z * 0.3 is the "c = 1.927 f" of A.4.
 constexpr double kZ = 3.090232306167813;
+// The Schur ridge the front end runs with (degeneracy_schur_ridge).
+const double kRidge = fast_lio::DegeneracyParams{}.schur_ridge;
 
 struct Point
 {
@@ -67,6 +77,99 @@ double gaussian(std::mt19937_64 & rng)
   const double u1 = uniform(rng);
   const double u2 = uniform(rng);
   return std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * 3.14159265358979323846 * u2);
+}
+
+// One scan's point-to-plane rows as the front end builds them: h_x N x 12 (position 0-2, rotation 3-5,
+// extrinsics 6-11), the residual h, each row's weight and its plane's normal covariance.
+struct Rows
+{
+  Eigen::MatrixXd h_x;
+  Eigen::VectorXd h;
+  std::vector<double> weights;
+  std::vector<std::optional<Eigen::Matrix3d>> covariances;
+};
+
+// A corridor along x: a floor 1 m below the sensor on a 40 x 4 grid and walls 2 m to either side, 240 patches,
+// each the five-point fit of design A (2 cm rms over 0.4 m), the sensor 5 m off the middle so that position and
+// rotation are coupled. Each normal is tilted along the corridor by tilt_scale times a Gaussian draw of its own
+// standard deviation there, as fit noise would; that tilt is all the along-corridor information the scan has. The
+// residual reads a position error (5, -3, 2) cm and a rotation error (2, 10, -4) mrad through the rows, plus
+// Gaussian noise; every draw is seeded. Without floor every patch is coplanar: same rows, no normal covariance.
+Rows corridorRows(double tilt_scale, double noise, bool with_floor = true)
+{
+  struct Patch
+  {
+    Eigen::Vector3d p, n, e1, e2;
+  };
+  const Eigen::Vector3d X = Eigen::Vector3d::UnitX();
+  const Eigen::Vector3d Y = Eigen::Vector3d::UnitY();
+  const Eigen::Vector3d Z = Eigen::Vector3d::UnitZ();
+  std::vector<Patch> patches;
+  for (int i = 0; i < 40; ++i) {
+    for (int j = 0; j < 4; ++j) {
+      patches.push_back({Eigen::Vector3d(-14.5 + i, -1.5 + j, -1.0), Z, X, Y});
+    }
+  }
+  for (int i = 0; i < 20; ++i) {
+    for (double y : {-2.0, 2.0}) {
+      for (double z : {-0.5, 0.5}) {
+        patches.push_back({Eigen::Vector3d(-14.0 + 2.0 * i, y, z), Eigen::Vector3d(0.0, -y / 2.0, 0.0), X, Z});
+      }
+    }
+  }
+  const Eigen::Vector3d position_error(0.05, -0.03, 0.02);
+  const Eigen::Vector3d rotation_error(0.002, 0.01, -0.004);
+  const double lambda0 = 0.002;
+  const double lambda1 = 0.16;
+  const double sigma_tilt = std::sqrt(lambda0 / 2.0 / lambda1);  // Cov(n) along e1 is sigma^2 / lambda1
+  std::mt19937_64 rng(20261108);
+  const int count = static_cast<int>(patches.size());
+  Rows rows;
+  rows.h_x = Eigen::MatrixXd::Zero(count, 12);
+  rows.h.resize(count);
+  for (int i = 0; i < count; ++i) {
+    const Patch & patch = patches[i];
+    PlaneFitEigen fit;
+    fit.lambda0 = with_floor ? lambda0 : 0.0;
+    fit.lambda1 = lambda1;
+    fit.lambda2 = 0.25;
+    fit.e1 = patch.e1;
+    fit.e2 = patch.e2;
+    fit.count = 5;
+    const double tilt = tilt_scale * sigma_tilt * gaussian(rng);
+    const Eigen::Vector3d n = (patch.n + tilt * patch.e1).normalized();
+    const Eigen::Vector3d rotation = patch.p.cross(n);
+    rows.h_x.block<1, 3>(i, 0) = n.transpose();
+    rows.h_x.block<1, 3>(i, 3) = rotation.transpose();
+    rows.h(i) = n.dot(position_error) + rotation.dot(rotation_error) + noise * gaussian(rng);
+    rows.weights.push_back(1.0);
+    rows.covariances.push_back(planeNormalCovariance(fit));
+  }
+  return rows;
+}
+
+FloorProjectionResult project(Rows & rows, const FloorParams & params = FloorParams{}, double ridge = kRidge)
+{
+  return applyFloorProjection(rows.h_x, rows.h, rows.weights, rows.covariances, params, ridge);
+}
+
+// What rows (H_t, H_r) and a residual h read about the position once the rotation is solved for:
+// b_t - M_tr (M_rr + ridge trace(M_rr) / 3 I)^-1 b_r, with the regularisation M_eff is built with.
+Eigen::Vector3d profiledInformation(const Eigen::MatrixXd & H_t, const Eigen::MatrixXd & H_r, const Eigen::VectorXd & h)
+{
+  const Eigen::Matrix3d M_tr = H_t.transpose() * H_r;
+  const Eigen::Matrix3d M_rr = H_r.transpose() * H_r;
+  const Eigen::Matrix3d rr = M_rr + kRidge * M_rr.trace() / 3.0 * Eigen::Matrix3d::Identity();
+  const Eigen::Vector3d b_t = H_t.transpose() * h;
+  const Eigen::Vector3d b_r = H_r.transpose() * h;
+  return b_t - M_tr * rr.ldlt().solve(b_r);
+}
+
+template<typename Derived>
+bool sameBits(const Eigen::PlainObjectBase<Derived> & a, const Eigen::PlainObjectBase<Derived> & b)
+{
+  return a.rows() == b.rows() && a.cols() == b.cols() &&
+         std::memcmp(a.data(), b.data(), sizeof(double) * static_cast<std::size_t>(a.size())) == 0;
 }
 }  // namespace
 
@@ -331,4 +434,212 @@ TEST(FloorParams, DefaultsAreTheDesignValues)
   const auto z = zFromFalseKeepRate(params.alpha);
   ASSERT_TRUE(z.has_value());
   EXPECT_NEAR(1.0 + *z * params.rel_uncertainty, 1.927, 5e-4);  // design A.4: c = 1.927 f
+}
+
+TEST(FloorResidualShift, AScanWithoutFloorKeepsItsResidualBitForBit)
+{
+  // Every gain exactly one: nothing is removed, so nothing is shifted, and the update gets the rows as built,
+  // bit for bit. The scan does read an offset; it is the gains, not the residual, that decide.
+  const Rows original = corridorRows(std::sqrt(0.5), 0.005, false);
+  Rows rows = original;
+  const FloorProjectionResult result = project(rows);
+  ASSERT_TRUE(result.valid);
+  EXPECT_EQ(result.noise_floor, Eigen::Vector3d::Zero());
+  EXPECT_EQ(result.gains, Eigen::Vector3d::Ones());
+  EXPECT_EQ(result.shift, Eigen::Vector3d::Zero());
+  EXPECT_TRUE(sameBits(rows.h, original.h));
+  EXPECT_TRUE(sameBits(rows.h_x, original.h_x));
+
+  const Eigen::MatrixXd H_t = original.h_x.leftCols(3);
+  const Eigen::MatrixXd H_r = original.h_x.middleCols(3, 3);
+  const Eigen::Vector3d b_t = H_t.transpose() * original.h;
+  const Eigen::Vector3d b_r = H_r.transpose() * original.h;
+  const Eigen::Matrix3d M_tr = H_t.transpose() * H_r;
+  const Eigen::Matrix3d M_rr = H_r.transpose() * H_r;
+  ASSERT_GT(b_t.norm(), 1.0);
+  EXPECT_EQ(floorResidualShift(result.eigenvectors,
+                               result.lambda,
+                               Eigen::Vector3d::Ones(),
+                               b_t,
+                               b_r,
+                               M_tr,
+                               M_rr,
+                               kRidge,
+                               static_cast<int>(original.h.size())),
+            Eigen::Vector3d::Zero());
+}
+
+TEST(ApplyFloorProjection, TheShiftedRowsReadNothingAlongTheRemovedDirection)
+{
+  // Design addendum 6.1 (ii). The noisy corridor keeps nothing along its axis (g = 0) and most of the other two
+  // directions (0 < g < 1). Before the shift the scan reads its along-corridor offset, mixed with what the
+  // rotation explains; after it, the residual against the rows as built reads nothing along the axis once the
+  // rotation is solved for (zero up to rounding: 1e-12 of the information vector), and g_k of its reading along
+  // a partly kept direction. The rotation and extrinsic columns stay as they are; a row without a normal
+  // covariance stays out of the floor and is counted.
+  const Rows original = corridorRows(std::sqrt(0.5), 0.005);
+  Rows rows = original;
+  rows.covariances[7] = std::nullopt;
+  const FloorProjectionResult result = project(rows);
+  ASSERT_TRUE(result.valid);
+  const Eigen::Vector3d u = result.eigenvectors.col(0);
+  ASSERT_GT(std::abs(u.x()), 0.999);  // the removed direction is the corridor's axis
+  ASSERT_EQ(result.gains(0), 0.0);
+  for (int k = 1; k < 3; ++k) {
+    ASSERT_GT(result.gains(k), 0.9) << k;
+    ASSERT_LT(result.gains(k), 1.0) << k;
+  }
+  EXPECT_EQ(result.points, static_cast<int>(original.h.size()));
+  EXPECT_EQ(result.points_without_covariance, 1);
+
+  const Eigen::MatrixXd H_t = original.h_x.leftCols(3);
+  const Eigen::MatrixXd H_r = original.h_x.middleCols(3, 3);
+  const Eigen::Vector3d before = result.eigenvectors.transpose() * profiledInformation(H_t, H_r, original.h);
+  const Eigen::Vector3d after = result.eigenvectors.transpose() * profiledInformation(H_t, H_r, rows.h);
+  const Eigen::Vector3d raw = H_t.transpose() * original.h;
+  const double scale = before.norm();
+  // There is a reading to remove, and the rotation is part of it: the profiled one is not the raw one.
+  EXPECT_GT(std::abs(before(0)), 1e-3 * scale);
+  EXPECT_GT(std::abs(u.dot(raw) - before(0)), 0.1 * std::abs(before(0)));
+  EXPECT_LE(std::abs(after(0)), 1e-12 * scale);
+  for (int k = 1; k < 3; ++k) {
+    EXPECT_NEAR(after(k), result.gains(k) * before(k), 1e-12 * scale) << k;
+  }
+
+  EXPECT_TRUE((rows.h_x.rightCols(9).array() == original.h_x.rightCols(9).array()).all());
+  // The position columns carry nothing along u either, down to V's orthonormality (cf. ProjectionFromGains).
+  EXPECT_LT((rows.h_x.leftCols(3) * u).cwiseAbs().maxCoeff(), 1e-14);
+}
+
+TEST(FloorResidualShift, ADirectionWithoutInformationIsNotShifted)
+{
+  // A direction the scan does not see has nothing to divide its reading by. Hand-built, lambda_0 = 0 and then
+  // lambda_0 below the rank tolerance eps N lambda_max, each with a reading a division would blow up; the partly
+  // kept direction is shifted by (1 - g) beta / lambda as ever, the kept one not at all.
+  const Eigen::Matrix3d V = Eigen::Matrix3d::Identity();
+  const Eigen::Vector3d gains(0.0, 0.5, 1.0);
+  const Eigen::Vector3d b_t(1e-3, 0.4, 0.3);
+  const Eigen::Matrix3d no_rotation = Eigen::Matrix3d::Zero();  // trace(M_rr) = 0: b_eff = b_t
+  for (double lambda0 : {0.0, 1e-20}) {
+    const Eigen::Vector3d shift = floorResidualShift(V,
+                                                     Eigen::Vector3d(lambda0, 2.0, 3.0),
+                                                     gains,
+                                                     b_t,
+                                                     Eigen::Vector3d::Zero(),
+                                                     no_rotation,
+                                                     no_rotation,
+                                                     kRidge,
+                                                     100);
+    ASSERT_TRUE(shift.allFinite()) << lambda0;
+    EXPECT_EQ(shift(0), 0.0) << lambda0;
+    EXPECT_DOUBLE_EQ(shift(1), 0.5 * 0.4 / 2.0) << lambda0;
+    EXPECT_EQ(shift(2), 0.0) << lambda0;
+  }
+
+  // From rows: a corridor with exact normals has no along-corridor information at all, lambda_0 and the reading
+  // both zero up to rounding. Everything stays finite, the directions the scan sees are still shifted, and
+  // nothing is shifted along the corridor.
+  Rows rows = corridorRows(0.0, 0.005);
+  const FloorProjectionResult result = project(rows);
+  ASSERT_TRUE(result.valid);
+  const Eigen::Vector3d u = result.eigenvectors.col(0);
+  ASSERT_GT(std::abs(u.x()), 1.0 - 1e-12);
+  ASSERT_LE(result.lambda(0),
+            std::numeric_limits<double>::epsilon() * static_cast<double>(rows.h.size()) * result.lambda(2));
+  EXPECT_EQ(result.gains(0), 0.0);
+  EXPECT_TRUE(result.shift.allFinite());
+  EXPECT_TRUE(rows.h.allFinite());
+  EXPECT_TRUE(rows.h_x.allFinite());
+  EXPECT_GT(result.shift.norm(), 0.0);
+  EXPECT_LE(std::abs(u.dot(result.shift)), 1e-14 * result.shift.norm());
+}
+
+TEST(FloorResidualShift, NonFiniteInputsGiveNoShift)
+{
+  // The conservative side for the residual is to leave it: any non-finite input, or a negative row count, gives
+  // the zero vector. The same inputs, finite, do shift.
+  struct Inputs
+  {
+    Eigen::Matrix3d V;
+    Eigen::Vector3d lambda, gains, b_t, b_r;
+    Eigen::Matrix3d M_tr, M_rr;
+    double ridge;
+    int rows;
+  };
+  const auto shift = [](const Inputs & in) {
+    return floorResidualShift(in.V, in.lambda, in.gains, in.b_t, in.b_r, in.M_tr, in.M_rr, in.ridge, in.rows);
+  };
+  Eigen::Matrix3d M_tr;
+  M_tr << 0.1, -0.2, 0.05, 0.0, 0.3, -0.1, 0.2, 0.1, 0.0;
+  const Inputs finite{orthonormalBasis(),
+                      Eigen::Vector3d(0.5, 2.0, 3.0),
+                      Eigen::Vector3d(0.0, 0.5, 1.0),
+                      Eigen::Vector3d(0.3, -0.2, 0.1),
+                      Eigen::Vector3d(0.05, 0.02, -0.01),
+                      M_tr,
+                      Eigen::Matrix3d(Eigen::Vector3d(4.0, 5.0, 6.0).asDiagonal()),
+                      kRidge,
+                      10};
+  ASSERT_GT(shift(finite).norm(), 0.0);
+  for (double bad : {kNaN, kInf, -kInf}) {
+    std::vector<Inputs> broken(8, finite);
+    broken[0].V(1, 2) = bad;
+    broken[1].lambda(1) = bad;
+    broken[2].gains(1) = bad;
+    broken[3].b_t(0) = bad;
+    broken[4].b_r(2) = bad;
+    broken[5].M_tr(2, 0) = bad;
+    broken[6].M_rr(1, 1) = bad;
+    broken[7].ridge = bad;
+    for (std::size_t i = 0; i < broken.size(); ++i) {
+      EXPECT_EQ(shift(broken[i]), Eigen::Vector3d::Zero()) << "argument " << i << " = " << bad;
+    }
+  }
+  Inputs negative_rows = finite;
+  negative_rows.rows = -1;
+  EXPECT_EQ(shift(negative_rows), Eigen::Vector3d::Zero());
+
+  // applyFloorProjection: rows or parameters it cannot use leave the rows as they are and say so; rows that do not
+  // match each other in size are a programming error.
+  const Rows original = corridorRows(std::sqrt(0.5), 0.005);
+  const auto refused = [](Rows rows, const FloorParams & params, double ridge) {
+    const Rows given = rows;
+    const FloorProjectionResult result = project(rows, params, ridge);
+    return !result.valid && result.gains == Eigen::Vector3d::Ones() && result.shift == Eigen::Vector3d::Zero() &&
+           sameBits(rows.h_x, given.h_x) && sameBits(rows.h, given.h);
+  };
+  Rows bad_row = original;
+  bad_row.h_x(5, 1) = kNaN;
+  EXPECT_TRUE(refused(bad_row, FloorParams{}, kRidge));
+  Rows bad_residual = original;
+  bad_residual.h(3) = kInf;
+  EXPECT_TRUE(refused(bad_residual, FloorParams{}, kRidge));
+  FloorParams no_alpha;
+  no_alpha.alpha = 0.0;
+  EXPECT_TRUE(refused(original, no_alpha, kRidge));
+  FloorParams bad_kappa;
+  bad_kappa.kappa = kNaN;
+  EXPECT_TRUE(refused(original, bad_kappa, kRidge));
+  FloorParams negative_margin;
+  negative_margin.rel_uncertainty = -0.1;
+  EXPECT_TRUE(refused(original, negative_margin, kRidge));
+  EXPECT_TRUE(refused(original, FloorParams{}, kInf));
+  Rows usable = original;
+  ASSERT_TRUE(project(usable).valid);
+
+  Rows rows = original;
+  Eigen::MatrixXd narrow = rows.h_x.leftCols(11);
+  EXPECT_THROW(applyFloorProjection(narrow, rows.h, rows.weights, rows.covariances, FloorParams{}, kRidge),
+               std::invalid_argument);
+  Eigen::VectorXd short_residual = rows.h.head(rows.h.size() - 1);
+  EXPECT_THROW(applyFloorProjection(rows.h_x, short_residual, rows.weights, rows.covariances, FloorParams{}, kRidge),
+               std::invalid_argument);
+  std::vector<double> long_weights = rows.weights;
+  long_weights.push_back(1.0);
+  EXPECT_THROW(applyFloorProjection(rows.h_x, rows.h, long_weights, rows.covariances, FloorParams{}, kRidge),
+               std::invalid_argument);
+  std::vector<std::optional<Eigen::Matrix3d>> short_covariances = rows.covariances;
+  short_covariances.pop_back();
+  EXPECT_THROW(applyFloorProjection(rows.h_x, rows.h, rows.weights, short_covariances, FloorParams{}, kRidge),
+               std::invalid_argument);
 }

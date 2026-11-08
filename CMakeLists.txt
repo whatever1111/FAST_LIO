@@ -558,6 +558,12 @@ ${sanitizer_tests}
   if(TARGET test_degeneracy_policy)
     target_include_directories(test_degeneracy_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
+  # Pure header, Eigen only: how much position information the plane normals' noise
+  # can fake, and the keep gains and projection that take it out.
+  ament_add_gtest(test_normal_noise_floor test/test_normal_noise_floor.cpp)
+  if(TARGET test_normal_noise_floor)
+    target_include_directories(test_normal_noise_floor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  endif()
   # Pure header, no PCL: one representative per occupied voxel, in one pass.
   ament_add_gtest(test_voxel_downsample test/test_voxel_downsample.cpp)
   if(TARGET test_voxel_downsample)

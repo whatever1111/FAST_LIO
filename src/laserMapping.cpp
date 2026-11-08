@@ -96,6 +96,7 @@
 #include <so3_math.h>
 #include <sys/random.h>
 #include <thread>
+#include <type_traits>
 #include <unistd.h>
 #include <unordered_map>
 
@@ -153,12 +154,8 @@ double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_ti
 // fast_lio::timingLogSlot() and the dump reads back through timingLogRowSlot() (timing_log_ring.hpp).
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN],
   s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
-double match_time = 0, solve_time = 0, solve_const_H_time = 0;
-// [ikd-profile] iEKF ledger: a correspondence search only runs on the iterations the
-// filter declares converged, so the two kinds of iteration are timed apart — that split
-// is what says whether the cost is the search or the residual/plane work around it.
-double match_search_time = 0, match_nosearch_time = 0;
-int ekf_iters = 0, ekf_search_iters = 0;
+double solve_const_H_time = 0;
+int ekf_iters = 0;
 int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false;
 bool ikd_profile = false;  // [ikd-profile] per-scan rebuild-split line, gated by env FLIO_IKD_PROFILE
@@ -171,7 +168,6 @@ bool ikd_profile = false;  // [ikd-profile] per-scan rebuild-split line, gated b
 std::atomic<bool> mapping_enabled{true};
 /**************************/
 
-std::vector<float> res_last;
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
@@ -198,29 +194,17 @@ string map_file_path;
 string odom_frame_id = "lidar_odom";
 string body_frame_id = "body";
 
-double res_mean_last = 0.05, total_residual = 0.0;
+double res_mean_last = 0.05;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double filter_size_map_min = 0;
 double cube_len = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int iterCount = 0, feats_down_size = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
-// Position-observability metric, refreshed each h_share_model call: eigenvalues
-// of the normal information matrix M = sum(n n^T) over the matched plane normals.
-// pos_obs_z_weak = |Z component| of the weakest eigenvector; →1 means Z is the
-// least-constrained direction (degenerate Z), the root trigger of the bag2
-// divergence (see memory bag2-divergence-is-flio2-frontend).
-double pos_obs_eig_min = 0.0, pos_obs_eig_max = 0.0, pos_obs_z_weak = 0.0;
-Eigen::Matrix3d pos_obs_M = Eigen::Matrix3d::Zero();  // Σ n nᵀ of the last update (world frame), for the [SCAN] trace
-bool degeneracy_debug = false;                        // verbose per-frame [DEGEN] diagnostics
+bool degeneracy_debug = false;  // verbose per-frame [DEGEN] diagnostics
 
-// Subspace weighting (FrontendParams::degeneracy_params is the policy): its verdict and what it did.
-fast_lio::DegeneracyResult degeneracy_last;  // last h_share_model verdict, for the traces
-// How much the policy actually did, since a throttled log line cannot say: scans whose
-// final iteration held a direction back, out of scans updated, and the mean per-point
-// weight it applied. Without these the dose is unmeasurable and so is any A/B.
+// Subspace weighting (FrontendParams::degeneracy_params is the policy; the measurement model's telemetry holds its
+// verdict and the points it weighted): scans whose final iteration held a direction back, out of scans updated.
 long degeneracy_scans_engaged = 0, degeneracy_scans_total = 0;
-long degeneracy_point_weighted = 0;
-double degeneracy_point_weight_sum = 0.0;
 
 // Front-end health side-channel (Plan C): per-scan along-motion observability and
 // quality metrics published on /Odometry twist.covariance for the PGO
@@ -261,20 +245,13 @@ struct GravWinAgg
 };
 std::deque<GravWinAgg> grav_win;  // scan-thread only
 double gravity_align_last_trig = -1e18;
-// The correspondence gate and robust kernel (FrontendParams::corr_gate and corr_kernel are the policy): what they
-// did on the last call, and their per-point and per-row values.
-std::atomic<int> corr_gate_rejected{0};  // matches the gate refused on the last h_share_model call
-double corr_gate_scan_sigma = 0.0;       // the scan's robust residual scale on the last call (1.4826 MAD)
-std::vector<double> gate_var, gate_nn0, gate_w, corr_weight;  // per point / per effective row
 // The correspondence dump (FrontendParams::corr_dump_en describes it): its files and its per-scan state.
 std::ofstream fout_corr, fout_corr_iter, fout_corr_scan;
 bool corr_dump_scan_active = false;  // this scan lies inside a dump window (set before the update)
-int corr_dump_iter = 0;              // h_share_model calls so far on this scan
+int corr_dump_iter = 0;              // measurement-model evaluations dumped so far on this scan
 // Attitude hold (FrontendParams::attitude_hold is the policy): this scan's verdicts and the telemetry.
-bool lidar_attitude_hold_active = false;   // this scan's scene-rule verdict; read by h_share_model
+bool lidar_attitude_hold_active = false;   // this scan's scene-rule verdict; read by the measurement model
 bool lidar_attitude_hold_allowed = false;  // release conditions satisfied this scan (starvation, age, holes)
-bool lidar_attitude_hold_info_active = false;  // the information rule held on the last h_share_model call
-double lidar_rot_obs_rp_min = 0.0;             // telemetry: last scan's roll/pitch information
 int lidar_attitude_hold_scans = 0;             // telemetry
 double lidar_attitude_hold_since = -1.0;       // lidar_end_time when the current hold began (-1 = off)
 
@@ -370,12 +347,6 @@ fast_lio::HealthyScanWindow reanchor_healthy_eff;
 // Runaway watchdog state (FrontendParams::runaway is the policy and runaway_on_trip its action).
 fast_lio::RunawayState runaway_state;
 double scan_far_frac = 1.0;  // per-scan telemetry: fraction of raw points beyond far_range
-// [RES] telemetry: converged point-to-plane residual by body range bin (0-2,2-5,5-10,10-20,20-40,40+ m):
-// count and sum of squares from the last h_share_model call of the scan (degeneracy_debug only).
-constexpr int kResBins = 6;
-constexpr double kResBinEdges[kResBins] = {2.0, 5.0, 10.0, 20.0, 40.0, 1e9};
-int res_bin_n[kResBins] = {0};
-double res_bin_ss[kResBins] = {0.0};
 
 int consec_engulf = 0;             // running engulfed-scan streak
 int consec_low_eff = 0;            // running degenerate-scan streak counter
@@ -383,10 +354,6 @@ bool flio_map_frozen = false;      // degraded: skip map_incremental (no garbage
 bool required_prior_lost = false;  // scan-owner latch; only a fresh activation can reinstall a required prior
 bool flio_degraded_odom = false;   // degraded: inflate published pose covariance
 
-// Ground recovery (FrontendParams::ground_recover_en and its band and gates are the policy).
-int canopy_ground_recovered = 0;  // diag: rows recovered last h_share call
-
-std::vector<std::uint8_t> point_selected_surf;
 bool lidar_pushed, flg_first_scan = true, flg_EKF_inited;
 bool scan_pub_en = false, dense_pub_en = false;
 bool is_first_lidar = true;
@@ -401,17 +368,6 @@ bool diag_first_odom_pub_logged = false;
 
 vector<vector<int>> pointSearchInd_surf;
 vector<BoxPointType> cub_needrm;
-vector<PointVector> Nearest_Points;
-// The neighbour set only moves on the iterations that search, so the 5x3 plane fit and the
-// body-range scale in the residual gate are invariant in between and are kept per point.
-vector<fast_lio::CachedPlane, Eigen::aligned_allocator<fast_lio::CachedPlane>> plane_cache;
-// Neighbour refresh (FrontendParams::nn_refresh_gate_en is the policy): the pose of the last search and the
-// telemetry.
-V3D nn_last_search_pos = V3D::Zero();
-M3D nn_last_search_rot = M3D::Identity();
-bool nn_have_last_search = false;
-double nn_max_shift = 0.0;  // per-scan telemetry: largest would-be refresh shift (m)
-int nn_skips = 0;
 using SteadyClock = std::chrono::steady_clock;
 using SteadyTimePoint = std::chrono::time_point<SteadyClock>;
 
@@ -523,9 +479,6 @@ PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
-PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
-PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
-PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr _featsArray;
 
 fast_lio::VoxelGridHash downSizeFilterSurf;  // scan downsample: one pass, real points
@@ -2668,25 +2621,30 @@ int reconfirmLastImuBatch()
 }
 
 // The H-model call in progress, right after compaction.
-static void reportHModelSelection(bool search_requested, bool searched)
+static void reportHModelSelection(const fast_lio::MeasurementScratch & scratch,
+                                  const fast_lio::MeasurementTelemetry & telemetry,
+                                  const fast_lio::MeasurementInputs & inputs,
+                                  const fast_lio::MeasurementOutputs & outputs,
+                                  bool search_requested,
+                                  bool searched)
 {
   HModelSelection selection;
-  selection.scan_end = lidar_end_time;
-  selection.call = ekf_iters;
+  selection.scan_end = inputs.scan_end_time;
+  selection.call = outputs.iterations;
   selection.search_requested = search_requested;
   selection.searched = searched;
-  selection.refresh_skips = nn_skips;
-  selection.refresh_max_shift = nn_max_shift;
-  selection.points = feats_down_size;
-  selection.selected = point_selected_surf.data();
-  selection.residuals = res_last.data();
-  selection.gate_rejected = corr_gate_rejected.load(std::memory_order_relaxed);
-  selection.gate_scan_sigma = corr_gate_scan_sigma;
-  selection.ground_rows = canopy_ground_recovered;
-  selection.rows.resize(static_cast<std::size_t>(std::max(effct_feat_num, 0)));
+  selection.refresh_skips = telemetry.nn_skips;
+  selection.refresh_max_shift = telemetry.nn_max_shift;
+  selection.points = inputs.point_count;
+  selection.selected = scratch.point_selected_surf.data();
+  selection.residuals = scratch.res_last.data();
+  selection.gate_rejected = telemetry.corr_gate_rejected.load(std::memory_order_relaxed);
+  selection.gate_scan_sigma = telemetry.corr_gate_scan_sigma;
+  selection.ground_rows = telemetry.canopy_ground_recovered;
+  selection.rows.resize(static_cast<std::size_t>(std::max(outputs.effective_rows, 0)));
   for (std::size_t i = 0; i < selection.rows.size(); ++i) {
-    const PointType & point = laserCloudOri->points[i];
-    const PointType & normal = corr_normvect->points[i];
+    const PointType & point = scratch.laserCloudOri.points[i];
+    const PointType & normal = scratch.corr_normvect.points[i];
     HModelRow & row = selection.rows[i];
     row.point[0] = point.x;
     row.point[1] = point.y;
@@ -2695,38 +2653,42 @@ static void reportHModelSelection(bool search_requested, bool searched)
     row.normal[1] = normal.y;
     row.normal[2] = normal.z;
     row.residual = normal.intensity;
-    row.weight = corr_weight[i];
+    row.weight = scratch.corr_weight[i];
   }
   afterHModelSelection(selection);
 }
 
 // The H-model call's exit. `hold_rows`: the call restricted its rotation rows to yaw (false without rows).
-static HModelExit hModelExit(bool valid, bool hold_rows)
+static HModelExit hModelExit(const fast_lio::MeasurementTelemetry & telemetry,
+                             const fast_lio::MeasurementInputs & inputs,
+                             const fast_lio::MeasurementOutputs & outputs,
+                             bool valid,
+                             bool hold_rows)
 {
   HModelExit out;
-  out.scan_end = lidar_end_time;
-  out.call = ekf_iters;
+  out.scan_end = inputs.scan_end_time;
+  out.call = outputs.iterations;
   out.valid = valid;
-  out.effective = effct_feat_num;
-  out.mean_residual = res_mean_last;
-  out.pos_eig_min = pos_obs_eig_min;
-  out.pos_eig_max = pos_obs_eig_max;
-  out.pos_z_weak = pos_obs_z_weak;
-  out.hold_scene = lidar_attitude_hold_active;
-  out.hold_allowed = lidar_attitude_hold_allowed;
+  out.effective = outputs.effective_rows;
+  out.mean_residual = outputs.mean_residual;
+  out.pos_eig_min = telemetry.pos_obs_eig_min;
+  out.pos_eig_max = telemetry.pos_obs_eig_max;
+  out.pos_z_weak = telemetry.pos_obs_z_weak;
+  out.hold_scene = inputs.attitude_hold_active;
+  out.hold_allowed = inputs.attitude_hold_allowed;
   out.hold_rows = hold_rows;
-  out.hold_info = lidar_attitude_hold_info_active;
-  out.rp_info_min = lidar_rot_obs_rp_min;
+  out.hold_info = telemetry.lidar_attitude_hold_info_active;
+  out.rp_info_min = telemetry.lidar_rot_obs_rp_min;
   out.rp_consider = rp_consider_active;
-  out.degeneracy_engaged = degeneracy_last.engaged;
+  out.degeneracy_engaged = telemetry.degeneracy_last.engaged;
   for (int i = 0; i < 3; ++i) {
-    out.degeneracy_shares[i] = degeneracy_last.lambda_norm(i);
-    out.degeneracy_lambdas[i] = degeneracy_last.lambda_abs(i);
-    out.degeneracy_weights[i] = degeneracy_last.weights(i);
+    out.degeneracy_shares[i] = telemetry.degeneracy_last.lambda_norm(i);
+    out.degeneracy_lambdas[i] = telemetry.degeneracy_last.lambda_abs(i);
+    out.degeneracy_weights[i] = telemetry.degeneracy_last.weights(i);
   }
-  out.degeneracy_weighted_points = degeneracy_point_weighted;
-  out.degeneracy_weight_sum = degeneracy_point_weight_sum;
-  out.dump_written = valid && corr_dump_scan_active && fout_corr.is_open();
+  out.degeneracy_weighted_points = telemetry.degeneracy_point_weighted;
+  out.degeneracy_weight_sum = telemetry.degeneracy_point_weight_sum;
+  out.dump_written = valid && outputs.dump_scan_active && outputs.dump_rows.is_open();
   return out;
 }
 
@@ -2904,7 +2866,8 @@ bool rebuildLocalMapStorage(int & map_before)
   return kept_prior;
 }
 
-void map_incremental()
+// nearest: each scan point's map neighbours from the measurement model's last search.
+void map_incremental(const std::vector<PointVector> & nearest)
 {
   PointVector PointToAdd;
   PointVector PointNoNeedDownsample;
@@ -2914,8 +2877,8 @@ void map_incremental()
     /* transform to world frame */
     pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
     /* decide if need add to map */
-    if (!Nearest_Points[i].empty() && flg_EKF_inited) {
-      const PointVector & points_near = Nearest_Points[i];
+    if (!nearest[i].empty() && flg_EKF_inited) {
+      const PointVector & points_near = nearest[i];
       bool need_add = true;
       BoxPointType Box_of_Point;
       PointType downsample_result, mid_point;
@@ -3126,11 +3089,13 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
   publish_count -= PUBFRAME_PERIOD;
 }
 
-void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
+// effect: the measurement model's effective points, body frame.
+void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect,
+                          const PointCloudXYZI & effect)
 {
   PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(effct_feat_num, 1));
   for (int i = 0; i < effct_feat_num; i++) {
-    RGBpointBodyToWorld(&laserCloudOri->points[i], &laserCloudWorld->points[i]);
+    RGBpointBodyToWorld(&effect.points[i], &laserCloudWorld->points[i]);
   }
   sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
   pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
@@ -3462,70 +3427,66 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
   }
 }
 
-// Called once at the real downsampled-scan boundary, before any int-indexed
-// scan loop. No scratch allocation occurs in the parallel measurement loop.
-bool prepareScanCorrespondenceStorage(std::size_t count)
-{
-  if (!fast_lio::prepareCorrespondenceScratch(count, point_selected_surf, res_last, feats_down_size))
-    return false;
-  if (plane_cache.size() < count) {
-    plane_cache.resize(count);
-    gate_var.resize(count);
-    gate_nn0.resize(count);
-    gate_w.resize(count);
-  }
-  return true;
-}
-
 namespace
 {
 // Sectors of the ground-recovery planes.
-constexpr int kGndSectors = 8;
+constexpr int kGndSectors = fast_lio::MeasurementScratch::kGndSectors;
+// Upper body-range edges of the [RES] residual bins (m).
+constexpr int kResBins = fast_lio::MeasurementTelemetry::kResBins;
+constexpr double kResBinEdges[kResBins] = {2.0, 5.0, 10.0, 20.0, 40.0, 1e9};
 
-bool decideSearch(const fast_lio::FrontendParams & params,
+bool decideSearch(fast_lio::MeasurementScratch & scratch,
+                  fast_lio::MeasurementTelemetry & telemetry,
+                  const fast_lio::FrontendParams & params,
+                  const fast_lio::MeasurementOutputs & outputs,
                   state_ikfom & s,
                   const esekfom::dyn_share_datastruct<double> & ekfom_data)
 {
   bool searching = ekfom_data.converge;
-  if (searching && nn_have_last_search) {
+  if (searching && scratch.nn_have_last_search) {
     // A point at range r moves by at most |dt| + r*|dtheta| between two states, so that
     // bound against the map resolution decides whether a refresh can change anything.
-    const V3D dt = s.pos - nn_last_search_pos;
-    const M3D dR = nn_last_search_rot.transpose() * s.rot.toRotationMatrix();
+    const V3D dt = s.pos - scratch.nn_last_search_pos;
+    const M3D dR = scratch.nn_last_search_rot.transpose() * s.rot.toRotationMatrix();
     const V3D dr = Log(dR);
     const double shift = dt.norm() + params.nn_refresh_ref_range * dr.norm();
-    nn_max_shift = std::max(nn_max_shift, shift);
+    telemetry.nn_max_shift = std::max(telemetry.nn_max_shift, shift);
     if (params.nn_refresh_gate_en && shift < params.nn_refresh_min_shift) {
       searching = false;
-      ++nn_skips;
+      ++telemetry.nn_skips;
     }
   }
   if (searching) {
-    nn_last_search_pos = s.pos;
-    nn_last_search_rot = s.rot.toRotationMatrix();
-    nn_have_last_search = true;
+    scratch.nn_last_search_pos = s.pos;
+    scratch.nn_last_search_rot = s.rot.toRotationMatrix();
+    scratch.nn_have_last_search = true;
   }
-  ++ekf_iters;
-  ekf_search_iters += searching ? 1 : 0;
-  total_residual = 0.0;
+  ++outputs.iterations;
+  telemetry.ekf_search_iters += searching ? 1 : 0;
+  scratch.total_residual = 0.0;
   return searching;
 }
 
 // [v11] the gate judges every residual against the prior's [pos, rot] covariance, which IKFoM keeps
 // unchanged through the iterations; read it once per call.
-bool gatePrior(const fast_lio::FrontendParams & params, Eigen::Matrix<double, 6, 6> & gate_P6)
+bool gatePrior(fast_lio::MeasurementTelemetry & telemetry,
+               const fast_lio::FrontendParams & params,
+               const fast_lio::MeasurementInputs & inputs,
+               Eigen::Matrix<double, 6, 6> & gate_P6)
 {
   const bool gate_on = params.corr_gate.innovation_k > 0.0 || params.corr_gate.nn0_max > 0.0;
   if (params.corr_gate.innovation_k > 0.0) {
-    gate_P6 =
-      fast_lio::flooredPriorBlock(kf.get_P().block<6, 6>(0, 0), params.corr_gate.rot_sigma_floor_deg * M_PI / 180.0);
+    gate_P6 = fast_lio::flooredPriorBlock(inputs.prior_covariance.block<6, 6>(0, 0),
+                                          params.corr_gate.rot_sigma_floor_deg * M_PI / 180.0);
   }
-  corr_gate_rejected.store(0, std::memory_order_relaxed);
+  telemetry.corr_gate_rejected.store(0, std::memory_order_relaxed);
   return gate_on;
 }
 
 /** closest surface search and residual computation **/
-void matchPoints(const fast_lio::FrontendParams & params,
+void matchPoints(fast_lio::MeasurementScratch & scratch,
+                 const fast_lio::FrontendParams & params,
+                 const fast_lio::MeasurementInputs & inputs,
                  state_ikfom & s,
                  bool searching,
                  bool gate_on,
@@ -3545,9 +3506,9 @@ void matchPoints(const fast_lio::FrontendParams & params,
   }
 #pragma omp parallel for
 #endif
-  for (int i = 0; i < feats_down_size; i++) {
-    PointType & point_body = feats_down_body->points[i];
-    PointType & point_world = feats_down_world->points[i];
+  for (int i = 0; i < inputs.point_count; i++) {
+    PointType & point_body = inputs.body.points[i];
+    PointType & point_world = inputs.world.points[i];
 
     /* transform to world frame */
     V3D p_body(point_body.x, point_body.y, point_body.z);
@@ -3559,13 +3520,13 @@ void matchPoints(const fast_lio::FrontendParams & params,
 
     std::vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
 
-    auto & points_near = Nearest_Points[i];
+    auto & points_near = scratch.Nearest_Points[i];
 
-    auto & cached_plane = plane_cache[i];
+    auto & cached_plane = scratch.plane_cache[i];
     if (searching) {
       // A failed search/fit must not leave the previous neighbourhood usable.
       cached_plane.invalidate();
-      ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+      inputs.map.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
       if (points_near.size() >= NUM_MATCH_POINTS && pointSearchSqDis[NUM_MATCH_POINTS - 1] <= 5) {
         cached_plane.fit<NUM_MATCH_POINTS>(points_near, 0.1f, std::sqrt(p_body.norm()));
       }
@@ -3573,7 +3534,7 @@ void matchPoints(const fast_lio::FrontendParams & params,
 
     // Per-iteration selection is independent of the cached neighbours. A row
     // rejected by residual/innovation/ground gates can recover at the new pose.
-    point_selected_surf[i] = false;
+    scratch.point_selected_surf[i] = false;
     if (!cached_plane.valid())
       continue;
 
@@ -3587,62 +3548,68 @@ void matchPoints(const fast_lio::FrontendParams & params,
         const V3D n_w(pabcd(0), pabcd(1), pabcd(2));
         const V3D point_this = s.offset_R_L_I * p_body + s.offset_T_L_I;
         const V3D A = point_this.cross(V3D(s.rot.conjugate() * n_w));
-        gate_var[i] =
+        scratch.gate_var[i] =
           params.corr_gate.innovation_k > 0.0 ? fast_lio::residualVariance(n_w, A, gate_P6, LASER_POINT_COV) : 0.0;
-        gate_nn0[i] = 0.0;
+        scratch.gate_nn0[i] = 0.0;
         if (params.corr_gate.nn0_max > 0.0 && !points_near.empty()) {
-          gate_nn0[i] = (V3D(points_near[0].x, points_near[0].y, points_near[0].z) - p_global).norm();
+          scratch.gate_nn0[i] = (V3D(points_near[0].x, points_near[0].y, points_near[0].z) - p_global).norm();
         }
       }
       if (residual.accepted) {
-        point_selected_surf[i] = true;
-        normvec->points[i].x = pabcd(0);
-        normvec->points[i].y = pabcd(1);
-        normvec->points[i].z = pabcd(2);
-        normvec->points[i].intensity = pd2;
-        res_last[i] = std::abs(pd2);
+        scratch.point_selected_surf[i] = true;
+        scratch.normvec.points[i].x = pabcd(0);
+        scratch.normvec.points[i].y = pabcd(1);
+        scratch.normvec.points[i].z = pabcd(2);
+        scratch.normvec.points[i].intensity = pd2;
+        scratch.res_last[i] = std::abs(pd2);
       }
     }
   }
 }
 
 // [v11] gate decision and kernel weights: the scan's robust residual scale is known only now.
-void applyGateAndKernels(const fast_lio::FrontendParams & params, bool gate_on)
+void applyGateAndKernels(fast_lio::MeasurementScratch & scratch,
+                         fast_lio::MeasurementTelemetry & telemetry,
+                         const fast_lio::FrontendParams & params,
+                         const fast_lio::MeasurementInputs & inputs,
+                         bool gate_on)
 {
-  corr_gate_scan_sigma = 0.0;
+  telemetry.corr_gate_scan_sigma = 0.0;
   if (gate_on || params.corr_kernel != 0) {
     if (params.corr_gate.mad_scale > 0.0 || params.corr_kernel != 0) {
       std::vector<double> res;
-      res.reserve(feats_down_size);
-      for (int i = 0; i < feats_down_size; i++) {
-        if (point_selected_surf[i]) {
-          res.push_back(normvec->points[i].intensity);
+      res.reserve(inputs.point_count);
+      for (int i = 0; i < inputs.point_count; i++) {
+        if (scratch.point_selected_surf[i]) {
+          res.push_back(scratch.normvec.points[i].intensity);
         }
       }
-      corr_gate_scan_sigma = fast_lio::robustResidualScale(res);
+      telemetry.corr_gate_scan_sigma = fast_lio::robustResidualScale(res);
     }
-    const double scan_floor = params.corr_gate.mad_scale * corr_gate_scan_sigma;
-    const double kernel_c = params.corr_kernel != 0 ? std::max(params.corr_kernel_mad_scale * corr_gate_scan_sigma,
-                                                               params.corr_kernel_min_scale)
-                                                    : 0.0;
+    const double scan_floor = params.corr_gate.mad_scale * telemetry.corr_gate_scan_sigma;
+    const double kernel_c =
+      params.corr_kernel != 0
+        ? std::max(params.corr_kernel_mad_scale * telemetry.corr_gate_scan_sigma, params.corr_kernel_min_scale)
+        : 0.0;
 #ifdef MP_EN
 #pragma omp parallel for
 #endif
-    for (int i = 0; i < feats_down_size; i++) {
-      gate_w[i] = 1.0;
-      if (!point_selected_surf[i]) {
+    for (int i = 0; i < inputs.point_count; i++) {
+      scratch.gate_w[i] = 1.0;
+      if (!scratch.point_selected_surf[i]) {
         continue;
       }
-      const double pd2 = normvec->points[i].intensity;
-      if (gate_on && !fast_lio::correspondenceAdmitted(params.corr_gate, pd2, gate_var[i], gate_nn0[i], scan_floor)) {
-        point_selected_surf[i] = false;
-        corr_gate_rejected.fetch_add(1, std::memory_order_relaxed);
+      const double pd2 = scratch.normvec.points[i].intensity;
+      if (gate_on && !fast_lio::correspondenceAdmitted(
+                       params.corr_gate, pd2, scratch.gate_var[i], scratch.gate_nn0[i], scan_floor)) {
+        scratch.point_selected_surf[i] = false;
+        telemetry.corr_gate_rejected.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
       if (params.corr_kernel == 1) {
-        gate_w[i] = fast_lio::gemanMcClureWeight(pd2, kernel_c);
+        scratch.gate_w[i] = fast_lio::gemanMcClureWeight(pd2, kernel_c);
       } else if (params.corr_kernel == 2) {
-        gate_w[i] = fast_lio::cauchyWeight(pd2, kernel_c);
+        scratch.gate_w[i] = fast_lio::cauchyWeight(pd2, kernel_c);
       }
     }
   }
@@ -3653,14 +3620,15 @@ void applyGateAndKernels(const fast_lio::FrontendParams & params, bool gate_on)
 // within a few degrees), sane height under the sensor. The height gate
 // is what makes always-on safe: the accepted surface must sit where
 // the vehicle's own ground sits.
-bool fitGround(const fast_lio::FrontendParams & params,
+bool fitGround(fast_lio::MeasurementScratch & scratch,
+               const fast_lio::FrontendParams & params,
                const std::vector<Eigen::Vector3d> * sets,
                int nsets,
                int min_in,
                Eigen::Vector3d & n_out,
                double & d_out)
 {
-  static std::vector<float> zs;
+  std::vector<float> & zs = scratch.zs;
   zs.clear();
   for (int k = 0; k < nsets; k++)
     for (const auto & p : sets[k])
@@ -3704,18 +3672,17 @@ bool fitGround(const fast_lio::FrontendParams & params,
          std::fabs(-d / std::max(n.z(), 1e-6) - params.canopy_ground_z) <= params.canopy_ground_halfband;
 }
 
-void fitGroundSectors(const fast_lio::FrontendParams & params,
-                      bool (&sec_ok)[kGndSectors],
-                      Eigen::Vector3d (&sec_n)[kGndSectors],
-                      double (&sec_d)[kGndSectors])
+void fitGroundSectors(fast_lio::MeasurementScratch & scratch,
+                      const fast_lio::FrontendParams & params,
+                      const fast_lio::MeasurementInputs & inputs)
 {
-  static std::vector<Eigen::Vector3d> cand[kGndSectors];
+  auto & cand = scratch.cand;
   for (int s = 0; s < kGndSectors; s++) {
     cand[s].clear();
-    sec_ok[s] = false;
+    scratch.sec_ok[s] = false;
   }
-  for (int i = 0; i < feats_down_size; i++) {
-    const PointType & pb = feats_down_body->points[i];
+  for (int i = 0; i < inputs.point_count; i++) {
+    const PointType & pb = inputs.body.points[i];
     if (std::hypot(pb.x, pb.y) > params.canopy_near_range)
       continue;
     if (std::fabs(pb.z - params.canopy_ground_z) > params.canopy_ground_halfband)
@@ -3728,11 +3695,11 @@ void fitGroundSectors(const fast_lio::FrontendParams & params,
   // prior every sector must agree with, and the fallback plane.
   Eigen::Vector3d gn(0, 0, 1);
   double gd = 0.0;
-  const bool glob_ok = fitGround(params, cand, kGndSectors, params.ground_recover_min_inliers, gn, gd);
+  const bool glob_ok = fitGround(scratch, params, cand, kGndSectors, params.ground_recover_min_inliers, gn, gd);
   for (int s = 0; s < kGndSectors; s++) {
     Eigen::Vector3d n;
     double d;
-    bool own_ok = fitGround(params, &cand[s], 1, params.ground_recover_min_inliers, n, d);
+    bool own_ok = fitGround(scratch, params, &cand[s], 1, params.ground_recover_min_inliers, n, d);
     if (own_ok && glob_ok) {
       // A sector plane may only REFINE the global one: normals must
       // agree and the plane heights at the sector centroid must match
@@ -3748,41 +3715,42 @@ void fitGroundSectors(const fast_lio::FrontendParams & params,
       own_ok = n.dot(gn) >= kSectorNormalDotMin && std::fabs(z_sec - z_glob) <= params.ground_recover_sector_tol;
     }
     if (own_ok) {
-      sec_ok[s] = true;
-      sec_n[s] = n;
-      sec_d[s] = d;
+      scratch.sec_ok[s] = true;
+      scratch.sec_n[s] = n;
+      scratch.sec_d[s] = d;
     } else if (glob_ok) {
-      sec_ok[s] = true;
-      sec_n[s] = gn;
-      sec_d[s] = gd;
+      scratch.sec_ok[s] = true;
+      scratch.sec_n[s] = gn;
+      scratch.sec_d[s] = gd;
     }
   }
 }
 
-void recoverGroundRows(const fast_lio::FrontendParams & params,
-                       const bool (&sec_ok)[kGndSectors],
-                       const Eigen::Vector3d (&sec_n)[kGndSectors],
-                       const double (&sec_d)[kGndSectors])
+void recoverGroundRows(fast_lio::MeasurementScratch & scratch,
+                       fast_lio::MeasurementTelemetry & telemetry,
+                       const fast_lio::FrontendParams & params,
+                       const fast_lio::MeasurementInputs & inputs)
 {
-  for (int i = 0; i < feats_down_size; i++) {
-    if (point_selected_surf[i])
+  for (int i = 0; i < inputs.point_count; i++) {
+    if (scratch.point_selected_surf[i])
       continue;
-    if (canopy_ground_recovered >= params.ground_recover_max_rows)
+    if (telemetry.canopy_ground_recovered >= params.ground_recover_max_rows)
       break;
-    const PointType & pb = feats_down_body->points[i];
+    const PointType & pb = inputs.body.points[i];
     if (std::hypot(pb.x, pb.y) > params.canopy_near_range)
       continue;
     const int s =
       std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
-    if (!sec_ok[s])
+    if (!scratch.sec_ok[s])
       continue;
     // Scan side: on this sector's ground plane (clutter trimmed by the fit band).
-    if (std::fabs(sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s]) > params.ground_recover_scan_band)
+    if (std::fabs(scratch.sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + scratch.sec_d[s]) >
+        params.ground_recover_scan_band)
       continue;
-    auto & pn = Nearest_Points[i];
+    auto & pn = scratch.Nearest_Points[i];
     if (static_cast<int>(pn.size()) < NUM_MATCH_POINTS)
       continue;
-    const PointType & pw = feats_down_world->points[i];
+    const PointType & pw = inputs.world.points[i];
     // Map neighborhood must actually be nearby (same criterion class as
     // the normal path's 5th-neighbor sqdist gate).
     const double dx0 = pn[0].x - pw.x, dy0 = pn[0].y - pw.y, dz0 = pn[0].z - pw.z;
@@ -3811,16 +3779,16 @@ void recoverGroundRows(const fast_lio::FrontendParams & params,
     const double pd2 = pw.z - z_ground_map;
     if (std::fabs(pd2) > params.ground_recover_max_residual)
       continue;
-    point_selected_surf[i] = true;
-    normvec->points[i].x = 0.0f;
-    normvec->points[i].y = 0.0f;
+    scratch.point_selected_surf[i] = true;
+    scratch.normvec.points[i].x = 0.0f;
+    scratch.normvec.points[i].y = 0.0f;
     // Row weight rides on the normal + residual scaling (information
     // scales as w_row^2 in the point-to-plane H) — same mechanism as an
     // ordinary row, no new plumbing.
-    normvec->points[i].z = static_cast<float>(w_row);
-    normvec->points[i].intensity = static_cast<float>(w_row * pd2);
-    res_last[i] = std::fabs(pd2);
-    ++canopy_ground_recovered;
+    scratch.normvec.points[i].z = static_cast<float>(w_row);
+    scratch.normvec.points[i].intensity = static_cast<float>(w_row * pd2);
+    scratch.res_last[i] = std::fabs(pd2);
+    ++telemetry.canopy_ground_recovered;
   }
 }
 
@@ -3860,54 +3828,57 @@ void recoverGroundRows(const fast_lio::FrontendParams & params,
  *   NOTE: distinct from the removed A'-3 boost, which amplified already-
  *   matched rows (NEGATIVE result); this restores SELECTION of discarded
  *   true ground. ***/
-void recoverGround(const fast_lio::FrontendParams & params)
+void recoverGround(fast_lio::MeasurementScratch & scratch,
+                   fast_lio::MeasurementTelemetry & telemetry,
+                   const fast_lio::FrontendParams & params,
+                   const fast_lio::MeasurementInputs & inputs)
 {
-  canopy_ground_recovered = 0;
+  telemetry.canopy_ground_recovered = 0;
   if (params.ground_recover_en) {
     // Per-sector ground planes, cached per scan (body cloud is fixed across
     // iEKF iterations). n·p + d = 0 with unit n, n_z > 0.
-    static double fit_time = -1.0;
-    static bool sec_ok[kGndSectors];
-    static Eigen::Vector3d sec_n[kGndSectors];
-    static double sec_d[kGndSectors];
-    if (lidar_end_time != fit_time) {
-      fit_time = lidar_end_time;
-      fitGroundSectors(params, sec_ok, sec_n, sec_d);
+    if (inputs.scan_end_time != scratch.fit_time) {
+      scratch.fit_time = inputs.scan_end_time;
+      fitGroundSectors(scratch, params, inputs);
     }
-    recoverGroundRows(params, sec_ok, sec_n, sec_d);
+    recoverGroundRows(scratch, telemetry, params, inputs);
   }
 }
 
-void compactRows(const fast_lio::FrontendParams & params)
+void compactRows(fast_lio::MeasurementScratch & scratch,
+                 fast_lio::MeasurementTelemetry & telemetry,
+                 const fast_lio::FrontendParams & params,
+                 const fast_lio::MeasurementInputs & inputs,
+                 const fast_lio::MeasurementOutputs & outputs)
 {
-  effct_feat_num = 0;
-  if (degeneracy_debug) {
-    std::fill(std::begin(res_bin_n), std::end(res_bin_n), 0);
-    std::fill(std::begin(res_bin_ss), std::end(res_bin_ss), 0.0);
+  outputs.effective_rows = 0;
+  if (inputs.degeneracy_debug) {
+    std::fill(std::begin(telemetry.res_bin_n), std::end(telemetry.res_bin_n), 0);
+    std::fill(std::begin(telemetry.res_bin_ss), std::end(telemetry.res_bin_ss), 0.0);
   }
 
   // res_last and point_selected_surf have the same extent; the compactor checks
   // that extent and the point/normal/weight bounds before invoking this observer.
-  effct_feat_num = static_cast<int>(fast_lio::compactSelectedCorrespondences(
-    static_cast<std::size_t>(feats_down_size),
-    *feats_down_body,
-    *normvec,
-    point_selected_surf,
-    gate_w,
+  outputs.effective_rows = static_cast<int>(fast_lio::compactSelectedCorrespondences(
+    static_cast<std::size_t>(inputs.point_count),
+    inputs.body,
+    scratch.normvec,
+    scratch.point_selected_surf,
+    scratch.gate_w,
     params.corr_kernel != 0,
-    *laserCloudOri,
-    *corr_normvect,
-    corr_weight,
+    scratch.laserCloudOri,
+    scratch.corr_normvect,
+    scratch.corr_weight,
     [&](std::size_t i) {
-      total_residual += res_last[i];
-      if (degeneracy_debug) {
-        const PointType & pb = feats_down_body->points[i];
+      scratch.total_residual += scratch.res_last[i];
+      if (inputs.degeneracy_debug) {
+        const PointType & pb = inputs.body.points[i];
         const double rng = std::sqrt(double(pb.x) * pb.x + double(pb.y) * pb.y + double(pb.z) * pb.z);
         int b = 0;
         while (b < kResBins - 1 && rng >= kResBinEdges[b])
           ++b;
-        ++res_bin_n[b];
-        res_bin_ss[b] += double(res_last[i]) * res_last[i];
+        ++telemetry.res_bin_n[b];
+        telemetry.res_bin_ss[b] += double(scratch.res_last[i]) * scratch.res_last[i];
       }
     }));
 }
@@ -3916,61 +3887,71 @@ void compactRows(const fast_lio::FrontendParams & params)
 // normal information matrix M = sum(n n^T) over effective points. The min
 // eigenvalue is the weakest-constrained position direction; if its
 // eigenvector points along Z, the Z update is ill-conditioned.
-void observePosition()
+void observePosition(const fast_lio::MeasurementScratch & scratch,
+                     fast_lio::MeasurementTelemetry & telemetry,
+                     const fast_lio::MeasurementOutputs & outputs)
 {
   Eigen::Matrix3d M = Eigen::Matrix3d::Zero();
-  for (int i = 0; i < effct_feat_num; i++) {
-    const PointType & np = corr_normvect->points[i];
+  for (int i = 0; i < outputs.effective_rows; i++) {
+    const PointType & np = scratch.corr_normvect.points[i];
     Eigen::Vector3d n(np.x, np.y, np.z);
     M.noalias() += n * n.transpose();
   }
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
-  pos_obs_M = M;
-  pos_obs_eig_min = es.eigenvalues()(0);
-  pos_obs_eig_max = es.eigenvalues()(2);
-  pos_obs_z_weak = std::abs(es.eigenvectors()(2, 0));  // |Z| of weakest eigenvector
+  telemetry.pos_obs_M = M;
+  telemetry.pos_obs_eig_min = es.eigenvalues()(0);
+  telemetry.pos_obs_eig_max = es.eigenvalues()(2);
+  telemetry.pos_obs_z_weak = std::abs(es.eigenvectors()(2, 0));  // |Z| of weakest eigenvector
 }
 
 // [v8] attitude hold: the vertical in the body frame (the gravity state's own up), recomputed per
 // iteration; every rotation row below is projected onto it so the update cannot move roll/pitch.
 // [v9] the information rule decides from this iteration's own rows: Σ AAᵀ restricted to the
 // roll/pitch plane, its weakest eigenvalue against lidar_attitude_hold_min_rp_info.
-bool prepareAttitudeHold(const fast_lio::FrontendParams & params, state_ikfom & s, V3D & hold_up)
+bool prepareAttitudeHold(const fast_lio::MeasurementScratch & scratch,
+                         fast_lio::MeasurementTelemetry & telemetry,
+                         const fast_lio::FrontendParams & params,
+                         const fast_lio::MeasurementInputs & inputs,
+                         const fast_lio::MeasurementOutputs & outputs,
+                         state_ikfom & s,
+                         V3D & hold_up)
 {
   {
     V3D grav_w(s.grav[0], s.grav[1], s.grav[2]);
     const V3D up_w = grav_w.norm() > 1e-6 ? V3D(-grav_w.normalized()) : V3D(0.0, 0.0, 1.0);
     hold_up = (s.rot.conjugate() * up_w).normalized();
   }
-  bool hold_rows = lidar_attitude_hold_active;
+  bool hold_rows = inputs.attitude_hold_active;
   {
     M3D rot_info = M3D::Zero();
-    for (int i = 0; i < effct_feat_num; i++) {
-      const PointType & laser_p = laserCloudOri->points[i];
+    for (int i = 0; i < outputs.effective_rows; i++) {
+      const PointType & laser_p = scratch.laserCloudOri.points[i];
       const V3D point_this = s.offset_R_L_I * V3D(laser_p.x, laser_p.y, laser_p.z) + s.offset_T_L_I;
-      const PointType & norm_p = corr_normvect->points[i];
+      const PointType & norm_p = scratch.corr_normvect.points[i];
       const V3D C(s.rot.conjugate() * V3D(norm_p.x, norm_p.y, norm_p.z));
       const V3D A(point_this.cross(C));
       rot_info += A * A.transpose();
     }
-    lidar_rot_obs_rp_min = fast_lio::rollPitchInformation(rot_info, hold_up);
-    if (lidar_attitude_hold_allowed && params.lidar_attitude_hold_min_rp_info > 0.0 &&
-        lidar_rot_obs_rp_min < params.lidar_attitude_hold_min_rp_info) {
+    telemetry.lidar_rot_obs_rp_min = fast_lio::rollPitchInformation(rot_info, hold_up);
+    if (inputs.attitude_hold_allowed && params.lidar_attitude_hold_min_rp_info > 0.0 &&
+        telemetry.lidar_rot_obs_rp_min < params.lidar_attitude_hold_min_rp_info) {
       hold_rows = true;
-      lidar_attitude_hold_info_active = true;
+      telemetry.lidar_attitude_hold_info_active = true;
     }
   }
   return hold_rows;
 }
 
-void buildRows(const fast_lio::FrontendParams & params,
+void buildRows(const fast_lio::MeasurementScratch & scratch,
+               const fast_lio::FrontendParams & params,
+               const fast_lio::MeasurementOutputs & outputs,
                state_ikfom & s,
                esekfom::dyn_share_datastruct<double> & ekfom_data,
                const V3D & hold_up,
                bool hold_rows)
 {
-  for (int i = 0; i < effct_feat_num; i++) {
-    const PointType & laser_p = laserCloudOri->points[i];
+  for (int i = 0; i < outputs.effective_rows; i++) {
+    const PointType & laser_p = scratch.laserCloudOri.points[i];
     V3D point_this_be(laser_p.x, laser_p.y, laser_p.z);
     M3D point_be_crossmat;
     point_be_crossmat << SKEW_SYM_MATRX(point_this_be);
@@ -3979,7 +3960,7 @@ void buildRows(const fast_lio::FrontendParams & params,
     point_crossmat << SKEW_SYM_MATRX(point_this);
 
     /*** get the normal vector of closest surface/corner ***/
-    const PointType & norm_p = corr_normvect->points[i];
+    const PointType & norm_p = scratch.corr_normvect.points[i];
     V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
 
     /*** calculate the Measuremnt Jacobian matrix H ***/
@@ -3999,8 +3980,8 @@ void buildRows(const fast_lio::FrontendParams & params,
 
     /*** Measuremnt: distance to the closest surface/corner ***/
     ekfom_data.h(i) = -norm_p.intensity;
-    if (params.corr_kernel != 0 && corr_weight[i] < 1.0) {
-      const double sw = std::sqrt(std::max(corr_weight[i], 0.0));
+    if (params.corr_kernel != 0 && scratch.corr_weight[i] < 1.0) {
+      const double sw = std::sqrt(std::max(scratch.corr_weight[i], 0.0));
       ekfom_data.h_x.block<1, 12>(i, 0) *= sw;
       ekfom_data.h(i) *= sw;
     }
@@ -4014,23 +3995,29 @@ void buildRows(const fast_lio::FrontendParams & params,
  *   direction. Row AND residual together — that is what makes it R_i <- R / s^2, a
  *   weight on the measurement, rather than a claim that the plane faces elsewhere.
  *   Recomputed every iEKF iteration: the correspondences move with the state. ***/
-void degeneracyWeights(const fast_lio::FrontendParams & params, esekfom::dyn_share_datastruct<double> & ekfom_data)
+void degeneracyWeights(const fast_lio::MeasurementScratch & scratch,
+                       fast_lio::MeasurementTelemetry & telemetry,
+                       const fast_lio::FrontendParams & params,
+                       rclcpp::Clock & spectrum_clock,
+                       const fast_lio::MeasurementInputs & inputs,
+                       const fast_lio::MeasurementOutputs & outputs,
+                       esekfom::dyn_share_datastruct<double> & ekfom_data)
 {
   const auto H_t = ekfom_data.h_x.leftCols(3);
   const auto H_r = ekfom_data.h_x.middleCols(3, 3);
   const Eigen::Matrix3d H_tt = H_t.transpose() * H_t;
   const Eigen::Matrix3d H_tr = H_t.transpose() * H_r;
   const Eigen::Matrix3d H_rr = H_r.transpose() * H_r;
-  degeneracy_last = fast_lio::computePositionDegeneracy(H_tt, H_tr, H_rr, effct_feat_num, params.degeneracy_params);
+  telemetry.degeneracy_last =
+    fast_lio::computePositionDegeneracy(H_tt, H_tr, H_rr, outputs.effective_rows, params.degeneracy_params);
   if (params.degeneracy_spectrum_trace) {
     // Both spectra side by side: the gap between them is what rotation explains away,
     // and it is the only way to see the coupling the thresholds now have to live with.
-    static rclcpp::Clock degen_spectrum_clock(RCL_STEADY_TIME);
     const Eigen::Vector3d tt = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(H_tt).eigenvalues();
-    const Eigen::Vector3d & sh = degeneracy_last.lambda_norm;
-    const Eigen::Vector3d & ab = degeneracy_last.lambda_abs;
+    const Eigen::Vector3d & sh = telemetry.degeneracy_last.lambda_norm;
+    const Eigen::Vector3d & ab = telemetry.degeneracy_last.lambda_abs;
     RCLCPP_INFO_THROTTLE(rclcpp::get_logger("laser_mapping"),
-                         degen_spectrum_clock,
+                         spectrum_clock,
                          2000,
                          "[DEGEN-SPECTRUM] shares [%.3f %.3f %.3f] sum=%.3f | judged raw [%.1f %.1f %.1f] | "
                          "H_tt raw [%.1f %.1f %.1f] | effct=%d far_frac=%.2f",
@@ -4044,42 +4031,50 @@ void degeneracyWeights(const fast_lio::FrontendParams & params, esekfom::dyn_sha
                          tt(0),
                          tt(1),
                          tt(2),
-                         effct_feat_num,
-                         scan_far_frac);
+                         outputs.effective_rows,
+                         inputs.far_fraction);
   }
-  if (degeneracy_last.engaged) {
-    for (int i = 0; i < effct_feat_num; i++) {
-      const PointType & np = corr_normvect->points[i];
-      const double point_w = fast_lio::pointWeight(degeneracy_last, Eigen::Vector3d(np.x, np.y, np.z));
+  if (telemetry.degeneracy_last.engaged) {
+    for (int i = 0; i < outputs.effective_rows; i++) {
+      const PointType & np = scratch.corr_normvect.points[i];
+      const double point_w = fast_lio::pointWeight(telemetry.degeneracy_last, Eigen::Vector3d(np.x, np.y, np.z));
       if (point_w < 1.0) {
         ekfom_data.h_x.block<1, 12>(i, 0) *= point_w;
         ekfom_data.h(i) *= point_w;
-        degeneracy_point_weight_sum += point_w;
-        ++degeneracy_point_weighted;
+        telemetry.degeneracy_point_weight_sum += point_w;
+        ++telemetry.degeneracy_point_weighted;
       }
     }
   }
 }
 
-void writeDump(state_ikfom & s, bool searching, const V3D & hold_up, bool hold_rows)
+void writeDump(const fast_lio::MeasurementScratch & scratch,
+               const fast_lio::MeasurementTelemetry & telemetry,
+               const fast_lio::MeasurementInputs & inputs,
+               const fast_lio::MeasurementOutputs & outputs,
+               state_ikfom & s,
+               bool searching,
+               const V3D & hold_up,
+               bool hold_rows)
 {
-  const int iter = corr_dump_iter++;
+  const int iter = outputs.dump_iteration++;
   const V3D sensor_w = s.rot * s.offset_T_L_I + s.pos;
-  fout_corr_iter << std::setprecision(15) << lidar_end_time << ',' << iter << ',' << effct_feat_num << ','
-                 << int(hold_rows) << ',' << std::setprecision(6) << lidar_rot_obs_rp_min << ',' << hold_up(0) << ','
-                 << hold_up(1) << ',' << hold_up(2) << ',' << int(searching) << ',' << int(degeneracy_last.engaged)
-                 << '\n';
-  for (int i = 0; i < feats_down_size; i++) {
-    const bool eff = point_selected_surf[i];
+  outputs.dump_iterations << std::setprecision(15) << inputs.scan_end_time << ',' << iter << ','
+                          << outputs.effective_rows << ',' << int(hold_rows) << ',' << std::setprecision(6)
+                          << telemetry.lidar_rot_obs_rp_min << ',' << hold_up(0) << ',' << hold_up(1) << ','
+                          << hold_up(2) << ',' << int(searching) << ',' << int(telemetry.degeneracy_last.engaged)
+                          << '\n';
+  for (int i = 0; i < inputs.point_count; i++) {
+    const bool eff = scratch.point_selected_surf[i];
     if (!eff && iter > 0) {
       continue;
     }
-    const auto & pb = feats_down_body->points[i];
+    const auto & pb = inputs.body.points[i];
     const V3D p_body(pb.x, pb.y, pb.z);
     const V3D point_this = s.offset_R_L_I * p_body + s.offset_T_L_I;
-    const auto & pwp = feats_down_world->points[i];
+    const auto & pwp = inputs.world.points[i];
     const V3D pw(pwp.x, pwp.y, pwp.z);
-    const auto & near = Nearest_Points[i];
+    const auto & near = scratch.Nearest_Points[i];
     const int n_near = static_cast<int>(near.size());
     double nn0 = -1.0, nn4 = -1.0, lam0 = -1.0, lam1 = -1.0, lam2 = -1.0, d_in = -1.0, plane_rms = -1.0;
     if (n_near > 0) {
@@ -4106,8 +4101,8 @@ void writeDump(state_ikfom & s, bool searching, const V3D & hold_up, bool hold_r
       const V3D nrm = es.eigenvectors().col(0);
       const V3D d = pw - c;
       d_in = (d - nrm * nrm.dot(d)).norm();
-      if (plane_cache[i].valid()) {
-        const Eigen::Matrix<float, 4, 1> & pl = plane_cache[i].coefficients();
+      if (scratch.plane_cache[i].valid()) {
+        const Eigen::Matrix<float, 4, 1> & pl = scratch.plane_cache[i].coefficients();
         double ss = 0.0;
         for (const auto & q : near) {
           const double dd = pl(0) * q.x + pl(1) * q.y + pl(2) * q.z + pl(3);
@@ -4118,7 +4113,7 @@ void writeDump(state_ikfom & s, bool searching, const V3D & hold_up, bool hold_r
     }
     double pd2 = 0.0, nx = 0.0, ny = 0.0, nz = 0.0, ax = 0.0, ay = 0.0, az = 0.0, cosv = 0.0, w = 1.0;
     if (eff) {
-      const auto & np = normvec->points[i];
+      const auto & np = scratch.normvec.points[i];
       nx = np.x;
       ny = np.y;
       nz = np.z;
@@ -4131,91 +4126,134 @@ void writeDump(state_ikfom & s, bool searching, const V3D & hold_up, bool hold_r
       az = A(2);
       const V3D dv = pw - sensor_w;
       cosv = dv.norm() > 1e-6 ? std::abs(n.dot(dv)) / dv.norm() : 0.0;
-      if (degeneracy_last.engaged) {
-        w = fast_lio::pointWeight(degeneracy_last, n);
+      if (telemetry.degeneracy_last.engaged) {
+        w = fast_lio::pointWeight(telemetry.degeneracy_last, n);
       }
     }
-    fout_corr << std::setprecision(15) << lidar_end_time << ',' << iter << ',' << i << ',' << int(eff)
-              << std::setprecision(5) << ',' << p_body.norm() << ',' << point_this(0) << ',' << point_this(1) << ','
-              << point_this(2) << ',' << nx << ',' << ny << ',' << nz << ',' << pd2 << ',' << ax << ',' << ay << ','
-              << az << ',' << nn0 << ',' << nn4 << ',' << n_near << ',' << int(plane_cache[i].valid()) << ','
-              << plane_rms << ',' << lam0 << ',' << lam1 << ',' << lam2 << ',' << d_in << ',' << cosv << ',' << w << ','
-              << pw(2) << ',' << pw(0) << ',' << pw(1) << '\n';
+    outputs.dump_rows << std::setprecision(15) << inputs.scan_end_time << ',' << iter << ',' << i << ',' << int(eff)
+                      << std::setprecision(5) << ',' << p_body.norm() << ',' << point_this(0) << ',' << point_this(1)
+                      << ',' << point_this(2) << ',' << nx << ',' << ny << ',' << nz << ',' << pd2 << ',' << ax << ','
+                      << ay << ',' << az << ',' << nn0 << ',' << nn4 << ',' << n_near << ','
+                      << int(scratch.plane_cache[i].valid()) << ',' << plane_rms << ',' << lam0 << ',' << lam1 << ','
+                      << lam2 << ',' << d_in << ',' << cosv << ',' << w << ',' << pw(2) << ',' << pw(0) << ',' << pw(1)
+                      << '\n';
   }
 }
 }  // namespace
 
-void h_share_model(state_ikfom & s,
-                   esekfom::dyn_share_datastruct<double> & ekfom_data,
-                   const fast_lio::FrontendParams & params)
+void fast_lio::FrontendMeasurement::beginScan()
+{
+  telemetry_.match_time = 0;
+  telemetry_.match_search_time = 0;
+  telemetry_.match_nosearch_time = 0;
+  telemetry_.ekf_search_iters = 0;
+  scratch_.nn_have_last_search = false;
+  for (auto & cached_plane : scratch_.plane_cache)
+    cached_plane.invalidate();
+  telemetry_.nn_max_shift = 0.0;
+  telemetry_.nn_skips = 0;
+  telemetry_.solve_time = 0;
+}
+
+// Called once at the real downsampled-scan boundary, before any int-indexed
+// scan loop. No scratch allocation occurs in the parallel measurement loop.
+bool fast_lio::FrontendMeasurement::prepareScan(std::size_t count, int & point_count)
+{
+  if (!fast_lio::prepareCorrespondenceScratch(count, scratch_.point_selected_surf, scratch_.res_last, point_count))
+    return false;
+  if (scratch_.plane_cache.size() < count) {
+    scratch_.plane_cache.resize(count);
+    scratch_.gate_var.resize(count);
+    scratch_.gate_nn0.resize(count);
+    scratch_.gate_w.resize(count);
+  }
+  return true;
+}
+
+void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state,
+                                             esekfom::dyn_share_datastruct<double> & data,
+                                             const MeasurementInputs & inputs,
+                                             const MeasurementOutputs & outputs)
 {
   double match_start = omp_get_wtime();
-  const bool searching = decideSearch(params, s, ekfom_data);
+  const bool searching = decideSearch(scratch_, telemetry_, params_, outputs, state, data);
   Eigen::Matrix<double, 6, 6> gate_P6 = Eigen::Matrix<double, 6, 6>::Zero();
-  const bool gate_on = gatePrior(params, gate_P6);
-  matchPoints(params, s, searching, gate_on, gate_P6);
-  applyGateAndKernels(params, gate_on);
-  recoverGround(params);
-  compactRows(params);
+  const bool gate_on = gatePrior(telemetry_, params_, inputs, gate_P6);
+  matchPoints(scratch_, params_, inputs, state, searching, gate_on, gate_P6);
+  applyGateAndKernels(scratch_, telemetry_, params_, inputs, gate_on);
+  recoverGround(scratch_, telemetry_, params_, inputs);
+  compactRows(scratch_, telemetry_, params_, inputs, outputs);
 
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterHModelRows)
-    fast_lio_test::afterHModelRows(static_cast<std::size_t>(feats_down_size), lidar_end_time, effct_feat_num);
+    fast_lio_test::afterHModelRows(
+      static_cast<std::size_t>(inputs.point_count), inputs.scan_end_time, outputs.effective_rows);
   if (fast_lio_test::afterHModelSelection)
-    fast_lio_test::reportHModelSelection(ekfom_data.converge, searching);
+    fast_lio_test::reportHModelSelection(scratch_, telemetry_, inputs, outputs, data.converge, searching);
 #endif
 
-  observePosition();
+  observePosition(scratch_, telemetry_, outputs);
 
-  if (effct_feat_num < 1) {
-    ekfom_data.valid = false;
+  if (outputs.effective_rows < 1) {
+    data.valid = false;
     std::cerr << "No Effective Points!" << '\n';
 #ifdef FASTLIO_TEST_HOOKS
     if (fast_lio_test::afterHModelMatrices)
-      fast_lio_test::afterHModelMatrices(lidar_end_time, ekfom_data.valid, Eigen::MatrixXd(), Eigen::VectorXd());
+      fast_lio_test::afterHModelMatrices(inputs.scan_end_time, data.valid, Eigen::MatrixXd(), Eigen::VectorXd());
     if (fast_lio_test::afterHModelExit)
-      fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(ekfom_data.valid, false));
+      fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(telemetry_, inputs, outputs, data.valid, false));
 #endif
     return;
   }
 
-  res_mean_last = total_residual / effct_feat_num;
+  outputs.mean_residual = scratch_.total_residual / outputs.effective_rows;
   const double match_dt = omp_get_wtime() - match_start;
-  match_time += match_dt;
-  (searching ? match_search_time : match_nosearch_time) += match_dt;
+  telemetry_.match_time += match_dt;
+  (searching ? telemetry_.match_search_time : telemetry_.match_nosearch_time) += match_dt;
   double solve_start_ = omp_get_wtime();
 
   /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
-  ekfom_data.h_x = Eigen::MatrixXd::Zero(effct_feat_num, 12);  // 23
-  ekfom_data.h.resize(effct_feat_num);
+  data.h_x = Eigen::MatrixXd::Zero(outputs.effective_rows, 12);  // 23
+  data.h.resize(outputs.effective_rows);
   V3D hold_up = V3D::Zero();
-  const bool hold_rows = prepareAttitudeHold(params, s, hold_up);
-  buildRows(params, s, ekfom_data, hold_up, hold_rows);
-  degeneracyWeights(params, ekfom_data);
-  if (corr_dump_scan_active && fout_corr.is_open()) {
-    writeDump(s, searching, hold_up, hold_rows);
+  const bool hold_rows = prepareAttitudeHold(scratch_, telemetry_, params_, inputs, outputs, state, hold_up);
+  buildRows(scratch_, params_, outputs, state, data, hold_up, hold_rows);
+  degeneracyWeights(scratch_, telemetry_, params_, spectrum_clock_, inputs, outputs, data);
+  if (outputs.dump_scan_active && outputs.dump_rows.is_open()) {
+    writeDump(scratch_, telemetry_, inputs, outputs, state, searching, hold_up, hold_rows);
   }
 
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterHModelMatrices)
-    fast_lio_test::afterHModelMatrices(lidar_end_time, ekfom_data.valid, ekfom_data.h_x, ekfom_data.h);
+    fast_lio_test::afterHModelMatrices(inputs.scan_end_time, data.valid, data.h_x, data.h);
   if (fast_lio_test::afterHModelExit)
-    fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(ekfom_data.valid, hold_rows));
+    fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(telemetry_, inputs, outputs, data.valid, hold_rows));
 #endif
-  solve_time += omp_get_wtime() - solve_start_;
-}
-
-void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state, esekfom::dyn_share_datastruct<double> & data)
-{
-  h_share_model(state, data, params_);
+  telemetry_.solve_time += omp_get_wtime() - solve_start_;
 }
 
 namespace
 {
-/// The filter's measurement model: context is the node's FrontendMeasurement.
+/// The filter's measurement model: context is the node's FrontendMeasurement, and the scan's values are this
+/// translation unit's.
 void measurementModel(void * context, state_ikfom & state, esekfom::dyn_share_datastruct<double> & data)
 {
-  static_cast<fast_lio::FrontendMeasurement *>(context)->evaluate(state, data);
+  // inputs.prior_covariance binds to the filter's own matrix only while get_P() returns exactly that type.
+  static_assert(std::is_same<decltype(kf.get_P()), const fast_lio::PriorCovariance &>::value,
+                "PriorCovariance must be the filter's covariance type");
+  const fast_lio::MeasurementInputs inputs{kf.get_P(),
+                                           ikdtree,
+                                           *feats_down_body,
+                                           *feats_down_world,
+                                           feats_down_size,
+                                           lidar_end_time,
+                                           scan_far_frac,
+                                           lidar_attitude_hold_active,
+                                           lidar_attitude_hold_allowed,
+                                           degeneracy_debug};
+  const fast_lio::MeasurementOutputs outputs{
+    effct_feat_num, ekf_iters, res_mean_last, corr_dump_scan_active, corr_dump_iter, fout_corr, fout_corr_iter};
+  static_cast<fast_lio::FrontendMeasurement *>(context)->evaluate(state, data, inputs, outputs);
 }
 }  // namespace
 
@@ -4595,6 +4633,7 @@ private:
     if (!params_.values().kalman_channel_diag_en || !fout_kalman.is_open())
       return;
 
+    const fast_lio::MeasurementTelemetry & measured = measurement_.telemetry();
     const V3D dpos = after.pos - before.pos;
     const V3D dvel = after.vel - before.vel;
     const V3D dba = after.ba - before.ba;
@@ -4611,9 +4650,9 @@ private:
                 << Measures.lidar_beg_time - first_lidar_time << ',' << channel << ',' << diagnostics.valid << ','
                 << diagnostics.converged << ',' << diagnostics.iterations << ',' << diagnostics.measurement_dim << ','
                 << diagnostics.residual_norm << ',' << diagnostics.weighted_residual_squared << ',' << effct_feat_num
-                << ',' << res_mean_last << ',' << pos_obs_eig_min << ',' << pos_obs_eig_max << ',' << pos_obs_z_weak
-                << ',' << measurement.x() << ',' << measurement.y() << ',' << measurement.z() << ',' << prediction.x()
-                << ',' << prediction.y() << ',' << prediction.z();
+                << ',' << res_mean_last << ',' << measured.pos_obs_eig_min << ',' << measured.pos_obs_eig_max << ','
+                << measured.pos_obs_z_weak << ',' << measurement.x() << ',' << measurement.y() << ',' << measurement.z()
+                << ',' << prediction.x() << ',' << prediction.y() << ',' << prediction.z();
     for (int i = 0; i < 23; ++i)
       fout_kalman << ',' << dx(i);
     fout_kalman << ',' << dpos.x() << ',' << dpos.y() << ',' << dpos.z() << ',' << dvel.x() << ',' << dvel.y() << ','
@@ -4631,7 +4670,7 @@ private:
                 << covarianceBlockNorm(covarianceBefore, 18, 3, 12, 3) << ',' << pBefore(21) << ',' << pBefore(22)
                 << ',' << pAfter(21) << ',' << pAfter(22) << ',' << pBefore(18) << ',' << pBefore(19) << ','
                 << pBefore(20) << ',' << pAfter(18) << ',' << pAfter(19) << ',' << pAfter(20) << ',' << drot.x() << ','
-                << drot.y() << ',' << drot.z() << ',' << lidar_rot_obs_rp_min << '\n';
+                << drot.y() << ',' << drot.z() << ',' << measured.lidar_rot_obs_rp_min << '\n';
     fout_kalman.flush();
   }
 
@@ -5280,9 +5319,9 @@ private:
   }
 
   /// The re-anchor gate's match test for the recovery. While the entry view serves a pending recovery the
-  /// evidence is this scan matched against the view at its final state, by h_share_model's rules
+  /// evidence is this scan matched against the view at its final state, by the measurement model's rules
   /// (recovery_view_match.hpp) and with the update's prior covariance `prior_P`; otherwise it is
-  /// h_share_model's own count.
+  /// the measurement model's own count.
   bool recoveryMatchOk(const fast_lio::ReanchorReference & reference,
                        const Eigen::Matrix<double, 23, 23> & prior_P) const
   {
@@ -5448,18 +5487,10 @@ private:
       // undistort / FOV-segment / downsample costs were invisible in the per-frame budget.
       double t_undist = 0.0, t_join = 0.0, t_fov = 0.0;
 
-      match_time = 0;
-      match_search_time = 0;
-      match_nosearch_time = 0;
+      measurement_.beginScan();
+      const fast_lio::MeasurementTelemetry & measured = measurement_.telemetry();
       ekf_iters = 0;
-      ekf_search_iters = 0;
-      nn_have_last_search = false;
-      for (auto & cached_plane : plane_cache)
-        cached_plane.invalidate();
-      nn_max_shift = 0.0;
-      nn_skips = 0;
       kdtree_search_time = 0.0;
-      solve_time = 0;
       solve_const_H_time = 0;
       svd_time = 0;
       t0 = omp_get_wtime();
@@ -5663,7 +5694,7 @@ private:
       /*** downsample the feature points in a scan ***/
       downSizeFilterSurf.filter(feats_undistort->points, feats_down_body->points);
       const std::size_t downsampled_count = feats_down_body->points.size();
-      if (!prepareScanCorrespondenceStorage(downsampled_count)) {
+      if (!measurement_.prepareScan(downsampled_count, feats_down_size)) {
         RCLCPP_ERROR(
           this->get_logger(), "Downsampled scan exceeds int-indexed estimator capacity: %zu points", downsampled_count);
         frontendDrop();
@@ -5916,7 +5947,7 @@ private:
         return;
       }
 
-      normvec->resize(feats_down_size);
+      measurement_.resizeNormals(feats_down_size);
       feats_down_world->resize(feats_down_size);
 
       V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
@@ -5938,7 +5969,7 @@ private:
 #endif
 
       pointSearchInd_surf.resize(feats_down_size);
-      Nearest_Points.resize(feats_down_size);
+      measurement_.resizeNeighbours(feats_down_size);
       int rematch_num = 0;
       bool nearest_search_en = true;  //
 
@@ -5972,12 +6003,12 @@ private:
         hold_in.hold_age_s = lidar_attitude_hold_since >= 0.0 ? lidar_end_time - lidar_attitude_hold_since : 0.0;
         hold_in.scan_gap_s = hole_last_scan_end > 0.0 ? Measures.lidar_beg_time - hole_last_scan_end : 0.1;
         hold_in.far_frac = scan_far_frac;
-        hold_in.z_weak_prev = pos_obs_z_weak;
+        hold_in.z_weak_prev = measured.pos_obs_z_weak;
         lidar_attitude_hold_active = fast_lio::holdAttitudeThisScan(p.attitude_hold, hold_in);
         fast_lio::AttitudeHoldInputs allowed_in = hold_in;
         allowed_in.engulf_latched = true;  // the release conditions alone: would a latch be honoured?
         lidar_attitude_hold_allowed = fast_lio::holdAttitudeThisScan(p.attitude_hold, allowed_in);
-        lidar_attitude_hold_info_active = false;
+        measurement_.clearAttitudeHoldInfo();
       }
       if (lidar_attitude_hold_active) {
         if (lidar_attitude_hold_since < 0.0) {
@@ -5992,7 +6023,7 @@ private:
                              engulf_latched,
                              effct_feat_num,
                              scan_far_frac,
-                             pos_obs_z_weak,
+                             measured.pos_obs_z_weak,
                              lidar_end_time - lidar_attitude_hold_since,
                              lidar_attitude_hold_scans);
       }
@@ -6016,8 +6047,8 @@ private:
         fast_lio::RollPitchConsiderInputs consider_in;
         consider_in.engulf_latched = engulf_latched;
         consider_in.since_release_s = engulf_release_time > 0.0 ? lidar_end_time - engulf_release_time : -1.0;
-        consider_in.rp_info_prev = lidar_rot_obs_rp_min;
-        consider_in.z_weak_prev = pos_obs_z_weak;
+        consider_in.rp_info_prev = measured.lidar_rot_obs_rp_min;
+        consider_in.z_weak_prev = measured.pos_obs_z_weak;
         consider_in.consider_age_s = rp_consider_since >= 0.0 ? lidar_end_time - rp_consider_since : 0.0;
         rp_consider_active = fast_lio::considerRollPitchThisScan(p.rp_consider, consider_in);
         if (rp_consider_active) {
@@ -6052,8 +6083,8 @@ private:
                                "%.2f deg vel %.2f m/s, min eig %.2e (%d indefinite so far)",
                                engulf_latched,
                                consider_in.since_release_s,
-                               lidar_rot_obs_rp_min,
-                               pos_obs_z_weak,
+                               measured.lidar_rot_obs_rp_min,
+                               measured.pos_obs_z_weak,
                                consider_in.consider_age_s,
                                rp_consider_scans,
                                std::sqrt(std::max(0.0, Pc.template block<3, 3>(0, 0).trace() / 3.0)),
@@ -6073,10 +6104,10 @@ private:
 
       state_point = kf.get_x();
       anchorTraceMeasurementUpdate(state_before_update, state_point);
-      if (!lidar_attitude_hold_active && !lidar_attitude_hold_info_active) {
+      if (!lidar_attitude_hold_active && !measured.lidar_attitude_hold_info_active) {
         lidar_attitude_hold_since = -1.0;
       }
-      if (lidar_attitude_hold_info_active && !lidar_attitude_hold_active) {
+      if (measured.lidar_attitude_hold_info_active && !lidar_attitude_hold_active) {
         if (lidar_attitude_hold_since < 0.0) {
           lidar_attitude_hold_since = lidar_end_time;
         }
@@ -6086,7 +6117,7 @@ private:
                              2000,
                              "[ATT-HOLD] information rule: roll/pitch info %.1f < %.1f, update restricted to "
                              "translation+yaw (effct=%d far_frac=%.2f, %d scans so far)",
-                             lidar_rot_obs_rp_min,
+                             measured.lidar_rot_obs_rp_min,
                              p.lidar_attitude_hold_min_rp_info,
                              effct_feat_num,
                              scan_far_frac,
@@ -6096,17 +6127,17 @@ private:
         writeKalmanChannel(
           "lidar", state_before_update, state_point, lidarCovarianceBefore, lidarDiagnostics, Zero3d, Zero3d);
       }
-      if ((p.corr_gate.innovation_k > 0.0 || p.corr_gate.nn0_max > 0.0) && corr_gate_rejected.load() > 0) {
+      if ((p.corr_gate.innovation_k > 0.0 || p.corr_gate.nn0_max > 0.0) && measured.corr_gate_rejected.load() > 0) {
         RCLCPP_INFO_THROTTLE(this->get_logger(),
                              *this->get_clock(),
                              5000,
                              "[CORR-GATE] refused %d matches on the last iteration (effct=%d, k=%.1f, nn0_max=%.2f, "
                              "scan sigma=%.3f m)",
-                             corr_gate_rejected.load(),
+                             measured.corr_gate_rejected.load(),
                              effct_feat_num,
                              p.corr_gate.innovation_k,
                              p.corr_gate.nn0_max,
-                             corr_gate_scan_sigma);
+                             measured.corr_gate_scan_sigma);
       }
       if (corr_dump_scan_active && fout_corr_scan.is_open()) {
         const M3D dR = state_before_update.rot.toRotationMatrix().transpose() * state_point.rot.toRotationMatrix();
@@ -6114,12 +6145,13 @@ private:
         const V3D dpos = state_point.pos - state_before_update.pos;
         fout_corr_scan << std::setprecision(15) << lidar_end_time << ',' << std::setprecision(9)
                        << Measures.lidar_beg_time - first_lidar_time << ',' << corr_dump_iter << ',' << effct_feat_num
-                       << ',' << int(lidar_attitude_hold_active) << ',' << int(lidar_attitude_hold_info_active) << ','
-                       << std::setprecision(6) << lidar_rot_obs_rp_min << ',' << drot(0) << ',' << drot(1) << ','
-                       << drot(2) << ',' << dpos(0) << ',' << dpos(1) << ',' << dpos(2) << ',' << scan_far_frac << ','
-                       << pos_obs_z_weak << ',' << lidarCovarianceBefore(3, 3) << ',' << lidarCovarianceBefore(4, 4)
-                       << ',' << lidarCovarianceBefore(5, 5) << ',' << lidarCovarianceBefore(0, 0) << ','
-                       << lidarCovarianceBefore(1, 1) << ',' << lidarCovarianceBefore(2, 2);
+                       << ',' << int(lidar_attitude_hold_active) << ',' << int(measured.lidar_attitude_hold_info_active)
+                       << ',' << std::setprecision(6) << measured.lidar_rot_obs_rp_min << ',' << drot(0) << ','
+                       << drot(1) << ',' << drot(2) << ',' << dpos(0) << ',' << dpos(1) << ',' << dpos(2) << ','
+                       << scan_far_frac << ',' << measured.pos_obs_z_weak << ',' << lidarCovarianceBefore(3, 3) << ','
+                       << lidarCovarianceBefore(4, 4) << ',' << lidarCovarianceBefore(5, 5) << ','
+                       << lidarCovarianceBefore(0, 0) << ',' << lidarCovarianceBefore(1, 1) << ','
+                       << lidarCovarianceBefore(2, 2);
         const V3D dvel = state_point.vel - state_before_update.vel;
         fout_corr_scan << ',' << dvel(0) << ',' << dvel(1) << ',' << dvel(2);
         const int blk[9] = {0, 1, 2, 3, 4, 5, 12, 13, 14};
@@ -6141,11 +6173,12 @@ private:
       if (p.degeneracy_params.enable) {
         ++degeneracy_scans_total;
       }
-      if (degeneracy_last.engaged) {
+      if (measured.degeneracy_last.engaged) {
         ++degeneracy_scans_engaged;
-        const Eigen::Vector3d weak = degeneracy_last.basis.col(0);
-        const double mean_w =
-          degeneracy_point_weighted > 0 ? degeneracy_point_weight_sum / double(degeneracy_point_weighted) : 1.0;
+        const Eigen::Vector3d weak = measured.degeneracy_last.basis.col(0);
+        const double mean_w = measured.degeneracy_point_weighted > 0
+                                ? measured.degeneracy_point_weight_sum / double(measured.degeneracy_point_weighted)
+                                : 1.0;
         RCLCPP_WARN_THROTTLE(this->get_logger(),
                              *this->get_clock(),
                              2000,
@@ -6155,15 +6188,15 @@ private:
                              weak.x(),
                              weak.y(),
                              weak.z(),
-                             degeneracy_last.lambda_norm(0),
-                             degeneracy_last.lambda_abs(0),
-                             degeneracy_last.weights(0),
+                             measured.degeneracy_last.lambda_norm(0),
+                             measured.degeneracy_last.lambda_abs(0),
+                             measured.degeneracy_last.weights(0),
                              effct_feat_num,
                              scan_far_frac,
                              degeneracy_scans_engaged,
                              degeneracy_scans_total,
                              mean_w,
-                             degeneracy_point_weighted,
+                             measured.degeneracy_point_weighted,
                              p.planar_constraint_en ? "on" : "OFF",
                              p.zupt_en ? "on" : "OFF");
       }
@@ -6387,7 +6420,7 @@ private:
           }
         }
         // Engagement: legacy trigger, [L1] hold hysteresis, [L2] continuous.
-        const bool ga_trig = pos_obs_z_weak > p.gravity_align_z_weak_thresh || flio_in_degraded;
+        const bool ga_trig = measured.pos_obs_z_weak > p.gravity_align_z_weak_thresh || flio_in_degraded;
         if (ga_trig) {
           gravity_align_last_trig = lidar_end_time;
         }
@@ -6541,10 +6574,11 @@ private:
                 state_point = kf.get_x();
                 V3D eul_after = SO3ToEuler(state_point.rot);
                 V3D deul = eul_after - eul_before;
-                std::cerr << "[GALIGN] z_weak=" << pos_obs_z_weak << " degr=" << flio_in_degraded << " trig=" << ga_trig
-                          << " held=" << ga_held << " win_n=" << win_n << " span=" << win_span << " sigma=" << sigma
-                          << " sig_eff=" << std::sqrt(n2) << " gvar=" << kf.get_P()(21, 21) << " tilt_deg=" << ang_deg
-                          << " alin=" << (lin_term.valid ? lin_term.accel.norm() : 0.0) << " alin_deg="
+                std::cerr << "[GALIGN] z_weak=" << measured.pos_obs_z_weak << " degr=" << flio_in_degraded
+                          << " trig=" << ga_trig << " held=" << ga_held << " win_n=" << win_n << " span=" << win_span
+                          << " sigma=" << sigma << " sig_eff=" << std::sqrt(n2) << " gvar=" << kf.get_P()(21, 21)
+                          << " tilt_deg=" << ang_deg << " alin=" << (lin_term.valid ? lin_term.accel.norm() : 0.0)
+                          << " alin_deg="
                           << (lin_term.valid ? fast_lio::leanOfAcceleration(lin_term.accel, G_m_s2) * 57.2958 : 0.0)
                           << " dRPY_deg=[" << deul.x() << "," << deul.y() << "," << deul.z() << "]"
                           << " posZ=" << state_point.pos[2] << "m" << std::endl;
@@ -6570,7 +6604,7 @@ private:
        *   robot's pitch (rotation state), not by body-frame vz. This supplies
        *   the missing vertical information that the degenerate iEKF otherwise
        *   dumps into the accel bias, flying the state off (bag2 km-runaway). ***/
-      if (p.planar_constraint_en && (pos_obs_z_weak > p.planar_constraint_z_weak_thresh || flio_in_degraded)) {
+      if (p.planar_constraint_en && (measured.pos_obs_z_weak > p.planar_constraint_z_weak_thresh || flio_in_degraded)) {
         state_ikfom st = kf.get_x();
         M3D Rw = st.rot.toRotationMatrix();
         V3D v_body = Rw.transpose() * st.vel;  // velocity in IMU/body frame
@@ -7079,11 +7113,11 @@ private:
             const Eigen::Vector3d vw(state_point.vel[0], state_point.vel[1], state_point.vel[2]);
             if (vw.norm() > 0.2) {
               const Eigen::Vector3d d = vw.normalized();
-              obs_along = d.dot(pos_obs_M * d) / n;
+              obs_along = d.dot(measured.pos_obs_M * d) / n;
             }
-            obs_emin = pos_obs_eig_min / n;
-            obs_emax = pos_obs_eig_max / n;
-            Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es2(pos_obs_M.topLeftCorner<2, 2>());
+            obs_emin = measured.pos_obs_eig_min / n;
+            obs_emax = measured.pos_obs_eig_max / n;
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es2(measured.pos_obs_M.topLeftCorner<2, 2>());
             obs_hmin = es2.eigenvalues()(0) / n;
           }
           std::cerr << std::fixed << std::setprecision(3) << "[SCAN] t=" << lidar_end_time
@@ -7095,17 +7129,18 @@ private:
                     << " bgz=" << state_point.bg[2] << " exT=" << state_point.offset_T_L_I[0] << ","
                     << state_point.offset_T_L_I[1] << "," << state_point.offset_T_L_I[2] << " exR=" << ex_eul[0] << ","
                     << ex_eul[1] << "," << ex_eul[2] << " res=";
-          for (int b = 0; b < kResBins; ++b)
-            std::cerr << (b ? "," : "") << res_bin_n[b] << ":"
-                      << (res_bin_n[b] ? std::sqrt(res_bin_ss[b] / res_bin_n[b]) * 1000.0 : 0.0);
+          for (int b = 0; b < fast_lio::MeasurementTelemetry::kResBins; ++b)
+            std::cerr << (b ? "," : "") << measured.res_bin_n[b] << ":"
+                      << (measured.res_bin_n[b] ? std::sqrt(measured.res_bin_ss[b] / measured.res_bin_n[b]) * 1000.0
+                                                : 0.0);
           std::cerr << std::endl;
         }
         if (lidar_correction > 0.2 || body_speed > 1.5 || dvel > 0.3 || dba > 0.05 || dbg > 0.01 ||
-            effct_feat_num < 200 || pos_obs_z_weak > 0.7) {
+            effct_feat_num < 200 || measured.pos_obs_z_weak > 0.7) {
           std::cerr << "[DEGEN] effct=" << effct_feat_num << " corr=" << lidar_correction << "m speed=" << body_speed
-                    << " dvel=" << dvel << " dba=" << dba << " dbg=" << dbg << " z_weak=" << pos_obs_z_weak
+                    << " dvel=" << dvel << " dba=" << dba << " dbg=" << dbg << " z_weak=" << measured.pos_obs_z_weak
                     << " posZ=" << state_point.pos[2] << "m"
-                    << " rec=" << canopy_ground_recovered << std::endl;
+                    << " rec=" << measured.canopy_ground_recovered << std::endl;
         }
       }
 
@@ -7183,7 +7218,7 @@ private:
         if (scan_body_speed > kHealthSpeedGate) {
           if (effct_feat_num > 0) {
             const Eigen::Vector3d d = vw / scan_body_speed;
-            scan_obs_along = d.dot(pos_obs_M * d) / effct_feat_num;
+            scan_obs_along = d.dot(measured.pos_obs_M * d) / effct_feat_num;
           } else {
             scan_obs_along = 0.0;  // moving with no effective points: worst case
           }
@@ -7217,7 +7252,7 @@ private:
       // scans fill the gaps between them.
       const bool frozen_by_prior = p.prior_map_freeze && prior_map_installed_;
       if (mapping_enabled.load(std::memory_order_relaxed) && !flio_map_frozen && !frozen_by_prior) {
-        map_incremental();
+        map_incremental(measurement_.nearestPoints());
         anchorTraceMapUpdated();
       }
       t5 = omp_get_wtime();
@@ -7271,14 +7306,14 @@ private:
           (t_fov - t_join) * 1000.0,
           (t1 - t_fov) * 1000.0,
           iekf_ms,
-          ekf_search_iters,
+          measured.ekf_search_iters,
           ekf_iters,
           effct_feat_num,
-          match_search_time * 1000.0,
-          match_nosearch_time * 1000.0,
-          (solve_time + solve_H_time) * 1000.0,
-          nn_max_shift * 1000.0,
-          nn_skips,
+          measured.match_search_time * 1000.0,
+          measured.match_nosearch_time * 1000.0,
+          (measured.solve_time + solve_H_time) * 1000.0,
+          measured.nn_max_shift * 1000.0,
+          measured.nn_skips,
           add_ms,
           join_ms,
           loop_ms,
@@ -7299,7 +7334,7 @@ private:
       if (scan_pub_en && p.scan_body_pub_en)
         publish_frame_body(pubLaserCloudFull_body_);
       if (p.effect_pub_en)
-        publish_effect_world(pubLaserCloudEffect_);
+        publish_effect_world(pubLaserCloudEffect_, measurement_.effectCloud());
       // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
       /*** Debug variables ***/
@@ -7310,10 +7345,11 @@ private:
         kdtree_size_end = async_map_en ? (kdtree_size_st + add_point_size) : ikdtree.size();
         aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t5 - t0) / frame_num;
         aver_time_icp = aver_time_icp * (frame_num - 1) / frame_num + (t_update_end - t_update_start) / frame_num;
-        aver_time_match = aver_time_match * (frame_num - 1) / frame_num + (match_time) / frame_num;
+        aver_time_match = aver_time_match * (frame_num - 1) / frame_num + (measured.match_time) / frame_num;
         aver_time_incre = aver_time_incre * (frame_num - 1) / frame_num + (kdtree_incremental_time) / frame_num;
-        aver_time_solve = aver_time_solve * (frame_num - 1) / frame_num + (solve_time + solve_H_time) / frame_num;
-        aver_time_const_H_time = aver_time_const_H_time * (frame_num - 1) / frame_num + solve_time / frame_num;
+        aver_time_solve =
+          aver_time_solve * (frame_num - 1) / frame_num + (measured.solve_time + solve_H_time) / frame_num;
+        aver_time_const_H_time = aver_time_const_H_time * (frame_num - 1) / frame_num + measured.solve_time / frame_num;
         if (fast_lio::timingLogAccepts(time_log_counter)) {
           const std::size_t slot = fast_lio::timingLogSlot(time_log_counter);
           T1[slot] = Measures.lidar_beg_time;

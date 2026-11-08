@@ -227,7 +227,12 @@ endfunction()
 if(BUILD_TESTING)
   # Link the real production model: do not compile a copied h-model into the test.
   ament_add_gtest(test_h_model_scan_bounds test/test_h_model_scan_bounds.cpp TIMEOUT 120)
-  target_include_directories(test_h_model_scan_bounds PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${PCL_INCLUDE_DIRS})
+  target_include_directories(test_h_model_scan_bounds PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${PCL_INCLUDE_DIRS})
+  # The fixture's map is the component's MapBackend, so the test names the same backend.
+  if(USE_IVOX)
+    target_compile_definitions(test_h_model_scan_bounds PRIVATE USE_IVOX)
+  endif()
   target_link_libraries(test_h_model_scan_bounds fastlio_mapping_component ${PCL_LIBRARIES} Eigen3::Eigen)
   ament_target_dependencies(test_h_model_scan_bounds ${dependencies})
   add_dependencies(test_h_model_scan_bounds fastlio_mapping)

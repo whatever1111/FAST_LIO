@@ -17,7 +17,7 @@ extern lio_ivox::IVox<PointType> ikdtree;
 extern PointCloudXYZI::Ptr feats_down_body;
 extern fast_lio::DelayedMapInsertion<PointVector> map_insert_pending;
 extern bool async_map_en;
-extern bool prepareScanCorrespondenceStorage(std::size_t);
+extern int feats_down_size;
 extern void startMapWorker();
 extern void stopMapWorker();
 extern void dispatchMapAdd(PointVector &, PointVector &);
@@ -86,7 +86,7 @@ void expectResetWaitsForTheWorker(int delayScans)
   std::promise<void> resetEntered;
   std::atomic<bool> discarded{false};
   prepareMap(true);
-  ASSERT_TRUE(prepareScanCorrespondenceStorage(1));
+  feats_down_size = 1;
   stageHeldBatches(20.0f, delayScans);
   ASSERT_EQ(map_insert_pending.pendingSize(), static_cast<std::size_t>(delayScans));
 
@@ -161,7 +161,7 @@ TEST(AsyncMapReset, EveryBatchOfAMultiScanDelayIsDiscarded)
 void expectResetWithoutTheWorker(int delayScans)
 {
   prepareMap(false);
-  ASSERT_TRUE(prepareScanCorrespondenceStorage(1));
+  feats_down_size = 1;
   stageHeldBatches(20.0f, delayScans);
   ASSERT_EQ(map_insert_pending.pendingSize(), static_cast<std::size_t>(delayScans));
 

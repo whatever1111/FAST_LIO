@@ -382,10 +382,7 @@ void FrontendParameters::readBacklog(const rclcpp::Node & node,
   }
 }
 
-void FrontendParameters::readDownsampleAndDegeneracy(const rclcpp::Node & node,
-                                                     bool & degeneracy_debug,
-                                                     bool & degeneracy_spectrum_trace,
-                                                     DegeneracyParams & degeneracy_params)
+void FrontendParameters::readDownsampleAndDegeneracy(const rclcpp::Node & node, bool & degeneracy_debug)
 {
   const DownsampleParameterSpecs downsample{};
   const MeasurementParameterSpecs measurement{};
@@ -397,16 +394,16 @@ void FrontendParameters::readDownsampleAndDegeneracy(const rclcpp::Node & node,
   readInto(node, downsample.adaptive_downsample_raise_after, values_.adaptive_ds.raise_after);
   readInto(node, downsample.adaptive_downsample_lower_after, values_.adaptive_ds.lower_after);
   readInto(node, measurement.degeneracy_debug, degeneracy_debug);
-  readInto(node, measurement.degeneracy_spectrum_trace, degeneracy_spectrum_trace);
-  readInto(node, measurement.degeneracy_weighting_en, degeneracy_params.enable);
-  readInto(node, measurement.degeneracy_lambda_bad, degeneracy_params.lambda_bad);
-  readInto(node, measurement.degeneracy_lambda_good, degeneracy_params.lambda_good);
-  readInto(node, measurement.degeneracy_min_weight, degeneracy_params.min_weight);
-  readInto(node, measurement.degeneracy_lambda_abs_bad, degeneracy_params.lambda_abs_bad);
-  readInto(node, measurement.degeneracy_lambda_abs_good, degeneracy_params.lambda_abs_good);
-  readInto(node, measurement.degeneracy_hard_projection, degeneracy_params.hard_projection);
-  readInto(node, measurement.degeneracy_schur_en, degeneracy_params.schur_en);
-  readInto(node, measurement.degeneracy_schur_ridge, degeneracy_params.schur_ridge);
+  readInto(node, measurement.degeneracy_spectrum_trace, values_.degeneracy_spectrum_trace);
+  readInto(node, measurement.degeneracy_weighting_en, values_.degeneracy_params.enable);
+  readInto(node, measurement.degeneracy_lambda_bad, values_.degeneracy_params.lambda_bad);
+  readInto(node, measurement.degeneracy_lambda_good, values_.degeneracy_params.lambda_good);
+  readInto(node, measurement.degeneracy_min_weight, values_.degeneracy_params.min_weight);
+  readInto(node, measurement.degeneracy_lambda_abs_bad, values_.degeneracy_params.lambda_abs_bad);
+  readInto(node, measurement.degeneracy_lambda_abs_good, values_.degeneracy_params.lambda_abs_good);
+  readInto(node, measurement.degeneracy_hard_projection, values_.degeneracy_params.hard_projection);
+  readInto(node, measurement.degeneracy_schur_en, values_.degeneracy_params.schur_en);
+  readInto(node, measurement.degeneracy_schur_ridge, values_.degeneracy_params.schur_ridge);
 }
 
 void FrontendParameters::readConstraints(const rclcpp::Node & node, bool & health_pub_en)
@@ -434,23 +431,19 @@ void FrontendParameters::readConstraints(const rclcpp::Node & node, bool & healt
   readInto(node, measurement.lidar_attitude_hold_en, values_.attitude_hold.enabled);
 }
 
-void FrontendParameters::readCorrespondence(const rclcpp::Node & node,
-                                            CorrespondenceGateParams & corr_gate,
-                                            int & corr_kernel,
-                                            double & corr_kernel_mad_scale,
-                                            double & corr_kernel_min_scale)
+void FrontendParameters::readCorrespondence(const rclcpp::Node & node)
 {
   const MeasurementParameterSpecs measurement{};
-  readInto(node, measurement.corr_innov_gate_k, corr_gate.innovation_k);
-  readInto(node, measurement.corr_nn0_max, corr_gate.nn0_max);
-  readInto(node, measurement.corr_gate_mad_scale, corr_gate.mad_scale);
-  readInto(node, measurement.corr_gate_rot_sigma_floor_deg, corr_gate.rot_sigma_floor_deg);
+  readInto(node, measurement.corr_innov_gate_k, values_.corr_gate.innovation_k);
+  readInto(node, measurement.corr_nn0_max, values_.corr_gate.nn0_max);
+  readInto(node, measurement.corr_gate_mad_scale, values_.corr_gate.mad_scale);
+  readInto(node, measurement.corr_gate_rot_sigma_floor_deg, values_.corr_gate.rot_sigma_floor_deg);
   std::string corr_kernel_str = "none";
   readInto(node, measurement.corr_kernel, corr_kernel_str);
-  readInto(node, measurement.corr_kernel_mad_scale, corr_kernel_mad_scale);
-  readInto(node, measurement.corr_kernel_min_scale, corr_kernel_min_scale);
-  corr_kernel = corr_kernel_str == "gm" ? 1 : corr_kernel_str == "cauchy" ? 2 : 0;
-  if (corr_kernel_str != "none" && corr_kernel == 0) {
+  readInto(node, measurement.corr_kernel_mad_scale, values_.corr_kernel_mad_scale);
+  readInto(node, measurement.corr_kernel_min_scale, values_.corr_kernel_min_scale);
+  values_.corr_kernel = corr_kernel_str == "gm" ? 1 : corr_kernel_str == "cauchy" ? 2 : 0;
+  if (corr_kernel_str != "none" && values_.corr_kernel == 0) {
     RCLCPP_WARN(node.get_logger(), "corr_kernel '%s' unknown (none|gm|cauchy): kernel off", corr_kernel_str.c_str());
   }
 #ifdef FASTLIO_TEST_HOOKS
@@ -480,9 +473,7 @@ void FrontendParameters::readCorrespondenceDump(const rclcpp::Node & node)
 #endif
 }
 
-void FrontendParameters::readAttitudeAndGravity(const rclcpp::Node & node,
-                                                double & lidar_attitude_hold_min_rp_info,
-                                                double & zupt_vel_reset_sigma)
+void FrontendParameters::readAttitudeAndGravity(const rclcpp::Node & node, double & zupt_vel_reset_sigma)
 {
   const MeasurementParameterSpecs measurement{};
   const RecoveryParameterSpecs recovery{};
@@ -491,7 +482,7 @@ void FrontendParameters::readAttitudeAndGravity(const rclcpp::Node & node,
   readInto(node, measurement.lidar_attitude_hold_min_effct, values_.attitude_hold.min_effct);
   readInto(node, measurement.lidar_attitude_hold_max_s, values_.attitude_hold.max_hold_s);
   readInto(node, measurement.lidar_attitude_hold_max_scan_gap_s, values_.attitude_hold.max_scan_gap_s);
-  readInto(node, measurement.lidar_attitude_hold_min_rp_info, lidar_attitude_hold_min_rp_info);
+  readInto(node, measurement.lidar_attitude_hold_min_rp_info, values_.lidar_attitude_hold_min_rp_info);
   readInto(node, recovery.guard_vel_reset_sigma, values_.guard_vel_reset_sigma);
   readInto(node, recovery.zupt_vel_reset_sigma, zupt_vel_reset_sigma);
   readInto(node, measurement.lidar_attitude_hold_z_weak, values_.attitude_hold.z_weak_min);
@@ -748,27 +739,18 @@ void FrontendParameters::readRunaway(const rclcpp::Node & node,
   readInto(node, recovery.divergence_guard_max_speed, values_.divergence_guard_max_speed);
 }
 
-void FrontendParameters::readCanopyAndGround(const rclcpp::Node & node,
-                                             double & canopy_near_range,
-                                             double & canopy_ground_z,
-                                             double & canopy_ground_halfband,
-                                             bool & ground_recover_en,
-                                             double & ground_recover_scan_band,
-                                             int & ground_recover_min_inliers,
-                                             double & ground_recover_max_residual,
-                                             double & ground_recover_sector_tol,
-                                             int & ground_recover_max_rows)
+void FrontendParameters::readCanopyAndGround(const rclcpp::Node & node)
 {
   const MeasurementParameterSpecs measurement{};
-  readInto(node, measurement.canopy_near_range, canopy_near_range);
-  readInto(node, measurement.canopy_ground_z, canopy_ground_z);
-  readInto(node, measurement.canopy_ground_halfband, canopy_ground_halfband);
-  readInto(node, measurement.ground_recover_en, ground_recover_en);
-  readInto(node, measurement.ground_recover_scan_band, ground_recover_scan_band);
-  readInto(node, measurement.ground_recover_min_inliers, ground_recover_min_inliers);
-  readInto(node, measurement.ground_recover_max_residual, ground_recover_max_residual);
-  readInto(node, measurement.ground_recover_sector_tol, ground_recover_sector_tol);
-  readInto(node, measurement.ground_recover_max_rows, ground_recover_max_rows);
+  readInto(node, measurement.canopy_near_range, values_.canopy_near_range);
+  readInto(node, measurement.canopy_ground_z, values_.canopy_ground_z);
+  readInto(node, measurement.canopy_ground_halfband, values_.canopy_ground_halfband);
+  readInto(node, measurement.ground_recover_en, values_.ground_recover_en);
+  readInto(node, measurement.ground_recover_scan_band, values_.ground_recover_scan_band);
+  readInto(node, measurement.ground_recover_min_inliers, values_.ground_recover_min_inliers);
+  readInto(node, measurement.ground_recover_max_residual, values_.ground_recover_max_residual);
+  readInto(node, measurement.ground_recover_sector_tol, values_.ground_recover_sector_tol);
+  readInto(node, measurement.ground_recover_max_rows, values_.ground_recover_max_rows);
 }
 
 void FrontendParameters::readDataPaths(const rclcpp::Node & node, std::string & map_file_path, std::string & root_dir)
@@ -945,9 +927,6 @@ void FrontendParameters::readImuCoverage(const rclcpp::Node & node,
 
 void FrontendParameters::readFeatureInputs(const rclcpp::Node & node,
                                            int & point_filter_num,
-                                           bool & nn_refresh_gate_en,
-                                           double & nn_refresh_min_shift,
-                                           double & nn_refresh_ref_range,
                                            bool & feature_enabled,
                                            bool & runtime_pos_log)
 {
@@ -955,9 +934,9 @@ void FrontendParameters::readFeatureInputs(const rclcpp::Node & node,
   const MeasurementParameterSpecs measurement{};
   const DiagnosticsParameterSpecs diagnostics{};
   readInto(node, input.point_filter_num, point_filter_num);
-  readInto(node, measurement.nn_refresh_gate_en, nn_refresh_gate_en);
-  readInto(node, measurement.nn_refresh_min_shift, nn_refresh_min_shift);
-  readInto(node, measurement.nn_refresh_ref_range, nn_refresh_ref_range);
+  readInto(node, measurement.nn_refresh_gate_en, values_.nn_refresh_gate_en);
+  readInto(node, measurement.nn_refresh_min_shift, values_.nn_refresh_min_shift);
+  readInto(node, measurement.nn_refresh_ref_range, values_.nn_refresh_ref_range);
   readInto(node, input.feature_extract_enable, feature_enabled);
   readInto(node, diagnostics.runtime_pos_log_enable, runtime_pos_log);
 }
@@ -988,7 +967,6 @@ void FrontendParameters::readDiagnosticsAndMapSave(const rclcpp::Node & node,
                                                    FrontendStartup & startup,
                                                    bool & latency_diag_en,
                                                    double & latency_log_period_sec,
-                                                   bool & extrinsic_est_en,
                                                    int & map_insert_delay_scans,
                                                    bool & pcd_save_en,
                                                    int & pcd_save_interval)
@@ -999,8 +977,8 @@ void FrontendParameters::readDiagnosticsAndMapSave(const rclcpp::Node & node,
   readInto(node, diagnostics.diagnostics_latency_enable, latency_diag_en);
   readInto(node, diagnostics.diagnostics_latency_log_period_sec, latency_log_period_sec);
   readInto(node, diagnostics.diagnostics_kalman_channel_enable, values_.kalman_channel_diag_en);
-  readInto(node, imu.mapping_extrinsic_est_en, extrinsic_est_en);
-  if (values_.attitude_hold.enabled && extrinsic_est_en) {
+  readInto(node, imu.mapping_extrinsic_est_en, values_.extrinsic_est_en);
+  if (values_.attitude_hold.enabled && values_.extrinsic_est_en) {
     RCLCPP_FATAL(node.get_logger(),
                  "lidar_attitude_hold_en and mapping.extrinsic_est_en cannot both be true: the hold projects only the "
                  "attitude columns of H onto yaw, so the extrinsic rotation columns would let roll and pitch "

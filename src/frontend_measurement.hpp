@@ -2,6 +2,7 @@
 // context entry.
 #pragma once
 
+#include "frontend_params.hpp"
 #include "ikfom_types.hpp"
 
 namespace fast_lio
@@ -12,7 +13,9 @@ namespace fast_lio
 class FrontendMeasurement
 {
 public:
-  FrontendMeasurement() = default;
+  /// params is the node's configuration, read from the first evaluation on: the node passes it before reading its
+  /// parameters, and it must outlive this object.
+  explicit FrontendMeasurement(const FrontendParams & params) : params_(params) {}
   ~FrontendMeasurement() = default;
   FrontendMeasurement(const FrontendMeasurement &) = delete;
   FrontendMeasurement & operator=(const FrontendMeasurement &) = delete;
@@ -22,5 +25,8 @@ public:
   /// One evaluation at the filter's current iterate: fills data's rows, or sets data.valid to false when no point
   /// is usable.
   void evaluate(state_ikfom & state, esekfom::dyn_share_datastruct<double> & data);
+
+private:
+  const FrontendParams & params_;
 };
 }  // namespace fast_lio

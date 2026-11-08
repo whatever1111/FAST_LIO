@@ -160,7 +160,7 @@ double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 double match_search_time = 0, match_nosearch_time = 0;
 int ekf_iters = 0, ekf_search_iters = 0;
 int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
-bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = false;
+bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false;
 bool ikd_profile = false;  // [ikd-profile] per-scan rebuild-split line, gated by env FLIO_IKD_PROFILE
 // Mapping pause/resume gate. Owned by PGO node (lio_slam_fastLioPGO publishes
 // /lio_slam/mapping_enabled with transient_local QoS); we mirror it here.
@@ -212,20 +212,8 @@ int iterCount = 0, feats_down_size = 0, laserCloudValidNum = 0, pcd_save_interva
 double pos_obs_eig_min = 0.0, pos_obs_eig_max = 0.0, pos_obs_z_weak = 0.0;
 Eigen::Matrix3d pos_obs_M = Eigen::Matrix3d::Zero();  // Σ n nᵀ of the last update (world frame), for the [SCAN] trace
 bool degeneracy_debug = false;                        // verbose per-frame [DEGEN] diagnostics
-// The spectrum trace alone, without the per-scan cerr traffic degeneracy_debug carries:
-// throttled, so it costs nothing and can run on a scoring replay. Calibrating the
-// thresholds needs the spectrum of a run that did NOT diverge, which is exactly what
-// the heavier flag cannot give.
-bool degeneracy_spectrum_trace = false;
 
-// Subspace weighting (degeneracy_policy.hpp): hold the LiDAR position update back in
-// the directions this scan does not constrain, instead of trusting or discarding the
-// scan whole. Inert by construction on a healthy scan; default OFF pending bag
-// validation. The scalar defences (guard / ZUPT / re-anchor) stay: this grades the
-// PARTIAL degeneracy of a doorway or corridor, it does not cover a starved scan that
-// constrains nothing at all, and it supplies no information of its own — the released
-// directions fall to IMU propagation until a prior (planar-Z, ZUPT, wheel) fills them.
-fast_lio::DegeneracyParams degeneracy_params;
+// Subspace weighting (FrontendParams::degeneracy_params is the policy): its verdict and what it did.
 fast_lio::DegeneracyResult degeneracy_last;  // last h_share_model verdict, for the traces
 // How much the policy actually did, since a throttled log line cannot say: scans whose
 // final iteration held a direction back, out of scans updated, and the mean per-point
@@ -273,18 +261,11 @@ struct GravWinAgg
 };
 std::deque<GravWinAgg> grav_win;  // scan-thread only
 double gravity_align_last_trig = -1e18;
-// [v11] correspondence gate (correspondence_gate.hpp): a match is admitted only when its residual lies
-// within corr_innov_gate_k sigma of its own predicted variance H P Hᵀ + R (and, separately, when its
-// nearest map point is within corr_nn0_max). Both 0 = the legacy s > 0.9 test alone.
-fast_lio::CorrespondenceGateParams corr_gate;
+// The correspondence gate and robust kernel (FrontendParams::corr_gate and corr_kernel are the policy): what they
+// did on the last call, and their per-point and per-row values.
 std::atomic<int> corr_gate_rejected{0};  // matches the gate refused on the last h_share_model call
 double corr_gate_scan_sigma = 0.0;       // the scan's robust residual scale on the last call (1.4826 MAD)
 std::vector<double> gate_var, gate_nn0, gate_w, corr_weight;  // per point / per effective row
-// [v11] optional robust kernel on the admitted rows (corr_kernel none|gm|cauchy): IRLS weight on the
-// squared residual with scale c = max(corr_kernel_mad_scale * scan scale, corr_kernel_min_scale); the row
-// and its residual are scaled by sqrt(w), i.e. R_i <- R / w.
-int corr_kernel = 0;  // 0 none, 1 Geman-McClure, 2 Cauchy
-double corr_kernel_mad_scale = 3.0, corr_kernel_min_scale = 0.03;
 // The correspondence dump (FrontendParams::corr_dump_en describes it): its files and its per-scan state.
 std::ofstream fout_corr, fout_corr_iter, fout_corr_scan;
 bool corr_dump_scan_active = false;  // this scan lies inside a dump window (set before the update)
@@ -292,9 +273,6 @@ int corr_dump_iter = 0;              // h_share_model calls so far on this scan
 // Attitude hold (FrontendParams::attitude_hold is the policy): this scan's verdicts and the telemetry.
 bool lidar_attitude_hold_active = false;   // this scan's scene-rule verdict; read by h_share_model
 bool lidar_attitude_hold_allowed = false;  // release conditions satisfied this scan (starvation, age, holes)
-double lidar_attitude_hold_min_rp_info =
-  0.0;  // [v9] information rule: hold when the scan's own roll/pitch
-        // information (attitude_hold.hpp rollPitchInformation) is below this; 0 = off
 bool lidar_attitude_hold_info_active = false;  // the information rule held on the last h_share_model call
 double lidar_rot_obs_rp_min = 0.0;             // telemetry: last scan's roll/pitch information
 int lidar_attitude_hold_scans = 0;             // telemetry
@@ -405,27 +383,8 @@ bool flio_map_frozen = false;      // degraded: skip map_incremental (no garbage
 bool required_prior_lost = false;  // scan-owner latch; only a fresh activation can reinstall a required prior
 bool flio_degraded_odom = false;   // degraded: inflate published pose covariance
 
-// Near-field ground geometry, in the LiDAR/cloud BODY frame so it is immune to
-// the Z drift it helps repair. Consumed by the ground recovery below; the
-// canopy_ prefix is historical (these were shared with a canopy scene detector
-// that measured as telemetry-only and was removed) and is kept so the giant
-// profiles keep working.
-double canopy_near_range = 20.0;      // near-field horizontal radius, cloud frame (m)
-double canopy_ground_z = -0.47;       // ground height in the CLOUD frame (giant rig measured)
-double canopy_ground_halfband = 0.8;  // ± band around canopy_ground_z counted as ground (m)
-
-// Ground recovery (selection-layer repair): re-admit true-ground returns that
-// the 5-NN plane gates reject under ground-hugging clutter (grass, crops,
-// debris — content-agnostic) — see the block comment in h_share_model.
-// SELF-GATED by per-sector fit quality + the sensor-height sanity gate; no
-// scene classifier involved. Default OFF.
-bool ground_recover_en = false;
-double ground_recover_scan_band = 0.15;    // |dist to sector ground plane| accept band (m)
-int ground_recover_min_inliers = 100;      // PER-SECTOR fit support gate (8 sectors)
-double ground_recover_max_residual = 1.0;  // |z - map lower envelope| accept gate (m)
-double ground_recover_sector_tol = 0.25;   // sector-vs-global plane height agreement (m)
-int ground_recover_max_rows = 4000;        // per-scan cap on recovered rows
-int canopy_ground_recovered = 0;           // diag: rows recovered last h_share call
+// Ground recovery (FrontendParams::ground_recover_en and its band and gates are the policy).
+int canopy_ground_recovered = 0;  // diag: rows recovered last h_share call
 
 std::vector<std::uint8_t> point_selected_surf;
 bool lidar_pushed, flg_first_scan = true, flg_EKF_inited;
@@ -446,12 +405,8 @@ vector<PointVector> Nearest_Points;
 // The neighbour set only moves on the iterations that search, so the 5x3 plane fit and the
 // body-range scale in the residual gate are invariant in between and are kept per point.
 vector<fast_lio::CachedPlane, Eigen::aligned_allocator<fast_lio::CachedPlane>> plane_cache;
-// Neighbour refresh: the filter searches again once it declares itself converged, but if the
-// state barely moved since the last search the neighbour sets cannot have changed, and that
-// second 5-NN pass over the scan is the single most expensive item in the front end.
-bool nn_refresh_gate_en = false;
-double nn_refresh_min_shift = 0.0;
-double nn_refresh_ref_range = 20.0;
+// Neighbour refresh (FrontendParams::nn_refresh_gate_en is the policy): the pose of the last search and the
+// telemetry.
 V3D nn_last_search_pos = V3D::Zero();
 M3D nn_last_search_rot = M3D::Identity();
 bool nn_have_last_search = false;
@@ -3527,7 +3482,9 @@ namespace
 // Sectors of the ground-recovery planes.
 constexpr int kGndSectors = 8;
 
-bool decideSearch(state_ikfom & s, const esekfom::dyn_share_datastruct<double> & ekfom_data)
+bool decideSearch(const fast_lio::FrontendParams & params,
+                  state_ikfom & s,
+                  const esekfom::dyn_share_datastruct<double> & ekfom_data)
 {
   bool searching = ekfom_data.converge;
   if (searching && nn_have_last_search) {
@@ -3536,9 +3493,9 @@ bool decideSearch(state_ikfom & s, const esekfom::dyn_share_datastruct<double> &
     const V3D dt = s.pos - nn_last_search_pos;
     const M3D dR = nn_last_search_rot.transpose() * s.rot.toRotationMatrix();
     const V3D dr = Log(dR);
-    const double shift = dt.norm() + nn_refresh_ref_range * dr.norm();
+    const double shift = dt.norm() + params.nn_refresh_ref_range * dr.norm();
     nn_max_shift = std::max(nn_max_shift, shift);
-    if (nn_refresh_gate_en && shift < nn_refresh_min_shift) {
+    if (params.nn_refresh_gate_en && shift < params.nn_refresh_min_shift) {
       searching = false;
       ++nn_skips;
     }
@@ -3556,18 +3513,23 @@ bool decideSearch(state_ikfom & s, const esekfom::dyn_share_datastruct<double> &
 
 // [v11] the gate judges every residual against the prior's [pos, rot] covariance, which IKFoM keeps
 // unchanged through the iterations; read it once per call.
-bool gatePrior(Eigen::Matrix<double, 6, 6> & gate_P6)
+bool gatePrior(const fast_lio::FrontendParams & params, Eigen::Matrix<double, 6, 6> & gate_P6)
 {
-  const bool gate_on = corr_gate.innovation_k > 0.0 || corr_gate.nn0_max > 0.0;
-  if (corr_gate.innovation_k > 0.0) {
-    gate_P6 = fast_lio::flooredPriorBlock(kf.get_P().block<6, 6>(0, 0), corr_gate.rot_sigma_floor_deg * M_PI / 180.0);
+  const bool gate_on = params.corr_gate.innovation_k > 0.0 || params.corr_gate.nn0_max > 0.0;
+  if (params.corr_gate.innovation_k > 0.0) {
+    gate_P6 =
+      fast_lio::flooredPriorBlock(kf.get_P().block<6, 6>(0, 0), params.corr_gate.rot_sigma_floor_deg * M_PI / 180.0);
   }
   corr_gate_rejected.store(0, std::memory_order_relaxed);
   return gate_on;
 }
 
 /** closest surface search and residual computation **/
-void matchPoints(state_ikfom & s, bool searching, bool gate_on, const Eigen::Matrix<double, 6, 6> & gate_P6)
+void matchPoints(const fast_lio::FrontendParams & params,
+                 state_ikfom & s,
+                 bool searching,
+                 bool gate_on,
+                 const Eigen::Matrix<double, 6, 6> & gate_P6)
 {
 #ifdef MP_EN
   // Respect OMP_NUM_THREADS when set so the runtime CPU budget (cgroup
@@ -3625,9 +3587,10 @@ void matchPoints(state_ikfom & s, bool searching, bool gate_on, const Eigen::Mat
         const V3D n_w(pabcd(0), pabcd(1), pabcd(2));
         const V3D point_this = s.offset_R_L_I * p_body + s.offset_T_L_I;
         const V3D A = point_this.cross(V3D(s.rot.conjugate() * n_w));
-        gate_var[i] = corr_gate.innovation_k > 0.0 ? fast_lio::residualVariance(n_w, A, gate_P6, LASER_POINT_COV) : 0.0;
+        gate_var[i] =
+          params.corr_gate.innovation_k > 0.0 ? fast_lio::residualVariance(n_w, A, gate_P6, LASER_POINT_COV) : 0.0;
         gate_nn0[i] = 0.0;
-        if (corr_gate.nn0_max > 0.0 && !points_near.empty()) {
+        if (params.corr_gate.nn0_max > 0.0 && !points_near.empty()) {
           gate_nn0[i] = (V3D(points_near[0].x, points_near[0].y, points_near[0].z) - p_global).norm();
         }
       }
@@ -3644,11 +3607,11 @@ void matchPoints(state_ikfom & s, bool searching, bool gate_on, const Eigen::Mat
 }
 
 // [v11] gate decision and kernel weights: the scan's robust residual scale is known only now.
-void applyGateAndKernels(bool gate_on)
+void applyGateAndKernels(const fast_lio::FrontendParams & params, bool gate_on)
 {
   corr_gate_scan_sigma = 0.0;
-  if (gate_on || corr_kernel != 0) {
-    if (corr_gate.mad_scale > 0.0 || corr_kernel != 0) {
+  if (gate_on || params.corr_kernel != 0) {
+    if (params.corr_gate.mad_scale > 0.0 || params.corr_kernel != 0) {
       std::vector<double> res;
       res.reserve(feats_down_size);
       for (int i = 0; i < feats_down_size; i++) {
@@ -3658,9 +3621,10 @@ void applyGateAndKernels(bool gate_on)
       }
       corr_gate_scan_sigma = fast_lio::robustResidualScale(res);
     }
-    const double scan_floor = corr_gate.mad_scale * corr_gate_scan_sigma;
-    const double kernel_c =
-      corr_kernel != 0 ? std::max(corr_kernel_mad_scale * corr_gate_scan_sigma, corr_kernel_min_scale) : 0.0;
+    const double scan_floor = params.corr_gate.mad_scale * corr_gate_scan_sigma;
+    const double kernel_c = params.corr_kernel != 0 ? std::max(params.corr_kernel_mad_scale * corr_gate_scan_sigma,
+                                                               params.corr_kernel_min_scale)
+                                                    : 0.0;
 #ifdef MP_EN
 #pragma omp parallel for
 #endif
@@ -3670,14 +3634,14 @@ void applyGateAndKernels(bool gate_on)
         continue;
       }
       const double pd2 = normvec->points[i].intensity;
-      if (gate_on && !fast_lio::correspondenceAdmitted(corr_gate, pd2, gate_var[i], gate_nn0[i], scan_floor)) {
+      if (gate_on && !fast_lio::correspondenceAdmitted(params.corr_gate, pd2, gate_var[i], gate_nn0[i], scan_floor)) {
         point_selected_surf[i] = false;
         corr_gate_rejected.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
-      if (corr_kernel == 1) {
+      if (params.corr_kernel == 1) {
         gate_w[i] = fast_lio::gemanMcClureWeight(pd2, kernel_c);
-      } else if (corr_kernel == 2) {
+      } else if (params.corr_kernel == 2) {
         gate_w[i] = fast_lio::cauchyWeight(pd2, kernel_c);
       }
     }
@@ -3689,8 +3653,12 @@ void applyGateAndKernels(bool gate_on)
 // within a few degrees), sane height under the sensor. The height gate
 // is what makes always-on safe: the accepted surface must sit where
 // the vehicle's own ground sits.
-bool fitGround(
-  const std::vector<Eigen::Vector3d> * sets, int nsets, int min_in, Eigen::Vector3d & n_out, double & d_out)
+bool fitGround(const fast_lio::FrontendParams & params,
+               const std::vector<Eigen::Vector3d> * sets,
+               int nsets,
+               int min_in,
+               Eigen::Vector3d & n_out,
+               double & d_out)
 {
   static std::vector<float> zs;
   zs.clear();
@@ -3733,10 +3701,13 @@ bool fitGround(
   n_out = n;
   d_out = d;
   return n_in >= min_in && n.z() >= 0.95 &&
-         std::fabs(-d / std::max(n.z(), 1e-6) - canopy_ground_z) <= canopy_ground_halfband;
+         std::fabs(-d / std::max(n.z(), 1e-6) - params.canopy_ground_z) <= params.canopy_ground_halfband;
 }
 
-void fitGroundSectors(bool (&sec_ok)[kGndSectors], Eigen::Vector3d (&sec_n)[kGndSectors], double (&sec_d)[kGndSectors])
+void fitGroundSectors(const fast_lio::FrontendParams & params,
+                      bool (&sec_ok)[kGndSectors],
+                      Eigen::Vector3d (&sec_n)[kGndSectors],
+                      double (&sec_d)[kGndSectors])
 {
   static std::vector<Eigen::Vector3d> cand[kGndSectors];
   for (int s = 0; s < kGndSectors; s++) {
@@ -3745,9 +3716,9 @@ void fitGroundSectors(bool (&sec_ok)[kGndSectors], Eigen::Vector3d (&sec_n)[kGnd
   }
   for (int i = 0; i < feats_down_size; i++) {
     const PointType & pb = feats_down_body->points[i];
-    if (std::hypot(pb.x, pb.y) > canopy_near_range)
+    if (std::hypot(pb.x, pb.y) > params.canopy_near_range)
       continue;
-    if (std::fabs(pb.z - canopy_ground_z) > canopy_ground_halfband)
+    if (std::fabs(pb.z - params.canopy_ground_z) > params.canopy_ground_halfband)
       continue;
     const int s =
       std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
@@ -3757,11 +3728,11 @@ void fitGroundSectors(bool (&sec_ok)[kGndSectors], Eigen::Vector3d (&sec_n)[kGnd
   // prior every sector must agree with, and the fallback plane.
   Eigen::Vector3d gn(0, 0, 1);
   double gd = 0.0;
-  const bool glob_ok = fitGround(cand, kGndSectors, ground_recover_min_inliers, gn, gd);
+  const bool glob_ok = fitGround(params, cand, kGndSectors, params.ground_recover_min_inliers, gn, gd);
   for (int s = 0; s < kGndSectors; s++) {
     Eigen::Vector3d n;
     double d;
-    bool own_ok = fitGround(&cand[s], 1, ground_recover_min_inliers, n, d);
+    bool own_ok = fitGround(params, &cand[s], 1, params.ground_recover_min_inliers, n, d);
     if (own_ok && glob_ok) {
       // A sector plane may only REFINE the global one: normals must
       // agree and the plane heights at the sector centroid must match
@@ -3774,7 +3745,7 @@ void fitGroundSectors(bool (&sec_ok)[kGndSectors], Eigen::Vector3d (&sec_n)[kGnd
       const double z_sec = -(d + n.x() * c.x() + n.y() * c.y()) / std::max(n.z(), 1e-6);
       const double z_glob = -(gd + gn.x() * c.x() + gn.y() * c.y()) / std::max(gn.z(), 1e-6);
       constexpr double kSectorNormalDotMin = 0.985;  // ~10 deg relative tilt
-      own_ok = n.dot(gn) >= kSectorNormalDotMin && std::fabs(z_sec - z_glob) <= ground_recover_sector_tol;
+      own_ok = n.dot(gn) >= kSectorNormalDotMin && std::fabs(z_sec - z_glob) <= params.ground_recover_sector_tol;
     }
     if (own_ok) {
       sec_ok[s] = true;
@@ -3788,24 +3759,25 @@ void fitGroundSectors(bool (&sec_ok)[kGndSectors], Eigen::Vector3d (&sec_n)[kGnd
   }
 }
 
-void recoverGroundRows(const bool (&sec_ok)[kGndSectors],
+void recoverGroundRows(const fast_lio::FrontendParams & params,
+                       const bool (&sec_ok)[kGndSectors],
                        const Eigen::Vector3d (&sec_n)[kGndSectors],
                        const double (&sec_d)[kGndSectors])
 {
   for (int i = 0; i < feats_down_size; i++) {
     if (point_selected_surf[i])
       continue;
-    if (canopy_ground_recovered >= ground_recover_max_rows)
+    if (canopy_ground_recovered >= params.ground_recover_max_rows)
       break;
     const PointType & pb = feats_down_body->points[i];
-    if (std::hypot(pb.x, pb.y) > canopy_near_range)
+    if (std::hypot(pb.x, pb.y) > params.canopy_near_range)
       continue;
     const int s =
       std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
     if (!sec_ok[s])
       continue;
     // Scan side: on this sector's ground plane (clutter trimmed by the fit band).
-    if (std::fabs(sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s]) > ground_recover_scan_band)
+    if (std::fabs(sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s]) > params.ground_recover_scan_band)
       continue;
     auto & pn = Nearest_Points[i];
     if (static_cast<int>(pn.size()) < NUM_MATCH_POINTS)
@@ -3837,7 +3809,7 @@ void recoverGroundRows(const bool (&sec_ok)[kGndSectors],
     }
     const double z_ground_map = 0.5 * (z1 + (z2 == std::numeric_limits<float>::max() ? z1 : z2));
     const double pd2 = pw.z - z_ground_map;
-    if (std::fabs(pd2) > ground_recover_max_residual)
+    if (std::fabs(pd2) > params.ground_recover_max_residual)
       continue;
     point_selected_surf[i] = true;
     normvec->points[i].x = 0.0f;
@@ -3888,10 +3860,10 @@ void recoverGroundRows(const bool (&sec_ok)[kGndSectors],
  *   NOTE: distinct from the removed A'-3 boost, which amplified already-
  *   matched rows (NEGATIVE result); this restores SELECTION of discarded
  *   true ground. ***/
-void recoverGround()
+void recoverGround(const fast_lio::FrontendParams & params)
 {
   canopy_ground_recovered = 0;
-  if (ground_recover_en) {
+  if (params.ground_recover_en) {
     // Per-sector ground planes, cached per scan (body cloud is fixed across
     // iEKF iterations). n·p + d = 0 with unit n, n_z > 0.
     static double fit_time = -1.0;
@@ -3900,13 +3872,13 @@ void recoverGround()
     static double sec_d[kGndSectors];
     if (lidar_end_time != fit_time) {
       fit_time = lidar_end_time;
-      fitGroundSectors(sec_ok, sec_n, sec_d);
+      fitGroundSectors(params, sec_ok, sec_n, sec_d);
     }
-    recoverGroundRows(sec_ok, sec_n, sec_d);
+    recoverGroundRows(params, sec_ok, sec_n, sec_d);
   }
 }
 
-void compactRows()
+void compactRows(const fast_lio::FrontendParams & params)
 {
   effct_feat_num = 0;
   if (degeneracy_debug) {
@@ -3922,7 +3894,7 @@ void compactRows()
     *normvec,
     point_selected_surf,
     gate_w,
-    corr_kernel != 0,
+    params.corr_kernel != 0,
     *laserCloudOri,
     *corr_normvect,
     corr_weight,
@@ -3963,7 +3935,7 @@ void observePosition()
 // iteration; every rotation row below is projected onto it so the update cannot move roll/pitch.
 // [v9] the information rule decides from this iteration's own rows: Σ AAᵀ restricted to the
 // roll/pitch plane, its weakest eigenvalue against lidar_attitude_hold_min_rp_info.
-bool prepareAttitudeHold(state_ikfom & s, V3D & hold_up)
+bool prepareAttitudeHold(const fast_lio::FrontendParams & params, state_ikfom & s, V3D & hold_up)
 {
   {
     V3D grav_w(s.grav[0], s.grav[1], s.grav[2]);
@@ -3982,8 +3954,8 @@ bool prepareAttitudeHold(state_ikfom & s, V3D & hold_up)
       rot_info += A * A.transpose();
     }
     lidar_rot_obs_rp_min = fast_lio::rollPitchInformation(rot_info, hold_up);
-    if (lidar_attitude_hold_allowed && lidar_attitude_hold_min_rp_info > 0.0 &&
-        lidar_rot_obs_rp_min < lidar_attitude_hold_min_rp_info) {
+    if (lidar_attitude_hold_allowed && params.lidar_attitude_hold_min_rp_info > 0.0 &&
+        lidar_rot_obs_rp_min < params.lidar_attitude_hold_min_rp_info) {
       hold_rows = true;
       lidar_attitude_hold_info_active = true;
     }
@@ -3991,7 +3963,11 @@ bool prepareAttitudeHold(state_ikfom & s, V3D & hold_up)
   return hold_rows;
 }
 
-void buildRows(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_data, const V3D & hold_up, bool hold_rows)
+void buildRows(const fast_lio::FrontendParams & params,
+               state_ikfom & s,
+               esekfom::dyn_share_datastruct<double> & ekfom_data,
+               const V3D & hold_up,
+               bool hold_rows)
 {
   for (int i = 0; i < effct_feat_num; i++) {
     const PointType & laser_p = laserCloudOri->points[i];
@@ -4012,7 +3988,7 @@ void buildRows(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_da
     if (hold_rows) {
       A = fast_lio::projectRotationRowToYaw(A, hold_up);
     }
-    if (extrinsic_est_en) {
+    if (params.extrinsic_est_en) {
       V3D B(point_be_crossmat * s.offset_R_L_I.conjugate() * C);  // s.rot.conjugate()*norm_vec);
       ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B),
         VEC_FROM_ARRAY(C);
@@ -4023,7 +3999,7 @@ void buildRows(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_da
 
     /*** Measuremnt: distance to the closest surface/corner ***/
     ekfom_data.h(i) = -norm_p.intensity;
-    if (corr_kernel != 0 && corr_weight[i] < 1.0) {
+    if (params.corr_kernel != 0 && corr_weight[i] < 1.0) {
       const double sw = std::sqrt(std::max(corr_weight[i], 0.0));
       ekfom_data.h_x.block<1, 12>(i, 0) *= sw;
       ekfom_data.h(i) *= sw;
@@ -4038,15 +4014,15 @@ void buildRows(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_da
  *   direction. Row AND residual together — that is what makes it R_i <- R / s^2, a
  *   weight on the measurement, rather than a claim that the plane faces elsewhere.
  *   Recomputed every iEKF iteration: the correspondences move with the state. ***/
-void degeneracyWeights(esekfom::dyn_share_datastruct<double> & ekfom_data)
+void degeneracyWeights(const fast_lio::FrontendParams & params, esekfom::dyn_share_datastruct<double> & ekfom_data)
 {
   const auto H_t = ekfom_data.h_x.leftCols(3);
   const auto H_r = ekfom_data.h_x.middleCols(3, 3);
   const Eigen::Matrix3d H_tt = H_t.transpose() * H_t;
   const Eigen::Matrix3d H_tr = H_t.transpose() * H_r;
   const Eigen::Matrix3d H_rr = H_r.transpose() * H_r;
-  degeneracy_last = fast_lio::computePositionDegeneracy(H_tt, H_tr, H_rr, effct_feat_num, degeneracy_params);
-  if (degeneracy_spectrum_trace) {
+  degeneracy_last = fast_lio::computePositionDegeneracy(H_tt, H_tr, H_rr, effct_feat_num, params.degeneracy_params);
+  if (params.degeneracy_spectrum_trace) {
     // Both spectra side by side: the gap between them is what rotation explains away,
     // and it is the only way to see the coupling the thresholds now have to live with.
     static rclcpp::Clock degen_spectrum_clock(RCL_STEADY_TIME);
@@ -4169,16 +4145,18 @@ void writeDump(state_ikfom & s, bool searching, const V3D & hold_up, bool hold_r
 }
 }  // namespace
 
-void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_data)
+void h_share_model(state_ikfom & s,
+                   esekfom::dyn_share_datastruct<double> & ekfom_data,
+                   const fast_lio::FrontendParams & params)
 {
   double match_start = omp_get_wtime();
-  const bool searching = decideSearch(s, ekfom_data);
+  const bool searching = decideSearch(params, s, ekfom_data);
   Eigen::Matrix<double, 6, 6> gate_P6 = Eigen::Matrix<double, 6, 6>::Zero();
-  const bool gate_on = gatePrior(gate_P6);
-  matchPoints(s, searching, gate_on, gate_P6);
-  applyGateAndKernels(gate_on);
-  recoverGround();
-  compactRows();
+  const bool gate_on = gatePrior(params, gate_P6);
+  matchPoints(params, s, searching, gate_on, gate_P6);
+  applyGateAndKernels(params, gate_on);
+  recoverGround(params);
+  compactRows(params);
 
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterHModelRows)
@@ -4211,9 +4189,9 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   ekfom_data.h_x = Eigen::MatrixXd::Zero(effct_feat_num, 12);  // 23
   ekfom_data.h.resize(effct_feat_num);
   V3D hold_up = V3D::Zero();
-  const bool hold_rows = prepareAttitudeHold(s, hold_up);
-  buildRows(s, ekfom_data, hold_up, hold_rows);
-  degeneracyWeights(ekfom_data);
+  const bool hold_rows = prepareAttitudeHold(params, s, hold_up);
+  buildRows(params, s, ekfom_data, hold_up, hold_rows);
+  degeneracyWeights(params, ekfom_data);
   if (corr_dump_scan_active && fout_corr.is_open()) {
     writeDump(s, searching, hold_up, hold_rows);
   }
@@ -4229,7 +4207,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
 
 void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state, esekfom::dyn_share_datastruct<double> & data)
 {
-  h_share_model(state, data);
+  h_share_model(state, data, params_);
 }
 
 namespace
@@ -4267,13 +4245,13 @@ public:
     fast_lio::FrontendStartup startup;
     params_.readOutputs(*this, startup, scan_pub_en, dense_pub_en, odom_frame_id, body_frame_id);
     params_.readBacklog(*this, max_buffered_scans, max_scan_backlog_sec, max_imu_backlog_sec);
-    params_.readDownsampleAndDegeneracy(*this, degeneracy_debug, degeneracy_spectrum_trace, degeneracy_params);
+    params_.readDownsampleAndDegeneracy(*this, degeneracy_debug);
     params_.readConstraints(*this, health_pub_en);
-    params_.readCorrespondence(*this, corr_gate, corr_kernel, corr_kernel_mad_scale, corr_kernel_min_scale);
+    params_.readCorrespondence(*this);
     params_.readCorrespondenceDump(*this);
     if (params_.values().corr_dump_en)
       openCorrespondenceDump();
-    params_.readAttitudeAndGravity(*this, lidar_attitude_hold_min_rp_info, zupt_vel_reset_sigma);
+    params_.readAttitudeAndGravity(*this, zupt_vel_reset_sigma);
     params_.readImuInit(*this, startup);
     params_.readGuards(*this, release_vel_params);
     params_.readHoleAndZupt(*this,
@@ -4296,16 +4274,7 @@ public:
     reanchor_healthy_eff =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(startup.reanchor_healthy_window), kReanchorHealthyMinScans);
     params_.readRunaway(*this, zupt_wheel_max_age, zupt_wheel_speed_thresh);
-    params_.readCanopyAndGround(*this,
-                                canopy_near_range,
-                                canopy_ground_z,
-                                canopy_ground_halfband,
-                                ground_recover_en,
-                                ground_recover_scan_band,
-                                ground_recover_min_inliers,
-                                ground_recover_max_residual,
-                                ground_recover_sector_tol,
-                                ground_recover_max_rows);
+    params_.readCanopyAndGround(*this);
     params_.readDataPaths(*this, map_file_path, root_dir);
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("read_policies");
@@ -4319,13 +4288,7 @@ public:
 #endif
     params_.readImuCoverage(
       *this, max_scan_duration_s, p_imu->coverage_params, p_imu->gap_params, reanchor_params.enabled);
-    params_.readFeatureInputs(*this,
-                              p_pre->point_filter_num,
-                              nn_refresh_gate_en,
-                              nn_refresh_min_shift,
-                              nn_refresh_ref_range,
-                              p_pre->feature_enabled,
-                              runtime_pos_log);
+    params_.readFeatureInputs(*this, p_pre->point_filter_num, p_pre->feature_enabled, runtime_pos_log);
     p_imu->runtime_log_en = runtime_pos_log;                // mirror to ImuProcess so Log/imu.txt is written
     ikd_profile = (getenv("FLIO_IKD_PROFILE") != nullptr);  // [ikd-profile] opt-in via env
     {
@@ -4355,7 +4318,6 @@ public:
                                       startup,
                                       latency_diag_en,
                                       latency_log_period_sec,
-                                      extrinsic_est_en,
                                       map_insert_delay_scans,
                                       pcd_save_en,
                                       pcd_save_interval);
@@ -4416,19 +4378,19 @@ public:
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("subscriptions");
 #endif
-    if (degeneracy_params.enable) {
+    if (params_.values().degeneracy_params.enable) {
+      const fast_lio::DegeneracyParams & degeneracy = params_.values().degeneracy_params;
       RCLCPP_INFO(this->get_logger(),
                   "Subspace weighting ON (%s): a position direction is held back only when its share is under %.3f "
                   "(isotropic = 0.333, full trust at %.3f) AND its raw eigenvalue is under %.1f (full trust at %.1f); "
                   "floor %.2f",
-                  degeneracy_params.schur_en
-                    ? (degeneracy_params.hard_projection ? "Schur, hard projection" : "Schur, graded")
-                    : (degeneracy_params.hard_projection ? "H_tt, hard projection" : "H_tt, graded"),
-                  degeneracy_params.lambda_bad,
-                  degeneracy_params.lambda_good,
-                  degeneracy_params.lambda_abs_bad,
-                  degeneracy_params.lambda_abs_good,
-                  degeneracy_params.min_weight);
+                  degeneracy.schur_en ? (degeneracy.hard_projection ? "Schur, hard projection" : "Schur, graded")
+                                      : (degeneracy.hard_projection ? "H_tt, hard projection" : "H_tt, graded"),
+                  degeneracy.lambda_bad,
+                  degeneracy.lambda_good,
+                  degeneracy.lambda_abs_bad,
+                  degeneracy.lambda_abs_good,
+                  degeneracy.min_weight);
     }
     pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
     pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
@@ -4928,28 +4890,28 @@ private:
   void effectiveMeasurementForTest(fast_lio_test::EffectiveRecorder & record)
   {
     record.value("degeneracy_debug", degeneracy_debug);
-    record.value("degeneracy_spectrum_trace", degeneracy_spectrum_trace);
-    record.value("degeneracy_weighting_en", degeneracy_params.enable);
-    record.value("degeneracy_lambda_bad", degeneracy_params.lambda_bad);
-    record.value("degeneracy_lambda_good", degeneracy_params.lambda_good);
-    record.value("degeneracy_min_weight", degeneracy_params.min_weight);
-    record.value("degeneracy_lambda_abs_bad", degeneracy_params.lambda_abs_bad);
-    record.value("degeneracy_lambda_abs_good", degeneracy_params.lambda_abs_good);
-    record.value("degeneracy_hard_projection", degeneracy_params.hard_projection);
-    record.value("degeneracy_schur_en", degeneracy_params.schur_en);
-    record.value("degeneracy_schur_ridge", degeneracy_params.schur_ridge);
+    record.value("degeneracy_spectrum_trace", params_.values().degeneracy_spectrum_trace);
+    record.value("degeneracy_weighting_en", params_.values().degeneracy_params.enable);
+    record.value("degeneracy_lambda_bad", params_.values().degeneracy_params.lambda_bad);
+    record.value("degeneracy_lambda_good", params_.values().degeneracy_params.lambda_good);
+    record.value("degeneracy_min_weight", params_.values().degeneracy_params.min_weight);
+    record.value("degeneracy_lambda_abs_bad", params_.values().degeneracy_params.lambda_abs_bad);
+    record.value("degeneracy_lambda_abs_good", params_.values().degeneracy_params.lambda_abs_good);
+    record.value("degeneracy_hard_projection", params_.values().degeneracy_params.hard_projection);
+    record.value("degeneracy_schur_en", params_.values().degeneracy_params.schur_en);
+    record.value("degeneracy_schur_ridge", params_.values().degeneracy_params.schur_ridge);
     record.value("lidar_attitude_hold_en", params_.values().attitude_hold.enabled);
-    record.value("corr_innov_gate_k", corr_gate.innovation_k);
-    record.value("corr_nn0_max", corr_gate.nn0_max);
-    record.value("corr_gate_mad_scale", corr_gate.mad_scale);
-    record.value("corr_gate_rot_sigma_floor_deg", corr_gate.rot_sigma_floor_deg);
-    record.value("corr_kernel_mad_scale", corr_kernel_mad_scale);
-    record.value("corr_kernel_min_scale", corr_kernel_min_scale);
+    record.value("corr_innov_gate_k", params_.values().corr_gate.innovation_k);
+    record.value("corr_nn0_max", params_.values().corr_gate.nn0_max);
+    record.value("corr_gate_mad_scale", params_.values().corr_gate.mad_scale);
+    record.value("corr_gate_rot_sigma_floor_deg", params_.values().corr_gate.rot_sigma_floor_deg);
+    record.value("corr_kernel_mad_scale", params_.values().corr_kernel_mad_scale);
+    record.value("corr_kernel_min_scale", params_.values().corr_kernel_min_scale);
     record.value("lidar_attitude_hold_far_frac", params_.values().attitude_hold.far_frac_max);
     record.value("lidar_attitude_hold_min_effct", params_.values().attitude_hold.min_effct);
     record.value("lidar_attitude_hold_max_s", params_.values().attitude_hold.max_hold_s);
     record.value("lidar_attitude_hold_max_scan_gap_s", params_.values().attitude_hold.max_scan_gap_s);
-    record.value("lidar_attitude_hold_min_rp_info", lidar_attitude_hold_min_rp_info);
+    record.value("lidar_attitude_hold_min_rp_info", params_.values().lidar_attitude_hold_min_rp_info);
     record.value("lidar_attitude_hold_z_weak", params_.values().attitude_hold.z_weak_min);
     record.value("lidar_consider_rp_en", params_.values().rp_consider.enabled);
     record.value("lidar_consider_rp_while_engulfed", params_.values().rp_consider.while_engulfed);
@@ -4957,18 +4919,18 @@ private:
     record.value("lidar_consider_rp_min_info", params_.values().rp_consider.min_rp_info);
     record.value("lidar_consider_rp_z_weak_min", params_.values().rp_consider.z_weak_min);
     record.value("lidar_consider_rp_max_s", params_.values().rp_consider.max_consider_s);
-    record.value("canopy_near_range", canopy_near_range);
-    record.value("canopy_ground_z", canopy_ground_z);
-    record.value("canopy_ground_halfband", canopy_ground_halfband);
-    record.value("ground_recover_en", ground_recover_en);
-    record.value("ground_recover_scan_band", ground_recover_scan_band);
-    record.value("ground_recover_min_inliers", ground_recover_min_inliers);
-    record.value("ground_recover_max_residual", ground_recover_max_residual);
-    record.value("ground_recover_sector_tol", ground_recover_sector_tol);
-    record.value("ground_recover_max_rows", ground_recover_max_rows);
-    record.value("nn_refresh_gate_en", nn_refresh_gate_en);
-    record.value("nn_refresh_min_shift", nn_refresh_min_shift);
-    record.value("nn_refresh_ref_range", nn_refresh_ref_range);
+    record.value("canopy_near_range", params_.values().canopy_near_range);
+    record.value("canopy_ground_z", params_.values().canopy_ground_z);
+    record.value("canopy_ground_halfband", params_.values().canopy_ground_halfband);
+    record.value("ground_recover_en", params_.values().ground_recover_en);
+    record.value("ground_recover_scan_band", params_.values().ground_recover_scan_band);
+    record.value("ground_recover_min_inliers", params_.values().ground_recover_min_inliers);
+    record.value("ground_recover_max_residual", params_.values().ground_recover_max_residual);
+    record.value("ground_recover_sector_tol", params_.values().ground_recover_sector_tol);
+    record.value("ground_recover_max_rows", params_.values().ground_recover_max_rows);
+    record.value("nn_refresh_gate_en", params_.values().nn_refresh_gate_en);
+    record.value("nn_refresh_min_shift", params_.values().nn_refresh_min_shift);
+    record.value("nn_refresh_ref_range", params_.values().nn_refresh_ref_range);
   }
   void effectiveInputForTest(fast_lio_test::EffectiveRecorder & record)
   {
@@ -5107,7 +5069,7 @@ private:
     record.value("imu_gap_accel_max_z", p_imu->gap_params.accel_max_z);
     record.value("imu_gap_verify_s", params_.values().imu_gap_verify_s);
     record.value("imu_gap_empty_scans", p_imu->gap_params.empty_scans);
-    record.value("mapping.extrinsic_est_en", extrinsic_est_en);
+    record.value("mapping.extrinsic_est_en", params_.values().extrinsic_est_en);
   }
   void effectiveMapForTest(fast_lio_test::EffectiveRecorder & record)
   {
@@ -5135,7 +5097,7 @@ private:
     record.value("derived:frontend_activation:frontend_clock_domain", frontend_clock_domain);
     record.bytes("derived:config_id:reference_contract_id", reference_contract_id);
     record.bytes("derived:config_id:reference_config_id", reference_config_id);
-    record.value("derived:corr_kernel:corr_kernel", corr_kernel);
+    record.value("derived:corr_kernel:corr_kernel", params_.values().corr_kernel);
     record.windows("derived:corr_dump:corr_dump_windows", params_.values().corr_dump_windows);
     record.matrix("derived:lever_arm:gravity_align_leg_lever_arm", params_.values().gravity_align_leg_lever_arm);
     record.value("derived:imu_static_limits:p_imu->init_require_still", p_imu->init_require_still);
@@ -5337,7 +5299,7 @@ private:
         ikdtree.Nearest_Search_View(p, k, near, sqdist);
       };
       const fast_lio::RecoveryViewMatch match = fast_lio::matchRecoveryView<NUM_MATCH_POINTS, PointVector>(
-        feats_down_body->points, pose, search, corr_gate, prior_P.block<6, 6>(0, 0), LASER_POINT_COV);
+        feats_down_body->points, pose, search, params_.values().corr_gate, prior_P.block<6, 6>(0, 0), LASER_POINT_COV);
 #ifdef FASTLIO_TEST_HOOKS
       if (fast_lio_test::afterRecoveryViewMatch)
         fast_lio_test::afterRecoveryViewMatch(
@@ -6125,7 +6087,7 @@ private:
                              "[ATT-HOLD] information rule: roll/pitch info %.1f < %.1f, update restricted to "
                              "translation+yaw (effct=%d far_frac=%.2f, %d scans so far)",
                              lidar_rot_obs_rp_min,
-                             lidar_attitude_hold_min_rp_info,
+                             p.lidar_attitude_hold_min_rp_info,
                              effct_feat_num,
                              scan_far_frac,
                              lidar_attitude_hold_scans);
@@ -6134,7 +6096,7 @@ private:
         writeKalmanChannel(
           "lidar", state_before_update, state_point, lidarCovarianceBefore, lidarDiagnostics, Zero3d, Zero3d);
       }
-      if ((corr_gate.innovation_k > 0.0 || corr_gate.nn0_max > 0.0) && corr_gate_rejected.load() > 0) {
+      if ((p.corr_gate.innovation_k > 0.0 || p.corr_gate.nn0_max > 0.0) && corr_gate_rejected.load() > 0) {
         RCLCPP_INFO_THROTTLE(this->get_logger(),
                              *this->get_clock(),
                              5000,
@@ -6142,8 +6104,8 @@ private:
                              "scan sigma=%.3f m)",
                              corr_gate_rejected.load(),
                              effct_feat_num,
-                             corr_gate.innovation_k,
-                             corr_gate.nn0_max,
+                             p.corr_gate.innovation_k,
+                             p.corr_gate.nn0_max,
                              corr_gate_scan_sigma);
       }
       if (corr_dump_scan_active && fout_corr_scan.is_open()) {
@@ -6176,7 +6138,7 @@ private:
       // same rate and the scan keeps matching. Name the direction and what fills it,
       // because nothing here does — the released axis rides on IMU propagation until a
       // prior (planar-Z, ZUPT, wheel) supplies it.
-      if (degeneracy_params.enable) {
+      if (p.degeneracy_params.enable) {
         ++degeneracy_scans_total;
       }
       if (degeneracy_last.engaged) {
@@ -7581,8 +7543,8 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mapping_enabled_sub_;
 
-  fast_lio::FrontendParameters params_;  // the configuration the constructor read; node methods use values()
-  fast_lio::FrontendMeasurement measurement_;  // the filter's measurement model; kf holds its address
+  fast_lio::FrontendParameters params_;  // the configuration the constructor read; read through values()
+  fast_lio::FrontendMeasurement measurement_{params_.values()};  // the filter's measurement model; kf holds its address
   int effect_feat_num = 0, frame_num = 0;
   double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0,
                          aver_time_solve = 0, aver_time_const_H_time = 0;

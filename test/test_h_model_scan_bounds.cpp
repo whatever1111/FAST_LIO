@@ -6,6 +6,7 @@
 
 #include "IKFoM_toolkit/esekfom/esekfom.hpp"
 #include "cached_plane.hpp"
+#include "frontend_params.hpp"
 #include "laser_mapping_test_types.hpp"
 
 #ifndef INSTANTIATE_TEST_SUITE_P
@@ -20,7 +21,7 @@ extern state_ikfom state_point;
 
 // These are the actual component's scan buffers and model, not a copied model.
 extern bool prepareScanCorrespondenceStorage(std::size_t count);
-extern void h_share_model(state_ikfom &, esekfom::dyn_share_datastruct<double> &);
+extern void h_share_model(state_ikfom &, esekfom::dyn_share_datastruct<double> &, const fast_lio::FrontendParams &);
 extern int feats_down_size, effct_feat_num, ekf_iters;
 extern std::vector<std::uint8_t> point_selected_surf;
 extern std::vector<float> res_last;
@@ -76,7 +77,8 @@ protected:
     esekfom::dyn_share_datastruct<double> measurement;
     measurement.converge = false;  // exercise the production cached-neighbour model
     measurement.valid = true;
-    h_share_model(state_point, measurement);
+    const fast_lio::FrontendParams params{};  // the defaults, as a node that read no parameter would hold them
+    h_share_model(state_point, measurement, params);
     EXPECT_EQ(effct_feat_num, rows ? static_cast<int>(count) : 0);
     ASSERT_EQ(laserCloudOri->size(), rows ? count : 0u);
     ASSERT_EQ(corr_normvect->size(), rows ? count : 0u);

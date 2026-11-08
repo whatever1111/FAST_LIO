@@ -6,8 +6,6 @@
 #include <string>
 #include <vector>
 
-#include "correspondence_gate.hpp"
-#include "degeneracy_policy.hpp"
 #include "engulf_release.hpp"
 #include "frontend_params.hpp"
 #include "imu_coverage_policy.hpp"
@@ -80,20 +78,11 @@ public:
                    int & max_buffered_scans,
                    double & max_scan_backlog_sec,
                    double & max_imu_backlog_sec);
-  void readDownsampleAndDegeneracy(const rclcpp::Node & node,
-                                   bool & degeneracy_debug,
-                                   bool & degeneracy_spectrum_trace,
-                                   DegeneracyParams & degeneracy_params);
+  void readDownsampleAndDegeneracy(const rclcpp::Node & node, bool & degeneracy_debug);
   void readConstraints(const rclcpp::Node & node, bool & health_pub_en);
-  void readCorrespondence(const rclcpp::Node & node,
-                          CorrespondenceGateParams & corr_gate,
-                          int & corr_kernel,
-                          double & corr_kernel_mad_scale,
-                          double & corr_kernel_min_scale);
+  void readCorrespondence(const rclcpp::Node & node);
   void readCorrespondenceDump(const rclcpp::Node & node);
-  void readAttitudeAndGravity(const rclcpp::Node & node,
-                              double & lidar_attitude_hold_min_rp_info,
-                              double & zupt_vel_reset_sigma);
+  void readAttitudeAndGravity(const rclcpp::Node & node, double & zupt_vel_reset_sigma);
   void readImuInit(const rclcpp::Node & node, FrontendStartup & startup);
   void readGuards(const rclcpp::Node & node, ReleaseVelocityParams & release_vel_params);
   void readHoleAndZupt(const rclcpp::Node & node,
@@ -115,16 +104,7 @@ public:
                         LostRecoveryParams & lost_recovery_params);
   void loadRecoveryEntryView(const rclcpp::Node & node);
   void readRunaway(const rclcpp::Node & node, double zupt_wheel_max_age, double zupt_wheel_speed_thresh);
-  void readCanopyAndGround(const rclcpp::Node & node,
-                           double & canopy_near_range,
-                           double & canopy_ground_z,
-                           double & canopy_ground_halfband,
-                           bool & ground_recover_en,
-                           double & ground_recover_scan_band,
-                           int & ground_recover_min_inliers,
-                           double & ground_recover_max_residual,
-                           double & ground_recover_sector_tol,
-                           int & ground_recover_max_rows);
+  void readCanopyAndGround(const rclcpp::Node & node);
   void readDataPaths(const rclcpp::Node & node, std::string & map_file_path, std::string & root_dir);
   void readInputs(const rclcpp::Node & node,
                   FrontendStartup & startup,
@@ -150,9 +130,6 @@ public:
                        bool reanchor_en);
   void readFeatureInputs(const rclcpp::Node & node,
                          int & point_filter_num,
-                         bool & nn_refresh_gate_en,
-                         double & nn_refresh_min_shift,
-                         double & nn_refresh_ref_range,
                          bool & feature_enabled,
                          bool & runtime_pos_log);
 #ifdef USE_IVOX
@@ -162,7 +139,6 @@ public:
                                  FrontendStartup & startup,
                                  bool & latency_diag_en,
                                  double & latency_log_period_sec,
-                                 bool & extrinsic_est_en,
                                  int & map_insert_delay_scans,
                                  bool & pcd_save_en,
                                  int & pcd_save_interval);

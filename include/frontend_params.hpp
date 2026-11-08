@@ -8,6 +8,8 @@
 
 #include "adaptive_downsample.hpp"
 #include "attitude_hold.hpp"
+#include "correspondence_gate.hpp"
+#include "degeneracy_policy.hpp"
 #include "engulf_release.hpp"
 #include "parked_hold.hpp"
 #include "prior_map_load.hpp"
@@ -17,9 +19,10 @@
 namespace fast_lio
 {
 /// The front end's configuration as the constructor leaves it: the parameters, and the values derived from them,
-/// that afterwards only node methods read. FrontendParameters fills it while the node is constructed and then only
-/// hands it out const. Values the scan path still writes, and values that free functions, workers or other owners
-/// read, stay in laserMapping.cpp until their own owners take them.
+/// that afterwards only node methods and the lidar measurement model (FrontendMeasurement) read. FrontendParameters
+/// fills it while the node is constructed and then only hands it out const. Values the scan path still writes, and
+/// values that other free functions, workers or other owners read, stay in laserMapping.cpp until their own owners
+/// take them.
 struct FrontendParams
 {
   bool path_en = true;
@@ -239,5 +242,63 @@ struct FrontendParams
   fast_lio::PriorMapAlign prior_map_align = fast_lio::PriorMapAlign::kAsDelivered;
   std::vector<double> initial_pose_vec;
   bool initial_pose_full_rpy_override = false;
+
+  // The lidar measurement model's parameters: the model reads them at every evaluation, the node only reports them.
+  // The lidar update also estimates the lidar-IMU extrinsic: its rows carry the extrinsic rotation and translation
+  // columns.
+  bool extrinsic_est_en = false;
+  // The spectrum trace alone, without the per-scan cerr traffic degeneracy_debug carries:
+  // throttled, so it costs nothing and can run on a scoring replay. Calibrating the
+  // thresholds needs the spectrum of a run that did NOT diverge, which is exactly what
+  // the heavier flag cannot give.
+  bool degeneracy_spectrum_trace = false;
+  // Subspace weighting (degeneracy_policy.hpp): hold the LiDAR position update back in
+  // the directions this scan does not constrain, instead of trusting or discarding the
+  // scan whole. Inert by construction on a healthy scan; default OFF pending bag
+  // validation. The scalar defences (guard / ZUPT / re-anchor) stay: this grades the
+  // PARTIAL degeneracy of a doorway or corridor, it does not cover a starved scan that
+  // constrains nothing at all, and it supplies no information of its own — the released
+  // directions fall to IMU propagation until a prior (planar-Z, ZUPT, wheel) fills them.
+  fast_lio::DegeneracyParams degeneracy_params;
+  // [v11] correspondence gate (correspondence_gate.hpp): a match is admitted only when its residual lies
+  // within corr_innov_gate_k sigma of its own predicted variance H P Hᵀ + R (and, separately, when its
+  // nearest map point is within corr_nn0_max). Both 0 = the legacy s > 0.9 test alone.
+  fast_lio::CorrespondenceGateParams corr_gate;
+  // [v11] optional robust kernel on the admitted rows (corr_kernel none|gm|cauchy): IRLS weight on the
+  // squared residual with scale c = max(corr_kernel_mad_scale * scan scale, corr_kernel_min_scale); the row
+  // and its residual are scaled by sqrt(w), i.e. R_i <- R / w.
+  int corr_kernel = 0;  // 0 none, 1 Geman-McClure, 2 Cauchy
+  double corr_kernel_mad_scale = 3.0, corr_kernel_min_scale = 0.03;
+  // [v9] Attitude hold's information rule: hold when the scan's own roll/pitch information (attitude_hold.hpp
+  // rollPitchInformation) is below this; 0 = off.
+  double lidar_attitude_hold_min_rp_info = 0.0;
+
+  // Near-field ground geometry, in the LiDAR/cloud BODY frame so it is immune to
+  // the Z drift it helps repair. Consumed by the ground recovery below; the
+  // canopy_ prefix is historical (these were shared with a canopy scene detector
+  // that measured as telemetry-only and was removed) and is kept so the giant
+  // profiles keep working.
+  double canopy_near_range = 20.0;      // near-field horizontal radius, cloud frame (m)
+  double canopy_ground_z = -0.47;       // ground height in the CLOUD frame (giant rig measured)
+  double canopy_ground_halfband = 0.8;  // ± band around canopy_ground_z counted as ground (m)
+
+  // Ground recovery (selection-layer repair): re-admit true-ground returns that
+  // the 5-NN plane gates reject under ground-hugging clutter (grass, crops,
+  // debris — content-agnostic) — see the block comment above the measurement
+  // model's recoverGround. SELF-GATED by per-sector fit quality + the
+  // sensor-height sanity gate; no scene classifier involved. Default OFF.
+  bool ground_recover_en = false;
+  double ground_recover_scan_band = 0.15;    // |dist to sector ground plane| accept band (m)
+  int ground_recover_min_inliers = 100;      // PER-SECTOR fit support gate (8 sectors)
+  double ground_recover_max_residual = 1.0;  // |z - map lower envelope| accept gate (m)
+  double ground_recover_sector_tol = 0.25;   // sector-vs-global plane height agreement (m)
+  int ground_recover_max_rows = 4000;        // per-scan cap on recovered rows
+
+  // Neighbour refresh: the filter searches again once it declares itself converged, but if the
+  // state barely moved since the last search the neighbour sets cannot have changed, and that
+  // second 5-NN pass over the scan is the single most expensive item in the front end.
+  bool nn_refresh_gate_en = false;
+  double nn_refresh_min_shift = 0.0;
+  double nn_refresh_ref_range = 20.0;
 };
 }  // namespace fast_lio

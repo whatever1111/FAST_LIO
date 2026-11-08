@@ -3521,9 +3521,13 @@ bool prepareScanCorrespondenceStorage(std::size_t count)
   return true;
 }
 
-void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_data)
+namespace
 {
-  double match_start = omp_get_wtime();
+// Sectors of the ground-recovery planes.
+constexpr int kGndSectors = 8;
+
+bool decideSearch(state_ikfom & s, const esekfom::dyn_share_datastruct<double> & ekfom_data)
+{
   bool searching = ekfom_data.converge;
   if (searching && nn_have_last_search) {
     // A point at range r moves by at most |dt| + r*|dtheta| between two states, so that
@@ -3546,18 +3550,24 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   ++ekf_iters;
   ekf_search_iters += searching ? 1 : 0;
   total_residual = 0.0;
+  return searching;
+}
 
-  // [v11] the gate judges every residual against the prior's [pos, rot] covariance, which IKFoM keeps
-  // unchanged through the iterations; read it once per call.
-  Eigen::Matrix<double, 6, 6> gate_P6 = Eigen::Matrix<double, 6, 6>::Zero();
+// [v11] the gate judges every residual against the prior's [pos, rot] covariance, which IKFoM keeps
+// unchanged through the iterations; read it once per call.
+bool gatePrior(Eigen::Matrix<double, 6, 6> & gate_P6)
+{
   const bool gate_on = corr_gate.innovation_k > 0.0 || corr_gate.nn0_max > 0.0;
   if (corr_gate.innovation_k > 0.0) {
     gate_P6 = fast_lio::flooredPriorBlock(kf.get_P().block<6, 6>(0, 0), corr_gate.rot_sigma_floor_deg * M_PI / 180.0);
   }
   corr_gate_rejected.store(0, std::memory_order_relaxed);
+  return gate_on;
+}
 
-  /** closest surface search and residual computation **/
-
+/** closest surface search and residual computation **/
+void matchPoints(state_ikfom & s, bool searching, bool gate_on, const Eigen::Matrix<double, 6, 6> & gate_P6)
+{
 #ifdef MP_EN
   // Respect OMP_NUM_THREADS when set so the runtime CPU budget (cgroup
   // --cpus) can be honoured; the compile-time MP_PROC_NUM (8 on x86) would
@@ -3584,7 +3594,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     point_world.z = p_global(2);
     point_world.intensity = point_body.intensity;
 
-    vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
+    std::vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
 
     auto & points_near = Nearest_Points[i];
 
@@ -3594,7 +3604,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
       cached_plane.invalidate();
       ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
       if (points_near.size() >= NUM_MATCH_POINTS && pointSearchSqDis[NUM_MATCH_POINTS - 1] <= 5) {
-        cached_plane.fit<NUM_MATCH_POINTS>(points_near, 0.1f, sqrt(p_body.norm()));
+        cached_plane.fit<NUM_MATCH_POINTS>(points_near, 0.1f, std::sqrt(p_body.norm()));
       }
     }
 
@@ -3604,7 +3614,7 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
     if (!cached_plane.valid())
       continue;
 
-    const VF(4) & pabcd = cached_plane.coefficients();
+    const Eigen::Matrix<float, 4, 1> & pabcd = cached_plane.coefficients();
     {
       const auto residual = cached_plane.evaluate(point_world.x, point_world.y, point_world.z);
       const float pd2 = residual.distance;
@@ -3626,12 +3636,15 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
         normvec->points[i].y = pabcd(1);
         normvec->points[i].z = pabcd(2);
         normvec->points[i].intensity = pd2;
-        res_last[i] = abs(pd2);
+        res_last[i] = std::abs(pd2);
       }
     }
   }
+}
 
-  // [v11] gate decision and kernel weights: the scan's robust residual scale is known only now.
+// [v11] gate decision and kernel weights: the scan's robust residual scale is known only now.
+void applyGateAndKernels(bool gate_on)
+{
   corr_gate_scan_sigma = 0.0;
   if (gate_on || corr_kernel != 0) {
     if (corr_gate.mad_scale > 0.0 || corr_kernel != 0) {
@@ -3668,216 +3681,232 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
       }
     }
   }
+}
 
-  // P2 VoxelMap-lite anisotropic deweight (see the flag's block comment).
-  // Runs on the ACCEPTED rows BEFORE ground recovery, so recovery rows (added
-  // below with fabricated vertical normals — the load-bearing counterweight)
-  // are never rescaled. esti_plane rewrites the organic normals every iEKF
-  // iteration, so the scaling is applied fresh each call — no compounding.
-  // The grid is only written from the main thread between scans; this pass
-  // is read-only and safe under OMP.
+// Shrinking-band iterative LS over one or more candidate sets.
+// Gates: enough support, near-horizontal (terrain + vehicle tilt stay
+// within a few degrees), sane height under the sensor. The height gate
+// is what makes always-on safe: the accepted surface must sit where
+// the vehicle's own ground sits.
+bool fitGround(
+  const std::vector<Eigen::Vector3d> * sets, int nsets, int min_in, Eigen::Vector3d & n_out, double & d_out)
+{
+  static std::vector<float> zs;
+  zs.clear();
+  for (int k = 0; k < nsets; k++)
+    for (const auto & p : sets[k])
+      zs.push_back(static_cast<float>(p.z()));
+  if (static_cast<int>(zs.size()) < min_in)
+    return false;
+  // Init: horizontal plane at the pooled median candidate height.
+  std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
+  Eigen::Vector3d n(0, 0, 1);
+  double d = -static_cast<double>(zs[zs.size() / 2]);
+  int n_in = 0;
+  const double bands[3] = {0.4, 0.25, 0.15};
+  for (double band : bands) {
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+    n_in = 0;
+    for (int k = 0; k < nsets; k++)
+      for (const auto & p : sets[k])
+        if (std::fabs(n.dot(p) + d) <= band) {
+          mean += p;
+          ++n_in;
+        }
+    if (n_in < min_in)
+      break;
+    mean /= n_in;
+    for (int k = 0; k < nsets; k++)
+      for (const auto & p : sets[k])
+        if (std::fabs(n.dot(p) + d) <= band) {
+          const Eigen::Vector3d q = p - mean;
+          cov.noalias() += q * q.transpose();
+        }
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
+    n = es.eigenvectors().col(0);
+    if (n.z() < 0)
+      n = -n;
+    d = -n.dot(mean);
+  }
+  n_out = n;
+  d_out = d;
+  return n_in >= min_in && n.z() >= 0.95 &&
+         std::fabs(-d / std::max(n.z(), 1e-6) - canopy_ground_z) <= canopy_ground_halfband;
+}
 
-  /*** Ground recovery (selection-layer repair, 2026-07-06 forensics): ANY
-   *   ground-hugging clutter (grass, crops, debris — content-agnostic) pollutes
-   *   the 5-NN esti_plane + s>0.9 gates: true-ground returns get REJECTED while
-   *   clutter micro-patches get accepted, depleting the vertical-normal share of
-   *   the effective set even though the raw scan-to-scan Z valley stays sharp
-   *   (measured: raw ground 62-70 % → ~10 % effective on the giant 0702 bag).
-   *   Repair at the same layer, SELF-GATED (no scene classifier): (1) fit robust
-   *   ground planes HYBRID global+sector in the body frame (shrinking-band LS —
-   *   anything above the dominant surface is trimmed regardless of what it is).
-   *   The whole-scan GLOBAL fit pools every candidate: maximum support, hardest
-   *   to bias (in deep clutter a per-sector fit can latch onto a locally
-   *   consistent clutter shelf that the pooled fit rejects — measured: sector-
-   *   only was ~2x weaker than whole-scan in the 0702 canopy). Per-SECTOR fits
-   *   refine it for crowned/rutted/partially-occupied terrain, but a sector
-   *   plane is used only where it AGREES with the global plane (normal dot +
-   *   height at the sector centroid); a sector that fails its own gates or
-   *   disagrees falls back to the global plane, and without a valid global fit
-   *   the surviving sector fits stand alone. The height-sanity gate (plane at
-   *   the known sensor mount height) guarantees the dominant surface IS what
-   *   the vehicle stands on, without scene semantics.
-   *   (2) re-admit rejected near-field returns lying on their sector's plane,
-   *   with an imposed vertical world normal and the residual measured against
-   *   the LOWER ENVELOPE of their map neighbors (mean of the two lowest z —
-   *   robust to clutter fuzz in the map). Rows flow into the standard
-   *   point-to-plane H. Only points the normal path rejected are touched.
-   *   NOTE: distinct from the removed A'-3 boost, which amplified already-
-   *   matched rows (NEGATIVE result); this restores SELECTION of discarded
-   *   true ground. ***/
+void fitGroundSectors(bool (&sec_ok)[kGndSectors], Eigen::Vector3d (&sec_n)[kGndSectors], double (&sec_d)[kGndSectors])
+{
+  static std::vector<Eigen::Vector3d> cand[kGndSectors];
+  for (int s = 0; s < kGndSectors; s++) {
+    cand[s].clear();
+    sec_ok[s] = false;
+  }
+  for (int i = 0; i < feats_down_size; i++) {
+    const PointType & pb = feats_down_body->points[i];
+    if (std::hypot(pb.x, pb.y) > canopy_near_range)
+      continue;
+    if (std::fabs(pb.z - canopy_ground_z) > canopy_ground_halfband)
+      continue;
+    const int s =
+      std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
+    cand[s].emplace_back(pb.x, pb.y, pb.z);
+  }
+  // Global whole-scan fit: pooled support is the hardest to bias — the
+  // prior every sector must agree with, and the fallback plane.
+  Eigen::Vector3d gn(0, 0, 1);
+  double gd = 0.0;
+  const bool glob_ok = fitGround(cand, kGndSectors, ground_recover_min_inliers, gn, gd);
+  for (int s = 0; s < kGndSectors; s++) {
+    Eigen::Vector3d n;
+    double d;
+    bool own_ok = fitGround(&cand[s], 1, ground_recover_min_inliers, n, d);
+    if (own_ok && glob_ok) {
+      // A sector plane may only REFINE the global one: normals must
+      // agree and the plane heights at the sector centroid must match
+      // within ground_recover_sector_tol; otherwise the sector fit
+      // latched onto something the pooled fit rejected.
+      Eigen::Vector3d c = Eigen::Vector3d::Zero();
+      for (const auto & p : cand[s])
+        c += p;
+      c /= static_cast<double>(cand[s].size());
+      const double z_sec = -(d + n.x() * c.x() + n.y() * c.y()) / std::max(n.z(), 1e-6);
+      const double z_glob = -(gd + gn.x() * c.x() + gn.y() * c.y()) / std::max(gn.z(), 1e-6);
+      constexpr double kSectorNormalDotMin = 0.985;  // ~10 deg relative tilt
+      own_ok = n.dot(gn) >= kSectorNormalDotMin && std::fabs(z_sec - z_glob) <= ground_recover_sector_tol;
+    }
+    if (own_ok) {
+      sec_ok[s] = true;
+      sec_n[s] = n;
+      sec_d[s] = d;
+    } else if (glob_ok) {
+      sec_ok[s] = true;
+      sec_n[s] = gn;
+      sec_d[s] = gd;
+    }
+  }
+}
+
+void recoverGroundRows(const bool (&sec_ok)[kGndSectors],
+                       const Eigen::Vector3d (&sec_n)[kGndSectors],
+                       const double (&sec_d)[kGndSectors])
+{
+  for (int i = 0; i < feats_down_size; i++) {
+    if (point_selected_surf[i])
+      continue;
+    if (canopy_ground_recovered >= ground_recover_max_rows)
+      break;
+    const PointType & pb = feats_down_body->points[i];
+    if (std::hypot(pb.x, pb.y) > canopy_near_range)
+      continue;
+    const int s =
+      std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
+    if (!sec_ok[s])
+      continue;
+    // Scan side: on this sector's ground plane (clutter trimmed by the fit band).
+    if (std::fabs(sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s]) > ground_recover_scan_band)
+      continue;
+    auto & pn = Nearest_Points[i];
+    if (static_cast<int>(pn.size()) < NUM_MATCH_POINTS)
+      continue;
+    const PointType & pw = feats_down_world->points[i];
+    // Map neighborhood must actually be nearby (same criterion class as
+    // the normal path's 5th-neighbor sqdist gate).
+    const double dx0 = pn[0].x - pw.x, dy0 = pn[0].y - pw.y, dz0 = pn[0].z - pw.z;
+    if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 > 5.0)
+      continue;
+    // Residual reference: the map-neighbour lower envelope (mean of the two
+    // lowest z — robust to clutter fuzz in the map). It DRIFTS with the
+    // vehicle, so this channel slows the Z ratchet, it does not anchor it.
+    // An absolute reference was tried and closed: every level of authority
+    // strong enough to matter rerouted the error into another channel
+    // (attitude torque in degenerate clutter, or an inconsistent
+    // measurement model when the attitude columns were zeroed). Fix the
+    // constraint set instead of injecting absolute Z here.
+    const double w_row = 1.0;
+    float z1 = pn[0].z, z2 = std::numeric_limits<float>::max();
+    for (size_t k = 1; k < pn.size(); k++) {
+      const float z = pn[k].z;
+      if (z < z1) {
+        z2 = z1;
+        z1 = z;
+      } else if (z < z2) {
+        z2 = z;
+      }
+    }
+    const double z_ground_map = 0.5 * (z1 + (z2 == std::numeric_limits<float>::max() ? z1 : z2));
+    const double pd2 = pw.z - z_ground_map;
+    if (std::fabs(pd2) > ground_recover_max_residual)
+      continue;
+    point_selected_surf[i] = true;
+    normvec->points[i].x = 0.0f;
+    normvec->points[i].y = 0.0f;
+    // Row weight rides on the normal + residual scaling (information
+    // scales as w_row^2 in the point-to-plane H) — same mechanism as an
+    // ordinary row, no new plumbing.
+    normvec->points[i].z = static_cast<float>(w_row);
+    normvec->points[i].intensity = static_cast<float>(w_row * pd2);
+    res_last[i] = std::fabs(pd2);
+    ++canopy_ground_recovered;
+  }
+}
+
+// P2 VoxelMap-lite anisotropic deweight (see the flag's block comment).
+// Runs on the ACCEPTED rows BEFORE ground recovery, so recovery rows (added
+// below with fabricated vertical normals — the load-bearing counterweight)
+// are never rescaled. esti_plane rewrites the organic normals every iEKF
+// iteration, so the scaling is applied fresh each call — no compounding.
+// The grid is only written from the main thread between scans; this pass
+// is read-only and safe under OMP.
+
+/*** Ground recovery (selection-layer repair, 2026-07-06 forensics): ANY
+ *   ground-hugging clutter (grass, crops, debris — content-agnostic) pollutes
+ *   the 5-NN esti_plane + s>0.9 gates: true-ground returns get REJECTED while
+ *   clutter micro-patches get accepted, depleting the vertical-normal share of
+ *   the effective set even though the raw scan-to-scan Z valley stays sharp
+ *   (measured: raw ground 62-70 % → ~10 % effective on the giant 0702 bag).
+ *   Repair at the same layer, SELF-GATED (no scene classifier): (1) fit robust
+ *   ground planes HYBRID global+sector in the body frame (shrinking-band LS —
+ *   anything above the dominant surface is trimmed regardless of what it is).
+ *   The whole-scan GLOBAL fit pools every candidate: maximum support, hardest
+ *   to bias (in deep clutter a per-sector fit can latch onto a locally
+ *   consistent clutter shelf that the pooled fit rejects — measured: sector-
+ *   only was ~2x weaker than whole-scan in the 0702 canopy). Per-SECTOR fits
+ *   refine it for crowned/rutted/partially-occupied terrain, but a sector
+ *   plane is used only where it AGREES with the global plane (normal dot +
+ *   height at the sector centroid); a sector that fails its own gates or
+ *   disagrees falls back to the global plane, and without a valid global fit
+ *   the surviving sector fits stand alone. The height-sanity gate (plane at
+ *   the known sensor mount height) guarantees the dominant surface IS what
+ *   the vehicle stands on, without scene semantics.
+ *   (2) re-admit rejected near-field returns lying on their sector's plane,
+ *   with an imposed vertical world normal and the residual measured against
+ *   the LOWER ENVELOPE of their map neighbors (mean of the two lowest z —
+ *   robust to clutter fuzz in the map). Rows flow into the standard
+ *   point-to-plane H. Only points the normal path rejected are touched.
+ *   NOTE: distinct from the removed A'-3 boost, which amplified already-
+ *   matched rows (NEGATIVE result); this restores SELECTION of discarded
+ *   true ground. ***/
+void recoverGround()
+{
   canopy_ground_recovered = 0;
   if (ground_recover_en) {
     // Per-sector ground planes, cached per scan (body cloud is fixed across
     // iEKF iterations). n·p + d = 0 with unit n, n_z > 0.
-    constexpr int kGndSectors = 8;
     static double fit_time = -1.0;
     static bool sec_ok[kGndSectors];
     static Eigen::Vector3d sec_n[kGndSectors];
     static double sec_d[kGndSectors];
     if (lidar_end_time != fit_time) {
       fit_time = lidar_end_time;
-      static std::vector<Eigen::Vector3d> cand[kGndSectors];
-      for (int s = 0; s < kGndSectors; s++) {
-        cand[s].clear();
-        sec_ok[s] = false;
-      }
-      for (int i = 0; i < feats_down_size; i++) {
-        const PointType & pb = feats_down_body->points[i];
-        if (std::hypot(pb.x, pb.y) > canopy_near_range)
-          continue;
-        if (std::fabs(pb.z - canopy_ground_z) > canopy_ground_halfband)
-          continue;
-        const int s =
-          std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
-        cand[s].emplace_back(pb.x, pb.y, pb.z);
-      }
-      // Shrinking-band iterative LS over one or more candidate sets.
-      // Gates: enough support, near-horizontal (terrain + vehicle tilt stay
-      // within a few degrees), sane height under the sensor. The height gate
-      // is what makes always-on safe: the accepted surface must sit where
-      // the vehicle's own ground sits.
-      auto fit_ground = [](const std::vector<Eigen::Vector3d> * sets,
-                           int nsets,
-                           int min_in,
-                           Eigen::Vector3d & n_out,
-                           double & d_out) -> bool {
-        static std::vector<float> zs;
-        zs.clear();
-        for (int k = 0; k < nsets; k++)
-          for (const auto & p : sets[k])
-            zs.push_back(static_cast<float>(p.z()));
-        if (static_cast<int>(zs.size()) < min_in)
-          return false;
-        // Init: horizontal plane at the pooled median candidate height.
-        std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
-        Eigen::Vector3d n(0, 0, 1);
-        double d = -static_cast<double>(zs[zs.size() / 2]);
-        int n_in = 0;
-        const double bands[3] = {0.4, 0.25, 0.15};
-        for (double band : bands) {
-          Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-          Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-          n_in = 0;
-          for (int k = 0; k < nsets; k++)
-            for (const auto & p : sets[k])
-              if (std::fabs(n.dot(p) + d) <= band) {
-                mean += p;
-                ++n_in;
-              }
-          if (n_in < min_in)
-            break;
-          mean /= n_in;
-          for (int k = 0; k < nsets; k++)
-            for (const auto & p : sets[k])
-              if (std::fabs(n.dot(p) + d) <= band) {
-                const Eigen::Vector3d q = p - mean;
-                cov.noalias() += q * q.transpose();
-              }
-          Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
-          n = es.eigenvectors().col(0);
-          if (n.z() < 0)
-            n = -n;
-          d = -n.dot(mean);
-        }
-        n_out = n;
-        d_out = d;
-        return n_in >= min_in && n.z() >= 0.95 &&
-               std::fabs(-d / std::max(n.z(), 1e-6) - canopy_ground_z) <= canopy_ground_halfband;
-      };
-      // Global whole-scan fit: pooled support is the hardest to bias — the
-      // prior every sector must agree with, and the fallback plane.
-      Eigen::Vector3d gn(0, 0, 1);
-      double gd = 0.0;
-      const bool glob_ok = fit_ground(cand, kGndSectors, ground_recover_min_inliers, gn, gd);
-      for (int s = 0; s < kGndSectors; s++) {
-        Eigen::Vector3d n;
-        double d;
-        bool own_ok = fit_ground(&cand[s], 1, ground_recover_min_inliers, n, d);
-        if (own_ok && glob_ok) {
-          // A sector plane may only REFINE the global one: normals must
-          // agree and the plane heights at the sector centroid must match
-          // within ground_recover_sector_tol; otherwise the sector fit
-          // latched onto something the pooled fit rejected.
-          Eigen::Vector3d c = Eigen::Vector3d::Zero();
-          for (const auto & p : cand[s])
-            c += p;
-          c /= static_cast<double>(cand[s].size());
-          const double z_sec = -(d + n.x() * c.x() + n.y() * c.y()) / std::max(n.z(), 1e-6);
-          const double z_glob = -(gd + gn.x() * c.x() + gn.y() * c.y()) / std::max(gn.z(), 1e-6);
-          constexpr double kSectorNormalDotMin = 0.985;  // ~10 deg relative tilt
-          own_ok = n.dot(gn) >= kSectorNormalDotMin && std::fabs(z_sec - z_glob) <= ground_recover_sector_tol;
-        }
-        if (own_ok) {
-          sec_ok[s] = true;
-          sec_n[s] = n;
-          sec_d[s] = d;
-        } else if (glob_ok) {
-          sec_ok[s] = true;
-          sec_n[s] = gn;
-          sec_d[s] = gd;
-        }
-      }
+      fitGroundSectors(sec_ok, sec_n, sec_d);
     }
-    for (int i = 0; i < feats_down_size; i++) {
-      if (point_selected_surf[i])
-        continue;
-      if (canopy_ground_recovered >= ground_recover_max_rows)
-        break;
-      const PointType & pb = feats_down_body->points[i];
-      if (std::hypot(pb.x, pb.y) > canopy_near_range)
-        continue;
-      const int s =
-        std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
-      if (!sec_ok[s])
-        continue;
-      // Scan side: on this sector's ground plane (clutter trimmed by the fit band).
-      if (std::fabs(sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + sec_d[s]) > ground_recover_scan_band)
-        continue;
-      auto & pn = Nearest_Points[i];
-      if (static_cast<int>(pn.size()) < NUM_MATCH_POINTS)
-        continue;
-      const PointType & pw = feats_down_world->points[i];
-      // Map neighborhood must actually be nearby (same criterion class as
-      // the normal path's 5th-neighbor sqdist gate).
-      const double dx0 = pn[0].x - pw.x, dy0 = pn[0].y - pw.y, dz0 = pn[0].z - pw.z;
-      if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 > 5.0)
-        continue;
-      // Residual reference: the map-neighbour lower envelope (mean of the two
-      // lowest z — robust to clutter fuzz in the map). It DRIFTS with the
-      // vehicle, so this channel slows the Z ratchet, it does not anchor it.
-      // An absolute reference was tried and closed: every level of authority
-      // strong enough to matter rerouted the error into another channel
-      // (attitude torque in degenerate clutter, or an inconsistent
-      // measurement model when the attitude columns were zeroed). Fix the
-      // constraint set instead of injecting absolute Z here.
-      const double w_row = 1.0;
-      float z1 = pn[0].z, z2 = std::numeric_limits<float>::max();
-      for (size_t k = 1; k < pn.size(); k++) {
-        const float z = pn[k].z;
-        if (z < z1) {
-          z2 = z1;
-          z1 = z;
-        } else if (z < z2) {
-          z2 = z;
-        }
-      }
-      const double z_ground_map = 0.5 * (z1 + (z2 == std::numeric_limits<float>::max() ? z1 : z2));
-      const double pd2 = pw.z - z_ground_map;
-      if (std::fabs(pd2) > ground_recover_max_residual)
-        continue;
-      point_selected_surf[i] = true;
-      normvec->points[i].x = 0.0f;
-      normvec->points[i].y = 0.0f;
-      // Row weight rides on the normal + residual scaling (information
-      // scales as w_row^2 in the point-to-plane H) — same mechanism as an
-      // ordinary row, no new plumbing.
-      normvec->points[i].z = static_cast<float>(w_row);
-      normvec->points[i].intensity = static_cast<float>(w_row * pd2);
-      res_last[i] = std::fabs(pd2);
-      ++canopy_ground_recovered;
-    }
+    recoverGroundRows(sec_ok, sec_n, sec_d);
   }
+}
 
+void compactRows()
+{
   effct_feat_num = 0;
   if (degeneracy_debug) {
     std::fill(std::begin(res_bin_n), std::end(res_bin_n), 0);
@@ -3908,58 +3937,33 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
         res_bin_ss[b] += double(res_last[i]) * res_last[i];
       }
     }));
+}
 
-#ifdef FASTLIO_TEST_HOOKS
-  if (fast_lio_test::afterHModelRows)
-    fast_lio_test::afterHModelRows(static_cast<std::size_t>(feats_down_size), lidar_end_time, effct_feat_num);
-  if (fast_lio_test::afterHModelSelection)
-    fast_lio_test::reportHModelSelection(ekfom_data.converge, searching);
-#endif
-
-  // Position-observability metric (degeneracy detector): eigenvalues of the
-  // normal information matrix M = sum(n n^T) over effective points. The min
-  // eigenvalue is the weakest-constrained position direction; if its
-  // eigenvector points along Z, the Z update is ill-conditioned.
-  {
-    Eigen::Matrix3d M = Eigen::Matrix3d::Zero();
-    for (int i = 0; i < effct_feat_num; i++) {
-      const PointType & np = corr_normvect->points[i];
-      Eigen::Vector3d n(np.x, np.y, np.z);
-      M.noalias() += n * n.transpose();
-    }
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
-    pos_obs_M = M;
-    pos_obs_eig_min = es.eigenvalues()(0);
-    pos_obs_eig_max = es.eigenvalues()(2);
-    pos_obs_z_weak = std::abs(es.eigenvectors()(2, 0));  // |Z| of weakest eigenvector
+// Position-observability metric (degeneracy detector): eigenvalues of the
+// normal information matrix M = sum(n n^T) over effective points. The min
+// eigenvalue is the weakest-constrained position direction; if its
+// eigenvector points along Z, the Z update is ill-conditioned.
+void observePosition()
+{
+  Eigen::Matrix3d M = Eigen::Matrix3d::Zero();
+  for (int i = 0; i < effct_feat_num; i++) {
+    const PointType & np = corr_normvect->points[i];
+    Eigen::Vector3d n(np.x, np.y, np.z);
+    M.noalias() += n * n.transpose();
   }
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
+  pos_obs_M = M;
+  pos_obs_eig_min = es.eigenvalues()(0);
+  pos_obs_eig_max = es.eigenvalues()(2);
+  pos_obs_z_weak = std::abs(es.eigenvectors()(2, 0));  // |Z| of weakest eigenvector
+}
 
-  if (effct_feat_num < 1) {
-    ekfom_data.valid = false;
-    std::cerr << "No Effective Points!" << std::endl;
-#ifdef FASTLIO_TEST_HOOKS
-    if (fast_lio_test::afterHModelMatrices)
-      fast_lio_test::afterHModelMatrices(lidar_end_time, ekfom_data.valid, Eigen::MatrixXd(), Eigen::VectorXd());
-    if (fast_lio_test::afterHModelExit)
-      fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(ekfom_data.valid, false));
-#endif
-    return;
-  }
-
-  res_mean_last = total_residual / effct_feat_num;
-  const double match_dt = omp_get_wtime() - match_start;
-  match_time += match_dt;
-  (searching ? match_search_time : match_nosearch_time) += match_dt;
-  double solve_start_ = omp_get_wtime();
-
-  /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
-  ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12);  // 23
-  ekfom_data.h.resize(effct_feat_num);
-  // [v8] attitude hold: the vertical in the body frame (the gravity state's own up), recomputed per
-  // iteration; every rotation row below is projected onto it so the update cannot move roll/pitch.
-  // [v9] the information rule decides from this iteration's own rows: Σ AAᵀ restricted to the
-  // roll/pitch plane, its weakest eigenvalue against lidar_attitude_hold_min_rp_info.
-  V3D hold_up = V3D::Zero();
+// [v8] attitude hold: the vertical in the body frame (the gravity state's own up), recomputed per
+// iteration; every rotation row below is projected onto it so the update cannot move roll/pitch.
+// [v9] the information rule decides from this iteration's own rows: Σ AAᵀ restricted to the
+// roll/pitch plane, its weakest eigenvalue against lidar_attitude_hold_min_rp_info.
+bool prepareAttitudeHold(state_ikfom & s, V3D & hold_up)
+{
   {
     V3D grav_w(s.grav[0], s.grav[1], s.grav[2]);
     const V3D up_w = grav_w.norm() > 1e-6 ? V3D(-grav_w.normalized()) : V3D(0.0, 0.0, 1.0);
@@ -3983,7 +3987,11 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
       lidar_attitude_hold_info_active = true;
     }
   }
+  return hold_rows;
+}
 
+void buildRows(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_data, const V3D & hold_up, bool hold_rows)
+{
   for (int i = 0; i < effct_feat_num; i++) {
     const PointType & laser_p = laserCloudOri->points[i];
     V3D point_this_be(laser_p.x, laser_p.y, laser_p.z);
@@ -4020,140 +4028,193 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
       ekfom_data.h(i) *= sw;
     }
   }
+}
 
-  /*** Subspace weighting. Judged on the position information LEFT once rotation has
-   *   been solved for (the Schur complement of H^T H over the rotation columns), taken
-   *   straight off the Jacobian we just built, then applied per point: this plane only
-   *   constrains its own normal, so weight it by how much the policy trusts that
-   *   direction. Row AND residual together — that is what makes it R_i <- R / s^2, a
-   *   weight on the measurement, rather than a claim that the plane faces elsewhere.
-   *   Recomputed every iEKF iteration: the correspondences move with the state. ***/
-  {
-    const auto H_t = ekfom_data.h_x.leftCols(3);
-    const auto H_r = ekfom_data.h_x.middleCols(3, 3);
-    const Eigen::Matrix3d H_tt = H_t.transpose() * H_t;
-    const Eigen::Matrix3d H_tr = H_t.transpose() * H_r;
-    const Eigen::Matrix3d H_rr = H_r.transpose() * H_r;
-    degeneracy_last = fast_lio::computePositionDegeneracy(H_tt, H_tr, H_rr, effct_feat_num, degeneracy_params);
-    if (degeneracy_spectrum_trace) {
-      // Both spectra side by side: the gap between them is what rotation explains away,
-      // and it is the only way to see the coupling the thresholds now have to live with.
-      static rclcpp::Clock degen_spectrum_clock(RCL_STEADY_TIME);
-      const Eigen::Vector3d tt = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(H_tt).eigenvalues();
-      const Eigen::Vector3d & sh = degeneracy_last.lambda_norm;
-      const Eigen::Vector3d & ab = degeneracy_last.lambda_abs;
-      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("laser_mapping"),
-                           degen_spectrum_clock,
-                           2000,
-                           "[DEGEN-SPECTRUM] shares [%.3f %.3f %.3f] sum=%.3f | judged raw [%.1f %.1f %.1f] | "
-                           "H_tt raw [%.1f %.1f %.1f] | effct=%d far_frac=%.2f",
-                           sh(0),
-                           sh(1),
-                           sh(2),
-                           sh.sum(),
-                           ab(0),
-                           ab(1),
-                           ab(2),
-                           tt(0),
-                           tt(1),
-                           tt(2),
-                           effct_feat_num,
-                           scan_far_frac);
-    }
-    if (degeneracy_last.engaged) {
-      for (int i = 0; i < effct_feat_num; i++) {
-        const PointType & np = corr_normvect->points[i];
-        const double point_w = fast_lio::pointWeight(degeneracy_last, Eigen::Vector3d(np.x, np.y, np.z));
-        if (point_w < 1.0) {
-          ekfom_data.h_x.block<1, 12>(i, 0) *= point_w;
-          ekfom_data.h(i) *= point_w;
-          degeneracy_point_weight_sum += point_w;
-          ++degeneracy_point_weighted;
-        }
+/*** Subspace weighting. Judged on the position information LEFT once rotation has
+ *   been solved for (the Schur complement of H^T H over the rotation columns), taken
+ *   straight off the Jacobian we just built, then applied per point: this plane only
+ *   constrains its own normal, so weight it by how much the policy trusts that
+ *   direction. Row AND residual together — that is what makes it R_i <- R / s^2, a
+ *   weight on the measurement, rather than a claim that the plane faces elsewhere.
+ *   Recomputed every iEKF iteration: the correspondences move with the state. ***/
+void degeneracyWeights(esekfom::dyn_share_datastruct<double> & ekfom_data)
+{
+  const auto H_t = ekfom_data.h_x.leftCols(3);
+  const auto H_r = ekfom_data.h_x.middleCols(3, 3);
+  const Eigen::Matrix3d H_tt = H_t.transpose() * H_t;
+  const Eigen::Matrix3d H_tr = H_t.transpose() * H_r;
+  const Eigen::Matrix3d H_rr = H_r.transpose() * H_r;
+  degeneracy_last = fast_lio::computePositionDegeneracy(H_tt, H_tr, H_rr, effct_feat_num, degeneracy_params);
+  if (degeneracy_spectrum_trace) {
+    // Both spectra side by side: the gap between them is what rotation explains away,
+    // and it is the only way to see the coupling the thresholds now have to live with.
+    static rclcpp::Clock degen_spectrum_clock(RCL_STEADY_TIME);
+    const Eigen::Vector3d tt = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(H_tt).eigenvalues();
+    const Eigen::Vector3d & sh = degeneracy_last.lambda_norm;
+    const Eigen::Vector3d & ab = degeneracy_last.lambda_abs;
+    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                         degen_spectrum_clock,
+                         2000,
+                         "[DEGEN-SPECTRUM] shares [%.3f %.3f %.3f] sum=%.3f | judged raw [%.1f %.1f %.1f] | "
+                         "H_tt raw [%.1f %.1f %.1f] | effct=%d far_frac=%.2f",
+                         sh(0),
+                         sh(1),
+                         sh(2),
+                         sh.sum(),
+                         ab(0),
+                         ab(1),
+                         ab(2),
+                         tt(0),
+                         tt(1),
+                         tt(2),
+                         effct_feat_num,
+                         scan_far_frac);
+  }
+  if (degeneracy_last.engaged) {
+    for (int i = 0; i < effct_feat_num; i++) {
+      const PointType & np = corr_normvect->points[i];
+      const double point_w = fast_lio::pointWeight(degeneracy_last, Eigen::Vector3d(np.x, np.y, np.z));
+      if (point_w < 1.0) {
+        ekfom_data.h_x.block<1, 12>(i, 0) *= point_w;
+        ekfom_data.h(i) *= point_w;
+        degeneracy_point_weight_sum += point_w;
+        ++degeneracy_point_weighted;
       }
     }
   }
+}
 
-  if (corr_dump_scan_active && fout_corr.is_open()) {
-    const int iter = corr_dump_iter++;
-    const V3D sensor_w = s.rot * s.offset_T_L_I + s.pos;
-    fout_corr_iter << std::setprecision(15) << lidar_end_time << ',' << iter << ',' << effct_feat_num << ','
-                   << int(hold_rows) << ',' << std::setprecision(6) << lidar_rot_obs_rp_min << ',' << hold_up(0) << ','
-                   << hold_up(1) << ',' << hold_up(2) << ',' << int(searching) << ',' << int(degeneracy_last.engaged)
-                   << '\n';
-    for (int i = 0; i < feats_down_size; i++) {
-      const bool eff = point_selected_surf[i];
-      if (!eff && iter > 0) {
-        continue;
-      }
-      const auto & pb = feats_down_body->points[i];
-      const V3D p_body(pb.x, pb.y, pb.z);
-      const V3D point_this = s.offset_R_L_I * p_body + s.offset_T_L_I;
-      const auto & pwp = feats_down_world->points[i];
-      const V3D pw(pwp.x, pwp.y, pwp.z);
-      const auto & near = Nearest_Points[i];
-      const int n_near = static_cast<int>(near.size());
-      double nn0 = -1.0, nn4 = -1.0, lam0 = -1.0, lam1 = -1.0, lam2 = -1.0, d_in = -1.0, plane_rms = -1.0;
-      if (n_near > 0) {
-        nn0 = (V3D(near[0].x, near[0].y, near[0].z) - pw).norm();
-        if (n_near >= NUM_MATCH_POINTS) {
-          const auto & q = near[NUM_MATCH_POINTS - 1];
-          nn4 = (V3D(q.x, q.y, q.z) - pw).norm();
-        }
-        V3D c = V3D::Zero();
-        for (const auto & q : near) {
-          c += V3D(q.x, q.y, q.z);
-        }
-        c /= double(n_near);
-        M3D S = M3D::Zero();
-        for (const auto & q : near) {
-          const V3D d = V3D(q.x, q.y, q.z) - c;
-          S += d * d.transpose();
-        }
-        S /= double(n_near);
-        Eigen::SelfAdjointEigenSolver<M3D> es(S);
-        lam0 = es.eigenvalues()(0);
-        lam1 = es.eigenvalues()(1);
-        lam2 = es.eigenvalues()(2);
-        const V3D nrm = es.eigenvectors().col(0);
-        const V3D d = pw - c;
-        d_in = (d - nrm * nrm.dot(d)).norm();
-        if (plane_cache[i].valid()) {
-          const VF(4) & pl = plane_cache[i].coefficients();
-          double ss = 0.0;
-          for (const auto & q : near) {
-            const double dd = pl(0) * q.x + pl(1) * q.y + pl(2) * q.z + pl(3);
-            ss += dd * dd;
-          }
-          plane_rms = std::sqrt(ss / double(n_near));
-        }
-      }
-      double pd2 = 0.0, nx = 0.0, ny = 0.0, nz = 0.0, ax = 0.0, ay = 0.0, az = 0.0, cosv = 0.0, w = 1.0;
-      if (eff) {
-        const auto & np = normvec->points[i];
-        nx = np.x;
-        ny = np.y;
-        nz = np.z;
-        pd2 = np.intensity;
-        const V3D n(nx, ny, nz);
-        const V3D C = s.rot.conjugate() * n;
-        const V3D A = point_this.cross(C);
-        ax = A(0);
-        ay = A(1);
-        az = A(2);
-        const V3D dv = pw - sensor_w;
-        cosv = dv.norm() > 1e-6 ? std::abs(n.dot(dv)) / dv.norm() : 0.0;
-        if (degeneracy_last.engaged) {
-          w = fast_lio::pointWeight(degeneracy_last, n);
-        }
-      }
-      fout_corr << std::setprecision(15) << lidar_end_time << ',' << iter << ',' << i << ',' << int(eff)
-                << std::setprecision(5) << ',' << p_body.norm() << ',' << point_this(0) << ',' << point_this(1) << ','
-                << point_this(2) << ',' << nx << ',' << ny << ',' << nz << ',' << pd2 << ',' << ax << ',' << ay << ','
-                << az << ',' << nn0 << ',' << nn4 << ',' << n_near << ',' << int(plane_cache[i].valid()) << ','
-                << plane_rms << ',' << lam0 << ',' << lam1 << ',' << lam2 << ',' << d_in << ',' << cosv << ',' << w
-                << ',' << pw(2) << ',' << pw(0) << ',' << pw(1) << '\n';
+void writeDump(state_ikfom & s, bool searching, const V3D & hold_up, bool hold_rows)
+{
+  const int iter = corr_dump_iter++;
+  const V3D sensor_w = s.rot * s.offset_T_L_I + s.pos;
+  fout_corr_iter << std::setprecision(15) << lidar_end_time << ',' << iter << ',' << effct_feat_num << ','
+                 << int(hold_rows) << ',' << std::setprecision(6) << lidar_rot_obs_rp_min << ',' << hold_up(0) << ','
+                 << hold_up(1) << ',' << hold_up(2) << ',' << int(searching) << ',' << int(degeneracy_last.engaged)
+                 << '\n';
+  for (int i = 0; i < feats_down_size; i++) {
+    const bool eff = point_selected_surf[i];
+    if (!eff && iter > 0) {
+      continue;
     }
+    const auto & pb = feats_down_body->points[i];
+    const V3D p_body(pb.x, pb.y, pb.z);
+    const V3D point_this = s.offset_R_L_I * p_body + s.offset_T_L_I;
+    const auto & pwp = feats_down_world->points[i];
+    const V3D pw(pwp.x, pwp.y, pwp.z);
+    const auto & near = Nearest_Points[i];
+    const int n_near = static_cast<int>(near.size());
+    double nn0 = -1.0, nn4 = -1.0, lam0 = -1.0, lam1 = -1.0, lam2 = -1.0, d_in = -1.0, plane_rms = -1.0;
+    if (n_near > 0) {
+      nn0 = (V3D(near[0].x, near[0].y, near[0].z) - pw).norm();
+      if (n_near >= NUM_MATCH_POINTS) {
+        const auto & q = near[NUM_MATCH_POINTS - 1];
+        nn4 = (V3D(q.x, q.y, q.z) - pw).norm();
+      }
+      V3D c = V3D::Zero();
+      for (const auto & q : near) {
+        c += V3D(q.x, q.y, q.z);
+      }
+      c /= double(n_near);
+      M3D S = M3D::Zero();
+      for (const auto & q : near) {
+        const V3D d = V3D(q.x, q.y, q.z) - c;
+        S += d * d.transpose();
+      }
+      S /= double(n_near);
+      Eigen::SelfAdjointEigenSolver<M3D> es(S);
+      lam0 = es.eigenvalues()(0);
+      lam1 = es.eigenvalues()(1);
+      lam2 = es.eigenvalues()(2);
+      const V3D nrm = es.eigenvectors().col(0);
+      const V3D d = pw - c;
+      d_in = (d - nrm * nrm.dot(d)).norm();
+      if (plane_cache[i].valid()) {
+        const Eigen::Matrix<float, 4, 1> & pl = plane_cache[i].coefficients();
+        double ss = 0.0;
+        for (const auto & q : near) {
+          const double dd = pl(0) * q.x + pl(1) * q.y + pl(2) * q.z + pl(3);
+          ss += dd * dd;
+        }
+        plane_rms = std::sqrt(ss / double(n_near));
+      }
+    }
+    double pd2 = 0.0, nx = 0.0, ny = 0.0, nz = 0.0, ax = 0.0, ay = 0.0, az = 0.0, cosv = 0.0, w = 1.0;
+    if (eff) {
+      const auto & np = normvec->points[i];
+      nx = np.x;
+      ny = np.y;
+      nz = np.z;
+      pd2 = np.intensity;
+      const V3D n(nx, ny, nz);
+      const V3D C = s.rot.conjugate() * n;
+      const V3D A = point_this.cross(C);
+      ax = A(0);
+      ay = A(1);
+      az = A(2);
+      const V3D dv = pw - sensor_w;
+      cosv = dv.norm() > 1e-6 ? std::abs(n.dot(dv)) / dv.norm() : 0.0;
+      if (degeneracy_last.engaged) {
+        w = fast_lio::pointWeight(degeneracy_last, n);
+      }
+    }
+    fout_corr << std::setprecision(15) << lidar_end_time << ',' << iter << ',' << i << ',' << int(eff)
+              << std::setprecision(5) << ',' << p_body.norm() << ',' << point_this(0) << ',' << point_this(1) << ','
+              << point_this(2) << ',' << nx << ',' << ny << ',' << nz << ',' << pd2 << ',' << ax << ',' << ay << ','
+              << az << ',' << nn0 << ',' << nn4 << ',' << n_near << ',' << int(plane_cache[i].valid()) << ','
+              << plane_rms << ',' << lam0 << ',' << lam1 << ',' << lam2 << ',' << d_in << ',' << cosv << ',' << w << ','
+              << pw(2) << ',' << pw(0) << ',' << pw(1) << '\n';
+  }
+}
+}  // namespace
+
+void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfom_data)
+{
+  double match_start = omp_get_wtime();
+  const bool searching = decideSearch(s, ekfom_data);
+  Eigen::Matrix<double, 6, 6> gate_P6 = Eigen::Matrix<double, 6, 6>::Zero();
+  const bool gate_on = gatePrior(gate_P6);
+  matchPoints(s, searching, gate_on, gate_P6);
+  applyGateAndKernels(gate_on);
+  recoverGround();
+  compactRows();
+
+#ifdef FASTLIO_TEST_HOOKS
+  if (fast_lio_test::afterHModelRows)
+    fast_lio_test::afterHModelRows(static_cast<std::size_t>(feats_down_size), lidar_end_time, effct_feat_num);
+  if (fast_lio_test::afterHModelSelection)
+    fast_lio_test::reportHModelSelection(ekfom_data.converge, searching);
+#endif
+
+  observePosition();
+
+  if (effct_feat_num < 1) {
+    ekfom_data.valid = false;
+    std::cerr << "No Effective Points!" << '\n';
+#ifdef FASTLIO_TEST_HOOKS
+    if (fast_lio_test::afterHModelMatrices)
+      fast_lio_test::afterHModelMatrices(lidar_end_time, ekfom_data.valid, Eigen::MatrixXd(), Eigen::VectorXd());
+    if (fast_lio_test::afterHModelExit)
+      fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(ekfom_data.valid, false));
+#endif
+    return;
+  }
+
+  res_mean_last = total_residual / effct_feat_num;
+  const double match_dt = omp_get_wtime() - match_start;
+  match_time += match_dt;
+  (searching ? match_search_time : match_nosearch_time) += match_dt;
+  double solve_start_ = omp_get_wtime();
+
+  /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
+  ekfom_data.h_x = Eigen::MatrixXd::Zero(effct_feat_num, 12);  // 23
+  ekfom_data.h.resize(effct_feat_num);
+  V3D hold_up = V3D::Zero();
+  const bool hold_rows = prepareAttitudeHold(s, hold_up);
+  buildRows(s, ekfom_data, hold_up, hold_rows);
+  degeneracyWeights(ekfom_data);
+  if (corr_dump_scan_active && fout_corr.is_open()) {
+    writeDump(s, searching, hold_up, hold_rows);
   }
 
 #ifdef FASTLIO_TEST_HOOKS

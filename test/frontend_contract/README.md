@@ -105,5 +105,8 @@ cp "$out"/golden/parameter/*.golden src/LIO-SLAM/third_party/FAST_LIO/test/front
 cp "$out"/golden/pipeline/*.golden src/LIO-SLAM/third_party/FAST_LIO/test/frontend_contract/golden/pipeline/
 ```
 
-`$out/receipts/` holds every case's receipt. Regenerate whenever the legacy node's behaviour changes on purpose;
-S1 regenerates once on its own base before it starts, and every later slice compares against those goldens.
+`$out/receipts/` holds every case's receipt. Regenerate whenever the legacy node's behaviour changes on purpose or
+a change adds records: generate from a commit that holds the code without the new goldens, the commit their headers
+then name, and commit the goldens on their own after it. A commit that only moves code compares against them and
+must reproduce every golden unchanged. Only goldens that gain records are replaced: the measurement records replaced
+the pipeline goldens, and the parameter goldens keep the commit they were generated from.

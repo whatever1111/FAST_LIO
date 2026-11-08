@@ -3,19 +3,39 @@
 // stay at the propagated value, the position still updates, and the roll/pitch variance is kept.
 // The same scene drives the filter's two dyn_share entries side by side: a model bound with a context
 // (init_dyn_share_context) must be called, and leave the filter, exactly as the plain entry does.
+//
+// Further down, the same estimator in a corridor with noisy plane normals: the floor projection
+// (normal_noise_floor.hpp) applied to the position columns as design B.1 does it, and the wheel update
+// (wheel_measurement.hpp) after the lidar, for design D.5 and F2 (a)-(c).
 #include <Eigen/Dense>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <iostream>
+#include <iterator>
+#include <limits>
 #include <omp.h>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <typeinfo>
+#include <utility>
 #include <vector>
 
+#include "degeneracy_policy.hpp"
+#include "normal_noise_floor.hpp"
 #include "rp_consider.hpp"
 #include "use-ikfom.hpp"
+#include "wheel_measurement.hpp"
+
+// The wheel Jacobian is written for this error-state layout.
+static_assert(state_ikfom::DOF == fast_lio::kWheelStateDim, "wheel Jacobian width");
+static_assert(decltype(state_ikfom::rot)::IDX == fast_lio::kWheelRotIndex, "wheel rotation columns");
+static_assert(decltype(state_ikfom::vel)::IDX == fast_lio::kWheelVelIndex, "wheel velocity columns");
+static_assert(decltype(state_ikfom::bg)::IDX == fast_lio::kWheelGyroBiasIndex, "wheel gyro-bias columns");
 
 namespace
 {
@@ -441,4 +461,498 @@ TEST(DynShareContext, SwitchesBindingsAndRejectsANullContext)
   dynShareUpdate(f);
   EXPECT_GT(f.calls.calls.size(), before_rejected);  // a rejected bind leaves the bound model in place
   EXPECT_EQ(first.calls.size(), first_calls);
+}
+
+namespace
+{
+// A 40 m corridor along x seen from (0, 0, 1): a floor of 160 points and two walls of 80. Each point lies on a
+// five-point patch with a 2 cm residual, so its fitted normal tilts by sqrt(0.00625) (4.5 degrees) along the
+// corridor, the signs balanced over the scan. The scan then holds f = 1.5 normals of fake along-corridor
+// information and no real one; the floor model sees exactly that and keeps g = 0 along x. End walls at
+// x = +-21 m add real along-corridor information in proportion to the square of their weight.
+constexpr double kAccCov = 0.003993957088823881;  // m20 acc_cov
+constexpr double kImuDt = 0.005;
+constexpr int kImuStepsPerScan = 20;
+constexpr double kScanPeriod = kImuDt * kImuStepsPerScan;
+constexpr double kLidarR = 0.001;
+constexpr double kQ = kAccCov * kImuDt;  // m^2/s^3 per axis: the predict adds acc_cov dt^2 per IMU step
+constexpr int kVelX = fast_lio::kWheelVelIndex;
+
+struct CorridorPoint
+{
+  Eigen::Vector3d body = Eigen::Vector3d::Zero();  // seen from the true pose
+  Eigen::Vector3d n = Eigen::Vector3d::UnitZ();    // the fitted (tilted) unit normal
+  double d = 0.0;
+  double weight = 1.0;
+  std::optional<Eigen::Matrix3d> cov;
+};
+
+struct Corridor
+{
+  std::vector<CorridorPoint> points;
+  bool project = true;
+  // The last projection, for the assertions.
+  Eigen::Vector3d lambda = Eigen::Vector3d::Zero();
+  Eigen::Vector3d noise_floor = Eigen::Vector3d::Zero();
+  Eigen::Vector3d gains = Eigen::Vector3d::Ones();
+  Eigen::Matrix3d V = Eigen::Matrix3d::Identity();
+  double zeroed_information = 0.0;  // largest sum_i (row_i . v_k)^2 over directions with g_k = 0, any call
+};
+
+Corridor makeCorridor(double tilt_scale, double end_weight, bool noisy = true)
+{
+  Corridor corridor;
+  const Eigen::Vector3d p_true(0.0, 0.0, 1.0);
+  const Eigen::Vector3d X = Eigen::Vector3d::UnitX();
+  const Eigen::Vector3d Y = Eigen::Vector3d::UnitY();
+  const Eigen::Vector3d Z = Eigen::Vector3d::UnitZ();
+  const auto add = [&](const Eigen::Vector3d & p_w,
+                       const Eigen::Vector3d & n_true,
+                       const Eigen::Vector3d & e1,
+                       const Eigen::Vector3d & e2,
+                       double sign,
+                       double weight) {
+    fast_lio::PlaneFitEigen fit;
+    fit.lambda0 = 0.002;  // 2 cm rms over five points
+    fit.lambda1 = 0.16;
+    fit.lambda2 = 0.25;
+    fit.e1 = e1;
+    fit.e2 = e2;
+    fit.count = 5;
+    CorridorPoint point;
+    point.cov = fast_lio::planeNormalCovariance(fit);
+    point.n = n_true;
+    if (noisy) {
+      point.n += tilt_scale * sign * std::sqrt(e1.dot(*point.cov * e1)) * e1;
+      point.n.normalize();
+    }
+    point.d = -point.n.dot(p_w);
+    point.body = p_w - p_true;
+    point.weight = weight;
+    corridor.points.push_back(point);
+  };
+  for (int i = 0; i < 40; ++i) {
+    for (int j = 0; j < 4; ++j) {
+      add(Eigen::Vector3d(-19.5 + i, -1.5 + j, 0.0), Z, X, Y, (i + j) % 2 == 0 ? 1.0 : -1.0, 1.0);
+    }
+  }
+  for (int i = 0; i < 20; ++i) {
+    for (int j = 0; j < 2; ++j) {
+      for (int k = 0; k < 2; ++k) {
+        const double y = k == 0 ? -2.0 : 2.0;
+        add(Eigen::Vector3d(-19.0 + 2.0 * i, y, 0.5 + j),
+            Eigen::Vector3d(0.0, -y / 2.0, 0.0),
+            X,
+            Z,
+            (i + j + k) % 2 == 0 ? 1.0 : -1.0,
+            1.0);
+      }
+    }
+  }
+  if (end_weight > 0.0) {
+    for (double x : {-21.0, 21.0}) {
+      for (double y : {-1.0, 1.0}) {
+        for (double z : {0.5, 1.5}) {
+          add(Eigen::Vector3d(x, y, z), Eigen::Vector3d(-x / 21.0, 0.0, 0.0), Y, Z, 1.0, end_weight);
+        }
+      }
+    }
+  }
+  return corridor;
+}
+
+Corridor * g_corridor = nullptr;
+
+// sceneModel's conventions, with the projection of design B.1 when the corridor asks for it: M_eff from
+// schurPositionInformation, the floor per eigenvector from the points' normal covariances, the keep gains with
+// the FloorParams defaults, and h_x.leftCols(3) *= G. The residual h is left as it is.
+void corridorModel(state_ikfom & s, esekfom::dyn_share_datastruct<double> & data)
+{
+  Corridor & corridor = *g_corridor;
+  const int m = static_cast<int>(corridor.points.size());
+  data.h_x = Eigen::MatrixXd::Zero(m, 12);
+  data.h.resize(m);
+  const Eigen::Matrix3d R = s.rot.toRotationMatrix();
+  for (int i = 0; i < m; ++i) {
+    const CorridorPoint & point = corridor.points[i];
+    const Eigen::Vector3d p_w = R * point.body + s.pos;
+    const Eigen::Vector3d A = point.body.cross(R.transpose() * point.n);
+    data.h_x.block<1, 3>(i, 0) = point.weight * point.n.transpose();
+    data.h_x.block<1, 3>(i, 3) = point.weight * A.transpose();
+    data.h(i) = -point.weight * (point.n.dot(p_w) + point.d);
+  }
+  if (corridor.project) {
+    const Eigen::MatrixXd H_t = data.h_x.leftCols(3);
+    const Eigen::MatrixXd H_r = data.h_x.middleCols(3, 3);
+    const Eigen::Matrix3d H_tt = H_t.transpose() * H_t;
+    const Eigen::Matrix3d H_tr = H_t.transpose() * H_r;
+    const Eigen::Matrix3d H_rr = H_r.transpose() * H_r;
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(fast_lio::schurPositionInformation(H_tt, H_tr, H_rr));
+    corridor.V = solver.eigenvectors();
+    corridor.lambda = solver.eigenvalues();
+    fast_lio::DirectionFloorAccumulator accumulator(corridor.V);
+    for (const CorridorPoint & point : corridor.points) {
+      accumulator.add(point.weight, point.cov);
+    }
+    const fast_lio::FloorParams params;
+    corridor.noise_floor = accumulator.floor(params.kappa);
+    corridor.gains = fast_lio::floorKeepGains(
+      corridor.lambda, corridor.noise_floor, *fast_lio::zFromFalseKeepRate(params.alpha), params.rel_uncertainty);
+    data.h_x.leftCols(3) = H_t * fast_lio::projectionFromGains(corridor.V, corridor.gains);
+    for (int k = 0; k < 3; ++k) {
+      if (corridor.gains(k) == 0.0) {
+        corridor.zeroed_information =
+          std::max(corridor.zeroed_information, (data.h_x.leftCols(3) * corridor.V.col(k)).squaredNorm());
+      }
+    }
+  }
+  data.valid = true;
+}
+
+state_ikfom restingState(const Eigen::Vector3d & position_offset = Eigen::Vector3d::Zero(),
+                         double pitch = 0.0,
+                         const Eigen::Vector3d & velocity = Eigen::Vector3d::Zero())
+{
+  state_ikfom x;
+  x.pos = Eigen::Vector3d(0.0, 0.0, 1.0) + position_offset;
+  x.rot = SO3(Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()).toRotationMatrix());
+  x.vel = velocity;
+  x.grav = S2(Eigen::Vector3d(0.0, 0.0, -9.81));
+  return x;
+}
+
+// The fixture's position and attitude priors; the extrinsics at the fixture's 1e-8; velocity and the
+// bias/gravity states as given.
+Filter::cov corridorPrior(double velocity, double biases)
+{
+  Filter::cov P = Filter::cov::Identity() * biases;
+  for (int k = 0; k < 3; ++k) {
+    P(k, k) = 1e-2;
+    P(3 + k, 3 + k) = 1e-4;
+    P(6 + k, 6 + k) = 1e-8;
+    P(9 + k, 9 + k) = 1e-8;
+    P(kVelX + k, kVelX + k) = velocity;
+  }
+  return P;
+}
+
+// The estimator at rest in a corridor: acc-only process noise (the q of design D), a lidar update per scan,
+// and the wheel update as part B is to call it: the wheel_measurement model, packed for update_simple.
+class CorridorEstimator
+{
+public:
+  CorridorEstimator(Corridor corridor, const Filter::cov & P0, const state_ikfom & x0) : corridor_(std::move(corridor))
+  {
+    double epsilon[23];
+    std::fill(std::begin(epsilon), std::end(epsilon), 0.001);
+    filter_.init_dyn_share(get_f, df_dx, df_dw, corridorModel, 6, epsilon);
+    state_ikfom x = x0;
+    filter_.change_x(x);
+    Filter::cov P = P0;
+    filter_.change_P(P);
+    Q_.setZero();
+    Q_.block<3, 3>(3, 3) = kAccCov * Eigen::Matrix3d::Identity();
+    // At rest the specific force is the state's own gravity reversed (S2 keeps |g| = 9.809), so nothing drifts.
+    in_.acc = Eigen::Vector3d(-x0.grav.get_vect());
+    in_.gyro = Eigen::Vector3d::Zero();
+  }
+
+  void propagate()
+  {
+    for (int step = 0; step < kImuStepsPerScan; ++step) {
+      double dt = kImuDt;
+      filter_.predict(dt, Q_, in_);
+    }
+  }
+
+  void lidar()
+  {
+    g_corridor = &corridor_;
+    double solve_time = 0.0;
+    filter_.update_iterated_dyn_share_modified(kLidarR, solve_time);
+  }
+
+  // The legs report standing still with the bridge's 0.05 m/s (below the 0.075 floor), lateral not observed.
+  // Returns the update's gain on the along-corridor velocity, 1 - P+/P-.
+  double wheel()
+  {
+    const state_ikfom x = filter_.get_x();
+    fast_lio::WheelFit fit;
+    fit.v = 0.0;
+    fit.samples = 1;
+    fit.var_vx = 0.05 * 0.05;
+    fit.var_lat = fast_lio::kBridgeUnobservedVariance;
+    const auto measurement = fast_lio::wheelMeasurement(fit,
+                                                        std::nullopt,
+                                                        x.rot.toRotationMatrix(),
+                                                        x.vel,
+                                                        x.bg,
+                                                        Eigen::Vector3d::Zero(),
+                                                        Eigen::Matrix3d::Identity(),
+                                                        fast_lio::WheelModelParams{});
+    if (!measurement) {
+      ADD_FAILURE() << "no wheel measurement";
+      return 0.0;
+    }
+    Eigen::Matrix<double, Eigen::Dynamic, fast_lio::kWheelStateDim> H;
+    Eigen::VectorXd residual;
+    Eigen::VectorXd variances;
+    measurement->pack(H, residual, variances);
+    const double before = filter_.get_P()(kVelX, kVelX);
+    filter_.update_simple(H, residual, variances);
+    return 1.0 - filter_.get_P()(kVelX, kVelX) / before;
+  }
+
+  Filter & filter() { return filter_; }
+  Corridor & corridor() { return corridor_; }
+
+private:
+  Corridor corridor_;
+  Filter filter_;
+  Eigen::Matrix<double, 12, 12> Q_;
+  input_ikfom in_;
+};
+
+// The along-corridor information and floor at the true pose, for placing lambda / f with end walls.
+std::pair<double, double> alongCorridorInformation(double tilt_scale, double end_weight)
+{
+  Corridor corridor = makeCorridor(tilt_scale, end_weight);
+  g_corridor = &corridor;
+  state_ikfom truth = restingState();
+  esekfom::dyn_share_datastruct<double> data;
+  corridorModel(truth, data);
+  g_corridor = nullptr;
+  return {corridor.lambda(0), corridor.noise_floor(0)};
+}
+
+// End-wall weight that puts lambda_u at `ratio` times the floor (the Schur coupling makes it nearly, not
+// exactly, linear in the weight squared; the tests read the realised ratio back).
+double endWeightFor(double tilt_scale, double ratio)
+{
+  const auto bare = alongCorridorInformation(tilt_scale, 0.0);
+  const auto unit = alongCorridorInformation(tilt_scale, 1.0);
+  return std::sqrt(std::max(ratio * bare.second - bare.first, 0.0) / (unit.first - bare.first));
+}
+
+// The largest |x_b - x_a| / sigma_a over the error state; a non-finite state counts as infinitely far.
+std::pair<double, int> worstSigmaDistance(const state_ikfom & a, const state_ikfom & b, const Filter::cov & P_a)
+{
+  Filter::vectorized_state difference = Filter::vectorized_state::Zero();
+  b.boxminus(difference, a);
+  double worst = 0.0;
+  int index = -1;
+  for (int i = 0; i < difference.size(); ++i) {
+    const double distance = std::abs(difference(i)) / std::sqrt(P_a(i, i));
+    if (!std::isfinite(distance)) {
+      return {std::numeric_limits<double>::infinity(), i};
+    }
+    if (distance > worst) {
+      worst = distance;
+      index = i;
+    }
+  }
+  return {worst, index};
+}
+
+std::string text(double value)
+{
+  std::ostringstream out;
+  out.precision(6);
+  out << value;
+  return out.str();
+}
+}  // namespace
+
+TEST(FloorProjection, WheelSetsTheAlongCorridorVelocityAndTheOtherDirectionsKeepTheirs)
+{
+  // Design D.5 (F6): 200 scans with the wheel update after each lidar update. With q = acc_cov dt and
+  // r = 0.075^2 T the along-corridor velocity sigma must converge to (q r)^(1/4) = 10.3 mm/s within 10 %, the
+  // wheel must take >= 1.5 % per scan, and the directions across the corridor keep the variance they have
+  // without the projection, up to the information the floor deduction takes from them: a variance ratio in
+  // [1, 1 / g^2]. Bias and gravity priors are tight because D.5's model has no unknown constant acceleration.
+  const Filter::cov P0 = corridorPrior(1e-8, 1e-12);
+  CorridorEstimator projected(makeCorridor(1.0, 0.0), P0, restingState());
+  CorridorEstimator plain(makeCorridor(1.0, 0.0), P0, restingState());
+  plain.corridor().project = false;
+  std::vector<double> gains;
+  double plain_gain = 0.0;
+  for (int scan = 0; scan < 200; ++scan) {
+    projected.propagate();
+    projected.lidar();
+    gains.push_back(projected.wheel());
+    plain.propagate();
+    plain.lidar();
+    plain_gain = plain.wheel();
+  }
+  const Corridor & corridor = projected.corridor();
+  for (int k = 0; k < 3; ++k) {
+    ASSERT_GT(std::abs(corridor.V(k, k)), 1.0 - 1e-9) << "eigenvector " << k << " is not the axis";
+  }
+  EXPECT_EQ(corridor.gains(0), 0.0);  // only the floor along the corridor
+  EXPECT_GT(corridor.gains(1), 0.99);
+  EXPECT_GT(corridor.gains(2), 0.99);
+
+  const double target = std::pow(kQ * 0.075 * 0.075 * kScanPeriod, 0.25);
+  const Filter::cov & P = projected.filter().get_P();
+  const Filter::cov & P_plain = plain.filter().get_P();
+  const double ratio = std::sqrt(P(kVelX, kVelX)) / target;
+  const double min_gain = *std::min_element(gains.end() - 50, gains.end());
+  RecordProperty("sigma_v_over_target", text(ratio));
+  RecordProperty("min_wheel_gain_last50", text(min_gain));
+  std::cout << "D.5: sigma_v " << std::sqrt(P(kVelX, kVelX)) << " m/s, (q r)^(1/4) " << target << ", ratio " << ratio
+            << ", min wheel gain over the last 50 scans " << min_gain << "\n";
+  EXPECT_NEAR(ratio, 1.0, 0.10);
+  EXPECT_GE(min_gain, 0.015);
+  for (int axis = 1; axis < 3; ++axis) {
+    const double bound = 1.0 / (corridor.gains(axis) * corridor.gains(axis));
+    for (int index : {axis, kVelX + axis}) {
+      const double variance_ratio = P(index, index) / P_plain(index, index);
+      RecordProperty("perpendicular_ratio_" + std::to_string(index), text(variance_ratio));
+      EXPECT_GE(variance_ratio, 1.0 - 1e-9) << "state " << index;
+      EXPECT_LE(variance_ratio, bound) << "state " << index;
+    }
+  }
+  // Without the projection the floor pins the along-corridor velocity and D.5 does not hold.
+  EXPECT_LT(std::sqrt(P_plain(kVelX, kVelX)) / target, 0.9);
+  EXPECT_LT(plain_gain, 0.015);
+}
+
+TEST(FloorProjection, ExactZeroTheLidarAddsNothingAlongTheCorridor)
+{
+  // F2 (c), without the wheel. (1) At every iteration of every scan the projected rows carry no information
+  // along the zeroed direction: sum_i (row_i . u)^2 <= 3.2e-9 normals, the level that would already pin the
+  // velocity (calc.out:17); what is left is the rounding of V's orthonormality. (2) So the covariance does not
+  // shrink along u: the along-corridor position and velocity variances follow, scan for scan, those of the same
+  // corridor with exact normals, where the lidar has no along-corridor information by construction. Both grow
+  // by q per scan apart from the tilt-gravity coupling they share; what differs is the second-order change of
+  // the tilt information from the tilted normals (simulation: 1.4e-4 relative), within the 1e-3 bound.
+  // Without the projection the same noisy corridor pins them to a tenth.
+  const Filter::cov P0 = corridorPrior(1e-8, 1e-12);
+  CorridorEstimator projected(makeCorridor(1.0, 0.0), P0, restingState());
+  CorridorEstimator exact(makeCorridor(1.0, 0.0, false), P0, restingState());
+  exact.corridor().project = false;
+  CorridorEstimator plain(makeCorridor(1.0, 0.0), P0, restingState());
+  plain.corridor().project = false;
+  double worst_velocity = 0.0;
+  double worst_position = 0.0;
+  double previous = 0.0;
+  double growth = 0.0;
+  for (int scan = 0; scan < 200; ++scan) {
+    for (CorridorEstimator * estimator : {&projected, &exact, &plain}) {
+      estimator->propagate();
+      estimator->lidar();
+    }
+    const Filter::cov & P = projected.filter().get_P();
+    const Filter::cov & P_exact = exact.filter().get_P();
+    worst_velocity = std::max(worst_velocity, std::abs(P(kVelX, kVelX) / P_exact(kVelX, kVelX) - 1.0));
+    worst_position = std::max(worst_position, std::abs(P(0, 0) / P_exact(0, 0) - 1.0));
+    growth = (P(kVelX, kVelX) - previous) / (kQ * kScanPeriod);
+    previous = P(kVelX, kVelX);
+  }
+  RecordProperty("zeroed_information", text(projected.corridor().zeroed_information));
+  RecordProperty("worst_velocity_variance_vs_exact", text(worst_velocity));
+  RecordProperty("worst_position_variance_vs_exact", text(worst_position));
+  RecordProperty("last_scan_growth_over_qT", text(growth));
+  std::cout << "F2(c): zeroed information " << projected.corridor().zeroed_information << " normals, P_vv vs exact "
+            << worst_velocity << ", P_pp vs exact " << worst_position << ", last-scan growth / qT " << growth << "\n";
+  EXPECT_EQ(projected.corridor().gains(0), 0.0);
+  EXPECT_LE(projected.corridor().zeroed_information, 3.2e-9);
+  EXPECT_LE(worst_velocity, 1e-3);
+  EXPECT_LE(worst_position, 1e-3);
+  EXPECT_LT(plain.filter().get_P()(kVelX, kVelX) / exact.filter().get_P()(kVelX, kVelX), 0.5);
+}
+
+TEST(FloorProjection, WheelBeforeOrAfterTheLidarAgreesWithinOnePercentSigma)
+{
+  // F2 (a) where the along-corridor gain is partial: end walls lift lambda_u to 2, 3 and 5 times the floor
+  // (g = 0.19, 0.60, 0.78). The fixture's priors and offsets plus a 3 cm/s velocity error for the wheel to
+  // correct; 50 scans with the wheel after the lidar and 50 with it before; every error-state component of the
+  // two runs within 1 % of its sigma at every scan.
+  const double tilt = std::sqrt(0.5);
+  for (double ratio : {2.0, 3.0, 5.0}) {
+    const double weight = endWeightFor(tilt, ratio);
+    const Filter::cov P0 = corridorPrior(1e-4, 1e-8);
+    const state_ikfom x0 = restingState(Eigen::Vector3d(0.05, -0.03, 0.02), 0.02, Eigen::Vector3d(0.03, 0.0, 0.0));
+    CorridorEstimator lidar_first(makeCorridor(tilt, weight), P0, x0);
+    CorridorEstimator wheel_first(makeCorridor(tilt, weight), P0, x0);
+    double worst = 0.0;
+    int worst_scan = -1;
+    int worst_index = -1;
+    for (int scan = 0; scan < 50; ++scan) {
+      lidar_first.propagate();
+      lidar_first.lidar();
+      lidar_first.wheel();
+      wheel_first.propagate();
+      wheel_first.wheel();
+      wheel_first.lidar();
+      const auto distance =
+        worstSigmaDistance(lidar_first.filter().get_x(), wheel_first.filter().get_x(), lidar_first.filter().get_P());
+      if (!(distance.first <= worst)) {
+        worst = distance.first;
+        worst_scan = scan;
+        worst_index = distance.second;
+      }
+    }
+    const double realised = lidar_first.corridor().lambda(0) / lidar_first.corridor().noise_floor(0);
+    RecordProperty("worst_sigma_fraction_at_ratio_" + text(ratio), text(worst));
+    std::cout << "F2(a): lambda/f " << realised << ", g " << lidar_first.corridor().gains(0) << ": worst |dx|/sigma "
+              << worst << " at scan " << worst_scan << ", state " << worst_index << "\n";
+    EXPECT_LT(worst, 0.01) << "lambda/f " << realised << ", scan " << worst_scan << ", state " << worst_index;
+  }
+}
+
+TEST(FloorProjection, AlongCorridorPosteriorIsContinuousAsTheInformationRisesThroughTheFloor)
+{
+  // F2 (b): lambda_u swept from 0.5 f to 5 f in 450 steps of 0.01 f by end walls of growing weight, one lidar
+  // update each from the same propagated prior (the fixture's priors and offsets, one scan of IMU). Adjacent
+  // posteriors along the corridor may differ by at most one scan of process noise: sqrt(q T^3 / 3) in position,
+  // sqrt(q T) in velocity.
+  const double tilt = std::sqrt(0.5);
+  CorridorEstimator propagated(
+    makeCorridor(tilt, 0.0), corridorPrior(1e-8, 1e-8), restingState(Eigen::Vector3d(0.05, -0.03, 0.02), 0.02));
+  propagated.propagate();
+  const state_ikfom x_prior = propagated.filter().get_x();
+  const Filter::cov P_prior = propagated.filter().get_P();
+  const auto bare = alongCorridorInformation(tilt, 0.0);
+  const auto unit = alongCorridorInformation(tilt, 1.0);
+  const int steps = 450;
+  std::vector<double> position;
+  std::vector<double> velocity;
+  std::vector<double> realised;
+  for (int j = 0; j <= steps; ++j) {
+    const double ratio = 0.5 + 4.5 * j / steps;
+    const double weight = std::sqrt(std::max(ratio * bare.second - bare.first, 0.0) / (unit.first - bare.first));
+    CorridorEstimator estimator(makeCorridor(tilt, weight), P_prior, x_prior);
+    estimator.lidar();
+    position.push_back(estimator.filter().get_x().pos.x());
+    velocity.push_back(estimator.filter().get_x().vel.x());
+    realised.push_back(estimator.corridor().lambda(0) / estimator.corridor().noise_floor(0));
+  }
+  // A non-finite step counts as an infinite one.
+  const auto step = [](double a, double b) {
+    const double difference = std::abs(a - b);
+    return std::isfinite(difference) ? difference : std::numeric_limits<double>::infinity();
+  };
+  double worst_position = 0.0;
+  double worst_velocity = 0.0;
+  int worst_step = 1;
+  for (int j = 1; j <= steps; ++j) {
+    const double dp = step(position[j], position[j - 1]);
+    if (dp > worst_position) {
+      worst_position = dp;
+      worst_step = j;
+    }
+    worst_velocity = std::max(worst_velocity, step(velocity[j], velocity[j - 1]));
+  }
+  const auto range = std::minmax_element(position.begin(), position.end());
+  RecordProperty("worst_adjacent_position_step", text(worst_position));
+  RecordProperty("worst_adjacent_velocity_step", text(worst_velocity));
+  std::cout << "F2(b): worst adjacent position step " << worst_position << " m between lambda/f "
+            << realised[worst_step - 1] << " and " << realised[worst_step] << " (" << position[worst_step - 1] << " -> "
+            << position[worst_step] << "), position range [" << *range.first << ", " << *range.second
+            << "], worst velocity step " << worst_velocity << " m/s\n";
+  EXPECT_LE(realised.front(), 0.51);
+  EXPECT_GE(realised.back(), 4.95);
+  EXPECT_LE(worst_position, std::sqrt(kQ * kScanPeriod * kScanPeriod * kScanPeriod / 3.0));
+  EXPECT_LE(worst_velocity, std::sqrt(kQ * kScanPeriod));
 }

@@ -500,8 +500,9 @@ ${sanitizer_tests}
   target_compile_definitions(test_imu_0906_timing PRIVATE
     FASTLIO_0906_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/m20_0906_scan_timing.txt")
   ament_add_gtest(test_preprocess_timing test/test_preprocess_timing.cpp src/preprocess.cpp)
-  # the consider update on the real estimator (use-ikfom.hpp pulls in the same dependencies)
-  ament_add_gtest(test_rp_consider_filter test/test_rp_consider_filter.cpp)
+  # the consider update on the real estimator (use-ikfom.hpp pulls in the same dependencies);
+  # the corridor runs (some 26000 predictions and 1750 lidar updates) need about a minute at -O0
+  ament_add_gtest(test_rp_consider_filter test/test_rp_consider_filter.cpp TIMEOUT 300)
   foreach(timing_test test_plane_fit test_simple_update_tangent test_imu_process_validity test_imu_0906_timing test_preprocess_timing test_rp_consider_filter)
     target_include_directories(${timing_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                ${CMAKE_CURRENT_SOURCE_DIR}/src ${PCL_INCLUDE_DIRS})

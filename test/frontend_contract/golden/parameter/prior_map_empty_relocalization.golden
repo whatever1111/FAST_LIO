@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/prior_map_empty_relocalization
-# fork_sha: 37a2745154d0c7d4d073308ea60e4522bd150f2f
+# fork_sha: 4ccd5350a822c9e7bef5e5b601f21e6202ae9413
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=

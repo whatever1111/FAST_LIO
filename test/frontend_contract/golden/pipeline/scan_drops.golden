@@ -1,5 +1,5 @@
 # frontend contract golden: pipeline/scan_drops
-# fork_sha: 187b36eb76b5bfa9e2157b8c2f87fb1e56e55341
+# fork_sha: 4ccd5350a822c9e7bef5e5b601f21e6202ae9413
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -193,7 +193,7 @@ record.post have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.target have=0 p=[0,0,0] q=[1,0,0,0]
 record.cov have=0 finite=0 sym=nan:0x7ff8000000000000 min_eig=nan:0x7ff8000000000000
 record.update map_updated=0 have_update=0 dp=nan:0x7ff8000000000000 dq=nan:0x7ff8000000000000
-record.reference present=0 snapshot=0 revision=0 scan=8 qualified=0 kind=3 lifecycle=2 startup=2 trust=1 local=0 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=3 cause=0 taint=0 hard=0 has_pose=0 evaluated_ns=1752500000 effective_ns=0 state_until_ns=1952500000 hr_until_ns=0
+record.reference present=0 snapshot=0 revision=0 scan=8 qualified=0 kind=3 lifecycle=2 startup=2 trust=1 local=0 hr_kind=0 legacy_flags=0 present_mask=143 true_mask=3 cause=0 taint=0 hard=0 has_pose=0 evaluated_ns=1752500000 effective_ns=1752500000 state_until_ns=1952500000 hr_until_ns=0
 inputs lidar_queued=0 imu_queued=21 rejected_lidar=0 rejected_imu=0 discarded_lidar=0 discarded_imu=0 faulted=0 map_frozen=0 degraded_odom=0 filter_end=1.6500000000000001
 slot 8 static scan=8 start=1.8 end=1.8500000000000001 imu=static cloud=dense guard=healthy
 scan_begin end=1.8500000000000001

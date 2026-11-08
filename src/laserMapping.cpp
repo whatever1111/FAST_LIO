@@ -109,6 +109,7 @@
 #include "covariance_reset.hpp"
 #include "degeneracy_policy.hpp"
 #include "engulf_release.hpp"
+#include "frontend_measurement.hpp"
 #include "frontend_observation.hpp"
 #include "frontend_parameters_ros.hpp"
 #include "gravity_align_kinematics.hpp"
@@ -4226,6 +4227,20 @@ void h_share_model(state_ikfom & s, esekfom::dyn_share_datastruct<double> & ekfo
   solve_time += omp_get_wtime() - solve_start_;
 }
 
+void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state, esekfom::dyn_share_datastruct<double> & data)
+{
+  h_share_model(state, data);
+}
+
+namespace
+{
+/// The filter's measurement model: context is the node's FrontendMeasurement.
+void measurementModel(void * context, state_ikfom & state, esekfom::dyn_share_datastruct<double> & data)
+{
+  static_cast<fast_lio::FrontendMeasurement *>(context)->evaluate(state, data);
+}
+}  // namespace
+
 class LaserMappingNode : public rclcpp::Node
 {
 public:
@@ -4387,7 +4402,7 @@ public:
     p_imu->set_acc_bias_cov(V3D(startup.b_acc_cov, startup.b_acc_cov, startup.b_acc_cov));
 
     fill(epsi, epsi + 23, 0.001);
-    kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, startup.num_max_iterations, epsi);
+    kf.init_dyn_share_context(get_f, df_dx, df_dw, measurementModel, &measurement_, startup.num_max_iterations, epsi);
 #ifdef FASTLIO_TEST_HOOKS
     effective_locals_for_test.value("derived:fov:FOV_DEG", FOV_DEG);
     effective_locals_for_test.value("derived:fov:HALF_FOV_COS", HALF_FOV_COS);
@@ -4525,6 +4540,8 @@ public:
 
   ~LaserMappingNode()
   {
+    // kf outlives the node: unbind measurement_ before any member goes.
+    kf.clear_dyn_share_context();
     emitAnchorTraceCounters();
     {
       std::lock_guard<std::mutex> lock(mtx_buffer);
@@ -7565,10 +7582,10 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mapping_enabled_sub_;
 
   fast_lio::FrontendParameters params_;  // the configuration the constructor read; node methods use values()
+  fast_lio::FrontendMeasurement measurement_;  // the filter's measurement model; kf holds its address
   int effect_feat_num = 0, frame_num = 0;
   double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0,
                          aver_time_solve = 0, aver_time_const_H_time = 0;
-  bool flg_EKF_converged, EKF_stop_flg = 0;
   double epsi[23] = {0.001};
 
   FileHandle positionLog_;

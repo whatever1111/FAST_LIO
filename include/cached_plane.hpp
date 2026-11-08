@@ -19,13 +19,16 @@ public:
   void invalidate() { valid_ = false; }
   bool valid() const { return valid_; }
   const Eigen::Vector4f & coefficients() const { return coefficients_; }
+  // The fit's scatter eigen data, kept with the plane for its normal covariance
+  // (normal_noise_floor.hpp); null while no plane is cached.
+  const PlaneFitEigen * eigen() const { return valid_ ? &eigen_ : nullptr; }
 
   template<int Count, typename Points>
   bool fit(const Points & points, float threshold, float body_range_sqrt)
   {
     invalidate();
     if (!std::isfinite(body_range_sqrt) || body_range_sqrt <= 0.0f ||
-        !fitPlane<Count>(points, threshold, coefficients_)) {
+        !fitPlane<Count>(points, threshold, coefficients_, &eigen_)) {
       return false;
     }
     bodyRangeSqrt_ = body_range_sqrt;
@@ -47,6 +50,7 @@ public:
 
 private:
   Eigen::Vector4f coefficients_ = Eigen::Vector4f::Zero();
+  PlaneFitEigen eigen_;
   float bodyRangeSqrt_ = 0.0f;
   bool valid_ = false;
 };

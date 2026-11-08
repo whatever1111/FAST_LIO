@@ -169,3 +169,71 @@ TEST(PlaneFit, RejectsFiniteCoefficientsOutsideOutputRangeBeforeNarrowing)
   ASSERT_TRUE(fast_lio::fitPlane<5>(points, 0.1, wide));
   EXPECT_DOUBLE_EQ(wide[3], 1e40);
 }
+
+TEST(PlaneFit, EigenOutputIsTheScatterOfAKnownPerturbationInAnyFrame)
+{
+  // The square with its centre raised by 0.1: centred heights -0.02 (four corners) and 0.08, so the scatter
+  // is diag(4, 4, 0.008) and lambda0 the sum of squared residuals. A rigid motion moves the in-plane
+  // eigenvectors with the plane and leaves the eigenvalues alone.
+  const Eigen::Matrix3d rotation =
+    (Eigen::AngleAxisd(0.4, Eigen::Vector3d::UnitX()) * Eigen::AngleAxisd(-0.7, Eigen::Vector3d::UnitY()))
+      .toRotationMatrix();
+  for (const Eigen::Vector3d translation : {Eigen::Vector3d::Zero().eval(), Eigen::Vector3d(2, -3, 4)}) {
+    for (const bool moved : {false, true}) {
+      Points points;
+      for (const auto & p : plane()) {
+        const Eigen::Vector3d raised(p.x, p.y, p.x == 0.0 && p.y == 0.0 ? 0.1 : 0.0);
+        const Eigen::Vector3d q = moved ? Eigen::Vector3d(rotation * raised + translation) : raised;
+        points.push_back({q.x(), q.y(), q.z()});
+      }
+      Eigen::Vector4d plain;
+      ASSERT_TRUE(fast_lio::fitPlane<5>(points, 0.1, plain));
+      Eigen::Vector4d coefficients;
+      fast_lio::PlaneFitEigen eigen;
+      ASSERT_TRUE(fast_lio::fitPlane<5>(points, 0.1, coefficients, &eigen));
+      EXPECT_EQ(coefficients, plain);            // asking for the eigen data changes nothing else
+      EXPECT_NEAR(eigen.lambda0, 0.008, 1e-13);  // rounding of the moved coordinates: ~1e-15
+      EXPECT_NEAR(eigen.lambda1, 4.0, 1e-12);
+      EXPECT_NEAR(eigen.lambda2, 4.0, 1e-12);
+      EXPECT_LE(eigen.lambda1, eigen.lambda2);
+      EXPECT_EQ(eigen.count, 5);
+      const Eigen::Vector3d normal = coefficients.head<3>();
+      const Eigen::Vector3d true_normal = moved ? Eigen::Vector3d(rotation.col(2)) : Eigen::Vector3d(0.0, 0.0, 1.0);
+      EXPECT_NEAR(std::abs(normal.dot(true_normal)), 1.0, 1e-12);
+      EXPECT_NEAR(eigen.e1.norm(), 1.0, 1e-12);
+      EXPECT_NEAR(eigen.e2.norm(), 1.0, 1e-12);
+      EXPECT_NEAR(eigen.e1.dot(eigen.e2), 0.0, 1e-12);
+      EXPECT_NEAR(eigen.e1.dot(normal), 0.0, 1e-12);  // both in the plane
+      EXPECT_NEAR(eigen.e2.dot(normal), 0.0, 1e-12);
+    }
+  }
+}
+
+TEST(PlaneFit, FailedFitLeavesTheEigenOutputAsItWas)
+{
+  fast_lio::PlaneFitEigen sentinel;
+  sentinel.lambda0 = 7.0;
+  sentinel.lambda1 = 8.0;
+  sentinel.lambda2 = 9.0;
+  sentinel.e1 = Eigen::Vector3d(1, 2, 3);
+  sentinel.e2 = Eigen::Vector3d(4, 5, 6);
+  sentinel.count = 99;
+  const auto expectUntouched = [&](const Points & points, double threshold) {
+    fast_lio::PlaneFitEigen eigen = sentinel;
+    Eigen::Vector4d coefficients = Eigen::Vector4d::Constant(42.0);
+    EXPECT_FALSE(fast_lio::fitPlane<5>(points, threshold, coefficients, &eigen));
+    EXPECT_EQ(eigen.lambda0, sentinel.lambda0);
+    EXPECT_EQ(eigen.lambda1, sentinel.lambda1);
+    EXPECT_EQ(eigen.lambda2, sentinel.lambda2);
+    EXPECT_EQ(eigen.e1, sentinel.e1);
+    EXPECT_EQ(eigen.e2, sentinel.e2);
+    EXPECT_EQ(eigen.count, sentinel.count);
+  };
+  Points raised = plane();
+  raised[4].z = 0.1;
+  expectUntouched(raised, 0.05);  // a residual of 0.08 is over the threshold
+  Points broken = plane();
+  broken[1].y = std::numeric_limits<double>::quiet_NaN();
+  expectUntouched(broken, 0.1);
+  expectUntouched({{0, 0, 0}, {1, 2, 3}, {2, 4, 6}, {3, 6, 9}, {4, 8, 12}}, 0.1);  // collinear
+}

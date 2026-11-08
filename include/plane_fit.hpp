@@ -10,11 +10,29 @@
 namespace fast_lio
 {
 
+// The scatter-matrix eigen-decomposition behind an accepted fit: what the first-order
+// covariance of the fitted normal needs (normal_noise_floor.hpp). Eigenvalues ascend;
+// lambda0 is the out-of-plane one (the sum of squared residuals), e1 and e2 are the
+// in-plane eigenvectors of lambda1 and lambda2, count the number of points fitted.
+struct PlaneFitEigen
+{
+  double lambda0 = 0.0;
+  double lambda1 = 0.0;
+  double lambda2 = 0.0;
+  Eigen::Vector3d e1 = Eigen::Vector3d::Zero();
+  Eigen::Vector3d e2 = Eigen::Vector3d::Zero();
+  int count = 0;
+};
+
 // Orthogonal least-squares fit to exactly the first Count points. Fixed-size
 // storage avoids allocations per correspondence; coordinates are evaluated in
-// double even when the point and output types use float. Failure preserves out.
+// double even when the point and output types use float. Failure preserves out
+// and *eigen; a null eigen asks for the coefficients only.
 template<int Count, typename Points, typename Scalar>
-bool fitPlane(const Points & points, double threshold, Eigen::Matrix<Scalar, 4, 1> & out)
+bool fitPlane(const Points & points,
+              double threshold,
+              Eigen::Matrix<Scalar, 4, 1> & out,
+              PlaneFitEigen * eigen = nullptr)
 {
   static_assert(Count >= 3, "A plane needs at least three points");
   if (points.size() < static_cast<std::size_t>(Count) || !std::isfinite(threshold) || threshold < 0.0)
@@ -71,6 +89,14 @@ bool fitPlane(const Points & points, double threshold, Eigen::Matrix<Scalar, 4, 
       return false;
   }
   out = result;
+  if (eigen != nullptr) {
+    eigen->lambda0 = values[0];
+    eigen->lambda1 = values[1];
+    eigen->lambda2 = values[2];
+    eigen->e1 = solver.eigenvectors().col(1);
+    eigen->e2 = solver.eigenvectors().col(2);
+    eigen->count = Count;
+  }
   return true;
 }
 

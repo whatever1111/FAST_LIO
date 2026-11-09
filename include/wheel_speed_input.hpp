@@ -54,11 +54,12 @@ inline std::optional<std::int64_t> wheelStampNs(std::int32_t sec, std::uint32_t 
 /// What a scan's wheel step did.
 enum class WheelOutcome
 {
-  kUpdate,          ///< the measurement went into the filter
-  kNoSample,        ///< no paired, valid sample in the scan's own span
-  kNoImu,           ///< the scan carried no IMU sample, so its mean angular rate is unknown
-  kPhiUnavailable,  ///< k != 0 and no IMU sample in the slip window
-  kInvalid,         ///< the slip correction is undefined or the measurement is not finite
+  kUpdate,                  ///< the measurement went into the filter
+  kNoSample,                ///< no paired, valid sample in the scan's own span
+  kNoImu,                   ///< the scan carried no IMU sample, so its mean angular rate is unknown
+  kPhiUnavailable,          ///< k != 0 and no IMU sample in the slip window
+  kInvalid,                 ///< the slip correction is undefined or the measurement is not finite
+  kUnidentifiableEndpoint,  ///< one wheel sample time strictly before the endpoint
 };
 
 inline const char * wheelOutcomeName(WheelOutcome outcome)
@@ -74,6 +75,8 @@ inline const char * wheelOutcomeName(WheelOutcome outcome)
       return "phi_unavailable";
     case WheelOutcome::kInvalid:
       return "invalid";
+    case WheelOutcome::kUnidentifiableEndpoint:
+      return "unidentifiable_endpoint";
   }
   return "unknown";
 }
@@ -82,6 +85,7 @@ inline const char * wheelOutcomeName(WheelOutcome outcome)
 struct WheelRingRead
 {
   std::optional<WheelFit> fit;
+  WheelFitStatus fit_status = WheelFitStatus::kNoSample;
   int unpaired = 0;                       ///< valid samples in the span still without their variances
   std::uint64_t unmatched_samples = 0;    ///< gated samples pushed out without their variances
   std::uint64_t unmatched_variances = 0;  ///< variances pushed out without their gated sample
@@ -155,7 +159,7 @@ public:
     // so their difference is exact, and the subtraction back has an exact, representable result.
     const double span = t_end - t_begin;
     WheelRingRead out;
-    out.fit = ring_.fitAt(t_end, span);
+    out.fit = ring_.fitAt(t_end, span, &out.fit_status);
     out.unpaired = ring_.unpairedIn(t_end, span);
     out.unmatched_samples = ring_.unmatchedSamples();
     out.unmatched_variances = ring_.unmatchedSigmas();
@@ -195,8 +199,14 @@ public:
     out.ring = ring;
     out.phi = slipPhi(imu_forward_, t_end, params.slip_window_s, params.slip_phi0);
     if (!ring.fit) {
-      ++counts_.no_sample;
-      out.outcome = WheelOutcome::kNoSample;
+      if (ring.fit_status == WheelFitStatus::kNoSample) {
+        ++counts_.no_sample;
+        out.outcome = WheelOutcome::kNoSample;
+      } else {
+        ++counts_.invalid;
+        out.outcome = ring.fit_status == WheelFitStatus::kUnidentifiableEndpoint ? WheelOutcome::kUnidentifiableEndpoint
+                                                                                 : WheelOutcome::kInvalid;
+      }
       return out;
     }
     if (!omega_mean) {

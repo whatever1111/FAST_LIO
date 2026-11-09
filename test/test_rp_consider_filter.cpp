@@ -685,8 +685,9 @@ public:
     fast_lio::WheelFit fit;
     fit.v = 0.0;
     fit.samples = 1;
-    fit.var_vx = 0.05 * 0.05;
-    fit.var_lat = fast_lio::kBridgeUnobservedVariance;
+    fit.sample_max_vx = fit.endpoint_bound_vx = 0.05 * 0.05;
+    fit.sample_max_lat = fast_lio::kBridgeUnobservedVariance;
+    fit.lateral_observed = false;
     const auto measurement = fast_lio::wheelMeasurement(fit,
                                                         std::nullopt,
                                                         x.rot.toRotationMatrix(),

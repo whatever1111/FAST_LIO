@@ -70,13 +70,26 @@ struct ModelState
   Eigen::Vector3d omega_mean = Eigen::Vector3d(0.11, -0.22, 0.805);  // raw gyro mean, bias included
 };
 
-std::optional<WheelMeasurement> modelAt(const ModelState & s, const WheelModelParams & params, double v = 0.9)
+WheelFit singleFit(double v, double var_vx, double var_lat)
 {
   WheelFit fit;
   fit.v = v;
   fit.samples = 1;
-  fit.var_vx = 0.002;
-  fit.var_lat = kUnobserved;
+  fit.sample_max_vx = fit.endpoint_bound_vx = var_vx;
+  fit.sample_max_lat = fit.endpoint_bound_lat = var_lat;
+  fit.lateral_observed = var_lat < kUnobserved;
+  fit.c_l1 = fit.c_l2_sq = 1.0;
+  return fit;
+}
+
+WheelNoise sampleNoise(double var_vx, double var_lat, double omega_norm, const WheelModelParams & params)
+{
+  return composeR(singleFit(0.0, var_vx, var_lat), omega_norm, params);
+}
+
+std::optional<WheelMeasurement> modelAt(const ModelState & s, const WheelModelParams & params, double v = 0.9)
+{
+  const WheelFit fit = singleFit(v, 0.002, kUnobserved);
   return wheelMeasurement(
     fit, std::nullopt, s.R_world_imu, s.velocity_world, s.gyro_bias, s.omega_mean, s.R_robot_to_imu, params);
 }
@@ -99,14 +112,20 @@ TEST(WheelSampleRing, FitIsExactOnALinearRampAtTheScanEnd)
   EXPECT_NEAR(fit->v, 0.8, 1e-12);  // the line's value at t_end, not the newest sample's 0.79875
   EXPECT_EQ(fit->samples, 50);      // k = 11 ... 60 lie in [t_end - 1 s, t_end]
   EXPECT_LT(fit->residual_rms, 1e-12);
-  EXPECT_EQ(fit->var_vx, 0.002 + 0.001 * 2);  // the largest variance used, not an average
-  EXPECT_EQ(fit->var_lat, kUnobserved);
+  EXPECT_EQ(fit->sample_max_vx, 0.002 + 0.001 * 2);
+  EXPECT_EQ(fit->sample_max_lat, kUnobserved);
+  // numerical-design.txt:L39, the same double-epoch ramp fixture.
+  EXPECT_NEAR(fit->endpoint_bound_vx, 0.007297929312071825, 1e-10);
+  EXPECT_NEAR(composeR(*fit, 0.0, WheelModelParams{}).var_vx, 0.008922929312071825, 1e-10);
 
-  // One paired sample is its own answer.
+  // numerical-design.txt:L35: an early single time cannot identify the endpoint.
   WheelSampleRing single(4);
   ASSERT_TRUE(single.pushSample(kEpochNs, 0.42, true));
   ASSERT_TRUE(single.attachSigma(kEpochNs, 0.003, 0.004));
-  const auto one = single.fitAt(seconds(kEpochNs) + 0.05, 1.0);
+  fast_lio::WheelFitStatus status;
+  EXPECT_FALSE(single.fitAt(seconds(kEpochNs) + 0.05, 1.0, &status));
+  EXPECT_EQ(status, fast_lio::WheelFitStatus::kUnidentifiableEndpoint);
+  const auto one = single.fitAt(seconds(kEpochNs), 1.0);
   ASSERT_TRUE(one.has_value());
   EXPECT_EQ(one->v, 0.42);
   EXPECT_EQ(one->samples, 1);
@@ -172,13 +191,16 @@ TEST(WheelSampleRing, PairsByExactStampInEitherArrivalOrder)
   for (std::size_t i = 0; i < 3; ++i) {
     EXPECT_EQ(ring.entries()[i].stamp_ns, kEpochNs + static_cast<std::int64_t>(i));  // kept in stamp order
   }
-  const auto fit = ring.fitAt(seconds(kEpochNs) + 0.01, 0.1);
+  fast_lio::WheelFitStatus status;
+  EXPECT_FALSE(ring.fitAt(seconds(kEpochNs) + 0.01, 0.1, &status));
+  EXPECT_EQ(status, fast_lio::WheelFitStatus::kUnidentifiableEndpoint);
+  const auto fit = ring.fitAt(seconds(kEpochNs), 0.1);
   ASSERT_TRUE(fit.has_value());
   EXPECT_EQ(fit->samples, 3);
   EXPECT_DOUBLE_EQ(fit->v, 2.0);  // equal times: no slope, the weighted mean
 }
 
-TEST(WheelSampleRing, SamplesAtOneDoubleTimeHaveNoSlopeWhereverTheScanEnds)
+TEST(WheelSampleRing, SamplesAtOneDoubleTimeIdentifyOnlyThatEndpoint)
 {
   // Stamps 1 ns apart are one double time at this epoch: zero time spread, so no slope. Centred on the
   // weighted mean time instead, the mean's rounding leaves a spread of an ulp, and the speeds' rounding
@@ -189,7 +211,8 @@ TEST(WheelSampleRing, SamplesAtOneDoubleTimeHaveNoSlopeWhereverTheScanEnds)
     ASSERT_TRUE(ring.pushSample(kEpochNs + i, speeds[i], true));
     ASSERT_TRUE(ring.attachSigma(kEpochNs + i, 0.003, kUnobserved));
   }
-  const auto fit = ring.fitAt(seconds(kEpochNs) + 0.015, 0.1);
+  EXPECT_FALSE(ring.fitAt(seconds(kEpochNs) + 0.015, 0.1));
+  const auto fit = ring.fitAt(seconds(kEpochNs), 0.1);
   ASSERT_TRUE(fit.has_value());
   EXPECT_EQ(fit->samples, 3);
   EXPECT_NEAR(fit->v, 0.7, 1e-15);
@@ -198,10 +221,11 @@ TEST(WheelSampleRing, SamplesAtOneDoubleTimeHaveNoSlopeWhereverTheScanEnds)
   ASSERT_TRUE(single.pushSample(kEpochNs, 0.1, true));
   ASSERT_TRUE(single.attachSigma(kEpochNs, 0.003, kUnobserved));
   for (int ms = 1; ms <= 20; ++ms) {
-    const auto one = single.fitAt(seconds(kEpochNs) + ms / 1000.0, 0.1);
-    ASSERT_TRUE(one.has_value());
-    EXPECT_EQ(one->v, 0.1) << "scan end " << ms << " ms after the sample";  // bit for bit
+    EXPECT_FALSE(single.fitAt(seconds(kEpochNs) + ms / 1000.0, 0.1)) << ms;
   }
+  const auto one = single.fitAt(seconds(kEpochNs), 0.1);
+  ASSERT_TRUE(one);
+  EXPECT_EQ(bits(one->v), bits(0.1));
 }
 
 TEST(WheelSampleRing, UnpairedSamplesStayOutOfTheUpdateAndAreCountedWhenDropped)
@@ -219,7 +243,8 @@ TEST(WheelSampleRing, UnpairedSamplesStayOutOfTheUpdateAndAreCountedWhenDropped)
   ASSERT_TRUE(ring.pushSample(1040000000LL, 1.0, true));
   ASSERT_TRUE(ring.attachSigma(1040000000LL, 0.002, kUnobserved));
   ASSERT_EQ(ring.size(), 5u);  // the unpaired 7.0 is still held, inside the window
-  const auto fit = ring.fitAt(1.05, 0.1);
+  EXPECT_FALSE(ring.fitAt(1.05, 0.1));
+  const auto fit = ring.fitAt(1.04, 0.1);
   ASSERT_TRUE(fit.has_value());
   EXPECT_EQ(fit->samples, 1);
   EXPECT_EQ(fit->v, 1.0);  // ... and not in the fit
@@ -253,6 +278,139 @@ TEST(WheelSampleRing, RefusesDuplicatesAndUnusableVariances)
   EXPECT_THROW(WheelSampleRing(0), std::invalid_argument);
 }
 
+TEST(WheelFit, TwoEarlySamplesAmplifyVariance)
+{
+  // numerical-design.txt:L26-L29. c=(-3,4), U=.0025*(3+4)^2.
+  WheelSampleRing ring(8);
+  ASSERT_TRUE(ring.pushSample(20000000, 0.775, true));
+  ASSERT_TRUE(ring.attachSigma(20000000, 0.0025, kUnobserved));
+  ASSERT_TRUE(ring.pushSample(40000000, 0.825, true));
+  ASSERT_TRUE(ring.attachSigma(40000000, 0.0025, kUnobserved));
+  const auto fit = ring.fitAt(0.1, 0.1);
+  ASSERT_TRUE(fit);
+  EXPECT_NEAR(fit->v, 0.975, 1e-12);
+  EXPECT_LT(fit->residual_rms, 1e-12);
+  EXPECT_NEAR(fit->c_l1, 7.0, 1e-12);
+  EXPECT_NEAR(fit->c_l2_sq, 25.0, 1e-12);
+  EXPECT_EQ(fit->fit_order, 1);
+  EXPECT_NEAR(fit->endpoint_bound_vx, 0.1225, 1e-12);
+  EXPECT_NEAR(composeR(*fit, 0.0, WheelModelParams{}).var_vx, 0.125625, 1e-12);
+}
+
+TEST(WheelFit, CommonAndWhitePartsHaveDifferentGains)
+{
+  // numerical-design.txt:L26-L29. Explicit covariance oracles, with no runtime rho input.
+  const Eigen::Vector2d c(-3.0, 4.0);
+  const double rho[] = {0.0, 0.5, 0.58, 1.0};
+  const double expected[] = {0.0625, 0.0325, 0.0277, 0.0025};
+  for (int i = 0; i < 4; ++i) {
+    const Eigen::Matrix2d covariance =
+      0.0025 * ((1.0 - rho[i]) * Eigen::Matrix2d::Identity() + rho[i] * Eigen::Matrix2d::Ones());
+    EXPECT_NEAR(c.dot(covariance * c), expected[i], 1e-12);
+    EXPECT_NEAR(c.dot(covariance * c), 0.0025 * ((1.0 - rho[i]) * 25.0 + rho[i]), 1e-12);
+  }
+}
+
+TEST(WheelFit, UnknownCorrelationBound)
+{
+  // numerical-design.txt:L38,L40. All PSD correlations lie below U, and the signed rank-one case attains it.
+  WheelSampleRing ring(8);
+  ring.pushSample(20000000, 0.7, true);
+  ring.attachSigma(20000000, 0.003, kUnobserved);
+  ring.pushSample(40000000, 0.74, true);
+  ring.attachSigma(40000000, 0.004, kUnobserved);
+  const auto fit = ring.fitAt(0.1, 0.1);
+  ASSERT_TRUE(fit);
+  const Eigen::Vector2d c(-3.0, 4.0);
+  const Eigen::Vector2d sigma(std::sqrt(0.003), std::sqrt(0.004));
+  for (double rho : {-1.0, -0.58, 0.0, 0.5, 1.0}) {
+    Eigen::Matrix2d covariance;
+    covariance << 0.003, rho * sigma.prod(), rho * sigma.prod(), 0.004;
+    EXPECT_LE(c.dot(covariance * c), fit->endpoint_bound_vx + 1e-12);
+  }
+  const Eigen::Vector2d signed_sigma(-sigma(0), sigma(1));
+  EXPECT_NEAR(c.dot(signed_sigma * signed_sigma.transpose() * c), fit->endpoint_bound_vx, 1e-12);
+  EXPECT_NEAR(composeR(*fit, 0.0, WheelModelParams{}).var_vx, 0.17576343876330622, 1e-12);
+}
+
+TEST(WheelFit, LateralCovarianceAndMarkerAreSeparate)
+{
+  // numerical-design.txt:L34 and D3.2's input-marker contract.
+  const auto fitWith = [](double first_lat, double second_lat) {
+    WheelSampleRing ring(8);
+    ring.pushSample(20000000, 0.8, true);
+    ring.attachSigma(20000000, 0.0025, first_lat);
+    ring.pushSample(40000000, 0.8, true);
+    ring.attachSigma(40000000, 0.0025, second_lat);
+    return ring.fitAt(0.1, 0.1);
+  };
+  const auto observed = fitWith(0.046 * 0.046, 0.046 * 0.046);
+  ASSERT_TRUE(observed);
+  EXPECT_TRUE(observed->lateral_observed);
+  EXPECT_NEAR(composeR(*observed, 0.0, WheelModelParams{}).var_vy, 0.103684, 1e-12);
+  const auto large = fitWith(999999.0, 999999.0);
+  ASSERT_TRUE(large);
+  EXPECT_TRUE(large->lateral_observed);
+  EXPECT_GT(composeR(*large, 0.0, WheelModelParams{}).var_vy, kUnobserved);
+  for (const auto & pair : {std::pair<double, double>{kUnobserved, 0.002}, {0.002, kUnobserved}}) {
+    const auto marker = fitWith(pair.first, pair.second);
+    ASSERT_TRUE(marker);
+    EXPECT_FALSE(marker->lateral_observed);
+    EXPECT_FALSE(composeR(*marker, 0.0, WheelModelParams{}).lateral);
+  }
+}
+
+TEST(WheelFit, RankOneEndpointIsNotExtrapolation)
+{
+  // numerical-design.txt:L35-L36. One double time identifies a constant only at that time.
+  for (int count : {1, 3}) {
+    WheelSampleRing ring(8);
+    for (int i = 0; i < count; ++i) {
+      ring.pushSample(kEpochNs + i, 0.7, true);
+      ring.attachSigma(kEpochNs + i, 0.003, kUnobserved);
+    }
+    fast_lio::WheelFitStatus status;
+    EXPECT_FALSE(ring.fitAt(seconds(kEpochNs) + 0.06, 0.1, &status));
+    EXPECT_EQ(status, fast_lio::WheelFitStatus::kUnidentifiableEndpoint);
+    const auto fit = ring.fitAt(seconds(kEpochNs), 0.1, &status);
+    ASSERT_TRUE(fit);
+    EXPECT_EQ(status, fast_lio::WheelFitStatus::kValid);
+    EXPECT_EQ(fit->fit_order, 0);
+    EXPECT_NEAR(fit->c_l1, 1.0, 1e-12);
+    EXPECT_NEAR(fit->c_l2_sq, 1.0 / count, 1e-12);
+    EXPECT_DOUBLE_EQ(composeR(*fit, 0.0, WheelModelParams{}).var_vx, 0.075 * 0.075);
+  }
+}
+
+TEST(WheelFit, FullWindowKeepsTheApprovedFloorCombination)
+{
+  // numerical-design.txt:L37. The ordinary five-sample endpoint still has negative coefficients.
+  WheelSampleRing ring(8);
+  for (int i = 1; i <= 5; ++i) {
+    ring.pushSample(i * 20000000, 0.8, true);
+    ring.attachSigma(i * 20000000, 0.0025, 0.046 * 0.046);
+  }
+  const auto fit = ring.fitAt(0.1, 0.1);
+  ASSERT_TRUE(fit);
+  EXPECT_NEAR(fit->c_l1, 1.4, 1e-12);
+  EXPECT_NEAR(composeR(*fit, 0.0, WheelModelParams{}).var_vx, 0.008025, 1e-12);
+}
+
+TEST(WheelFit, NormalizedWeightsAvoidReciprocalOverflow)
+{
+  // D3.3: scaling every variance must leave the line and endpoint coefficients unchanged.
+  WheelSampleRing ring(8);
+  ring.pushSample(20000000, 0.775, true);
+  ring.attachSigma(20000000, 1e-320, 1e-320);
+  ring.pushSample(40000000, 0.825, true);
+  ring.attachSigma(40000000, 1e-320, 1e-320);
+  const auto fit = ring.fitAt(0.1, 0.1);
+  ASSERT_TRUE(fit);
+  EXPECT_NEAR(fit->v, 0.975, 1e-12);
+  EXPECT_NEAR(fit->c_l1, 7.0, 1e-12);
+  EXPECT_TRUE(std::isfinite(fit->endpoint_bound_vx));
+}
+
 TEST(SlipCorrection, ZeroCoefficientReturnsTheSpeedBitForBit)
 {
   for (double v : {0.7351, -0.0, 5e-324, 1e300, std::nextafter(1.0, 2.0), -2.5}) {
@@ -284,10 +442,7 @@ TEST(SlipCorrection, DividesByOnePlusKPhiAndNeedsPhiOtherwise)
   params.speed_scale = 0.973;
   params.slip_k = 0.13;
   const ModelState s;
-  WheelFit fit;
-  fit.v = 1.0;
-  fit.var_vx = 0.002;
-  fit.var_lat = kUnobserved;
+  const WheelFit fit = singleFit(1.0, 0.002, kUnobserved);
   const auto m =
     wheelMeasurement(fit, 0.2, s.R_world_imu, s.velocity_world, s.gyro_bias, s.omega_mean, s.R_robot_to_imu, params);
   ASSERT_TRUE(m.has_value());
@@ -401,18 +556,18 @@ TEST(WheelMeasurementModel, NoiseHasTheFloorTheLeverTermAndTheLateralMarker)
   WheelModelParams params;
   params.sigma_lever = 0.02;
   const double lever2 = (0.5 * 0.02) * (0.5 * 0.02);  // |omega| = 0.5 rad/s
-  const WheelNoise below = composeR(0.002, kUnobserved, 0.5, params);
+  const WheelNoise below = sampleNoise(0.002, kUnobserved, 0.5, params);
   EXPECT_DOUBLE_EQ(below.var_vx, 0.075 * 0.075 + lever2);  // the per-frame floor of design C.1
   EXPECT_FALSE(below.lateral);                             // cov[7] at the bridge's marker
   EXPECT_EQ(below.var_vy, 0.0);
   EXPECT_DOUBLE_EQ(below.var_vz, 0.10 * 0.10);
-  const WheelNoise above = composeR(0.01, 4e-4, 0.5, params);
+  const WheelNoise above = sampleNoise(0.01, 4e-4, 0.5, params);
   EXPECT_DOUBLE_EQ(above.var_vx, 0.01 + lever2);
   EXPECT_TRUE(above.lateral);
   EXPECT_DOUBLE_EQ(above.var_vy, 4e-4 + lever2);
-  EXPECT_FALSE(composeR(0.01, 2e6, 0.5, params).lateral);
-  EXPECT_TRUE(composeR(0.01, 999999.0, 0.5, params).lateral);
-  EXPECT_DOUBLE_EQ(composeR(0.002, kUnobserved, 0.0, params).var_vx, 0.075 * 0.075);  // no rotation, no lever term
+  EXPECT_FALSE(sampleNoise(0.01, 2e6, 0.5, params).lateral);
+  EXPECT_TRUE(sampleNoise(0.01, 999999.0, 0.5, params).lateral);
+  EXPECT_DOUBLE_EQ(sampleNoise(0.002, kUnobserved, 0.0, params).var_vx, 0.075 * 0.075);
 
   // pack(): (vx, vz) without the lateral axis, (vx, vy, vz) with it, residual z - h.
   const ModelState s;
@@ -429,7 +584,7 @@ TEST(WheelMeasurementModel, NoiseHasTheFloorTheLeverTermAndTheLateralMarker)
   EXPECT_EQ(residual(1), -m->h(2));
   EXPECT_EQ(variances(0), m->noise.var_vx);
   EXPECT_EQ(variances(1), m->noise.var_vz);
-  m->noise = composeR(0.01, 4e-4, 0.5, params);
+  m->noise = sampleNoise(0.01, 4e-4, 0.5, params);
   m->pack(H, residual, variances);
   ASSERT_EQ(H.rows(), 3);
   EXPECT_EQ(H.row(1), m->H.row(1));
@@ -524,7 +679,9 @@ TEST(WheelSpeedInput, PairsTheTwoTopicsByStampInEitherArrivalOrder)
   ASSERT_TRUE(ring.fit.has_value());
   EXPECT_EQ(ring.fit->samples, 2);  // only the paired samples enter the update
   EXPECT_EQ(ring.unpaired, 1);
-  EXPECT_EQ(ring.fit->var_vx, 0.004);
+  EXPECT_EQ(ring.fit->sample_max_vx, 0.004);
+  // numerical-design.txt:L38; epoch rounding changes the two double time differences.
+  EXPECT_NEAR(composeR(*ring.fit, 0.0, WheelModelParams{}).var_vx, 0.17576343876330622, 1e-6 * 0.17576343876330622);
   EXPECT_EQ(ring.unmatched_samples, 0u);
   EXPECT_EQ(ring.rejected, 0u);
 
@@ -571,7 +728,7 @@ TEST(WheelSpeedInput, MalformedStampsAndDuplicateHalvesAreRefusedAndCounted)
   EXPECT_EQ(ring.unpaired, 1);
 }
 
-TEST(WheelSpeedInput, WithoutAVarianceTopicTheUpdateIsTodays)
+TEST(WheelSpeedInput, WithoutAVarianceTopicAnEndpointSamplePreservesTodaysUnits)
 {
   // Today's update: the gated sample with R = diag(vx^2, vy^2, vz^2) of the parameter sigmas, z = v * scale,
   // h = R_robot<-imu R_world<-imu^T v and H on the rotation and velocity columns. Without a variance topic, a zero
@@ -588,7 +745,20 @@ TEST(WheelSpeedInput, WithoutAVarianceTopicTheUpdateIsTodays)
   params.speed_scale = scale;
   params.sigma_vx_floor = sigma_vx;
   params.sigma_vz = sigma_vz;
-  const fast_lio::WheelStep step = stepOf(input, params);
+  const auto early = stepOf(input, params);
+  EXPECT_EQ(early.outcome, WheelOutcome::kUnidentifiableEndpoint);
+  EXPECT_FALSE(early.measurement);
+  addTwistAt(input, kEpochNs + 100000000, v);
+  // Exclude the earlier sample to exercise the exact single-endpoint R14 contract.
+  const ModelState endpoint_state;
+  const fast_lio::WheelStep step = input.step(input.read(kScanEnd, kScanEnd),
+                                              kScanEnd,
+                                              endpoint_state.omega_mean,
+                                              endpoint_state.R_world_imu,
+                                              endpoint_state.velocity_world,
+                                              endpoint_state.gyro_bias,
+                                              endpoint_state.R_robot_to_imu,
+                                              params);
   ASSERT_EQ(step.outcome, WheelOutcome::kUpdate);
   ASSERT_TRUE(step.measurement.has_value());
   EXPECT_EQ(step.ring.fit->samples, 1);
@@ -635,6 +805,8 @@ TEST(WheelSpeedInput, AScanWithoutImuSamplesMakesNoUpdate)
   WheelSpeedInput input;
   input.configure(false, 0.10, 0.05);
   addTwistAt(input, kEpochNs + 50000000, 0.5);
+  EXPECT_EQ(stepOf(input, WheelModelParams{}).outcome, WheelOutcome::kUnidentifiableEndpoint);
+  addTwistAt(input, kEpochNs + 100000000, 0.5);
   const fast_lio::WheelStep step = stepOf(input, WheelModelParams{}, std::nullopt);
   EXPECT_EQ(step.outcome, WheelOutcome::kNoImu);
   EXPECT_FALSE(step.measurement.has_value());
@@ -653,6 +825,8 @@ TEST(WheelSpeedInput, TheSlipNeedsPhiOnlyWhenKIsNotZero)
   WheelSpeedInput without_imu;
   without_imu.configure(false, 0.10, 0.05);
   addTwistAt(without_imu, kEpochNs + 50000000, v);
+  EXPECT_EQ(stepOf(without_imu, slip).outcome, WheelOutcome::kUnidentifiableEndpoint);
+  addTwistAt(without_imu, kEpochNs + 100000000, v);
   const fast_lio::WheelStep refused = stepOf(without_imu, slip);
   EXPECT_EQ(refused.outcome, WheelOutcome::kPhiUnavailable);
   EXPECT_FALSE(refused.phi.has_value());
@@ -669,6 +843,8 @@ TEST(WheelSpeedInput, TheSlipNeedsPhiOnlyWhenKIsNotZero)
   WheelSpeedInput with_imu;
   with_imu.configure(false, 0.10, 0.05);
   addTwistAt(with_imu, kEpochNs + 50000000, v);
+  EXPECT_EQ(stepOf(with_imu, slip).outcome, WheelOutcome::kUnidentifiableEndpoint);
+  addTwistAt(with_imu, kEpochNs + 100000000, v);
   const std::int64_t imu_period = 5000000;
   for (std::int64_t i = 300; i >= 0; --i) {
     with_imu.recordImu(seconds(kEpochNs + 100000000 - i * imu_period), 0.5);
@@ -706,7 +882,20 @@ TEST(WheelSpeedInput, WheelLineCarriesTheOutcomeAndEveryCounter)
   input.configure(true, 0.075, 0.05);
   addTwistAt(input, kEpochNs + 50000000, 0.5);
   addVariancesAt(input, kEpochNs + 50000000, 0.003, 0.004);
-  const fast_lio::WheelStep updated = stepOf(input, WheelModelParams{});
+  const auto early = stepOf(input, WheelModelParams{});
+  EXPECT_EQ(early.outcome, WheelOutcome::kUnidentifiableEndpoint);
+  EXPECT_NE(fast_lio::wheelLine(kScanEnd, early, input.counts()).find("outcome=unidentifiable_endpoint"),
+            std::string::npos);
+  const ModelState state;
+  const auto endpoint_ring = input.read(seconds(kEpochNs + 50000000), seconds(kEpochNs + 50000000));
+  const fast_lio::WheelStep updated = input.step(endpoint_ring,
+                                                 seconds(kEpochNs + 50000000),
+                                                 state.omega_mean,
+                                                 state.R_world_imu,
+                                                 state.velocity_world,
+                                                 state.gyro_bias,
+                                                 state.R_robot_to_imu,
+                                                 WheelModelParams{});
   ASSERT_EQ(updated.outcome, WheelOutcome::kUpdate);
   const std::string line = fast_lio::wheelLine(kScanEnd, updated, input.counts());
   EXPECT_EQ(line.rfind("[WHEEL] t=", 0), 0u) << line;
@@ -718,7 +907,7 @@ TEST(WheelSpeedInput, WheelLineCarriesTheOutcomeAndEveryCounter)
                              " no_sample=0 ",
                              " no_imu=0 ",
                              " phi_unavailable=0 ",
-                             " invalid=0 ",
+                             " invalid=1 ",
                              " unmatched_samples=0 ",
                              " unmatched_variances=0 "}) {
     EXPECT_NE(line.find(field), std::string::npos) << field << " in " << line;

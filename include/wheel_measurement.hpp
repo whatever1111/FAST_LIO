@@ -10,10 +10,9 @@
 // Per scan, every such sample in [t_end - window, t_end] is used: a line weighted by
 // 1/sigma^2 is evaluated at the scan end, which removes the lag of taking the newest
 // sample (up to one bridge period) without the half-window lag of a mean. The fit's
-// scatter is for logging only; the measurement variance stays the per-sample one,
-// floored at the honest per-frame sigma of the 5 s averaging horizon, because the
-// speed error is correlated over seconds and averaging the frame's samples does not
-// shrink it.
+// scatter is for logging only. Endpoint coefficients propagate a worst-correlation
+// variance bound, with the effective per-frame noise budget added once. The speed
+// error is correlated over seconds, so averaging does not shrink that budget.
 //
 // On a slope a fraction of the stride slips. With phi the window mean of the raw
 // forward specific force in g, minus the platform's level intercept phi0, the speed is
@@ -76,9 +75,97 @@ struct WheelFit
   double v = 0.0;             ///< m/s at t_end
   int samples = 0;            ///< paired samples used
   double residual_rms = 0.0;  ///< m/s about the line (0 for a single sample); logging only
-  double var_vx = 0.0;        ///< (m/s)^2, largest forward variance among the samples used
-  double var_lat = 0.0;       ///< (m/s)^2, largest lateral variance among the samples used
+  double sample_max_vx = 0.0;       ///< (m/s)^2, largest forward input variance
+  double sample_max_lat = 0.0;      ///< (m/s)^2, largest lateral input variance
+  double endpoint_bound_vx = 0.0;   ///< (m/s)^2, max(sample_max_vx, U_x)
+  double endpoint_bound_lat = 0.0;  ///< (m/s)^2, max(sample_max_lat, U_y), when observed
+  bool lateral_observed = false;    ///< all input lateral variances are below the bridge marker
+  int fit_order = 0;                ///< 0 = identifiable constant at t_end, 1 = affine endpoint
+  double c_l1 = 0.0;                ///< sum |c_i| of the forward fit, dimensionless
+  double c_l2_sq = 0.0;             ///< sum c_i^2 of the forward fit, dimensionless
 };
+
+enum class WheelFitStatus
+{
+  kValid,
+  kNoSample,
+  kUnidentifiableEndpoint,
+  kInvalid
+};
+
+namespace wheel_detail
+{
+struct EndpointFit
+{
+  double value = 0.0;
+  double residual_rms = 0.0;
+  double bound = 0.0;
+  double c_l1 = 0.0;
+  double c_l2_sq = 0.0;
+  int order = 0;
+};
+
+// The caller supplies paired samples in time order, with positive finite variances.
+// min(variance)/variance is (1/variance)/max(1/variance) without overflowing the reciprocal.
+inline std::optional<EndpointFit>
+fitEndpoint(const std::vector<const WheelSample *> & samples, double t_end, bool lateral)
+{
+  const auto variance = [lateral](const WheelSample & sample) {
+    return lateral ? sample.var_lat : sample.var_vx;
+  };
+  const WheelSample & reference = *samples.back();
+  double min_variance = variance(reference);
+  double max_variance = min_variance;
+  for (const auto * sample : samples) {
+    min_variance = std::min(min_variance, variance(*sample));
+    max_variance = std::max(max_variance, variance(*sample));
+  }
+  double sw = 0.0;
+  double swt = 0.0;
+  double swv = 0.0;
+  for (const auto * sample : samples) {
+    const double w = min_variance / variance(*sample);
+    sw += w;
+    swt += w * (sample->t - reference.t);
+    swv += w * (sample->v - reference.v);
+  }
+  const double mean_t = swt / sw;
+  const double mean_v = swv / sw;
+  double spread = 0.0;
+  double cross = 0.0;
+  for (const auto * sample : samples) {
+    const double w = min_variance / variance(*sample);
+    const double dt = (sample->t - reference.t) - mean_t;
+    spread += w * dt * dt;
+    cross += w * dt * ((sample->v - reference.v) - mean_v);
+  }
+  const double slope = spread > 0.0 ? cross / spread : 0.0;
+  const double endpoint_dt = (t_end - reference.t) - mean_t;
+  EndpointFit out;
+  out.order = spread > 0.0 ? 1 : 0;
+  out.value = reference.v + mean_v + slope * endpoint_dt;
+  double std_bound = 0.0;
+  double squares = 0.0;
+  for (const auto * sample : samples) {
+    const double w = min_variance / variance(*sample);
+    const double dt = (sample->t - reference.t) - mean_t;
+    const double coefficient = w / sw + (spread > 0.0 ? endpoint_dt * w * dt / spread : 0.0);
+    out.c_l1 += std::abs(coefficient);
+    out.c_l2_sq += coefficient * coefficient;
+    std_bound += std::abs(coefficient) * std::sqrt(variance(*sample));
+    const double residual = (sample->v - reference.v) - (mean_v + slope * dt);
+    squares += residual * residual;
+  }
+  out.bound = spread > 0.0 ? std::max(max_variance, std_bound * std_bound) : max_variance;
+  out.residual_rms = std::sqrt(squares / samples.size());
+  if (!std::isfinite(sw) || !std::isfinite(spread) || !std::isfinite(cross) || !std::isfinite(out.value) ||
+      !std::isfinite(out.bound) || !std::isfinite(out.residual_rms) || !std::isfinite(out.c_l1) ||
+      !std::isfinite(out.c_l2_sq)) {
+    return std::nullopt;
+  }
+  return out;
+}
+}  // namespace wheel_detail
 
 /// Bridge samples by exact stamp, oldest first. Capacity is the window times the
 /// sample rate; whatever is pushed out unpaired is counted and gone.
@@ -131,68 +218,58 @@ public:
   }
 
   /// The speed at t_end from the paired, valid samples in [t_end - window_s, t_end]:
-  /// a 1/var_vx-weighted line for two or more, the sample itself for one, nullopt for
-  /// none or for a non-finite t_end or window. Samples whose stamps coincide in double
-  /// seconds leave the slope undetermined; the weighted mean is then the answer.
-  std::optional<WheelFit> fitAt(double t_end, double window_s) const
+  /// a 1/var_vx-weighted line. One distinct time identifies only that time's endpoint.
+  /// status distinguishes an empty window, an unidentifiable endpoint and invalid arithmetic.
+  std::optional<WheelFit> fitAt(double t_end, double window_s, WheelFitStatus * status = nullptr) const
   {
+    const auto set_status = [status](WheelFitStatus value) {
+      if (status != nullptr) {
+        *status = value;
+      }
+    };
+    set_status(WheelFitStatus::kInvalid);
     if (!std::isfinite(t_end) || !std::isfinite(window_s) || window_s < 0.0) {
       return std::nullopt;
     }
     const double t_begin = t_end - window_s;
-    // Times and speeds relative to the newest usable sample. Its own offsets are exactly
-    // zero, so one sample, or samples at one double time, give exactly zero time spread
-    // and no slope. Centred on a weighted mean instead, the mean's rounding leaves a
-    // spread of an ulp, and the speeds' rounding divided by it is an arbitrary slope.
-    const WheelSample * reference = nullptr;
+    std::vector<const WheelSample *> samples;
+    WheelFit fit;
+    fit.lateral_observed = true;
     for (const WheelSample & e : entries_) {
       if (usable(e, t_begin, t_end)) {
-        reference = &e;
+        samples.push_back(&e);
+        fit.sample_max_vx = std::max(fit.sample_max_vx, e.var_vx);
+        fit.sample_max_lat = std::max(fit.sample_max_lat, e.var_lat);
+        fit.lateral_observed = fit.lateral_observed && e.var_lat < kBridgeUnobservedVariance;
       }
     }
-    if (reference == nullptr) {
+    if (samples.empty()) {
+      set_status(WheelFitStatus::kNoSample);
       return std::nullopt;
     }
-    WheelFit fit;
-    double sw = 0.0;
-    double swt = 0.0;
-    double swv = 0.0;
-    for (const WheelSample & e : entries_) {
-      if (!usable(e, t_begin, t_end)) {
-        continue;
-      }
-      const double w = 1.0 / e.var_vx;
-      sw += w;
-      swt += w * (e.t - reference->t);
-      swv += w * (e.v - reference->v);
-      fit.var_vx = std::max(fit.var_vx, e.var_vx);
-      fit.var_lat = std::max(fit.var_lat, e.var_lat);
-      ++fit.samples;
+    if (samples.front()->t == samples.back()->t && samples.back()->t != t_end) {
+      set_status(WheelFitStatus::kUnidentifiableEndpoint);
+      return std::nullopt;
     }
-    const double tau_mean = swt / sw;
-    const double dv_mean = swv / sw;
-    double stt = 0.0;
-    double stv = 0.0;
-    for (const WheelSample & e : entries_) {
-      if (!usable(e, t_begin, t_end)) {
-        continue;
-      }
-      const double w = 1.0 / e.var_vx;
-      const double dt = (e.t - reference->t) - tau_mean;
-      stt += w * dt * dt;
-      stv += w * dt * ((e.v - reference->v) - dv_mean);
+    const auto forward = wheel_detail::fitEndpoint(samples, t_end, false);
+    if (!forward) {
+      return std::nullopt;
     }
-    const double slope = stt > 0.0 ? stv / stt : 0.0;
-    fit.v = reference->v + dv_mean + slope * ((t_end - reference->t) - tau_mean);
-    double squares = 0.0;
-    for (const WheelSample & e : entries_) {
-      if (!usable(e, t_begin, t_end)) {
-        continue;
+    fit.samples = static_cast<int>(samples.size());
+    fit.v = forward->value;
+    fit.residual_rms = forward->residual_rms;
+    fit.endpoint_bound_vx = forward->bound;
+    fit.fit_order = forward->order;
+    fit.c_l1 = forward->c_l1;
+    fit.c_l2_sq = forward->c_l2_sq;
+    if (fit.lateral_observed) {
+      const auto lateral = wheel_detail::fitEndpoint(samples, t_end, true);
+      if (!lateral) {
+        return std::nullopt;
       }
-      const double residual = (e.v - reference->v) - (dv_mean + slope * ((e.t - reference->t) - tau_mean));
-      squares += residual * residual;
+      fit.endpoint_bound_lat = lateral->bound;
     }
-    fit.residual_rms = std::sqrt(squares / fit.samples);
+    set_status(WheelFitStatus::kValid);
     return fit;
   }
 
@@ -342,16 +419,16 @@ struct WheelNoise
   bool lateral = false;
 };
 
-/// R_vx = max(var_vx, floor^2) + (|omega| sigma_lever)^2; R_vy = var_lat + the same lever
-/// term when var_lat is below the bridge's unobserved marker, no lateral row otherwise;
-/// R_vz = sigma_vz^2. omega_norm is the scan's mean bias-corrected angular rate.
-inline WheelNoise composeR(double var_vx, double var_lat, double omega_norm, const WheelModelParams & params)
+/// Add the effective common noise budget once, then the lever's geometric uncertainty.
+/// Lateral validity comes from the input marker, independently of the propagated bound.
+inline WheelNoise composeR(const WheelFit & fit, double omega_norm, const WheelModelParams & params)
 {
   const double lever = omega_norm * params.sigma_lever;
   WheelNoise noise;
-  noise.var_vx = std::max(var_vx, params.sigma_vx_floor * params.sigma_vx_floor) + lever * lever;
-  noise.lateral = var_lat < kBridgeUnobservedVariance;
-  noise.var_vy = noise.lateral ? var_lat + lever * lever : 0.0;
+  noise.var_vx = std::max(fit.sample_max_vx, params.sigma_vx_floor * params.sigma_vx_floor) +
+                 (fit.endpoint_bound_vx - fit.sample_max_vx) + lever * lever;
+  noise.lateral = fit.lateral_observed;
+  noise.var_vy = noise.lateral ? fit.endpoint_bound_lat + lever * lever : 0.0;
   noise.var_vz = params.sigma_vz * params.sigma_vz;
   return noise;
 }
@@ -426,7 +503,7 @@ inline std::optional<WheelMeasurement> wheelMeasurement(const WheelFit & fit,
   m.H.block<3, 3>(0, kWheelRotIndex) = R_wheel_imu * wheel_detail::skew(v_imu);
   m.H.block<3, 3>(0, kWheelVelIndex) = R_wheel_imu * R_world_imu.transpose();
   m.H.block<3, 3>(0, kWheelGyroBiasIndex) = -R_wheel_imu * wheel_detail::skew(params.lever_arm);
-  m.noise = composeR(fit.var_vx, fit.var_lat, omega.norm(), params);
+  m.noise = composeR(fit, omega.norm(), params);
   if (!m.z.allFinite() || !m.h.allFinite() || !m.H.allFinite() || !std::isfinite(m.noise.var_vx) ||
       !std::isfinite(m.noise.var_vy) || !std::isfinite(m.noise.var_vz)) {
     return std::nullopt;

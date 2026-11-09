@@ -112,10 +112,14 @@ inline double cauchyWeight(double residual, double c)
 /// Predicted variance of one point-to-plane residual (m²): H P Hᵀ + R with H = [n_world; A_body],
 /// P6 the prior covariance over [pos(3), rot(3)] and point_cov the per-point measurement variance.
 /// Returns a non-finite value for non-finite inputs so the caller's test rejects.
-inline double residualVariance(const Eigen::Vector3d & n_world,
-                               const Eigen::Vector3d & A_body,
-                               const Eigen::Matrix<double, 6, 6> & P6,
-                               double point_cov)
+///
+/// Kept out of line so every caller gets the same rounding. Inlined into a caller that holds objects
+/// with destructors, GCC 9 on aarch64 puts each NEON load of the dot product in its own block and
+/// stops fusing one of its multiply-adds, which changes the last bits of the variance.
+__attribute__((noinline)) inline double residualVariance(const Eigen::Vector3d & n_world,
+                                                         const Eigen::Vector3d & A_body,
+                                                         const Eigen::Matrix<double, 6, 6> & P6,
+                                                         double point_cov)
 {
   Eigen::Matrix<double, 6, 1> H;
   H << n_world, A_body;

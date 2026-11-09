@@ -18,6 +18,7 @@
 #include <iterator>
 #include <limits>
 #include <omp.h>
+#include <optional>
 #include <so3_math.h>
 #include <vector>
 
@@ -26,6 +27,8 @@
 #include "correspondence_compaction.hpp"
 #include "correspondence_gate.hpp"
 #include "degeneracy_policy.hpp"
+#include "normal_noise_floor.hpp"
+#include "plane_fit.hpp"
 
 #ifdef FASTLIO_TEST_HOOKS
 #include "laser_mapping_test_hooks.hpp"
@@ -95,14 +98,19 @@ static HModelExit hModelExit(const fast_lio::MeasurementTelemetry & telemetry,
   out.hold_info = telemetry.lidar_attitude_hold_info_active;
   out.rp_info_min = telemetry.lidar_rot_obs_rp_min;
   out.rp_consider = rp_consider_active;
-  out.degeneracy_engaged = telemetry.degeneracy_last.engaged;
+  // The floor's decision (the last evaluation that ran it on this scan): neutral while the floor is off or has not
+  // decided, which is the inert record of the former subspace weighting field for field.
+  const fast_lio::FloorProjectionResult & decision = telemetry.floor.last;
+  out.degeneracy_engaged = telemetry.floor.projected;
   for (int i = 0; i < 3; ++i) {
-    out.degeneracy_shares[i] = telemetry.degeneracy_last.lambda_norm(i);
-    out.degeneracy_lambdas[i] = telemetry.degeneracy_last.lambda_abs(i);
-    out.degeneracy_weights[i] = telemetry.degeneracy_last.weights(i);
+    out.degeneracy_shares[i] = decision.valid && outputs.effective_rows > 0
+                                 ? decision.lambda(i) / static_cast<double>(outputs.effective_rows)
+                                 : 1.0;
+    out.degeneracy_lambdas[i] = decision.lambda(i);
+    out.degeneracy_weights[i] = decision.gains(i);
   }
-  out.degeneracy_weighted_points = telemetry.degeneracy_point_weighted;
-  out.degeneracy_weight_sum = telemetry.degeneracy_point_weight_sum;
+  out.degeneracy_weighted_points = telemetry.floor_rows_projected;
+  out.degeneracy_weight_sum = telemetry.floor_kept_sum;
   out.dump_written = valid && outputs.dump_scan_active && outputs.dump_rows.is_open();
   return out;
 }
@@ -240,6 +248,7 @@ void matchPoints(fast_lio::MeasurementScratch & scratch,
       }
       if (residual.accepted) {
         scratch.point_selected_surf[i] = true;
+        scratch.point_plane[i] = cached_plane.eigen();
         scratch.normvec.points[i].x = pabcd(0);
         scratch.normvec.points[i].y = pabcd(1);
         scratch.normvec.points[i].z = pabcd(2);
@@ -463,6 +472,7 @@ void recoverGroundRows(fast_lio::MeasurementScratch & scratch,
     if (std::fabs(pd2) > params.ground_recover_max_residual)
       continue;
     scratch.point_selected_surf[i] = true;
+    scratch.point_plane[i] = nullptr;  // the normal is imposed, not fitted: no plane covariance
     scratch.normvec.points[i].x = 0.0f;
     scratch.normvec.points[i].y = 0.0f;
     // Row weight rides on the normal + residual scaling (information
@@ -539,8 +549,11 @@ void compactRows(fast_lio::MeasurementScratch & scratch,
     std::fill(std::begin(telemetry.res_bin_n), std::end(telemetry.res_bin_n), 0);
     std::fill(std::begin(telemetry.res_bin_ss), std::end(telemetry.res_bin_ss), 0.0);
   }
+  // The floor needs each row's plane: carried in row order, parallel to corr_normvect.
+  const bool floor_on = params.degeneracy_floor_mode != fast_lio::FloorMode::kOff;
+  scratch.corr_plane.clear();
 
-  // res_last and point_selected_surf have the same extent; the compactor checks
+  // res_last, point_selected_surf and point_plane have the same extent; the compactor checks
   // that extent and the point/normal/weight bounds before invoking this observer.
   outputs.effective_rows = static_cast<int>(fast_lio::compactSelectedCorrespondences(
     static_cast<std::size_t>(inputs.point_count),
@@ -554,6 +567,9 @@ void compactRows(fast_lio::MeasurementScratch & scratch,
     scratch.corr_weight,
     [&](std::size_t i) {
       scratch.total_residual += scratch.res_last[i];
+      if (floor_on) {
+        scratch.corr_plane.push_back(scratch.point_plane[i]);
+      }
       if (inputs.degeneracy_debug) {
         const PointType & pb = inputs.body.points[i];
         const double rng = std::sqrt(double(pb.x) * pb.x + double(pb.y) * pb.y + double(pb.z) * pb.z);
@@ -625,6 +641,13 @@ bool prepareAttitudeHold(const fast_lio::MeasurementScratch & scratch,
   return hold_rows;
 }
 
+// The weight a row carries into the update: the robust kernel's sqrt(w) on a row the kernel down-weights, 1 on any
+// other. buildRows scales the row and its residual by it, and the floor counts the row's normal noise with it.
+double rowWeight(const fast_lio::FrontendParams & params, double kernel_weight)
+{
+  return params.corr_kernel != 0 && kernel_weight < 1.0 ? std::sqrt(std::max(kernel_weight, 0.0)) : 1.0;
+}
+
 void buildRows(const fast_lio::MeasurementScratch & scratch,
                const fast_lio::FrontendParams & params,
                const fast_lio::MeasurementOutputs & outputs,
@@ -663,71 +686,90 @@ void buildRows(const fast_lio::MeasurementScratch & scratch,
 
     /*** Measuremnt: distance to the closest surface/corner ***/
     ekfom_data.h(i) = -norm_p.intensity;
-    if (params.corr_kernel != 0 && scratch.corr_weight[i] < 1.0) {
-      const double sw = std::sqrt(std::max(scratch.corr_weight[i], 0.0));
+    const double sw = rowWeight(params, scratch.corr_weight[i]);
+    if (sw != 1.0) {
       ekfom_data.h_x.block<1, 12>(i, 0) *= sw;
       ekfom_data.h(i) *= sw;
     }
   }
 }
 
-/*** Subspace weighting. Judged on the position information LEFT once rotation has
- *   been solved for (the Schur complement of H^T H over the rotation columns), taken
- *   straight off the Jacobian we just built, then applied per point: this plane only
- *   constrains its own normal, so weight it by how much the policy trusts that
- *   direction. Row AND residual together — that is what makes it R_i <- R / s^2, a
- *   weight on the measurement, rather than a claim that the plane faces elsewhere.
- *   Recomputed every iEKF iteration: the correspondences move with the state. ***/
-void degeneracyWeights(const fast_lio::MeasurementScratch & scratch,
-                       fast_lio::MeasurementTelemetry & telemetry,
-                       const fast_lio::FrontendParams & params,
-                       rclcpp::Clock & spectrum_clock,
-                       const fast_lio::MeasurementInputs & inputs,
-                       const fast_lio::MeasurementOutputs & outputs,
-                       esekfom::dyn_share_datastruct<double> & ekfom_data)
+// [DEGEN-SPECTRUM]: the position information of the rows as built, before the floor touches them. The Schur
+// complement over the rotation columns (what the floor judges, raw and as shares of the rows) beside the raw
+// translation block: the gap between them is what rotation explains away.
+void traceSpectrum(const fast_lio::FrontendParams & params,
+                   rclcpp::Clock & spectrum_clock,
+                   const fast_lio::MeasurementInputs & inputs,
+                   const fast_lio::MeasurementOutputs & outputs,
+                   const esekfom::dyn_share_datastruct<double> & ekfom_data)
 {
   const auto H_t = ekfom_data.h_x.leftCols(3);
   const auto H_r = ekfom_data.h_x.middleCols(3, 3);
   const Eigen::Matrix3d H_tt = H_t.transpose() * H_t;
   const Eigen::Matrix3d H_tr = H_t.transpose() * H_r;
   const Eigen::Matrix3d H_rr = H_r.transpose() * H_r;
-  telemetry.degeneracy_last =
-    fast_lio::computePositionDegeneracy(H_tt, H_tr, H_rr, outputs.effective_rows, params.degeneracy_params);
-  if (params.degeneracy_spectrum_trace) {
-    // Both spectra side by side: the gap between them is what rotation explains away,
-    // and it is the only way to see the coupling the thresholds now have to live with.
-    const Eigen::Vector3d tt = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(H_tt).eigenvalues();
-    const Eigen::Vector3d & sh = telemetry.degeneracy_last.lambda_norm;
-    const Eigen::Vector3d & ab = telemetry.degeneracy_last.lambda_abs;
-    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("laser_mapping"),
-                         spectrum_clock,
-                         2000,
-                         "[DEGEN-SPECTRUM] shares [%.3f %.3f %.3f] sum=%.3f | judged raw [%.1f %.1f %.1f] | "
-                         "H_tt raw [%.1f %.1f %.1f] | effct=%d far_frac=%.2f",
-                         sh(0),
-                         sh(1),
-                         sh(2),
-                         sh.sum(),
-                         ab(0),
-                         ab(1),
-                         ab(2),
-                         tt(0),
-                         tt(1),
-                         tt(2),
-                         outputs.effective_rows,
-                         inputs.far_fraction);
-  }
-  if (telemetry.degeneracy_last.engaged) {
-    for (int i = 0; i < outputs.effective_rows; i++) {
-      const PointType & np = scratch.corr_normvect.points[i];
-      const double point_w = fast_lio::pointWeight(telemetry.degeneracy_last, Eigen::Vector3d(np.x, np.y, np.z));
-      if (point_w < 1.0) {
-        ekfom_data.h_x.block<1, 12>(i, 0) *= point_w;
-        ekfom_data.h(i) *= point_w;
-        telemetry.degeneracy_point_weight_sum += point_w;
-        ++telemetry.degeneracy_point_weighted;
-      }
+  const Eigen::Vector3d tt = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(H_tt).eigenvalues();
+  const Eigen::Vector3d ab =
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(
+      fast_lio::schurPositionInformation(H_tt, H_tr, H_rr, params.degeneracy_params.schur_ridge))
+      .eigenvalues();
+  const Eigen::Vector3d sh = ab / static_cast<double>(outputs.effective_rows);
+  RCLCPP_INFO_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                       spectrum_clock,
+                       2000,
+                       "[DEGEN-SPECTRUM] shares [%.3f %.3f %.3f] sum=%.3f | judged raw [%.1f %.1f %.1f] | "
+                       "H_tt raw [%.1f %.1f %.1f] | effct=%d far_frac=%.2f",
+                       sh(0),
+                       sh(1),
+                       sh(2),
+                       sh.sum(),
+                       ab(0),
+                       ab(1),
+                       ab(2),
+                       tt(0),
+                       tt(1),
+                       tt(2),
+                       outputs.effective_rows,
+                       inputs.far_fraction);
+}
+
+// The normal-noise floor (FrontendParams::degeneracy_floor_mode is the policy, normal_noise_floor.hpp the decision)
+// on every evaluation that built rows, once each row carries its final weight. Each row brings the weight it was
+// scaled by and its normal's covariance: a fitted plane's from its scatter, none for a ground-recovery row, whose
+// imposed normal the floor counts apart and adds nothing for. Only the position columns and the residual can change;
+// the rotation and extrinsic columns are never touched.
+void noiseFloor(fast_lio::MeasurementScratch & scratch,
+                fast_lio::MeasurementTelemetry & telemetry,
+                const fast_lio::FrontendParams & params,
+                const fast_lio::MeasurementOutputs & outputs,
+                esekfom::dyn_share_datastruct<double> & ekfom_data)
+{
+  const std::size_t rows = static_cast<std::size_t>(outputs.effective_rows);
+  scratch.floor_weights.resize(rows);
+  scratch.floor_cov.resize(rows);
+  for (std::size_t i = 0; i < rows; ++i) {
+    scratch.floor_weights[i] = rowWeight(params, scratch.corr_weight[i]);
+    scratch.floor_cov[i].reset();
+    if (scratch.corr_plane[i] != nullptr) {
+      scratch.floor_cov[i] = fast_lio::planeNormalCovariance(*scratch.corr_plane[i]);
     }
+  }
+  fast_lio::floorStep(params.degeneracy_floor_mode,
+                      ekfom_data.h_x,
+                      ekfom_data.h,
+                      scratch.floor_weights,
+                      scratch.floor_cov,
+                      params.degeneracy_floor,
+                      params.degeneracy_params.schur_ridge,
+                      telemetry.floor);
+  if (telemetry.floor.projected) {
+    const Eigen::Matrix3d G =
+      fast_lio::projectionFromGains(telemetry.floor.last.eigenvectors, telemetry.floor.last.gains);
+    for (std::size_t i = 0; i < rows; ++i) {
+      const PointType & np = scratch.corr_normvect.points[i];
+      telemetry.floor_kept_sum += (G * Eigen::Vector3d(np.x, np.y, np.z)).norm();
+    }
+    telemetry.floor_rows_projected += static_cast<long>(rows);
   }
 }
 
@@ -745,8 +787,12 @@ void writeDump(const fast_lio::MeasurementScratch & scratch,
   outputs.dump_iterations << std::setprecision(15) << inputs.scan_end_time << ',' << iter << ','
                           << outputs.effective_rows << ',' << int(hold_rows) << ',' << std::setprecision(6)
                           << telemetry.lidar_rot_obs_rp_min << ',' << hold_up(0) << ',' << hold_up(1) << ','
-                          << hold_up(2) << ',' << int(searching) << ',' << int(telemetry.degeneracy_last.engaged)
-                          << '\n';
+                          << hold_up(2) << ',' << int(searching) << ',' << int(telemetry.floor.projected) << '\n';
+  // A projected evaluation's per-point column is the share of the point's normal the projection kept, |G n|.
+  Eigen::Matrix3d floor_projection = Eigen::Matrix3d::Identity();
+  if (telemetry.floor.projected) {
+    floor_projection = fast_lio::projectionFromGains(telemetry.floor.last.eigenvectors, telemetry.floor.last.gains);
+  }
   for (int i = 0; i < inputs.point_count; i++) {
     const bool eff = scratch.point_selected_surf[i];
     if (!eff && iter > 0) {
@@ -809,8 +855,8 @@ void writeDump(const fast_lio::MeasurementScratch & scratch,
       az = A(2);
       const V3D dv = pw - sensor_w;
       cosv = dv.norm() > 1e-6 ? std::abs(n.dot(dv)) / dv.norm() : 0.0;
-      if (telemetry.degeneracy_last.engaged) {
-        w = fast_lio::pointWeight(telemetry.degeneracy_last, n);
+      if (telemetry.floor.projected) {
+        w = (floor_projection * n).norm();
       }
     }
     outputs.dump_rows << std::setprecision(15) << inputs.scan_end_time << ',' << iter << ',' << i << ',' << int(eff)
@@ -836,6 +882,7 @@ void fast_lio::FrontendMeasurement::beginScan()
   telemetry_.nn_max_shift = 0.0;
   telemetry_.nn_skips = 0;
   telemetry_.solve_time = 0;
+  telemetry_.floor = fast_lio::FloorScanRecord{};
 }
 
 // Called once at the real downsampled-scan boundary, before any int-indexed
@@ -846,6 +893,7 @@ bool fast_lio::FrontendMeasurement::prepareScan(std::size_t count, int & point_c
     return false;
   if (scratch_.plane_cache.size() < count) {
     scratch_.plane_cache.resize(count);
+    scratch_.point_plane.resize(count, nullptr);
     scratch_.gate_var.resize(count);
     scratch_.gate_nn0.resize(count);
     scratch_.gate_w.resize(count);
@@ -901,7 +949,12 @@ void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state,
   V3D hold_up = V3D::Zero();
   const bool hold_rows = prepareAttitudeHold(scratch_, telemetry_, params_, inputs, outputs, state, hold_up);
   buildRows(scratch_, params_, outputs, state, data, hold_up, hold_rows);
-  degeneracyWeights(scratch_, telemetry_, params_, spectrum_clock_, inputs, outputs, data);
+  if (params_.degeneracy_spectrum_trace) {
+    traceSpectrum(params_, spectrum_clock_, inputs, outputs, data);
+  }
+  if (params_.degeneracy_floor_mode != fast_lio::FloorMode::kOff) {
+    noiseFloor(scratch_, telemetry_, params_, outputs, data);
+  }
   if (outputs.dump_scan_active && outputs.dump_rows.is_open()) {
     writeDump(scratch_, telemetry_, inputs, outputs, state, searching, hold_up, hold_rows);
   }

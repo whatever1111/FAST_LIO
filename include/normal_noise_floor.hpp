@@ -50,9 +50,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "degeneracy_policy.hpp"
@@ -60,6 +62,42 @@
 
 namespace fast_lio
 {
+
+/// What the lidar update does with the floor (degeneracy_floor_mode).
+enum class FloorMode
+{
+  kOff,      ///< "off": nothing is computed; the rows stay as built
+  kObserve,  ///< "observe": the decision is computed and reported; the rows stay as built
+  kApply,    ///< "apply": the decision is applied to the rows (applyFloorProjection)
+};
+
+/// The mode a parameter value names; nullopt for anything but "off", "observe" and "apply".
+inline std::optional<FloorMode> floorModeFromName(const std::string & name)
+{
+  if (name == "off") {
+    return FloorMode::kOff;
+  }
+  if (name == "observe") {
+    return FloorMode::kObserve;
+  }
+  if (name == "apply") {
+    return FloorMode::kApply;
+  }
+  return std::nullopt;
+}
+
+inline const char * floorModeName(FloorMode mode)
+{
+  switch (mode) {
+    case FloorMode::kObserve:
+      return "observe";
+    case FloorMode::kApply:
+      return "apply";
+    case FloorMode::kOff:
+      break;
+  }
+  return "off";
+}
 
 /// Parameters of the floor decision.
 struct FloorParams
@@ -345,6 +383,140 @@ inline FloorProjectionResult applyFloorProjection(Eigen::Ref<Eigen::MatrixXd> h_
   result.points = accumulator.points();
   result.points_without_covariance = accumulator.pointsWithoutCovariance();
   return result;
+}
+
+/// Steps 1-3 of applyFloorProjection on the rows as built, which it only reads: M_eff
+/// with its eigenvectors and eigenvalues, the floor f and the gains g. No shift is
+/// computed (it stays zero) and nothing is written: this is the observe mode, built from
+/// the same building blocks in the same order as applyFloorProjection, so on the same
+/// rows the two reach the same decision. The size contract (std::invalid_argument) and
+/// the validity rules (valid false: parameters out of range, a non-finite row, a failed
+/// eigen decomposition) are applyFloorProjection's.
+inline FloorProjectionResult observeFloor(const Eigen::Ref<const Eigen::MatrixXd> & h_x,
+                                          const Eigen::Ref<const Eigen::VectorXd> & h,
+                                          const std::vector<double> & weights,
+                                          const std::vector<std::optional<Eigen::Matrix3d>> & normal_cov,
+                                          const FloorParams & params,
+                                          double ridge)
+{
+  const Eigen::Index rows = h_x.rows();
+  if (h_x.cols() != 12 || h.size() != rows || static_cast<Eigen::Index>(weights.size()) != rows ||
+      static_cast<Eigen::Index>(normal_cov.size()) != rows) {
+    throw std::invalid_argument("observeFloor: h_x must be N x 12, h, weights and normal_cov of length N");
+  }
+  FloorProjectionResult result;
+  const std::optional<double> z_alpha = zFromFalseKeepRate(params.alpha);
+  if (!z_alpha || !std::isfinite(params.kappa) || !(params.kappa >= 0.0) || !std::isfinite(params.rel_uncertainty) ||
+      !(params.rel_uncertainty >= 0.0) || !std::isfinite(ridge) || !h_x.allFinite() || !h.allFinite()) {
+    return result;
+  }
+  const Eigen::MatrixXd H_t = h_x.leftCols(3);
+  const Eigen::MatrixXd H_r = h_x.middleCols(3, 3);
+  const Eigen::Matrix3d M_tt = H_t.transpose() * H_t;
+  const Eigen::Matrix3d M_tr = H_t.transpose() * H_r;
+  const Eigen::Matrix3d M_rr = H_r.transpose() * H_r;
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(schurPositionInformation(M_tt, M_tr, M_rr, ridge));
+  if (solver.info() != Eigen::Success || !solver.eigenvalues().allFinite() || !solver.eigenvectors().allFinite()) {
+    return result;
+  }
+  DirectionFloorAccumulator accumulator(solver.eigenvectors());
+  for (std::size_t i = 0; i < weights.size(); ++i) {
+    accumulator.add(weights[i], normal_cov[i]);
+  }
+  const Eigen::Vector3d noise_floor = accumulator.floor(params.kappa);
+  result.valid = true;
+  result.lambda = solver.eigenvalues();
+  result.eigenvectors = solver.eigenvectors();
+  result.noise_floor = noise_floor;
+  result.gains = floorKeepGains(solver.eigenvalues(), noise_floor, *z_alpha, params.rel_uncertainty);
+  result.points = accumulator.points();
+  result.points_without_covariance = accumulator.pointsWithoutCovariance();
+  return result;
+}
+
+/// One scan's floor, for its [FLOOR] line: the result of the scan's last evaluation, how
+/// many of its evaluations ran the floor and how many of those were refused (valid false:
+/// the rows stayed as built). The measurement model clears it at each new scan.
+struct FloorScanRecord
+{
+  FloorProjectionResult last;   ///< the scan's last evaluation; neutral (valid false) before the first
+  int evaluations = 0;          ///< evaluations of the scan that ran the floor
+  int invalid_evaluations = 0;  ///< of them, those that returned valid false
+  bool projected = false;       ///< the last evaluation changed the rows: apply, valid, some gain below one
+};
+
+/// The floor on one evaluation's rows (h_x N x 12 with h, weights and normal_cov as for
+/// applyFloorProjection) under mode:
+///
+///   off      nothing is computed and record is left as it is;
+///   observe  record.last = observeFloor(...): the rows stay as built;
+///   apply    record.last = applyFloorProjection(...): the rows are projected and shifted.
+///
+/// Every evaluation that runs is counted, and so is every one that comes back valid
+/// false, so a refused evaluation is never silent.
+inline void floorStep(FloorMode mode,
+                      Eigen::Ref<Eigen::MatrixXd> h_x,
+                      Eigen::Ref<Eigen::VectorXd> h,
+                      const std::vector<double> & weights,
+                      const std::vector<std::optional<Eigen::Matrix3d>> & normal_cov,
+                      const FloorParams & params,
+                      double ridge,
+                      FloorScanRecord & record)
+{
+  if (mode == FloorMode::kOff) {
+    return;
+  }
+  record.last = mode == FloorMode::kApply ? applyFloorProjection(h_x, h, weights, normal_cov, params, ridge)
+                                          : observeFloor(h_x, h, weights, normal_cov, params, ridge);
+  ++record.evaluations;
+  if (!record.last.valid) {
+    ++record.invalid_evaluations;
+  }
+  record.projected = mode == FloorMode::kApply && record.last.valid && !(record.last.gains.array() == 1.0).all();
+}
+
+/// The [FLOOR] log line of one scan: its last evaluation's decision under mode, and how
+/// many of the scan's evaluations ran the floor and were refused. One line:
+///
+///   [FLOOR] t=<lidar_end_time> mode=<observe|apply> valid=<0|1> points=<rows>
+///   points_without_covariance=<rows> iterations=<n> invalid_iterations=<n>
+///   lambda=[l0 l1 l2] f=[f0 f1 f2] g=[g0 g1 g2]
+///
+/// lambda ascending, f and g in the same order; apply appends " d=<|d|> coef=[c0 c1 c2]"
+/// with coef = V^T d, the shift's coordinates on the eigenvectors. t is %.6f seconds,
+/// every other real %.9g. Before the scan's first evaluation (iterations=0) the fields
+/// are the neutral ones of FloorProjectionResult.
+inline std::string floorLine(double lidar_end_time, FloorMode mode, const FloorScanRecord & record)
+{
+  const FloorProjectionResult & r = record.last;
+  char text[768];
+  std::snprintf(text,
+                sizeof text,
+                "[FLOOR] t=%.6f mode=%s valid=%d points=%d points_without_covariance=%d iterations=%d "
+                "invalid_iterations=%d lambda=[%.9g %.9g %.9g] f=[%.9g %.9g %.9g] g=[%.9g %.9g %.9g]",
+                lidar_end_time,
+                floorModeName(mode),
+                r.valid ? 1 : 0,
+                r.points,
+                r.points_without_covariance,
+                record.evaluations,
+                record.invalid_evaluations,
+                r.lambda(0),
+                r.lambda(1),
+                r.lambda(2),
+                r.noise_floor(0),
+                r.noise_floor(1),
+                r.noise_floor(2),
+                r.gains(0),
+                r.gains(1),
+                r.gains(2));
+  std::string line(text);
+  if (mode == FloorMode::kApply) {
+    const Eigen::Vector3d coef = r.eigenvectors.transpose() * r.shift;
+    std::snprintf(text, sizeof text, " d=%.9g coef=[%.9g %.9g %.9g]", r.shift.norm(), coef(0), coef(1), coef(2));
+    line += text;
+  }
+  return line;
 }
 
 }  // namespace fast_lio

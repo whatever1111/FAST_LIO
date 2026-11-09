@@ -5,6 +5,7 @@
 #include <Eigen/Core>
 
 #include <cmath>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -66,14 +67,10 @@ void FrontendParameters::declareOutputsAndMeasurement(rclcpp::Node & node)
   declareOnly(node, downsample.adaptive_downsample_lower_after);
   declareOnly(node, measurement.degeneracy_debug);
   declareOnly(node, measurement.degeneracy_spectrum_trace);
-  declareOnly(node, measurement.degeneracy_weighting_en);
-  declareOnly(node, measurement.degeneracy_lambda_bad);
-  declareOnly(node, measurement.degeneracy_lambda_good);
-  declareOnly(node, measurement.degeneracy_min_weight);
-  declareOnly(node, measurement.degeneracy_lambda_abs_bad);
-  declareOnly(node, measurement.degeneracy_lambda_abs_good);
-  declareOnly(node, measurement.degeneracy_hard_projection);
-  declareOnly(node, measurement.degeneracy_schur_en);
+  declareOnly(node, measurement.degeneracy_floor_mode);
+  declareOnly(node, measurement.degeneracy_false_keep_rate);
+  declareOnly(node, measurement.degeneracy_floor_model_scale);
+  declareOnly(node, measurement.degeneracy_floor_rel_uncertainty);
   declareOnly(node, measurement.degeneracy_schur_ridge);
   declareOnly(node, output.health_pub_en);
   declareOnly(node, constraints.planar_constraint_en);
@@ -395,14 +392,20 @@ void FrontendParameters::readDownsampleAndDegeneracy(const rclcpp::Node & node, 
   readInto(node, downsample.adaptive_downsample_lower_after, values_.adaptive_ds.lower_after);
   readInto(node, measurement.degeneracy_debug, degeneracy_debug);
   readInto(node, measurement.degeneracy_spectrum_trace, values_.degeneracy_spectrum_trace);
-  readInto(node, measurement.degeneracy_weighting_en, values_.degeneracy_params.enable);
-  readInto(node, measurement.degeneracy_lambda_bad, values_.degeneracy_params.lambda_bad);
-  readInto(node, measurement.degeneracy_lambda_good, values_.degeneracy_params.lambda_good);
-  readInto(node, measurement.degeneracy_min_weight, values_.degeneracy_params.min_weight);
-  readInto(node, measurement.degeneracy_lambda_abs_bad, values_.degeneracy_params.lambda_abs_bad);
-  readInto(node, measurement.degeneracy_lambda_abs_good, values_.degeneracy_params.lambda_abs_good);
-  readInto(node, measurement.degeneracy_hard_projection, values_.degeneracy_params.hard_projection);
-  readInto(node, measurement.degeneracy_schur_en, values_.degeneracy_params.schur_en);
+  std::string floor_mode_name = "off";
+  readInto(node, measurement.degeneracy_floor_mode, floor_mode_name);
+  const std::optional<fast_lio::FloorMode> floor_mode = fast_lio::floorModeFromName(floor_mode_name);
+  if (!floor_mode) {
+    RCLCPP_FATAL(node.get_logger(),
+                 "degeneracy_floor_mode must be 'off', 'observe' or 'apply', got '%s'",
+                 floor_mode_name.c_str());
+    throw std::invalid_argument("degeneracy_floor_mode");
+  }
+  values_.degeneracy_floor_mode = *floor_mode;
+  fast_lio::FloorParams & floor_params = values_.degeneracy_floor;
+  readInto(node, measurement.degeneracy_false_keep_rate, floor_params.alpha);
+  readInto(node, measurement.degeneracy_floor_model_scale, floor_params.kappa);
+  readInto(node, measurement.degeneracy_floor_rel_uncertainty, floor_params.rel_uncertainty);
   readInto(node, measurement.degeneracy_schur_ridge, values_.degeneracy_params.schur_ridge);
 }
 
@@ -410,6 +413,28 @@ void FrontendParameters::readConstraints(const rclcpp::Node & node, bool & healt
 {
   const OutputParameterSpecs output{};
   const ConstraintParameterSpecs constraints{};
+  if (!(floor_params.alpha > 0.0 && floor_params.alpha < 0.5)) {
+    RCLCPP_FATAL(node.get_logger(), "degeneracy_false_keep_rate must lie in (0, 0.5), got %g", floor_params.alpha);
+    throw std::invalid_argument("degeneracy_false_keep_rate");
+  }
+  if (!std::isfinite(floor_params.kappa) || !(floor_params.kappa > 0.0)) {
+    RCLCPP_FATAL(node.get_logger(), "degeneracy_floor_model_scale must be finite and > 0, got %g", floor_params.kappa);
+    throw std::invalid_argument("degeneracy_floor_model_scale");
+  }
+  if (!std::isfinite(floor_params.rel_uncertainty) || !(floor_params.rel_uncertainty >= 0.0)) {
+    RCLCPP_FATAL(node.get_logger(),
+                 "degeneracy_floor_rel_uncertainty must be finite and >= 0, got %g",
+                 floor_params.rel_uncertainty);
+    throw std::invalid_argument("degeneracy_floor_rel_uncertainty");
+  }
+  if (!std::isfinite(values_.degeneracy_params.schur_ridge)) {
+    RCLCPP_FATAL(
+      node.get_logger(), "degeneracy_schur_ridge must be finite, got %g", values_.degeneracy_params.schur_ridge);
+    throw std::invalid_argument("degeneracy_schur_ridge");
+  }
+#ifdef FASTLIO_TEST_HOOKS
+  locals_for_test_.value("degeneracy_floor_mode", floor_mode_name);
+#endif
   const MeasurementParameterSpecs measurement{};
   readInto(node, output.health_pub_en, health_pub_en);
   readInto(node, constraints.planar_constraint_en, values_.planar_constraint_en);

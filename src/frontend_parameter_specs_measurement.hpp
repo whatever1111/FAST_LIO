@@ -6,7 +6,7 @@
 
 namespace fast_lio
 {
-/// The lidar measurement update: iterations, degeneracy weighting, attitude hold, correspondence gating and kernels,
+/// The lidar measurement update: iterations, the normal-noise floor, attitude hold, correspondence gating and kernels,
 /// canopy and ground recovery, nearest-neighbour refresh. One spec per parameter, in declaration order, named after the
 /// parameter with '.' written '_'. FrontendParameters declares and reads them in the constructor's original order, not
 /// domain by domain.
@@ -15,23 +15,14 @@ struct MeasurementParameterSpecs
   const ParameterSpec<int> max_iteration{"max_iteration", 4, 4};
   const ParameterSpec<bool> degeneracy_debug{"degeneracy_debug", false, false};
   const ParameterSpec<bool> degeneracy_spectrum_trace{"degeneracy_spectrum_trace", false, false};
-  // Subspace weighting of the LiDAR position update. The thresholds are SHARES of
-  // the scan's position information (the three normalised eigenvalues sum to 1), so
-  // they must stay well under 1/3 — see degeneracy_policy.hpp.
-  const ParameterSpec<bool> degeneracy_weighting_en{"degeneracy_weighting_en", false, false};
-  const ParameterSpec<double> degeneracy_lambda_bad{"degeneracy_lambda_bad", 0.02, 0.02};
-  const ParameterSpec<double> degeneracy_lambda_good{"degeneracy_lambda_good", 0.10, 0.10};
-  const ParameterSpec<double> degeneracy_min_weight{"degeneracy_min_weight", 0.0, 0.0};
-  // Absolute test, in effective normals: scales with the downsample density, so it is
-  // a platform value. Compare against R / sigma_pos^2 — below that the propagated
-  // prior already outweighs the scan in that direction. 0/0 disables it.
-  const ParameterSpec<double> degeneracy_lambda_abs_bad{"degeneracy_lambda_abs_bad", 2.0, 2.0};
-  const ParameterSpec<double> degeneracy_lambda_abs_good{"degeneracy_lambda_abs_good", 20.0, 20.0};
-  // Every weight 0 or 1: the only setting that is also an exact constrained solve.
-  const ParameterSpec<bool> degeneracy_hard_projection{"degeneracy_hard_projection", false, false};
-  // Judge the Schur complement, so a direction rotation can explain away is not
-  // counted as observed. Changes what both thresholds mean — recalibrate with them.
-  const ParameterSpec<bool> degeneracy_schur_en{"degeneracy_schur_en", false, false};
+  // The normal-noise floor of the LiDAR position update (normal_noise_floor.hpp): off | observe | apply.
+  const ParameterSpec<std::string> degeneracy_floor_mode{"degeneracy_floor_mode", "off", std::string("off")};
+  // alpha: the rate at which a direction made only of floor is kept anyway, per direction and frame; in (0, 0.5).
+  const ParameterSpec<double> degeneracy_false_keep_rate{"degeneracy_false_keep_rate", 1e-3, 1e-3};
+  // kappa, the scale of the floor model (> 0), and sigma_rel, its relative uncertainty (>= 0).
+  const ParameterSpec<double> degeneracy_floor_model_scale{"degeneracy_floor_model_scale", 1.0, 1.0};
+  const ParameterSpec<double> degeneracy_floor_rel_uncertainty{"degeneracy_floor_rel_uncertainty", 0.3, 0.3};
+  // Regularisation of the Schur complement the floor judges, relative to trace(H_rr)/3.
   const ParameterSpec<double> degeneracy_schur_ridge{"degeneracy_schur_ridge", 1e-6, 1e-6};
   const ParameterSpec<bool> lidar_attitude_hold_en{"lidar_attitude_hold_en", false, false};
   const ParameterSpec<double> corr_innov_gate_k{"corr_innov_gate_k", 0.0, 0.0};

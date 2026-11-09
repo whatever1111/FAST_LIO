@@ -1526,4 +1526,72 @@ TEST(FrontendParameterContract, TwoInvalidLostRecoveryThenAnchor)
   checkCase(c);
 }
 
+// The normal-noise floor refuses at the entry what it cannot use: an unknown mode, a false-keep rate outside
+// (0, 0.5), a model scale that is not positive and a value that is not finite. The refusal names the parameter.
+void expectRefused(const std::string & record, const std::string & key)
+{
+  EXPECT_NE(record.find("\noutcome threw std::invalid_argument: \"" + key), std::string::npos) << record;
+  const std::vector<std::string> lines = splitLines(record);
+  EXPECT_TRUE(std::any_of(lines.begin(),
+                          lines.end(),
+                          [&key](const std::string & line) {
+                            return line.rfind("log FATAL ", 0) == 0 && line.find(key) != std::string::npos;
+                          }))
+    << record;
+}
+
+void checkRefused(const std::string & name, const std::string & key, const std::vector<rclcpp::Parameter> & overrides)
+{
+  ParameterCase c = overridesCase(name, Expect::kRejected);
+  for (const auto & parameter : overrides)
+    setOverride(c, parameter);
+  std::string record;
+  checkCase(c, &record);
+  expectRefused(record, key);
+}
+
+TEST(FrontendParameterContract, FloorModeUnknown)
+{
+  checkRefused("floor_mode_unknown",
+               "degeneracy_floor_mode",
+               {rclcpp::Parameter("degeneracy_floor_mode", std::string("weighting"))});
+}
+
+TEST(FrontendParameterContract, FloorFalseKeepRateOutOfRange)
+{
+  checkRefused("floor_false_keep_rate_out_of_range",
+               "degeneracy_false_keep_rate",
+               {rclcpp::Parameter("degeneracy_false_keep_rate", 0.5)});
+}
+
+TEST(FrontendParameterContract, FloorModelScaleZero)
+{
+  checkRefused(
+    "floor_model_scale_zero", "degeneracy_floor_model_scale", {rclcpp::Parameter("degeneracy_floor_model_scale", 0.0)});
+}
+
+TEST(FrontendParameterContract, NanFloorRelUncertainty)
+{
+  checkRefused("nan_floor_rel_uncertainty",
+               "degeneracy_floor_rel_uncertainty",
+               {rclcpp::Parameter("degeneracy_floor_rel_uncertainty", std::numeric_limits<double>::quiet_NaN())});
+}
+
+TEST(FrontendParameterContract, InfSchurRidge)
+{
+  checkRefused("inf_schur_ridge",
+               "degeneracy_schur_ridge",
+               {rclcpp::Parameter("degeneracy_schur_ridge", std::numeric_limits<double>::infinity())});
+}
+
+TEST(FrontendParameterContract, FloorModeObserve)
+{
+  ParameterCase c = overridesCase("floor_mode_observe", Expect::kConstructed);
+  setOverride(c, rclcpp::Parameter("degeneracy_floor_mode", std::string("observe")));
+  std::string record;
+  checkCase(c, &record);
+  EXPECT_NE(record.find("\nlog INFO laser_mapping \"[FLOOR] normal-noise floor observe: "), std::string::npos)
+    << record;
+}
+
 }  // namespace

@@ -10,14 +10,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <optional>
 #include <vector>
 
 #include "cached_plane.hpp"
-#include "degeneracy_policy.hpp"
 #include "frontend_params.hpp"
 #include "frontend_point_types.hpp"
 #include "ikfom_types.hpp"
 #include "map_backend_reference.hpp"
+#include "normal_noise_floor.hpp"
+#include "plane_fit.hpp"
 
 namespace fast_lio
 {
@@ -73,12 +75,13 @@ struct MeasurementTelemetry
   double pos_obs_eig_max = 0.0;
   double pos_obs_z_weak = 0.0;
   Eigen::Matrix3d pos_obs_M = Eigen::Matrix3d::Zero();  // M itself (world frame), for the [SCAN] trace
-  // Subspace weighting (FrontendParams::degeneracy_params is the policy): the verdict of the last evaluation that
-  // built rows and, over the node's life, the points it weighted and the sum of their weights, which a throttled log
-  // line cannot give: without these the dose is unmeasurable and so is any A/B.
-  fast_lio::DegeneracyResult degeneracy_last;
-  long degeneracy_point_weighted = 0;
-  double degeneracy_point_weight_sum = 0.0;
+  // The normal-noise floor (FrontendParams::degeneracy_floor_mode is the policy): on the current scan, the last
+  // evaluation's decision and how many evaluations ran it and were refused, for the [FLOOR] line; over the node's
+  // life, the rows of the evaluations whose projection changed them and the sum of the position information each of
+  // those rows kept (|G n| for its unit normal n), so the dose stays measurable.
+  fast_lio::FloorScanRecord floor;
+  long floor_rows_projected = 0;
+  double floor_kept_sum = 0.0;
   // The correspondence gate and robust kernel (FrontendParams::corr_gate and corr_kernel are the policy) on the last
   // evaluation: the matches the gate refused, and the scan's robust residual scale (1.4826 MAD).
   std::atomic<int> corr_gate_rejected{0};
@@ -121,6 +124,14 @@ struct MeasurementScratch
   // The neighbour set only moves on the iterations that search, so the 5x3 plane fit and the body-range scale in the
   // residual gate are invariant in between and are kept per point.
   std::vector<fast_lio::CachedPlane, Eigen::aligned_allocator<fast_lio::CachedPlane>> plane_cache;
+  // Per point, the scatter of the plane its row was accepted against (plane_cache's own eigen data, written with the
+  // selection; null for a ground-recovery row, whose normal is imposed rather than fitted). Per effective row, the
+  // same pointer, compacted with the rows while the floor is on, and the floor's inputs: the weight the row was
+  // scaled by and its normal's covariance.
+  std::vector<const fast_lio::PlaneFitEigen *> point_plane;
+  std::vector<const fast_lio::PlaneFitEigen *> corr_plane;
+  std::vector<double> floor_weights;
+  std::vector<std::optional<Eigen::Matrix3d>> floor_cov;
   // Neighbour refresh: the pose of the last search.
   V3D nn_last_search_pos = V3D::Zero();
   M3D nn_last_search_rot = M3D::Identity();
@@ -154,8 +165,8 @@ public:
   FrontendMeasurement(FrontendMeasurement &&) = delete;
   FrontendMeasurement & operator=(FrontendMeasurement &&) = delete;
 
-  /// A new scan: clears the scan's timings, search count and neighbour-refresh telemetry, and drops every cached
-  /// neighbour plane and the pose of the last search.
+  /// A new scan: clears the scan's timings, search count, neighbour-refresh telemetry and floor record, and drops
+  /// every cached neighbour plane and the pose of the last search.
   void beginScan();
   /// Sizes the per-point storage for a downsampled scan of count points and sets point_count to count. A count the
   /// evaluation's int-indexed loops cannot hold returns false and changes neither.

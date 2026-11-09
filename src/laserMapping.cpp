@@ -108,7 +108,6 @@
 #include "correspondence_compaction.hpp"
 #include "correspondence_gate.hpp"
 #include "covariance_reset.hpp"
-#include "degeneracy_policy.hpp"
 #include "engulf_release.hpp"
 #include "frontend_measurement.hpp"
 #include "frontend_observation.hpp"
@@ -120,6 +119,7 @@
 #include "map_backend_reference.hpp"
 #include "parked_hold.hpp"
 #include "preprocess.h"
+#include "normal_noise_floor.hpp"
 #include "prior_map_load.hpp"
 #include "reanchor_gate.hpp"
 #include "recovery_view_match.hpp"
@@ -201,10 +201,6 @@ double cube_len = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 
 int effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int iterCount = 0, feats_down_size = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool degeneracy_debug = false;  // verbose per-frame [DEGEN] diagnostics
-
-// Subspace weighting (FrontendParams::degeneracy_params is the policy; the measurement model's telemetry holds its
-// verdict and the points it weighted): scans whose final iteration held a direction back, out of scans updated.
-long degeneracy_scans_engaged = 0, degeneracy_scans_total = 0;
 
 // Front-end health side-channel (Plan C): per-scan along-motion observability and
 // quality metrics published on /Odometry twist.covariance for the PGO
@@ -3539,19 +3535,16 @@ public:
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("subscriptions");
 #endif
-    if (params_.values().degeneracy_params.enable) {
-      const fast_lio::DegeneracyParams & degeneracy = params_.values().degeneracy_params;
+    if (params_.values().degeneracy_floor_mode != fast_lio::FloorMode::kOff) {
+      const fast_lio::FloorParams & floor_params = params_.values().degeneracy_floor;
       RCLCPP_INFO(this->get_logger(),
-                  "Subspace weighting ON (%s): a position direction is held back only when its share is under %.3f "
-                  "(isotropic = 0.333, full trust at %.3f) AND its raw eigenvalue is under %.1f (full trust at %.1f); "
-                  "floor %.2f",
-                  degeneracy.schur_en ? (degeneracy.hard_projection ? "Schur, hard projection" : "Schur, graded")
-                                      : (degeneracy.hard_projection ? "H_tt, hard projection" : "H_tt, graded"),
-                  degeneracy.lambda_bad,
-                  degeneracy.lambda_good,
-                  degeneracy.lambda_abs_bad,
-                  degeneracy.lambda_abs_good,
-                  degeneracy.min_weight);
+                  "[FLOOR] normal-noise floor %s: false keep rate %g, model scale %g, relative uncertainty %g, "
+                  "Schur ridge %g",
+                  fast_lio::floorModeName(params_.values().degeneracy_floor_mode),
+                  floor_params.alpha,
+                  floor_params.kappa,
+                  floor_params.rel_uncertainty,
+                  params_.values().degeneracy_params.schur_ridge);
     }
     pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
     pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
@@ -4053,14 +4046,9 @@ private:
   {
     record.value("degeneracy_debug", degeneracy_debug);
     record.value("degeneracy_spectrum_trace", params_.values().degeneracy_spectrum_trace);
-    record.value("degeneracy_weighting_en", params_.values().degeneracy_params.enable);
-    record.value("degeneracy_lambda_bad", params_.values().degeneracy_params.lambda_bad);
-    record.value("degeneracy_lambda_good", params_.values().degeneracy_params.lambda_good);
-    record.value("degeneracy_min_weight", params_.values().degeneracy_params.min_weight);
-    record.value("degeneracy_lambda_abs_bad", params_.values().degeneracy_params.lambda_abs_bad);
-    record.value("degeneracy_lambda_abs_good", params_.values().degeneracy_params.lambda_abs_good);
-    record.value("degeneracy_hard_projection", params_.values().degeneracy_params.hard_projection);
-    record.value("degeneracy_schur_en", params_.values().degeneracy_params.schur_en);
+    record.value("degeneracy_false_keep_rate", params_.values().degeneracy_floor.alpha);
+    record.value("degeneracy_floor_model_scale", params_.values().degeneracy_floor.kappa);
+    record.value("degeneracy_floor_rel_uncertainty", params_.values().degeneracy_floor.rel_uncertainty);
     record.value("degeneracy_schur_ridge", params_.values().degeneracy_params.schur_ridge);
     record.value("lidar_attitude_hold_en", params_.values().attitude_hold.enabled);
     record.value("corr_innov_gate_k", params_.values().corr_gate.innovation_k);
@@ -5289,39 +5277,13 @@ private:
         fout_corr_scan.flush();
       }
 
-      // Held-back directions are otherwise invisible: the pose keeps coming out at the
-      // same rate and the scan keeps matching. Name the direction and what fills it,
-      // because nothing here does — the released axis rides on IMU propagation until a
-      // prior (planar-Z, ZUPT, wheel) supplies it.
-      if (p.degeneracy_params.enable) {
-        ++degeneracy_scans_total;
-      }
-      if (measured.degeneracy_last.engaged) {
-        ++degeneracy_scans_engaged;
-        const Eigen::Vector3d weak = measured.degeneracy_last.basis.col(0);
-        const double mean_w = measured.degeneracy_point_weighted > 0
-                                ? measured.degeneracy_point_weight_sum / double(measured.degeneracy_point_weighted)
-                                : 1.0;
-        RCLCPP_WARN_THROTTLE(this->get_logger(),
-                             *this->get_clock(),
-                             2000,
-                             "[SUBSPACE] LiDAR position held back: weakest dir [%.2f %.2f %.2f] share=%.3f lambda=%.1f "
-                             "weight=%.2f (effct=%d far_frac=%.2f); dose: %ld/%ld scans, mean point weight %.3f over "
-                             "%ld points; that axis is on IMU propagation, planar-Z %s ZUPT %s",
-                             weak.x(),
-                             weak.y(),
-                             weak.z(),
-                             measured.degeneracy_last.lambda_norm(0),
-                             measured.degeneracy_last.lambda_abs(0),
-                             measured.degeneracy_last.weights(0),
-                             effct_feat_num,
-                             scan_far_frac,
-                             degeneracy_scans_engaged,
-                             degeneracy_scans_total,
-                             mean_w,
-                             measured.degeneracy_point_weighted,
-                             p.planar_constraint_en ? "on" : "OFF",
-                             p.zupt_en ? "on" : "OFF");
+      // The floor's decision on this scan's last evaluation, every scan, unthrottled: a released direction is
+      // otherwise invisible (the pose keeps coming out and the scan keeps matching), and a replay has to follow each
+      // direction's information against its floor scan by scan.
+      if (p.degeneracy_floor_mode != fast_lio::FloorMode::kOff) {
+        RCLCPP_INFO(this->get_logger(),
+                    "%s",
+                    fast_lio::floorLine(lidar_end_time, p.degeneracy_floor_mode, measured.floor).c_str());
       }
 
       /*** Divergence guard (P1) — two independent divergence signals:

@@ -1,19 +1,23 @@
 // test_normal_noise_floor.cpp — the per-point normal covariance, the scan's floor, the keep
-// gains, the projection built from them and the residual shift that goes with it
+// gains, the projection built from them and the residual shift that goes with it, and the
+// lidar update's three modes with the per-scan record and log line they leave
 // (normal_noise_floor.hpp).
 
 #include <Eigen/Dense>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <gtest/gtest.h>
 #include <limits>
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "degeneracy_policy.hpp"
@@ -23,6 +27,7 @@
 using fast_lio::applyFloorProjection;
 using fast_lio::DirectionFloorAccumulator;
 using fast_lio::floorKeepGains;
+using fast_lio::FloorMode;
 using fast_lio::FloorParams;
 using fast_lio::FloorProjectionResult;
 using fast_lio::floorResidualShift;
@@ -642,4 +647,169 @@ TEST(FloorResidualShift, NonFiniteInputsGiveNoShift)
   short_covariances.pop_back();
   EXPECT_THROW(applyFloorProjection(rows.h_x, rows.h, rows.weights, short_covariances, FloorParams{}, kRidge),
                std::invalid_argument);
+}
+
+// --- the lidar update's modes (degeneracy_floor_mode), the scan's record and its [FLOOR] line ---------------------
+
+TEST(FloorMode, ParsesTheThreeNamesAndRefusesAnyOther)
+{
+  EXPECT_TRUE(fast_lio::floorModeFromName("off") == FloorMode::kOff);
+  EXPECT_TRUE(fast_lio::floorModeFromName("observe") == FloorMode::kObserve);
+  EXPECT_TRUE(fast_lio::floorModeFromName("apply") == FloorMode::kApply);
+  for (const char * name : {"", "Apply", "OFF", "on", "true", "apply "}) {
+    EXPECT_FALSE(fast_lio::floorModeFromName(name).has_value()) << '"' << name << '"';
+  }
+  for (const FloorMode mode : {FloorMode::kOff, FloorMode::kObserve, FloorMode::kApply}) {
+    EXPECT_TRUE(fast_lio::floorModeFromName(fast_lio::floorModeName(mode)) == mode);
+  }
+}
+
+TEST(FloorStep, OffComputesNothingAndLeavesTheRowsAndTheRecord)
+{
+  const Rows original = corridorRows(std::sqrt(0.5), 0.005);
+  Rows rows = original;
+  fast_lio::FloorScanRecord record;
+  fast_lio::floorStep(FloorMode::kOff, rows.h_x, rows.h, rows.weights, rows.covariances, FloorParams{}, kRidge, record);
+  EXPECT_TRUE(sameBits(rows.h_x, original.h_x));
+  EXPECT_TRUE(sameBits(rows.h, original.h));
+  EXPECT_EQ(record.evaluations, 0);
+  EXPECT_EQ(record.invalid_evaluations, 0);
+  EXPECT_FALSE(record.projected);
+  EXPECT_FALSE(record.last.valid);
+}
+
+TEST(FloorStep, ObserveReachesTheDecisionApplyActsOnAndLeavesTheRowsBitForBit)
+{
+  // F0's kappa observation: lambda, f and g of the evaluation, while the update runs on the rows as built. On the
+  // noisy corridor the same decision applied removes the axis (g = 0) and does change the rows.
+  const Rows original = corridorRows(std::sqrt(0.5), 0.005);
+  Rows observed = original;
+  Rows applied = original;
+  fast_lio::FloorScanRecord observe;
+  fast_lio::FloorScanRecord apply;
+  fast_lio::floorStep(FloorMode::kObserve,
+                      observed.h_x,
+                      observed.h,
+                      observed.weights,
+                      observed.covariances,
+                      FloorParams{},
+                      kRidge,
+                      observe);
+  fast_lio::floorStep(
+    FloorMode::kApply, applied.h_x, applied.h, applied.weights, applied.covariances, FloorParams{}, kRidge, apply);
+
+  EXPECT_TRUE(sameBits(observed.h_x, original.h_x));
+  EXPECT_TRUE(sameBits(observed.h, original.h));
+  EXPECT_FALSE(sameBits(applied.h_x, original.h_x));
+  ASSERT_TRUE(observe.last.valid);
+  ASSERT_TRUE(apply.last.valid);
+  EXPECT_FALSE(observe.projected);
+  EXPECT_TRUE(apply.projected);
+  EXPECT_EQ(observe.last.shift, Eigen::Vector3d::Zero());
+  EXPECT_EQ(observe.last.gains(0), 0.0);
+  EXPECT_EQ(observe.last.points, apply.last.points);
+  EXPECT_EQ(observe.last.points_without_covariance, apply.last.points_without_covariance);
+  for (int k = 0; k < 3; ++k) {
+    EXPECT_NEAR(observe.last.lambda(k), apply.last.lambda(k), 1e-12 * apply.last.lambda.maxCoeff()) << k;
+    EXPECT_NEAR(observe.last.noise_floor(k), apply.last.noise_floor(k), 1e-12 * apply.last.noise_floor.maxCoeff()) << k;
+    EXPECT_NEAR(observe.last.gains(k), apply.last.gains(k), 1e-12) << k;
+    EXPECT_NEAR(std::abs(observe.last.eigenvectors.col(k).dot(apply.last.eigenvectors.col(k))), 1.0, 1e-12) << k;
+  }
+  EXPECT_EQ(observe.evaluations, 1);
+  EXPECT_EQ(observe.invalid_evaluations, 0);
+}
+
+TEST(FloorStep, ARefusedEvaluationIsCountedAndLeavesTheRows)
+{
+  // valid false (here a non-finite residual) leaves the rows as built in either mode, and the scan's record counts
+  // the refusal among its evaluations; the next good evaluation becomes the scan's last decision.
+  const Rows original = corridorRows(std::sqrt(0.5), 0.005);
+  for (const FloorMode mode : {FloorMode::kObserve, FloorMode::kApply}) {
+    Rows bad = original;
+    bad.h(3) = kNaN;
+    const Rows bad_before = bad;
+    fast_lio::FloorScanRecord record;
+    fast_lio::floorStep(mode, bad.h_x, bad.h, bad.weights, bad.covariances, FloorParams{}, kRidge, record);
+    EXPECT_TRUE(sameBits(bad.h_x, bad_before.h_x));
+    EXPECT_TRUE(sameBits(bad.h, bad_before.h));
+    EXPECT_FALSE(record.last.valid);
+    EXPECT_FALSE(record.projected);
+    EXPECT_EQ(record.evaluations, 1);
+    EXPECT_EQ(record.invalid_evaluations, 1);
+
+    Rows good = original;
+    fast_lio::floorStep(mode, good.h_x, good.h, good.weights, good.covariances, FloorParams{}, kRidge, record);
+    EXPECT_TRUE(record.last.valid);
+    EXPECT_EQ(record.evaluations, 2);
+    EXPECT_EQ(record.invalid_evaluations, 1);
+    EXPECT_EQ(record.projected, mode == FloorMode::kApply);
+  }
+}
+
+TEST(FloorStep, ApplyWithoutFloorIsNotAProjection)
+{
+  // Every gain exactly one: apply hands the update its rows bit for bit and the evaluation is not a projected one.
+  const Rows original = corridorRows(std::sqrt(0.5), 0.005, false);
+  Rows rows = original;
+  fast_lio::FloorScanRecord record;
+  fast_lio::floorStep(
+    FloorMode::kApply, rows.h_x, rows.h, rows.weights, rows.covariances, FloorParams{}, kRidge, record);
+  ASSERT_TRUE(record.last.valid);
+  EXPECT_FALSE(record.projected);
+  EXPECT_TRUE(sameBits(rows.h_x, original.h_x));
+  EXPECT_TRUE(sameBits(rows.h, original.h));
+}
+
+TEST(FloorLine, CarriesTheDecisionAndTheScansCountsInItsFormat)
+{
+  // The [FLOOR] line the replay reader parses: the fixed fields in order, every number read back to its 9 digits,
+  // and the shift's length and coordinates only in apply mode.
+  const Rows original = corridorRows(std::sqrt(0.5), 0.005);
+  Rows rows = original;
+  rows.covariances[7] = std::nullopt;
+  fast_lio::FloorScanRecord record;
+  fast_lio::floorStep(
+    FloorMode::kApply, rows.h_x, rows.h, rows.weights, rows.covariances, FloorParams{}, kRidge, record);
+  ASSERT_TRUE(record.projected);
+  const std::string line = fast_lio::floorLine(1234.5, FloorMode::kApply, record);
+  const std::string head = "[FLOOR] t=1234.500000 mode=apply valid=1 points=" + std::to_string(original.h.size()) +
+                           " points_without_covariance=1 iterations=1 invalid_iterations=0 lambda=[";
+  ASSERT_EQ(line.rfind(head, 0), 0u) << line;
+  const std::size_t numbers = line.find(" lambda=[");
+  ASSERT_NE(numbers, std::string::npos) << line;
+  double lambda[3], noise[3], gains[3], shift = 0.0, coef[3];
+  ASSERT_EQ(std::sscanf(line.c_str() + numbers,
+                        " lambda=[%lf %lf %lf] f=[%lf %lf %lf] g=[%lf %lf %lf] d=%lf coef=[%lf %lf %lf]",
+                        &lambda[0],
+                        &lambda[1],
+                        &lambda[2],
+                        &noise[0],
+                        &noise[1],
+                        &noise[2],
+                        &gains[0],
+                        &gains[1],
+                        &gains[2],
+                        &shift,
+                        &coef[0],
+                        &coef[1],
+                        &coef[2]),
+            13)
+    << line;
+  const auto matches = [](double printed, double value) {
+    return std::abs(printed - value) <= 1e-8 * std::max(1.0, std::abs(value));
+  };
+  const Eigen::Vector3d expected_coef = record.last.eigenvectors.transpose() * record.last.shift;
+  for (int k = 0; k < 3; ++k) {
+    EXPECT_TRUE(matches(lambda[k], record.last.lambda(k))) << k << ' ' << line;
+    EXPECT_TRUE(matches(noise[k], record.last.noise_floor(k))) << k << ' ' << line;
+    EXPECT_TRUE(matches(gains[k], record.last.gains(k))) << k << ' ' << line;
+    EXPECT_TRUE(matches(coef[k], expected_coef(k))) << k << ' ' << line;
+  }
+  EXPECT_TRUE(matches(shift, record.last.shift.norm())) << line;
+  EXPECT_GT(shift, 0.0);
+
+  const std::string observed = fast_lio::floorLine(1234.5, FloorMode::kObserve, record);
+  EXPECT_EQ(observed.rfind("[FLOOR] t=1234.500000 mode=observe valid=1 ", 0), 0u) << observed;
+  EXPECT_EQ(observed.find(" d="), std::string::npos) << observed;
+  EXPECT_EQ(observed.find(" coef="), std::string::npos) << observed;
 }

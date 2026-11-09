@@ -1277,18 +1277,17 @@ Scenario groundScenario()
   return s;
 }
 
-// The subspace weighting (degeneracy_weighting_en) on the corridor, judged on the Schur complement over the rotation
-// columns, with the residual histogram and the spectrum trace on: the vertical gets no weight, the direction along the
-// corridor, seen only by the end patch, a partial one, and every row a weight from its normal.
+// The normal-noise floor applied (degeneracy_floor_mode apply) on the corridor, with the residual histogram and the
+// spectrum trace on: nothing faces up, so the vertical information of the walls' rows is what their noisy normals
+// fake, and the floor projects it out of the position columns with the matching residual shift.
 Scenario degeneracyScenario()
 {
   Scenario s = measurementScenario("h_degeneracy", Cloud::kCorridor);
-  setParam(s, rclcpp::Parameter("degeneracy_weighting_en", true));
-  setParam(s, rclcpp::Parameter("degeneracy_schur_en", true));
+  setParam(s, rclcpp::Parameter("degeneracy_floor_mode", std::string("apply")));
   setParam(s, rclcpp::Parameter("degeneracy_debug", true));
   setParam(s, rclcpp::Parameter("degeneracy_spectrum_trace", true));
   append(s, 8, sceneSlot(Cloud::kCorridor));
-  s.claims = {"h_degeneracy_weighted"};
+  s.claims = {"h_floor_projected"};
   return s;
 }
 
@@ -1338,24 +1337,17 @@ Scenario dumpScenario()
 }
 
 // The H-model keys of config/profiles/m20 (three iterations, the refresh gate, the correspondence gate, the
-// degeneracy thresholds with the weighting off, roll/pitch considered after a scan with little roll/pitch information,
-// extrinsic estimation off) on parked and turning room scans; the fixture's plane, matched once it is in the map,
-// leaves too little roll/pitch information for the next scan.
+// normal-noise floor off, roll/pitch considered after a scan with little roll/pitch information, extrinsic estimation
+// off) on parked and turning room scans; the fixture's plane, matched once it is in the map, leaves too little
+// roll/pitch information for the next scan.
 Scenario m20Scenario()
 {
   Scenario s = measurementScenario("h_m20", Cloud::kRoom);
   for (const auto & p : {rclcpp::Parameter("max_iteration", 3),
                          rclcpp::Parameter("nn_refresh_gate_en", true),
                          rclcpp::Parameter("nn_refresh_min_shift", 0.05),
-                         rclcpp::Parameter("degeneracy_lambda_bad", 0.05),
-                         rclcpp::Parameter("degeneracy_lambda_good", 0.30),
-                         rclcpp::Parameter("degeneracy_lambda_abs_bad", 6.0),
-                         rclcpp::Parameter("degeneracy_lambda_abs_good", 30.0),
-                         rclcpp::Parameter("degeneracy_schur_en", true),
                          rclcpp::Parameter("degeneracy_schur_ridge", 1.0e-6),
-                         rclcpp::Parameter("degeneracy_hard_projection", true),
-                         rclcpp::Parameter("degeneracy_min_weight", 0.0),
-                         rclcpp::Parameter("degeneracy_weighting_en", false),
+                         rclcpp::Parameter("degeneracy_floor_mode", std::string("off")),
                          rclcpp::Parameter("corr_innov_gate_k", 2.5),
                          rclcpp::Parameter("corr_gate_mad_scale", 1.0),
                          rclcpp::Parameter("corr_gate_rot_sigma_floor_deg", 0.3),
@@ -1473,10 +1465,11 @@ constexpr Branch kBranches[] = {
    "H-model calls that kept the cached planes because the filter asked for no search (an unconverged iteration)",
    "test_cached_plane CachedPlane.*"},
   {"h_ground_rows", "H-model calls to which the ground recovery added rows (ground_recover_en)", ""},
-  {"h_degeneracy_weighted",
-   "H-model calls with rows whose subspace weighting scaled at least one of them (degeneracy_weighting_en)",
-   "test_degeneracy_policy DegeneracyPolicy.*; test_degeneracy_policy DegeneracyWeight.*; "
-   "test_degeneracy_policy SchurComplement.*"},
+  {"h_floor_projected",
+   "H-model calls with rows the normal-noise floor projected: apply, a valid decision, a keep gain below one "
+   "(degeneracy_floor_mode)",
+   "test_normal_noise_floor; test_degeneracy_policy SchurComplement.*; "
+   "test_rp_consider_filter FloorProjection*"},
   {"h_hold_rows",
    "H-model calls with rows whose rotation rows the attitude hold's scene rule restricted to yaw",
    "test_attitude_hold AttitudeHold.*"},
@@ -1745,10 +1738,9 @@ private:
     fast_lio_test::afterHModelExit = [this](const fast_lio_test::HModelExit & e) {
       if (!note("afterHModelExit", formatExit(e)))
         return;
-      // The weighted-row count runs since construction: a call weighted rows when it rose.
-      if (e.valid && e.degeneracy_engaged && e.degeneracy_weighted_points > degeneracy_weighted_seen_)
-        ++counts_["h_degeneracy_weighted"];
-      degeneracy_weighted_seen_ = e.degeneracy_weighted_points;
+      // The floor's decision of the call itself: every call with rows runs the floor while it is on.
+      if (e.valid && e.degeneracy_engaged)
+        ++counts_["h_floor_projected"];
       if (e.valid && e.hold_rows && e.hold_scene)
         ++counts_["h_hold_rows"];
       if (e.valid && e.hold_rows && e.hold_info && !e.hold_scene)
@@ -2455,7 +2447,6 @@ private:
   std::vector<std::string> stream_;
   std::map<std::string, std::uint64_t> counts_;
   std::map<std::int64_t, int> h_max_effective_;  // by scan end: the most effective points of an H-model iteration
-  long degeneracy_weighted_seen_ = 0;            // the subspace weighting's weighted-row count at the last H exit
   std::string dump_dir_;                         // the correspondence dump's directory (dump scenario only)
   std::string counters_line_;
   bool throw_next_imu_process_ = false;
@@ -2924,7 +2915,7 @@ TEST(FrontendPipelineContract, MeasurementGroundRecovery)
   checkScenario(groundScenario());
 }
 
-TEST(FrontendPipelineContract, MeasurementDegeneracyWeighting)
+TEST(FrontendPipelineContract, MeasurementNoiseFloorApplied)
 {
   checkScenario(degeneracyScenario());
 }

@@ -116,12 +116,14 @@ struct HModelExit
   bool hold_info = false;           ///< the information rule has held the attitude on this scan
   double rp_info_min = 0.0;         ///< roll/pitch information of the rows
   bool rp_consider = false;         ///< the scan's update leaves roll/pitch to the gyro (lidar_consider_rp_en)
-  bool degeneracy_engaged = false;  ///< the subspace weighting held back a position direction
-  double degeneracy_shares[3] = {0.0, 0.0, 0.0};   ///< its eigenvalue shares, ascending
-  double degeneracy_lambdas[3] = {0.0, 0.0, 0.0};  ///< its raw eigenvalues
-  double degeneracy_weights[3] = {0.0, 0.0, 0.0};  ///< its weight per direction
-  long degeneracy_weighted_points = 0;             ///< rows the weighting scaled since construction
-  double degeneracy_weight_sum = 0.0;              ///< the sum of their weights
+  // The normal-noise floor's decision of the scan's last evaluation that ran it; neutral (1, 0, 1, 0, 0) while the
+  // floor is off.
+  bool degeneracy_engaged = false;                 ///< the floor's projection changed this call's rows
+  double degeneracy_shares[3] = {0.0, 0.0, 0.0};   ///< M_eff's eigenvalues over the rows, ascending (1 undecided)
+  double degeneracy_lambdas[3] = {0.0, 0.0, 0.0};  ///< M_eff's eigenvalues
+  double degeneracy_weights[3] = {0.0, 0.0, 0.0};  ///< the keep gain per direction
+  long degeneracy_weighted_points = 0;             ///< rows the floor projected since construction
+  double degeneracy_weight_sum = 0.0;              ///< the sum of what each of them kept, |G n|
   bool dump_written = false;                       ///< this call appended to the correspondence dump
 };
 /// Every H-model call right after afterHModelRows.

@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/type_integer_for_bool
-# fork_sha: 4ccd5350a822c9e7bef5e5b601f21e6202ae9413
+# fork_sha: 7603d5f6aaaa005a8624b8b8cd13da50591905bf
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -10,5 +10,5 @@ override feature_extract_enable type=integer value=1
 override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
 override mapping.extrinsic_T type=double_array value=[0,0,0]
 outcome threw rclcpp::exceptions::InvalidParameterTypeException: "parameter 'feature_extract_enable' has invalid type: Wrong parameter type, parameter {feature_extract_enable} is of type {bool}, setting it to {integer} is not allowed."
-event.v1 declare_front declared=153 names_sha256=7a09cb33feca00eb2edf82716ef8205fec69556808f3a181484b8e6c8d30aa7c
-event.v1 typed_outputs declared=157 names_sha256=8aec833e61c10385d01066c2547302af0479a5abb8c51d8fce357b497f04e0f0
+event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
+event.v1 typed_outputs declared=153 names_sha256=2ea6b8f17ef100433f2047577867e9f0985d22eefd59b7b0df0f2ac6604a3aa9

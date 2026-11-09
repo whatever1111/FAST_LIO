@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/prior_map_unknown_alignment
-# fork_sha: 4ccd5350a822c9e7bef5e5b601f21e6202ae9413
+# fork_sha: 7603d5f6aaaa005a8624b8b8cd13da50591905bf
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -11,34 +11,34 @@ override mapping.extrinsic_T type=double_array value=[0,0,0]
 override prior_map_align type=string value="sideways"
 override prior_map_pcd type=string value="/nonexistent/fastlio_contract/prior.pcd"
 outcome constructed
-event.v1 declare_front declared=153 names_sha256=7a09cb33feca00eb2edf82716ef8205fec69556808f3a181484b8e6c8d30aa7c
-event.v1 typed_outputs declared=157 names_sha256=8aec833e61c10385d01066c2547302af0479a5abb8c51d8fce357b497f04e0f0
-event.v1 declare_back declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
-event.v1 lost_recovery_loaded declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
-event.v1 read_policies declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
+event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
+event.v1 typed_outputs declared=153 names_sha256=2ea6b8f17ef100433f2047577867e9f0985d22eefd59b7b0df0f2ac6604a3aa9
+event.v1 declare_back declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
+event.v1 lost_recovery_loaded declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
+event.v1 read_policies declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
 log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
-event.v1 anchor_gap_resolved declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
+event.v1 anchor_gap_resolved declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
 log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
-event.v1 map_backend declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
+event.v1 map_backend declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
 log ERROR laser_mapping "prior_map_align='sideways' is not a known value (as_delivered | relocalization) - loading the map as delivered"
 log INFO laser_mapping "p_pre->lidar_type 1"
-event.v1 read_inputs declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
-event.v1 filter_init declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
+event.v1 read_inputs declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
+event.v1 filter_init declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
 log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
 log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
-event.v1 subscriptions declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
-event.v1 cloud_publishers declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
-event.v1 odometry_publishers declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
-event.v1 scan_timer declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
-event.v1 map_timer declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
+event.v1 subscriptions declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
+event.v1 cloud_publishers declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
+event.v1 odometry_publishers declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
+event.v1 scan_timer declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
+event.v1 map_timer declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
-event.v1 config_id declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
+event.v1 config_id declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
 log INFO laser_mapping "Node init finished."
-event.v1 constructed declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
-parameters 244
+event.v1 constructed declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
+parameters 246
 param prior_map_align type=string value="sideways" read_only=0 descriptor_type=4
 param prior_map_pcd type=string value="/nonexistent/fastlio_contract/prior.pcd" read_only=0 descriptor_type=4
-effective.v1.count 309
+effective.v1.count 312
 effective.v1 derived:prior_startup:recovery_state.cold_start_eligible bool 0
 effective.v1 prior_map_align string[8] "sideways"
 effective.v1 prior_map_pcd string[39] "/nonexistent/fastlio_contract/prior.pcd"

@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/defaults
-# fork_sha: 4ccd5350a822c9e7bef5e5b601f21e6202ae9413
+# fork_sha: 7603d5f6aaaa005a8624b8b8cd13da50591905bf
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -9,30 +9,30 @@ overrides 2
 override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
 override mapping.extrinsic_T type=double_array value=[0,0,0]
 outcome constructed
-event.v1 declare_front declared=153 names_sha256=7a09cb33feca00eb2edf82716ef8205fec69556808f3a181484b8e6c8d30aa7c
-event.v1 typed_outputs declared=157 names_sha256=8aec833e61c10385d01066c2547302af0479a5abb8c51d8fce357b497f04e0f0
-event.v1 declare_back declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
-event.v1 lost_recovery_loaded declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
-event.v1 read_policies declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
+event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
+event.v1 typed_outputs declared=153 names_sha256=2ea6b8f17ef100433f2047577867e9f0985d22eefd59b7b0df0f2ac6604a3aa9
+event.v1 declare_back declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
+event.v1 lost_recovery_loaded declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
+event.v1 read_policies declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
 log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
-event.v1 anchor_gap_resolved declared=236 names_sha256=3dd8f50ef18c39d702edb9a1df50729147e054bd4aad8a977c3d849a387a3033
+event.v1 anchor_gap_resolved declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
 log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
-event.v1 map_backend declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
+event.v1 map_backend declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
 log INFO laser_mapping "p_pre->lidar_type 1"
-event.v1 read_inputs declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
-event.v1 filter_init declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
+event.v1 read_inputs declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
+event.v1 filter_init declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
 log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
 log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
-event.v1 subscriptions declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
-event.v1 cloud_publishers declared=240 names_sha256=7dae6ea3117dd0ad8bc071a712ecec9b70f67f1ddb928579de7701bbb5ea5a70
-event.v1 odometry_publishers declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
-event.v1 scan_timer declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
-event.v1 map_timer declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
+event.v1 subscriptions declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
+event.v1 cloud_publishers declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
+event.v1 odometry_publishers declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
+event.v1 scan_timer declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
+event.v1 map_timer declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
-event.v1 config_id declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
+event.v1 config_id declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
 log INFO laser_mapping "Node init finished."
-event.v1 constructed declared=244 names_sha256=ccda8bc4f9ba4d8dbf1b5d82765ce697b1886d2b88ad17e96f3c283f76fcfde3
-parameters 244
+event.v1 constructed declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
+parameters 246
 param adaptive_downsample_budget_sec type=double value=0.059999999999999998 read_only=0 descriptor_type=3
 param adaptive_downsample_en type=bool value=false read_only=0 descriptor_type=1
 param adaptive_downsample_lower_after type=integer value=100 read_only=0 descriptor_type=2
@@ -62,16 +62,12 @@ param corr_nn0_max type=double value=0 read_only=0 descriptor_type=3
 param cube_side_length type=double value=200 read_only=0 descriptor_type=3
 param data_dir type=string value="" read_only=0 descriptor_type=4
 param degeneracy_debug type=bool value=false read_only=0 descriptor_type=1
-param degeneracy_hard_projection type=bool value=false read_only=0 descriptor_type=1
-param degeneracy_lambda_abs_bad type=double value=2 read_only=0 descriptor_type=3
-param degeneracy_lambda_abs_good type=double value=20 read_only=0 descriptor_type=3
-param degeneracy_lambda_bad type=double value=0.02 read_only=0 descriptor_type=3
-param degeneracy_lambda_good type=double value=0.10000000000000001 read_only=0 descriptor_type=3
-param degeneracy_min_weight type=double value=0 read_only=0 descriptor_type=3
-param degeneracy_schur_en type=bool value=false read_only=0 descriptor_type=1
+param degeneracy_false_keep_rate type=double value=0.001 read_only=0 descriptor_type=3
+param degeneracy_floor_mode type=string value="off" read_only=0 descriptor_type=4
+param degeneracy_floor_model_scale type=double value=1 read_only=0 descriptor_type=3
+param degeneracy_floor_rel_uncertainty type=double value=0.29999999999999999 read_only=0 descriptor_type=3
 param degeneracy_schur_ridge type=double value=9.9999999999999995e-07 read_only=0 descriptor_type=3
 param degeneracy_spectrum_trace type=bool value=false read_only=0 descriptor_type=1
-param degeneracy_weighting_en type=bool value=false read_only=0 descriptor_type=1
 param diagnostics.kalman_channel_enable type=bool value=false read_only=0 descriptor_type=1
 param diagnostics.latency_enable type=bool value=true read_only=0 descriptor_type=1
 param diagnostics.latency_log_period_sec type=double value=1 read_only=0 descriptor_type=3
@@ -254,8 +250,14 @@ param runaway_watchdog_en type=bool value=true read_only=0 descriptor_type=1
 param runaway_wheel_speed_margin type=double value=1 read_only=0 descriptor_type=3
 param runtime_pos_log_enable type=bool value=false read_only=0 descriptor_type=1
 param use_sim_time type=bool value=false read_only=0 descriptor_type=1
+param wheel_cov_topic type=string value="" read_only=0 descriptor_type=4
 param wheel_extrinsic_R type=double_array value=[] read_only=0 descriptor_type=8
+param wheel_lever_arm type=double_array value=[0,0,0] read_only=0 descriptor_type=8
+param wheel_lever_sigma type=double value=0 read_only=0 descriptor_type=3
 param wheel_odom_en type=bool value=false read_only=0 descriptor_type=1
+param wheel_slip_fx_window_s type=double value=1 read_only=0 descriptor_type=3
+param wheel_slip_k type=double value=0 read_only=0 descriptor_type=3
+param wheel_slip_phi0 type=double value=0 read_only=0 descriptor_type=3
 param wheel_speed_scale type=double value=1 read_only=0 descriptor_type=3
 param wheel_topic type=string value="/lio/twist" read_only=0 descriptor_type=4
 param wheel_vel_noise_vx type=double value=0.10000000000000001 read_only=0 descriptor_type=3
@@ -285,7 +287,7 @@ set filter_size_map type=string value="0.4" -> rejected "Wrong parameter type, p
 after_set filter_size_map type=double value=0.40000000000000002
 set frontend_contract.undeclared type=integer value=1 -> rejected "parameter 'frontend_contract.undeclared' cannot be set because it was not declared"
 after_set frontend_contract.undeclared undeclared
-effective.v1.count 309
+effective.v1.count 312
 effective.v1 adaptive_downsample_budget_sec float64 0x3faeb851eb851eb8
 effective.v1 adaptive_downsample_en bool 0
 effective.v1 adaptive_downsample_lower_after int32 100
@@ -315,16 +317,12 @@ effective.v1 corr_nn0_max float64 0x0000000000000000
 effective.v1 cube_side_length float64 0x4069000000000000
 effective.v1 data_dir string[0] ""
 effective.v1 degeneracy_debug bool 0
-effective.v1 degeneracy_hard_projection bool 0
-effective.v1 degeneracy_lambda_abs_bad float64 0x4000000000000000
-effective.v1 degeneracy_lambda_abs_good float64 0x4034000000000000
-effective.v1 degeneracy_lambda_bad float64 0x3f947ae147ae147b
-effective.v1 degeneracy_lambda_good float64 0x3fb999999999999a
-effective.v1 degeneracy_min_weight float64 0x0000000000000000
-effective.v1 degeneracy_schur_en bool 0
+effective.v1 degeneracy_false_keep_rate float64 0x3f50624dd2f1a9fc
+effective.v1 degeneracy_floor_mode string[3] "off"
+effective.v1 degeneracy_floor_model_scale float64 0x3ff0000000000000
+effective.v1 degeneracy_floor_rel_uncertainty float64 0x3fd3333333333333
 effective.v1 degeneracy_schur_ridge float64 0x3eb0c6f7a0b5ed8d
 effective.v1 degeneracy_spectrum_trace bool 0
-effective.v1 degeneracy_weighting_en bool 0
 effective.v1 derived:anchor_gap:stationary_anchor_params.max_scan_gap_ns int64 300000000
 effective.v1 derived:config_id:reference_config_id bytes[32] 0000000000000000000000000000000000000000000000000000000000000000
 effective.v1 derived:config_id:reference_contract_id bytes[32] 0000000000000000000000000000000000000000000000000000000000000000
@@ -367,6 +365,7 @@ effective.v1 derived:ivox:ikdtree.nbr_ int32[27x3] [0,0,0,1,0,0,-1,0,0,0,1,0,0,-
 effective.v1 derived:ivox:ikdtree.per_voxel_cap_ int32 50
 effective.v1 derived:ivox:ikdtree.res_ float32 0x3f000000
 effective.v1 derived:lever_arm:gravity_align_leg_lever_arm float64[3x1] [0x0000000000000000,0x0000000000000000,0x0000000000000000]
+effective.v1 derived:lever_arm:wheel_lever_arm float64[3x1] [0x0000000000000000,0x0000000000000000,0x0000000000000000]
 effective.v1 derived:lost_recovery:lost_recovery_params.enabled bool 0
 effective.v1 derived:lost_recovery:lost_recovery_params.stable_ns int64 2000000000
 effective.v1 derived:map_timer:map_pub_timer_.period_ns int64 5000000000
@@ -572,8 +571,14 @@ effective.v1 runaway_parked_speed_thresh float64 0x3fd3333333333333
 effective.v1 runaway_watchdog_en bool 1
 effective.v1 runaway_wheel_speed_margin float64 0x3ff0000000000000
 effective.v1 runtime_pos_log_enable bool 0
+effective.v1 wheel_cov_topic string[0] ""
 effective.v1 wheel_extrinsic_R float64[0] []
+effective.v1 wheel_lever_arm float64[3] [0x0000000000000000,0x0000000000000000,0x0000000000000000]
+effective.v1 wheel_lever_sigma float64 0x0000000000000000
 effective.v1 wheel_odom_en bool 0
+effective.v1 wheel_slip_fx_window_s float64 0x3ff0000000000000
+effective.v1 wheel_slip_k float64 0x0000000000000000
+effective.v1 wheel_slip_phi0 float64 0x0000000000000000
 effective.v1 wheel_speed_scale float64 0x3ff0000000000000
 effective.v1 wheel_topic string[10] "/lio/twist"
 effective.v1 wheel_vel_noise_vx float64 0x3fb999999999999a

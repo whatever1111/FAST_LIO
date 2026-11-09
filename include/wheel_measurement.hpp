@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <Eigen/Cholesky>
 #include <Eigen/Core>
 #include <Eigen/Geometry>  // cross()
 
@@ -37,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -55,6 +57,146 @@ constexpr int kWheelStateDim = 23;
 constexpr int kWheelRotIndex = 3;
 constexpr int kWheelVelIndex = 12;
 constexpr int kWheelGyroBiasIndex = 15;
+
+enum class WheelAngularStatus
+{
+  kValid,
+  kNoImu,
+  kEndpointUnavailable,
+  kInvalidTime,
+  kInvalidRate,
+  kInvalidCovariance,
+  kNonFiniteEndpoint
+};
+
+inline const char * wheelAngularStatusName(WheelAngularStatus status)
+{
+  switch (status) {
+    case WheelAngularStatus::kValid:
+      return "valid";
+    case WheelAngularStatus::kNoImu:
+      return "no_imu";
+    case WheelAngularStatus::kEndpointUnavailable:
+      return "endpoint_unavailable";
+    case WheelAngularStatus::kInvalidTime:
+      return "invalid_imu_time";
+    case WheelAngularStatus::kInvalidRate:
+      return "invalid_gyro";
+    case WheelAngularStatus::kInvalidCovariance:
+      return "invalid_gyro_covariance";
+    case WheelAngularStatus::kNonFiniteEndpoint:
+      return "nonfinite_angular_endpoint";
+  }
+  return "invalid";
+}
+
+struct WheelAngularSample
+{
+  double t = 0.0;                                 ///< seconds
+  Eigen::Vector3d raw = Eigen::Vector3d::Zero();  ///< rad/s, bias included
+};
+
+struct WheelAngularEndpoint
+{
+  WheelAngularStatus status = WheelAngularStatus::kNoImu;
+  Eigen::Vector3d raw = Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
+  Eigen::Matrix3d covariance = Eigen::Matrix3d::Constant(std::numeric_limits<double>::quiet_NaN());
+  double t0 = std::numeric_limits<double>::quiet_NaN();
+  double t1 = std::numeric_limits<double>::quiet_NaN();
+  Eigen::Vector2d weights = Eigen::Vector2d::Constant(std::numeric_limits<double>::quiet_NaN());
+};
+
+/// Endpoint of a locally affine raw rate, using only this scan's samples. gyro_variance is cov_gyr's
+/// diagonal in (rad/s)^2, shared by the independent samples. Equal timestamps use the last raw sample.
+inline WheelAngularEndpoint
+angularRateAtEnd(const std::vector<WheelAngularSample> & samples, double t_end, const Eigen::Vector3d & gyro_variance)
+{
+  WheelAngularEndpoint out;
+  if (samples.empty()) {
+    return out;
+  }
+  out.status = WheelAngularStatus::kInvalidTime;
+  if (!std::isfinite(t_end)) {
+    return out;
+  }
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    if (!std::isfinite(samples[i].t) || (i > 0 && samples[i].t < samples[i - 1].t)) {
+      return out;
+    }
+    if (!samples[i].raw.allFinite()) {
+      out.status = WheelAngularStatus::kInvalidRate;
+      return out;
+    }
+  }
+  if (!gyro_variance.allFinite() || (gyro_variance.array() < 0.0).any()) {
+    out.status = WheelAngularStatus::kInvalidCovariance;
+    return out;
+  }
+  std::size_t tail = samples.size();
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    if (samples[i].t <= t_end) {
+      tail = i;
+    }
+  }
+  out.status = WheelAngularStatus::kEndpointUnavailable;
+  if (tail == samples.size()) {
+    return out;  // no sample on the earlier side, so no backward extrapolation
+  }
+  if (samples[tail].t == t_end) {
+    out.raw = samples[tail].raw;
+    out.t0 = out.t1 = t_end;
+    out.weights = Eigen::Vector2d(0.0, 1.0);
+    out.covariance = gyro_variance.asDiagonal();
+  } else {
+    std::size_t first = tail;
+    std::size_t second = tail + 1;
+    if (second == samples.size()) {
+      while (first > 0 && samples[first - 1].t == samples[tail].t) {
+        --first;
+      }
+      if (first == 0) {
+        return out;
+      }
+      --first;
+      second = tail;
+    }
+    out.t0 = samples[first].t;
+    out.t1 = samples[second].t;
+    const double span = out.t1 - out.t0;
+    if (!std::isfinite(span) || !(span > 0.0)) {
+      out.status = WheelAngularStatus::kNonFiniteEndpoint;
+      return out;
+    }
+    const double beta = (t_end - out.t0) / span;
+    out.weights = Eigen::Vector2d(1.0 - beta, beta);
+    out.raw = out.weights(0) * samples[first].raw + out.weights(1) * samples[second].raw;
+    out.covariance = (out.weights.squaredNorm() * gyro_variance).asDiagonal();
+  }
+  if (!out.raw.allFinite() || !out.weights.allFinite() || !out.covariance.allFinite()) {
+    out.status = WheelAngularStatus::kNonFiniteEndpoint;
+    return out;
+  }
+  out.status = WheelAngularStatus::kValid;
+  return out;
+}
+
+/// Pure structural conversion of the current MeasureGroup's IMU messages, without a ROS dependency.
+/// The node and its timestamped-input contract test use this same conversion.
+template<typename ImuSamples>
+WheelAngularEndpoint
+angularEndpointFromImu(const ImuSamples & imu_samples, double t_end, const Eigen::Vector3d & gyro_variance)
+{
+  std::vector<WheelAngularSample> samples;
+  samples.reserve(imu_samples.size());
+  for (const auto & imu : imu_samples) {
+    const auto & stamp = imu->header.stamp;
+    const auto & rate = imu->angular_velocity;
+    const std::int64_t stamp_ns = static_cast<std::int64_t>(stamp.sec) * 1000000000LL + stamp.nanosec;
+    const double t = static_cast<double>(stamp_ns) / 1e9;  // rclcpp::Time::seconds()
+    samples.push_back({t, Eigen::Vector3d(rate.x, rate.y, rate.z)});
+  }
+  return angularRateAtEnd(samples, t_end, gyro_variance);
+}
 
 /// One bridge sample as the ring holds it. Either half may still be missing.
 struct WheelSample
@@ -127,7 +269,7 @@ fitEndpoint(const std::vector<const WheelSample *> & samples, double t_end, bool
     const double w = min_variance / variance(*sample);
     sw += w;
     swt += w * (sample->t - reference.t);
-    swv += w * (sample->v - reference.v);
+    swv += w * (lateral ? 0.0 : sample->v - reference.v);
   }
   const double mean_t = swt / sw;
   const double mean_v = swv / sw;
@@ -137,13 +279,16 @@ fitEndpoint(const std::vector<const WheelSample *> & samples, double t_end, bool
     const double w = min_variance / variance(*sample);
     const double dt = (sample->t - reference.t) - mean_t;
     spread += w * dt * dt;
-    cross += w * dt * ((sample->v - reference.v) - mean_v);
+    cross += w * dt * ((lateral ? 0.0 : sample->v - reference.v) - mean_v);
+  }
+  if (spread == 0.0 && (samples.front()->t != reference.t || t_end != reference.t)) {
+    return std::nullopt;  // distinguish numerical loss of time spread from an identified constant
   }
   const double slope = spread > 0.0 ? cross / spread : 0.0;
   const double endpoint_dt = (t_end - reference.t) - mean_t;
   EndpointFit out;
   out.order = spread > 0.0 ? 1 : 0;
-  out.value = reference.v + mean_v + slope * endpoint_dt;
+  out.value = (lateral ? 0.0 : reference.v) + mean_v + slope * endpoint_dt;
   double std_bound = 0.0;
   double squares = 0.0;
   for (const auto * sample : samples) {
@@ -153,7 +298,7 @@ fitEndpoint(const std::vector<const WheelSample *> & samples, double t_end, bool
     out.c_l1 += std::abs(coefficient);
     out.c_l2_sq += coefficient * coefficient;
     std_bound += std::abs(coefficient) * std::sqrt(variance(*sample));
-    const double residual = (sample->v - reference.v) - (mean_v + slope * dt);
+    const double residual = (lateral ? 0.0 : sample->v - reference.v) - (mean_v + slope * dt);
     squares += residual * residual;
   }
   out.bound = spread > 0.0 ? std::max(max_variance, std_bound * std_bound) : max_variance;
@@ -417,6 +562,10 @@ struct WheelNoise
   double var_vy = 0.0;
   double var_vz = 0.0;
   bool lateral = false;
+  double fit_vx = 0.0;                             ///< (m/s)^2, Rfit_x before the lever and gyro terms
+  double fit_vy = 0.0;                             ///< (m/s)^2, Rfit_y when observed
+  Eigen::Matrix3d gyro = Eigen::Matrix3d::Zero();  ///< A_r C_omega A_r^T, (m/s)^2
+  Eigen::Matrix3d R = Eigen::Matrix3d::Zero();     ///< native covariance in the robot frame, (m/s)^2
 };
 
 /// Add the effective common noise budget once, then the lever's geometric uncertainty.
@@ -425,11 +574,14 @@ inline WheelNoise composeR(const WheelFit & fit, double omega_norm, const WheelM
 {
   const double lever = omega_norm * params.sigma_lever;
   WheelNoise noise;
-  noise.var_vx = std::max(fit.sample_max_vx, params.sigma_vx_floor * params.sigma_vx_floor) +
-                 (fit.endpoint_bound_vx - fit.sample_max_vx) + lever * lever;
+  noise.fit_vx = std::max(fit.sample_max_vx, params.sigma_vx_floor * params.sigma_vx_floor) +
+                 (fit.endpoint_bound_vx - fit.sample_max_vx);
+  noise.fit_vy = fit.endpoint_bound_lat;
+  noise.var_vx = noise.fit_vx + lever * lever;
   noise.lateral = fit.lateral_observed;
   noise.var_vy = noise.lateral ? fit.endpoint_bound_lat + lever * lever : 0.0;
   noise.var_vz = params.sigma_vz * params.sigma_vz;
+  noise.R.diagonal() << noise.var_vx, noise.var_vy, noise.var_vz;
   return noise;
 }
 
@@ -441,27 +593,63 @@ struct WheelMeasurement
   Eigen::Matrix<double, 3, kWheelStateDim> H = Eigen::Matrix<double, 3, kWheelStateDim>::Zero();
   WheelNoise noise;
 
-  /// The rows the update uses, (vx, vy, vz) or (vx, vz), as update_simple takes them.
-  void pack(Eigen::Matrix<double, Eigen::Dynamic, kWheelStateDim> & jacobian,
+  /// Select native rows before any factorization. Inactive y never conditions x/z.
+  void nativeRows(Eigen::Matrix<double, Eigen::Dynamic, kWheelStateDim> & jacobian,
+                  Eigen::VectorXd & residual,
+                  Eigen::MatrixXd & covariance) const
+  {
+    const int rows = noise.lateral ? 3 : 2;
+    const int axes[] = {0, noise.lateral ? 1 : 2, 2};
+    jacobian.resize(rows, kWheelStateDim);
+    residual.resize(rows);
+    covariance.resize(rows, rows);
+    for (int i = 0; i < rows; ++i) {
+      jacobian.row(i) = H.row(axes[i]);
+      residual(i) = z(axes[i]) - h(axes[i]);
+      for (int j = 0; j < rows; ++j) {
+        covariance(i, j) = noise.R(axes[i], axes[j]);
+      }
+    }
+  }
+
+  /// update_simple receives L^-1 H and L^-1(z-h), with unit R_diag. Residuals are dimensionless.
+  /// A singular or non-finite active R is refused, with no jitter or additional floor.
+  bool pack(Eigen::Matrix<double, Eigen::Dynamic, kWheelStateDim> & jacobian,
             Eigen::VectorXd & residual,
             Eigen::VectorXd & variances) const
   {
-    const int rows = noise.lateral ? 3 : 2;
-    jacobian.resize(rows, kWheelStateDim);
-    residual.resize(rows);
-    variances.resize(rows);
-    int row = 0;
-    const auto put = [&](int axis, double variance) {
-      jacobian.row(row) = H.row(axis);
-      residual(row) = z(axis) - h(axis);
-      variances(row) = variance;
-      ++row;
-    };
-    put(0, noise.var_vx);
-    if (noise.lateral) {
-      put(1, noise.var_vy);
+    Eigen::MatrixXd covariance;
+    nativeRows(jacobian, residual, covariance);
+    if (!covariance.allFinite()) {
+      return false;
     }
-    put(2, noise.var_vz);
+    const Eigen::LLT<Eigen::MatrixXd> llt(covariance);
+    if (llt.info() != Eigen::Success) {
+      return false;
+    }
+    jacobian = llt.matrixL().solve(jacobian).eval();
+    residual = llt.matrixL().solve(residual).eval();
+    variances = Eigen::VectorXd::Ones(residual.size());
+    return jacobian.allFinite() && residual.allFinite();
+  }
+
+  /// Native active-row NIS at the wheel update's prior, diagnostic only.
+  std::optional<double> nis(const Eigen::Matrix<double, kWheelStateDim, kWheelStateDim> & prior) const
+  {
+    Eigen::Matrix<double, Eigen::Dynamic, kWheelStateDim> jacobian;
+    Eigen::VectorXd residual;
+    Eigen::MatrixXd covariance;
+    nativeRows(jacobian, residual, covariance);
+    const Eigen::MatrixXd innovation = jacobian * prior * jacobian.transpose() + covariance;
+    if (!innovation.allFinite() || !residual.allFinite()) {
+      return std::nullopt;
+    }
+    const Eigen::LLT<Eigen::MatrixXd> llt(innovation);
+    if (llt.info() != Eigen::Success) {
+      return std::nullopt;
+    }
+    const double value = residual.dot(llt.solve(residual));
+    return std::isfinite(value) ? std::optional<double>(value) : std::nullopt;
   }
 };
 
@@ -485,17 +673,20 @@ inline std::optional<WheelMeasurement> wheelMeasurement(const WheelFit & fit,
                                                         const Eigen::Matrix3d & R_world_imu,
                                                         const Eigen::Vector3d & velocity_world,
                                                         const Eigen::Vector3d & gyro_bias,
-                                                        const Eigen::Vector3d & omega_mean,
+                                                        const WheelAngularEndpoint & endpoint,
                                                         const Eigen::Matrix3d & R_robot_to_imu,
                                                         const WheelModelParams & params)
 {
+  if (endpoint.status != WheelAngularStatus::kValid || !endpoint.raw.allFinite() || !endpoint.covariance.allFinite()) {
+    return std::nullopt;
+  }
   const std::optional<double> forward = slipCorrect(fit.v * params.speed_scale, phi, params.slip_k);
   if (!forward) {
     return std::nullopt;
   }
   const Eigen::Matrix3d R_wheel_imu = R_robot_to_imu.transpose();
   const Eigen::Vector3d v_imu = R_world_imu.transpose() * velocity_world;
-  const Eigen::Vector3d omega = omega_mean - gyro_bias;
+  const Eigen::Vector3d omega = endpoint.raw - gyro_bias;
 
   WheelMeasurement m;
   m.z = Eigen::Vector3d(*forward, 0.0, 0.0);
@@ -504,8 +695,14 @@ inline std::optional<WheelMeasurement> wheelMeasurement(const WheelFit & fit,
   m.H.block<3, 3>(0, kWheelVelIndex) = R_wheel_imu * R_world_imu.transpose();
   m.H.block<3, 3>(0, kWheelGyroBiasIndex) = -R_wheel_imu * wheel_detail::skew(params.lever_arm);
   m.noise = composeR(fit, omega.norm(), params);
+  const Eigen::Matrix3d A = R_wheel_imu * wheel_detail::skew(params.lever_arm);
+  m.noise.gyro = A * endpoint.covariance * A.transpose();
+  m.noise.R += m.noise.gyro;
+  m.noise.var_vx = m.noise.R(0, 0);
+  m.noise.var_vy = m.noise.R(1, 1);
+  m.noise.var_vz = m.noise.R(2, 2);
   if (!m.z.allFinite() || !m.h.allFinite() || !m.H.allFinite() || !std::isfinite(m.noise.var_vx) ||
-      !std::isfinite(m.noise.var_vy) || !std::isfinite(m.noise.var_vz)) {
+      !std::isfinite(m.noise.var_vy) || !std::isfinite(m.noise.var_vz) || !m.noise.R.allFinite()) {
     return std::nullopt;
   }
   return m;

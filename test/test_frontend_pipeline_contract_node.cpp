@@ -95,6 +95,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <fast_lio_interfaces/msg/frontend_observation.hpp>
 #include <fast_lio_interfaces/msg/reference_health.hpp>
@@ -127,6 +128,7 @@
 #include "imu_process_outcome.hpp"
 #include "laser_mapping_test_hooks.hpp"
 #include "preprocess.h"
+#include "wheel_speed_input.hpp"
 
 namespace
 {
@@ -3003,6 +3005,59 @@ TEST(FrontendPipelineContract, KalmanChannelsLidarRowsEndWithThePosteriorVelocit
     actual.push_back(bitsList(values.data(), values.size()));
   }
   EXPECT_EQ(actual, expected);
+}
+
+// The pipeline driver fixes its IMU grid/rates and has no wheel publishers. Exercise the pure MeasureGroup input
+// conversion used by updateWheelSpeed with real timestamped ROS messages, without adding a stand-in node hook.
+TEST(WheelInput, NodeUsesTimestampedAngularEndpoint)
+{
+  // numerical-design.txt:L26,L34,L41,L45,L49: zero innovation and the native endpoint/gyro covariance oracles.
+  for (double alpha : {2.0, 5.0, 10.0}) {
+    std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu;
+    for (int i = 1; i <= 20; ++i) {
+      auto sample = std::make_shared<sensor_msgs::msg::Imu>();
+      sample->header.stamp.sec = 0;
+      sample->header.stamp.nanosec = static_cast<std::uint32_t>(i * 5000000);
+      sample->angular_velocity.z = alpha * (i / 200.0);
+      imu.push_back(sample);
+    }
+    fast_lio::WheelSpeedInput wheel;
+    wheel.configure(true, 0.075, 0.05);
+    for (std::uint32_t stamp : {20000000u, 40000000u}) {
+      wheel.addTwist(0, stamp, 0.8);
+      wheel.addVariances(0, stamp, 0.0025, 0.046 * 0.046);
+    }
+    const auto endpoint = fast_lio::angularEndpointFromImu(imu, 0.1, Eigen::Vector3d::Constant(1e-4));
+    ASSERT_EQ(endpoint.status, fast_lio::WheelAngularStatus::kValid);
+    EXPECT_EQ(endpoint.weights, Eigen::Vector2d(0.0, 1.0));
+    EXPECT_DOUBLE_EQ(endpoint.t1, 0.1);
+    fast_lio::WheelModelParams params;
+    params.lever_arm = Eigen::Vector3d(0.3238, 0.0, 0.2793);
+    params.sigma_lever = 0.04;
+    params.sigma_vz = 0.2;
+    const double omega = alpha * 0.1;
+    const Eigen::Vector3d velocity =
+      Eigen::Vector3d(0.8, 0.0, 0.0) + Eigen::Vector3d(0.0, 0.0, omega).cross(params.lever_arm);
+    const auto step = wheel.step(wheel.read(0.0, 0.1),
+                                 0.1,
+                                 endpoint,
+                                 Eigen::Matrix3d::Identity(),
+                                 velocity,
+                                 Eigen::Vector3d::Zero(),
+                                 Eigen::Matrix3d::Identity(),
+                                 params,
+                                 Eigen::Matrix<double, 23, 23>::Identity());
+    ASSERT_EQ(step.outcome, fast_lio::WheelOutcome::kUpdate);
+    ASSERT_TRUE(step.measurement);
+    EXPECT_LT((step.measurement->z - step.measurement->h).norm(), 1e-12);
+    const double geometry = omega * omega * 0.04 * 0.04;
+    EXPECT_NEAR(step.measurement->noise.R(0, 0), 0.125625 + geometry + 1e-4 * 0.07800849, 1e-12);
+    EXPECT_NEAR(step.measurement->noise.R(1, 1), 0.103684 + geometry + 1e-4 * 0.18285493, 1e-12);
+    EXPECT_NEAR(step.measurement->noise.R(2, 2), 0.04 + 1e-4 * 0.10484644, 1e-12);
+    EXPECT_NEAR(step.measurement->noise.R(0, 2), -1e-4 * 0.09043734, 1e-12);
+    EXPECT_EQ(step.nis_dof, 3);
+    EXPECT_NEAR(step.nis, 0.0, 1e-12);
+  }
 }
 
 // The worker suite is what the front-end ThreadSanitizer phase runs. Here: the map worker and the reset that joins it.

@@ -3853,17 +3853,12 @@ private:
       std::lock_guard<std::mutex> lk(mtx_twist);
       ring = wheel_speed_.read(Measures.lidar_beg_time, lidar_end_time);
     }
-    V3D omega_sum = V3D::Zero();
     for (const auto & imu : Measures.imu) {
       const auto & a = imu->linear_acceleration;
-      const auto & w = imu->angular_velocity;
       wheel_speed_.recordImu(get_time_sec(imu->header.stamp),
                              fast_lio::wheelForward(p.R_robot_to_imu, V3D(a.x, a.y, a.z)));
-      omega_sum += V3D(w.x, w.y, w.z);
     }
-    std::optional<Eigen::Vector3d> omega_mean;
-    if (!Measures.imu.empty())
-      omega_mean = Eigen::Vector3d(omega_sum / static_cast<double>(Measures.imu.size()));
+    const auto angular = fast_lio::angularEndpointFromImu(Measures.imu, lidar_end_time, p_imu->cov_gyr);
     fast_lio::WheelModelParams model;
     model.speed_scale = p.wheel_speed_scale;
     model.slip_k = p.wheel_slip_k;
@@ -3875,17 +3870,17 @@ private:
     model.lever_arm = p.wheel_lever_arm;
     const state_ikfom st = kf.get_x();
     const fast_lio::WheelStep step = wheel_speed_.step(
-      ring, lidar_end_time, omega_mean, st.rot.toRotationMatrix(), st.vel, st.bg, p.R_robot_to_imu, model);
+      ring, lidar_end_time, angular, st.rot.toRotationMatrix(), st.vel, st.bg, p.R_robot_to_imu, model, kf.get_P());
     if (step.measurement) {
-      Eigen::Matrix<double, Eigen::Dynamic, fast_lio::kWheelStateDim> H;
-      Eigen::VectorXd residual;
-      Eigen::VectorXd R_diag;
-      step.measurement->pack(H, residual, R_diag);
+      // The wheel diagnostics' residual_norm is dimensionless after whitening. z/h/R stay native for the CSV.
       EkfUpdateDiagnostics wheelDiagnostics;
       Eigen::Matrix<double, 23, 23> wheelCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
       if (p.kalman_channel_diag_en)
         wheelCovarianceBefore = kf.get_P();
-      kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &wheelDiagnostics : nullptr);
+      kf.update_simple(step.jacobian_white,
+                       step.residual_white,
+                       step.variances_white,
+                       p.kalman_channel_diag_en ? &wheelDiagnostics : nullptr);
       state_point = kf.get_x();  // re-read corrected state
       if (p.kalman_channel_diag_en) {
         writeKalmanChannel("wheel",

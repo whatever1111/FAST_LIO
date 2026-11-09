@@ -688,14 +688,15 @@ public:
     fit.sample_max_vx = fit.endpoint_bound_vx = 0.05 * 0.05;
     fit.sample_max_lat = fast_lio::kBridgeUnobservedVariance;
     fit.lateral_observed = false;
-    const auto measurement = fast_lio::wheelMeasurement(fit,
-                                                        std::nullopt,
-                                                        x.rot.toRotationMatrix(),
-                                                        x.vel,
-                                                        x.bg,
-                                                        Eigen::Vector3d::Zero(),
-                                                        Eigen::Matrix3d::Identity(),
-                                                        fast_lio::WheelModelParams{});
+    const auto measurement = fast_lio::wheelMeasurement(
+      fit,
+      std::nullopt,
+      x.rot.toRotationMatrix(),
+      x.vel,
+      x.bg,
+      fast_lio::angularRateAtEnd({{0.0, Eigen::Vector3d::Zero()}}, 0.0, Eigen::Vector3d::Zero()),
+      Eigen::Matrix3d::Identity(),
+      fast_lio::WheelModelParams{});
     if (!measurement) {
       ADD_FAILURE() << "no wheel measurement";
       return 0.0;
@@ -703,7 +704,10 @@ public:
     Eigen::Matrix<double, Eigen::Dynamic, fast_lio::kWheelStateDim> H;
     Eigen::VectorXd residual;
     Eigen::VectorXd variances;
-    measurement->pack(H, residual, variances);
+    if (!measurement->pack(H, residual, variances)) {
+      ADD_FAILURE() << "wheel covariance could not be whitened";
+      return 0.0;
+    }
     const double before = filter_.get_P()(kVelX, kVelX);
     filter_.update_simple(H, residual, variances);
     return 1.0 - filter_.get_P()(kVelX, kVelX) / before;

@@ -434,6 +434,7 @@ sanitizer=${FASTLIO_TEST_SANITIZER}")
     foreach(contract_entry
         "test_frontend_parameter_contract_node:test_frontend_parameter_contract_node:FrontendParameterContract:600"
         "test_frontend_pipeline_contract_node:test_frontend_pipeline_contract_node:FrontendPipelineContract:900"
+        "test_frontend_pipeline_wheel_endpoint_node:test_frontend_pipeline_contract_node:WheelInput:120"
         "test_frontend_pipeline_contract_node_worker:test_frontend_pipeline_contract_node:FrontendPipelineWorker:600")
       string(REPLACE ":" ";" contract_entry "${contract_entry}")
       list(GET contract_entry 0 contract_test)

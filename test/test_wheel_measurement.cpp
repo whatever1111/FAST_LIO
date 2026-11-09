@@ -19,9 +19,13 @@
 #include "wheel_measurement.hpp"
 #include "wheel_speed_input.hpp"
 
+using fast_lio::angularRateAtEnd;
 using fast_lio::composeR;
 using fast_lio::slipCorrect;
 using fast_lio::slipPhi;
+using fast_lio::WheelAngularEndpoint;
+using fast_lio::WheelAngularSample;
+using fast_lio::WheelAngularStatus;
 using fast_lio::WheelFit;
 using fast_lio::wheelForward;
 using fast_lio::WheelMeasurement;
@@ -67,8 +71,14 @@ struct ModelState
   Eigen::Matrix3d R_robot_to_imu = rotation(0.05, Eigen::Vector3d::UnitX()) * rotation(-0.02, Eigen::Vector3d::UnitY());
   Eigen::Vector3d velocity_world = Eigen::Vector3d(0.6, -0.4, 0.05);
   Eigen::Vector3d gyro_bias = Eigen::Vector3d(0.01, -0.02, 0.005);
-  Eigen::Vector3d omega_mean = Eigen::Vector3d(0.11, -0.22, 0.805);  // raw gyro mean, bias included
+  Eigen::Vector3d omega_raw = Eigen::Vector3d(0.11, -0.22, 0.805);  // raw endpoint rate, bias included
 };
+
+WheelAngularEndpoint
+endpointAt(const Eigen::Vector3d & raw, const Eigen::Vector3d & variance = Eigen::Vector3d::Zero(), double t = 0.1)
+{
+  return angularRateAtEnd({{t, raw}}, t, variance);
+}
 
 WheelFit singleFit(double v, double var_vx, double var_lat)
 {
@@ -91,7 +101,7 @@ std::optional<WheelMeasurement> modelAt(const ModelState & s, const WheelModelPa
 {
   const WheelFit fit = singleFit(v, 0.002, kUnobserved);
   return wheelMeasurement(
-    fit, std::nullopt, s.R_world_imu, s.velocity_world, s.gyro_bias, s.omega_mean, s.R_robot_to_imu, params);
+    fit, std::nullopt, s.R_world_imu, s.velocity_world, s.gyro_bias, endpointAt(s.omega_raw), s.R_robot_to_imu, params);
 }
 }  // namespace
 
@@ -360,6 +370,21 @@ TEST(WheelFit, LateralCovarianceAndMarkerAreSeparate)
   }
 }
 
+TEST(WheelFit, LateralWeightsAreIndependentOfForwardWeights)
+{
+  // D3.1-D3.2 hand oracle. cy=(-19/18,1/9,35/18), U_y=.001*(29/9)^2.
+  WheelSampleRing ring(8);
+  const double lateral[] = {0.001, 0.004, 0.001};
+  for (int i = 0; i < 3; ++i) {
+    const std::int64_t stamp = (i + 1) * 20000000;
+    ring.pushSample(stamp, 0.8, true);
+    ring.attachSigma(stamp, 0.0025, lateral[i]);
+  }
+  const auto fit = ring.fitAt(0.1, 0.1);
+  ASSERT_TRUE(fit);
+  EXPECT_NEAR(fit->endpoint_bound_lat, 0.001 * 841.0 / 81.0, 1e-12);
+}
+
 TEST(WheelFit, RankOneEndpointIsNotExtrapolation)
 {
   // numerical-design.txt:L35-L36. One double time identifies a constant only at that time.
@@ -411,6 +436,220 @@ TEST(WheelFit, NormalizedWeightsAvoidReciprocalOverflow)
   EXPECT_TRUE(std::isfinite(fit->endpoint_bound_vx));
 }
 
+TEST(AngularEndpoint, AcceleratingYawHasNoArtificialInnovation)
+{
+  // numerical-design.txt:L41,L45,L49. Twenty raw samples, with a sample exactly at t_end.
+  const double alpha[] = {2.0, 5.0, 10.0};
+  const double old_lateral[] = {-0.030761, -0.0769025, -0.153805};
+  WheelModelParams params;
+  params.lever_arm = Eigen::Vector3d(0.3238, 0.0, 0.2793);
+  const auto fit = singleFit(0.8, 0.0025, 0.046 * 0.046);
+  for (int k = 0; k < 3; ++k) {
+    std::vector<WheelAngularSample> samples;
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    for (int i = 1; i <= 20; ++i) {
+      const double t = i / 200.0;
+      samples.push_back({t, Eigen::Vector3d(0.0, 0.0, alpha[k] * t)});
+      mean += samples.back().raw / 20.0;
+    }
+    const auto endpoint = angularRateAtEnd(samples, 0.1, Eigen::Vector3d::Constant(1e-4));
+    ASSERT_EQ(endpoint.status, WheelAngularStatus::kValid);
+    EXPECT_EQ(endpoint.weights, Eigen::Vector2d(0.0, 1.0));
+    const Eigen::Vector3d truth(0.0, 0.0, alpha[k] * 0.1);
+    const Eigen::Vector3d velocity = Eigen::Vector3d(0.8, 0.0, 0.0) + truth.cross(params.lever_arm);
+    const auto m = wheelMeasurement(fit,
+                                    std::nullopt,
+                                    Eigen::Matrix3d::Identity(),
+                                    velocity,
+                                    Eigen::Vector3d::Zero(),
+                                    endpoint,
+                                    Eigen::Matrix3d::Identity(),
+                                    params);
+    ASSERT_TRUE(m);
+    EXPECT_LT((m->z - m->h).norm(), 1e-12);
+    const auto old = wheelMeasurement(fit,
+                                      std::nullopt,
+                                      Eigen::Matrix3d::Identity(),
+                                      velocity,
+                                      Eigen::Vector3d::Zero(),
+                                      endpointAt(mean),
+                                      Eigen::Matrix3d::Identity(),
+                                      params);
+    ASSERT_TRUE(old);
+    EXPECT_NEAR((old->z - old->h)(1), old_lateral[k], 1e-12);
+  }
+}
+
+TEST(AngularEndpoint, MissingTailPropagatesTrendAndCovariance)
+{
+  // numerical-design.txt:L42-L44,L46-L48,L50-L52, including the shared-sample extrapolation cross term.
+  const double tail[] = {0.0975, 0.095, 0.04};
+  const double first_weight[] = {-0.5, -1.0, -12.0};
+  const double factor[] = {2.5, 5.0, 313.0};
+  WheelModelParams params;
+  params.lever_arm = Eigen::Vector3d(0.3238, 0.0, 0.2793);
+  for (double alpha : {2.0, 5.0, 10.0}) {
+    for (int k = 0; k < 3; ++k) {
+      const double t0 = tail[k] - 0.005;
+      const auto endpoint = angularRateAtEnd(
+        {{t0, Eigen::Vector3d(0.0, 0.0, alpha * t0)}, {tail[k], Eigen::Vector3d(0.0, 0.0, alpha * tail[k])}},
+        0.1,
+        Eigen::Vector3d::Constant(1e-4));
+      ASSERT_EQ(endpoint.status, WheelAngularStatus::kValid);
+      EXPECT_NEAR(endpoint.weights(0), first_weight[k], 1e-12);
+      EXPECT_NEAR(endpoint.weights(1), 1.0 - first_weight[k], 1e-12);
+      EXPECT_LT((endpoint.covariance - factor[k] * 1e-4 * Eigen::Matrix3d::Identity()).norm(), 1e-12);
+      const Eigen::Vector3d velocity =
+        Eigen::Vector3d(0.8, 0.0, 0.0) + Eigen::Vector3d(0.0, 0.0, alpha * 0.1).cross(params.lever_arm);
+      const auto m = wheelMeasurement(singleFit(0.8, 0.0025, 0.046 * 0.046),
+                                      std::nullopt,
+                                      Eigen::Matrix3d::Identity(),
+                                      velocity,
+                                      Eigen::Vector3d::Zero(),
+                                      endpoint,
+                                      Eigen::Matrix3d::Identity(),
+                                      params);
+      ASSERT_TRUE(m);
+      EXPECT_LT((m->z - m->h).norm(), 1e-12);
+    }
+  }
+}
+
+TEST(AngularEndpoint, EmptySingleAndCoincidentTimes)
+{
+  // D2.1 rank/input contract. Exact endpoint uses the raw sample, including with duplicate timestamps.
+  const Eigen::Vector3d covariance(1e-4, 2e-4, 3e-4);
+  const Eigen::Vector3d raw(0.01, -0.02, 0.2);
+  EXPECT_EQ(angularRateAtEnd({}, 0.1, covariance).status, WheelAngularStatus::kNoImu);
+  const auto single = angularRateAtEnd({{0.1, raw}}, 0.1, covariance);
+  ASSERT_EQ(single.status, WheelAngularStatus::kValid);
+  EXPECT_EQ(single.raw, raw);
+  EXPECT_EQ(single.covariance, Eigen::Matrix3d(covariance.asDiagonal()));
+  const auto exact_duplicate = angularRateAtEnd({{0.1, Eigen::Vector3d::Zero()}, {0.1, raw}}, 0.1, covariance);
+  ASSERT_EQ(exact_duplicate.status, WheelAngularStatus::kValid);
+  EXPECT_EQ(exact_duplicate.raw, raw);
+  EXPECT_EQ(exact_duplicate.covariance, single.covariance);
+  EXPECT_EQ(angularRateAtEnd({{0.04, raw}}, 0.1, covariance).status, WheelAngularStatus::kEndpointUnavailable);
+  EXPECT_EQ(angularRateAtEnd({{0.04, raw}, {0.04, raw}}, 0.1, covariance).status,
+            WheelAngularStatus::kEndpointUnavailable);
+  EXPECT_EQ(angularRateAtEnd({{0.12, raw}}, 0.1, covariance).status, WheelAngularStatus::kEndpointUnavailable);
+  const auto duplicate = angularRateAtEnd(
+    {{0.02, Eigen::Vector3d(0.0, 0.0, 0.04)}, {0.04, Eigen::Vector3d::Zero()}, {0.04, Eigen::Vector3d(0.0, 0.0, 0.08)}},
+    0.1,
+    covariance);
+  ASSERT_EQ(duplicate.status, WheelAngularStatus::kValid);
+  EXPECT_NEAR(duplicate.raw(2), 0.2, 1e-12);
+  EXPECT_NEAR(duplicate.weights(0), -3.0, 1e-12);
+  const auto bracket = angularRateAtEnd({{0.02, Eigen::Vector3d(0.0, 0.0, 0.04)},
+                                         {0.08, Eigen::Vector3d(0.0, 0.0, 0.16)},
+                                         {0.12, Eigen::Vector3d(0.0, 0.0, 0.24)},
+                                         {0.14, Eigen::Vector3d(0.0, 0.0, 0.28)}},
+                                        0.1,
+                                        covariance);
+  ASSERT_EQ(bracket.status, WheelAngularStatus::kValid);
+  EXPECT_NEAR(bracket.raw(2), 0.2, 1e-12);
+  EXPECT_DOUBLE_EQ(bracket.t0, 0.08);
+  EXPECT_DOUBLE_EQ(bracket.t1, 0.12);
+  EXPECT_LT((bracket.covariance - 0.5 * Eigen::Matrix3d(covariance.asDiagonal())).norm(), 1e-12);
+}
+
+TEST(AngularEndpoint, InvalidInputsAreRefusedWithTheirReason)
+{
+  const Eigen::Vector3d raw = Eigen::Vector3d::Ones();
+  const Eigen::Vector3d covariance = Eigen::Vector3d::Constant(1e-4);
+  EXPECT_EQ(angularRateAtEnd({{0.04, raw}, {0.03, raw}}, 0.1, covariance).status, WheelAngularStatus::kInvalidTime);
+  EXPECT_EQ(angularRateAtEnd({{kNaN, raw}}, 0.1, covariance).status, WheelAngularStatus::kInvalidTime);
+  EXPECT_EQ(angularRateAtEnd({{0.1, raw}}, kInf, covariance).status, WheelAngularStatus::kInvalidTime);
+  EXPECT_EQ(angularRateAtEnd({{0.1, Eigen::Vector3d(kNaN, 0.0, 0.0)}}, 0.1, covariance).status,
+            WheelAngularStatus::kInvalidRate);
+  EXPECT_EQ(angularRateAtEnd({{0.1, raw}}, 0.1, Eigen::Vector3d(-1.0, 0.0, 0.0)).status,
+            WheelAngularStatus::kInvalidCovariance);
+  EXPECT_EQ(angularRateAtEnd({{0.1, raw}}, 0.1, Eigen::Vector3d(kInf, 0.0, 0.0)).status,
+            WheelAngularStatus::kInvalidCovariance);
+  EXPECT_EQ(angularRateAtEnd({{0.02, 1e308 * raw}, {0.04, -1e308 * raw}}, 0.1, covariance).status,
+            WheelAngularStatus::kNonFiniteEndpoint);
+}
+
+TEST(WheelNoise, GyroCovarianceUsesParameterAndNotBiasP)
+{
+  // numerical-design.txt:L41. These coefficients are A_r A_r^T for the frozen lever.
+  WheelModelParams params;
+  params.lever_arm = Eigen::Vector3d(0.3238, 0.0, 0.2793);
+  const auto measure = [&](double qg, const Eigen::Matrix3d & rotation_robot) {
+    return wheelMeasurement(singleFit(0.8, 0.0025, 0.046 * 0.046),
+                            std::nullopt,
+                            Eigen::Matrix3d::Identity(),
+                            Eigen::Vector3d::Zero(),
+                            Eigen::Vector3d::Zero(),
+                            endpointAt(Eigen::Vector3d(0.0, 0.0, 0.2), Eigen::Vector3d::Constant(qg)),
+                            rotation_robot,
+                            params);
+  };
+  const auto m = measure(1e-4, Eigen::Matrix3d::Identity());
+  const auto scaled = measure(4e-4, Eigen::Matrix3d::Identity());
+  ASSERT_TRUE(m && scaled);
+  Eigen::Matrix3d oracle;
+  oracle << 0.07800849, 0.0, -0.09043734, 0.0, 0.18285493, 0.0, -0.09043734, 0.0, 0.10484644;
+  EXPECT_LT((m->noise.gyro - 1e-4 * oracle).norm(), 1e-12);
+  EXPECT_LT((scaled->noise.gyro - 4.0 * m->noise.gyro).norm(), 1e-12);
+  const auto R_before = m->noise.R;
+  Eigen::Matrix<double, 23, 23> prior = Eigen::Matrix<double, 23, 23>::Identity();
+  const auto first_nis = m->nis(prior);
+  prior.block<3, 3>(15, 15) *= 100.0;
+  const auto second_nis = m->nis(prior);
+  ASSERT_TRUE(first_nis && second_nis);
+  EXPECT_NE(*first_nis, *second_nis);
+  EXPECT_EQ(m->noise.R, R_before);  // P_bg participates only in S, never in native R.
+  EXPECT_EQ((m->H.block<3, 3>(0, 15)), -fast_lio::wheel_detail::skew(params.lever_arm));
+  const Eigen::Matrix3d R = rotation(0.3, Eigen::Vector3d(1.0, 2.0, 3.0));
+  const auto rotated = measure(1e-4, R);
+  ASSERT_TRUE(rotated);
+  EXPECT_LT((rotated->noise.gyro - R.transpose() * m->noise.gyro * R).norm(), 1e-12);
+  params.lever_arm = Eigen::Vector3d(-0.2, 0.1, 0.4);
+  const auto moved = measure(1e-4, R);
+  ASSERT_TRUE(moved);
+  const Eigen::Matrix3d A = R.transpose() * fast_lio::wheel_detail::skew(params.lever_arm);
+  EXPECT_LT((moved->noise.gyro - 1e-4 * A * A.transpose()).norm(), 1e-12);
+}
+
+TEST(WheelNoise, DenseCovarianceWhiteningIsEquivalent)
+{
+  // numerical-design.txt:L53, with qg=1e-4 and extrapolation weights (-1,2).
+  WheelModelParams params;
+  params.lever_arm = Eigen::Vector3d(0.3238, 0.0, 0.2793);
+  params.sigma_vz = 0.2;
+  const auto endpoint =
+    angularRateAtEnd({{0.09, Eigen::Vector3d(0.0, 0.0, 0.18)}, {0.095, Eigen::Vector3d(0.0, 0.0, 0.19)}},
+                     0.1,
+                     Eigen::Vector3d::Constant(1e-4));
+  auto m = wheelMeasurement(singleFit(0.8, 0.0025, 0.046 * 0.046),
+                            std::nullopt,
+                            Eigen::Matrix3d::Identity(),
+                            Eigen::Vector3d(0.6, -0.4, 0.05),
+                            Eigen::Vector3d::Zero(),
+                            endpoint,
+                            Eigen::Matrix3d::Identity(),
+                            params);
+  ASSERT_TRUE(m);
+  Eigen::Matrix3d oracle;
+  oracle << 0.005664004245, 0.0, -4.521867e-05, 0.0, 0.002207427465, 0.0, -4.521867e-05, 0.0, 0.04005242322000001;
+  EXPECT_LT((m->noise.R - oracle).norm(), 1e-12);
+  for (bool lateral : {true, false}) {
+    m->noise.lateral = lateral;
+    Eigen::Matrix<double, Eigen::Dynamic, 23> H, H_native;
+    Eigen::VectorXd residual, residual_native, variance;
+    Eigen::MatrixXd R_native;
+    m->nativeRows(H_native, residual_native, R_native);
+    ASSERT_TRUE(m->pack(H, residual, variance));
+    EXPECT_EQ(H.rows(), lateral ? 3 : 2);
+    EXPECT_EQ(variance, Eigen::VectorXd::Ones(H.rows()));
+    const Eigen::MatrixXd information = H_native.transpose() * R_native.ldlt().solve(H_native);
+    const Eigen::VectorXd vector = H_native.transpose() * R_native.ldlt().solve(residual_native);
+    EXPECT_LE((H.transpose() * H - information).norm(), 1e-10 * std::max(1.0, information.norm()));
+    EXPECT_LE((H.transpose() * residual - vector).norm(), 1e-10 * std::max(1.0, vector.norm()));
+  }
+}
+
 TEST(SlipCorrection, ZeroCoefficientReturnsTheSpeedBitForBit)
 {
   for (double v : {0.7351, -0.0, 5e-324, 1e300, std::nextafter(1.0, 2.0), -2.5}) {
@@ -443,16 +682,21 @@ TEST(SlipCorrection, DividesByOnePlusKPhiAndNeedsPhiOtherwise)
   params.slip_k = 0.13;
   const ModelState s;
   const WheelFit fit = singleFit(1.0, 0.002, kUnobserved);
-  const auto m =
-    wheelMeasurement(fit, 0.2, s.R_world_imu, s.velocity_world, s.gyro_bias, s.omega_mean, s.R_robot_to_imu, params);
+  const auto m = wheelMeasurement(
+    fit, 0.2, s.R_world_imu, s.velocity_world, s.gyro_bias, endpointAt(s.omega_raw), s.R_robot_to_imu, params);
   ASSERT_TRUE(m.has_value());
   EXPECT_DOUBLE_EQ(m->z(0), 0.973 / (1.0 + 0.13 * 0.2));  // the scale first, then the slip
   EXPECT_EQ(m->z(1), 0.0);
   EXPECT_EQ(m->z(2), 0.0);
-  EXPECT_FALSE(
-    wheelMeasurement(
-      fit, std::nullopt, s.R_world_imu, s.velocity_world, s.gyro_bias, s.omega_mean, s.R_robot_to_imu, params)
-      .has_value());
+  EXPECT_FALSE(wheelMeasurement(fit,
+                                std::nullopt,
+                                s.R_world_imu,
+                                s.velocity_world,
+                                s.gyro_bias,
+                                endpointAt(s.omega_raw),
+                                s.R_robot_to_imu,
+                                params)
+                 .has_value());
 }
 
 TEST(SlipPhi, WindowMeanOfTheRawForwardSpecificForceInGMinusTheIntercept)
@@ -494,7 +738,7 @@ TEST(WheelMeasurementModel, LeverArmSignMatchesLegEdgeVelocity)
   WheelModelParams params;
   params.lever_arm = Eigen::Vector3d(-0.25, 0.05, 0.12);
   const double vx = 0.9;
-  const Eigen::Vector3d omega = s.omega_mean - s.gyro_bias;
+  const Eigen::Vector3d omega = s.omega_raw - s.gyro_bias;
   const Eigen::Vector3d v_imu = fast_lio::legEdgeVelocity(vx, s.R_robot_to_imu, omega, params.lever_arm);
   s.velocity_world = s.R_world_imu * v_imu;
   const auto m = modelAt(s, params, vx);
@@ -569,27 +813,26 @@ TEST(WheelMeasurementModel, NoiseHasTheFloorTheLeverTermAndTheLateralMarker)
   EXPECT_TRUE(sampleNoise(0.01, 999999.0, 0.5, params).lateral);
   EXPECT_DOUBLE_EQ(sampleNoise(0.002, kUnobserved, 0.0, params).var_vx, 0.075 * 0.075);
 
-  // pack(): (vx, vz) without the lateral axis, (vx, vy, vz) with it, residual z - h.
+  // pack(): select (vx,vz) or (vx,vy,vz), then whiten the residual and Jacobian.
   const ModelState s;
   auto m = modelAt(s, params);
   ASSERT_TRUE(m.has_value());
   Eigen::Matrix<double, Eigen::Dynamic, fast_lio::kWheelStateDim> H;
   Eigen::VectorXd residual;
   Eigen::VectorXd variances;
-  m->pack(H, residual, variances);
+  ASSERT_TRUE(m->pack(H, residual, variances));
   ASSERT_EQ(H.rows(), 2);
-  EXPECT_EQ(H.row(0), m->H.row(0));
-  EXPECT_EQ(H.row(1), m->H.row(2));
-  EXPECT_EQ(residual(0), m->z(0) - m->h(0));
-  EXPECT_EQ(residual(1), -m->h(2));
-  EXPECT_EQ(variances(0), m->noise.var_vx);
-  EXPECT_EQ(variances(1), m->noise.var_vz);
+  EXPECT_TRUE(H.row(0).isApprox(m->H.row(0) / std::sqrt(m->noise.var_vx), 1e-14));
+  EXPECT_TRUE(H.row(1).isApprox(m->H.row(2) / std::sqrt(m->noise.var_vz), 1e-14));
+  EXPECT_DOUBLE_EQ(residual(0), (m->z(0) - m->h(0)) / std::sqrt(m->noise.var_vx));
+  EXPECT_DOUBLE_EQ(residual(1), -m->h(2) / std::sqrt(m->noise.var_vz));
+  EXPECT_EQ(variances, Eigen::VectorXd::Ones(2));
   m->noise = sampleNoise(0.01, 4e-4, 0.5, params);
-  m->pack(H, residual, variances);
+  ASSERT_TRUE(m->pack(H, residual, variances));
   ASSERT_EQ(H.rows(), 3);
-  EXPECT_EQ(H.row(1), m->H.row(1));
-  EXPECT_EQ(residual(1), -m->h(1));
-  EXPECT_EQ(variances(1), m->noise.var_vy);
+  EXPECT_TRUE(H.row(1).isApprox(m->H.row(1) / std::sqrt(m->noise.var_vy), 1e-14));
+  EXPECT_DOUBLE_EQ(residual(1), -m->h(1) / std::sqrt(m->noise.var_vy));
+  EXPECT_EQ(variances, Eigen::VectorXd::Ones(3));
 }
 
 TEST(WheelMeasurementModel, NonFiniteInputsGiveNoMeasurement)
@@ -603,6 +846,30 @@ TEST(WheelMeasurementModel, NonFiniteInputsGiveNoMeasurement)
   EXPECT_FALSE(modelAt(fine, params).has_value());
   EXPECT_FALSE(modelAt(fine, WheelModelParams{}, kNaN).has_value());
   EXPECT_TRUE(modelAt(fine, WheelModelParams{}).has_value());
+  const auto fit = singleFit(0.8, 0.0025, kUnobserved);
+  for (const auto & endpoint : {WheelAngularEndpoint{},
+                                endpointAt(Eigen::Vector3d::Constant(kNaN)),
+                                endpointAt(Eigen::Vector3d::Zero(), Eigen::Vector3d::Constant(kInf))}) {
+    EXPECT_FALSE(wheelMeasurement(fit,
+                                  std::nullopt,
+                                  fine.R_world_imu,
+                                  fine.velocity_world,
+                                  fine.gyro_bias,
+                                  endpoint,
+                                  fine.R_robot_to_imu,
+                                  WheelModelParams{}));
+  }
+  params = WheelModelParams{};
+  params.sigma_vz = 0.0;
+  auto singular = modelAt(fine, params);
+  ASSERT_TRUE(singular);
+  Eigen::Matrix<double, Eigen::Dynamic, 23> H;
+  Eigen::VectorXd residual, variance;
+  EXPECT_FALSE(singular->pack(H, residual, variance));
+  singular->noise.R(0, 0) = kNaN;
+  EXPECT_FALSE(singular->pack(H, residual, variance));
+  singular->noise.R(0, 0) = -1.0;
+  EXPECT_FALSE(singular->pack(H, residual, variance));
 }
 
 // The front end's holder of the wheel samples (wheel_speed_input.hpp): the two callbacks' halves paired by the
@@ -641,17 +908,18 @@ const double kScanEnd = seconds(kEpochNs + 100000000);
 
 fast_lio::WheelStep stepOf(WheelSpeedInput & input,
                            const WheelModelParams & params,
-                           const std::optional<Eigen::Vector3d> & omega_mean = ModelState().omega_mean)
+                           const WheelAngularEndpoint & angular = endpointAt(ModelState().omega_raw))
 {
   const ModelState s;
   return input.step(input.read(kScanBegin, kScanEnd),
                     kScanEnd,
-                    omega_mean,
+                    angular,
                     s.R_world_imu,
                     s.velocity_world,
                     s.gyro_bias,
                     s.R_robot_to_imu,
-                    params);
+                    params,
+                    Eigen::Matrix<double, 23, 23>::Identity());
 }
 
 Eigen::Matrix3d skew(const Eigen::Vector3d & v)
@@ -753,12 +1021,13 @@ TEST(WheelSpeedInput, WithoutAVarianceTopicAnEndpointSamplePreservesTodaysUnits)
   const ModelState endpoint_state;
   const fast_lio::WheelStep step = input.step(input.read(kScanEnd, kScanEnd),
                                               kScanEnd,
-                                              endpoint_state.omega_mean,
+                                              endpointAt(endpoint_state.omega_raw),
                                               endpoint_state.R_world_imu,
                                               endpoint_state.velocity_world,
                                               endpoint_state.gyro_bias,
                                               endpoint_state.R_robot_to_imu,
-                                              params);
+                                              params,
+                                              Eigen::Matrix<double, 23, 23>::Identity());
   ASSERT_EQ(step.outcome, WheelOutcome::kUpdate);
   ASSERT_TRUE(step.measurement.has_value());
   EXPECT_EQ(step.ring.fit->samples, 1);
@@ -767,11 +1036,12 @@ TEST(WheelSpeedInput, WithoutAVarianceTopicAnEndpointSamplePreservesTodaysUnits)
   Eigen::Matrix<double, Eigen::Dynamic, fast_lio::kWheelStateDim> H;
   Eigen::VectorXd residual;
   Eigen::VectorXd variances;
-  step.measurement->pack(H, residual, variances);
+  ASSERT_TRUE(step.measurement->pack(H, residual, variances));
   ASSERT_EQ(variances.size(), 3);
-  EXPECT_EQ(bits(variances(0)), bits(sigma_vx * sigma_vx));
-  EXPECT_EQ(bits(variances(1)), bits(sigma_vy * sigma_vy));
-  EXPECT_EQ(bits(variances(2)), bits(sigma_vz * sigma_vz));
+  EXPECT_EQ(variances, Eigen::VectorXd::Ones(3));
+  EXPECT_EQ(bits(step.measurement->noise.R(0, 0)), bits(sigma_vx * sigma_vx));
+  EXPECT_EQ(bits(step.measurement->noise.R(1, 1)), bits(sigma_vy * sigma_vy));
+  EXPECT_EQ(bits(step.measurement->noise.R(2, 2)), bits(sigma_vz * sigma_vz));
   EXPECT_EQ(bits(step.measurement->z(0)), bits(v * scale));
 
   const ModelState s;
@@ -781,7 +1051,9 @@ TEST(WheelSpeedInput, WithoutAVarianceTopicAnEndpointSamplePreservesTodaysUnits)
   Eigen::Matrix<double, 3, fast_lio::kWheelStateDim> today = Eigen::Matrix<double, 3, fast_lio::kWheelStateDim>::Zero();
   today.block<3, 3>(0, fast_lio::kWheelRotIndex) = Re_T * skew(v_imu);
   today.block<3, 3>(0, fast_lio::kWheelVelIndex) = Re_T * s.R_world_imu.transpose();
-  EXPECT_TRUE(H.isApprox(today, 1e-14)) << H << "\n\n" << today;
+  EXPECT_TRUE(step.measurement->H.isApprox(today, 1e-14));
+  const Eigen::Matrix3d inverse_sigma = Eigen::Vector3d(1.0 / sigma_vx, 1.0 / sigma_vy, 1.0 / sigma_vz).asDiagonal();
+  EXPECT_TRUE(H.isApprox(inverse_sigma * today, 1e-14));
   EXPECT_TRUE(H.middleCols(fast_lio::kWheelGyroBiasIndex, 3).isZero(0.0));
 }
 
@@ -807,7 +1079,7 @@ TEST(WheelSpeedInput, AScanWithoutImuSamplesMakesNoUpdate)
   addTwistAt(input, kEpochNs + 50000000, 0.5);
   EXPECT_EQ(stepOf(input, WheelModelParams{}).outcome, WheelOutcome::kUnidentifiableEndpoint);
   addTwistAt(input, kEpochNs + 100000000, 0.5);
-  const fast_lio::WheelStep step = stepOf(input, WheelModelParams{}, std::nullopt);
+  const fast_lio::WheelStep step = stepOf(input, WheelModelParams{}, WheelAngularEndpoint{});
   EXPECT_EQ(step.outcome, WheelOutcome::kNoImu);
   EXPECT_FALSE(step.measurement.has_value());
   EXPECT_EQ(input.counts().no_imu, 1u);
@@ -890,12 +1162,13 @@ TEST(WheelSpeedInput, WheelLineCarriesTheOutcomeAndEveryCounter)
   const auto endpoint_ring = input.read(seconds(kEpochNs + 50000000), seconds(kEpochNs + 50000000));
   const fast_lio::WheelStep updated = input.step(endpoint_ring,
                                                  seconds(kEpochNs + 50000000),
-                                                 state.omega_mean,
+                                                 endpointAt(state.omega_raw),
                                                  state.R_world_imu,
                                                  state.velocity_world,
                                                  state.gyro_bias,
                                                  state.R_robot_to_imu,
-                                                 WheelModelParams{});
+                                                 WheelModelParams{},
+                                                 Eigen::Matrix<double, 23, 23>::Identity());
   ASSERT_EQ(updated.outcome, WheelOutcome::kUpdate);
   const std::string line = fast_lio::wheelLine(kScanEnd, updated, input.counts());
   EXPECT_EQ(line.rfind("[WHEEL] t=", 0), 0u) << line;
@@ -914,6 +1187,22 @@ TEST(WheelSpeedInput, WheelLineCarriesTheOutcomeAndEveryCounter)
   }
   EXPECT_NE(line.find(" rejected=0"), std::string::npos) << line;
   EXPECT_EQ(line.find("r_vy=nan"), std::string::npos) << line;  // the lateral axis was observed
+  for (const char * field : {" schema=2 ",
+                             " omega_end=[",
+                             " omega_t0=",
+                             " omega_t1=",
+                             " omega_weights=[",
+                             " Rgyro=[",
+                             " fit_order=0 ",
+                             " c_l1=1 ",
+                             " c_l2_sq=1 ",
+                             " Rfit_x=",
+                             " Rfit_y=",
+                             " nis=",
+                             " nis_dof=3 ",
+                             " reason=valid"}) {
+    EXPECT_NE(line.find(field), std::string::npos) << field << " in " << line;
+  }
 
   WheelSpeedInput empty;
   empty.configure(true, 0.075, 0.05);
@@ -922,4 +1211,64 @@ TEST(WheelSpeedInput, WheelLineCarriesTheOutcomeAndEveryCounter)
   EXPECT_NE(skipped.find(" outcome=no_sample samples=0 unpaired=0 raw_vx=nan fit_rms=nan "), std::string::npos)
     << skipped;
   EXPECT_NE(skipped.find(" z=nan r_vx=nan r_vy=nan r_vz=nan "), std::string::npos) << skipped;
+  EXPECT_NE(skipped.find("omega_end=[nan nan nan]"), std::string::npos);
+  EXPECT_NE(skipped.find("Rfit_x=nan Rfit_y=nan nis=nan nis_dof=0 reason=no_sample"), std::string::npos);
+}
+
+TEST(WheelSpeedInput, EndpointFailuresHaveSpecificOutcomesAndKeepTheInvalidCounter)
+{
+  WheelSpeedInput input;
+  input.configure(false, 0.1, 0.05);
+  addTwistAt(input, kEpochNs + 100000000, 0.8);
+  const auto unavailable =
+    angularRateAtEnd({{kScanEnd - 0.01, Eigen::Vector3d::Zero()}}, kScanEnd, Eigen::Vector3d::Constant(1e-4));
+  const auto missing = stepOf(input, WheelModelParams{}, unavailable);
+  EXPECT_EQ(missing.outcome, WheelOutcome::kEndpointUnavailable);
+  EXPECT_STREQ(missing.reason, "endpoint_unavailable");
+  EXPECT_FALSE(missing.measurement);
+  auto invalid = unavailable;
+  invalid.status = WheelAngularStatus::kInvalidTime;
+  const auto malformed = stepOf(input, WheelModelParams{}, invalid);
+  EXPECT_EQ(malformed.outcome, WheelOutcome::kInvalid);
+  EXPECT_STREQ(malformed.reason, "invalid_imu_time");
+  WheelModelParams params;
+  params.sigma_vz = 0.0;
+  const auto singular = stepOf(input, params);
+  EXPECT_EQ(singular.outcome, WheelOutcome::kInvalid);
+  EXPECT_STREQ(singular.reason, "invalid_active_covariance");
+  EXPECT_FALSE(singular.measurement);
+  EXPECT_EQ(input.counts().invalid, 3u);
+  EXPECT_EQ(input.counts().updates, 0u);
+}
+
+TEST(WheelSpeedInput, NisUsesTheNativeActiveRowsAndTheWheelPrior)
+{
+  // numerical-design.txt:L26: P=0 gives .175^2/.125625, then a nonzero P changes only NIS.
+  WheelSpeedInput input;
+  input.configure(true, 0.075, 0.05);
+  input.addTwist(0, 20000000, 0.775);
+  input.addVariances(0, 20000000, 0.0025, kUnobserved);
+  input.addTwist(0, 40000000, 0.825);
+  input.addVariances(0, 40000000, 0.0025, kUnobserved);
+  Eigen::Matrix<double, 23, 23> prior = Eigen::Matrix<double, 23, 23>::Zero();
+  const auto run = [&](const Eigen::Matrix<double, 23, 23> & P) {
+    return input.step(input.read(0.0, 0.1),
+                      0.1,
+                      endpointAt(Eigen::Vector3d::Zero()),
+                      Eigen::Matrix3d::Identity(),
+                      Eigen::Vector3d(0.8, 0.0, 0.0),
+                      Eigen::Vector3d::Zero(),
+                      Eigen::Matrix3d::Identity(),
+                      WheelModelParams{},
+                      P);
+  };
+  const auto zero = run(prior);
+  ASSERT_EQ(zero.outcome, WheelOutcome::kUpdate);
+  EXPECT_EQ(zero.nis_dof, 2);
+  EXPECT_NEAR(zero.nis, 0.2437810945273608, 1e-12);
+  prior(12, 12) = 0.01;
+  const auto with_prior = run(prior);
+  ASSERT_EQ(with_prior.outcome, WheelOutcome::kUpdate);
+  EXPECT_NEAR(with_prior.nis, 0.175 * 0.175 / (0.125625 + 0.01), 1e-12);
+  EXPECT_EQ(with_prior.measurement->noise.R, zero.measurement->noise.R);
 }

@@ -56,10 +56,11 @@ enum class WheelOutcome
 {
   kUpdate,                  ///< the measurement went into the filter
   kNoSample,                ///< no paired, valid sample in the scan's own span
-  kNoImu,                   ///< the scan carried no IMU sample, so its mean angular rate is unknown
+  kNoImu,                   ///< the scan carried no IMU sample
   kPhiUnavailable,          ///< k != 0 and no IMU sample in the slip window
   kInvalid,                 ///< the slip correction is undefined or the measurement is not finite
   kUnidentifiableEndpoint,  ///< one wheel sample time strictly before the endpoint
+  kEndpointUnavailable,     ///< the scan's IMU times cannot identify its endpoint
 };
 
 inline const char * wheelOutcomeName(WheelOutcome outcome)
@@ -77,6 +78,8 @@ inline const char * wheelOutcomeName(WheelOutcome outcome)
       return "invalid";
     case WheelOutcome::kUnidentifiableEndpoint:
       return "unidentifiable_endpoint";
+    case WheelOutcome::kEndpointUnavailable:
+      return "endpoint_unavailable";
   }
   return "unknown";
 }
@@ -109,6 +112,13 @@ struct WheelStep
   WheelRingRead ring;
   std::optional<double> phi;  ///< the scan's slip regressor, whether or not k needs it
   std::optional<WheelMeasurement> measurement;
+  WheelAngularEndpoint angular;
+  const char * reason = "no_sample";
+  Eigen::Matrix<double, Eigen::Dynamic, kWheelStateDim> jacobian_white;
+  Eigen::VectorXd residual_white;                         ///< dimensionless, after noise whitening
+  Eigen::VectorXd variances_white;                        ///< ones
+  double nis = std::numeric_limits<double>::quiet_NaN();  ///< diagnostic only
+  int nis_dof = 0;
 };
 
 class WheelSpeedInput
@@ -180,16 +190,17 @@ public:
     imu_forward_.emplace_back(t, a_forward);
   }
 
-  /// The wheel step of the scan ending at t_end, after its IMU samples were recorded. omega_mean is the mean raw
-  /// angular rate of the scan's IMU samples, nullopt when it had none. Forgets the IMU samples no later window needs.
+  /// The wheel step after this scan's IMU samples were recorded, using its timestamped raw angular endpoint.
+  /// prior is the filter covariance immediately before the wheel update, used only for diagnostic NIS.
   WheelStep step(const WheelRingRead & ring,
                  double t_end,
-                 const std::optional<Eigen::Vector3d> & omega_mean,
+                 const WheelAngularEndpoint & angular,
                  const Eigen::Matrix3d & R_world_imu,
                  const Eigen::Vector3d & velocity_world,
                  const Eigen::Vector3d & gyro_bias,
                  const Eigen::Matrix3d & R_robot_to_imu,
-                 const WheelModelParams & params)
+                 const WheelModelParams & params,
+                 const Eigen::Matrix<double, kWheelStateDim, kWheelStateDim> & prior)
   {
     const double t_begin = t_end - params.slip_window_s;
     while (!imu_forward_.empty() && imu_forward_.front().first < t_begin) {
@@ -206,28 +217,53 @@ public:
         ++counts_.invalid;
         out.outcome = ring.fit_status == WheelFitStatus::kUnidentifiableEndpoint ? WheelOutcome::kUnidentifiableEndpoint
                                                                                  : WheelOutcome::kInvalid;
+        out.reason =
+          ring.fit_status == WheelFitStatus::kUnidentifiableEndpoint ? "unidentifiable_endpoint" : "invalid_fit";
       }
       return out;
     }
-    if (!omega_mean) {
-      ++counts_.no_imu;
-      out.outcome = WheelOutcome::kNoImu;
+    out.angular = angular;
+    if (angular.status != WheelAngularStatus::kValid) {
+      out.reason = wheelAngularStatusName(angular.status);
+      if (angular.status == WheelAngularStatus::kNoImu) {
+        ++counts_.no_imu;
+        out.outcome = WheelOutcome::kNoImu;
+      } else {
+        ++counts_.invalid;
+        out.outcome = angular.status == WheelAngularStatus::kEndpointUnavailable ? WheelOutcome::kEndpointUnavailable
+                                                                                 : WheelOutcome::kInvalid;
+      }
       return out;
     }
     if (params.slip_k != 0.0 && !out.phi) {
       ++counts_.phi_unavailable;
       out.outcome = WheelOutcome::kPhiUnavailable;
+      out.reason = "phi_unavailable";
       return out;
     }
     out.measurement =
-      wheelMeasurement(*ring.fit, out.phi, R_world_imu, velocity_world, gyro_bias, *omega_mean, R_robot_to_imu, params);
+      wheelMeasurement(*ring.fit, out.phi, R_world_imu, velocity_world, gyro_bias, angular, R_robot_to_imu, params);
     if (!out.measurement) {
       ++counts_.invalid;
       out.outcome = WheelOutcome::kInvalid;
+      out.reason = "invalid_measurement";
       return out;
     }
+    if (!out.measurement->pack(out.jacobian_white, out.residual_white, out.variances_white)) {
+      out.measurement.reset();
+      ++counts_.invalid;
+      out.outcome = WheelOutcome::kInvalid;
+      out.reason = "invalid_active_covariance";
+      return out;
+    }
+    const auto nis = out.measurement->nis(prior);
+    if (nis) {
+      out.nis = *nis;
+    }
+    out.nis_dof = static_cast<int>(out.residual_white.size());
     ++counts_.updates;
     out.outcome = WheelOutcome::kUpdate;
+    out.reason = "valid";
     return out;
   }
 
@@ -256,12 +292,15 @@ inline std::string wheelLine(double t_end, const WheelStep & step, const WheelSc
   const bool fitted = step.ring.fit.has_value();
   const bool measured = step.measurement.has_value();
   const bool lateral = measured && step.measurement->noise.lateral;
-  char text[640];
+  char text[3072];
   std::snprintf(text,
                 sizeof(text),
                 "[WHEEL] t=%.6f outcome=%s samples=%d unpaired=%d raw_vx=%.9g fit_rms=%.9g phi=%.9g z=%.9g r_vx=%.9g "
                 "r_vy=%.9g r_vz=%.9g updates=%llu no_sample=%llu no_imu=%llu phi_unavailable=%llu invalid=%llu "
-                "unmatched_samples=%llu unmatched_variances=%llu rejected=%llu",
+                "unmatched_samples=%llu unmatched_variances=%llu rejected=%llu schema=2 "
+                "omega_end=[%.17g %.17g %.17g] omega_t0=%.17g omega_t1=%.17g omega_weights=[%.17g %.17g] "
+                "Rgyro=[%.17g %.17g %.17g %.17g %.17g %.17g] fit_order=%d c_l1=%.17g c_l2_sq=%.17g "
+                "Rfit_x=%.17g Rfit_y=%.17g nis=%.17g nis_dof=%d reason=%s",
                 t_end,
                 wheelOutcomeName(step.outcome),
                 fitted ? step.ring.fit->samples : 0,
@@ -280,7 +319,28 @@ inline std::string wheelLine(double t_end, const WheelStep & step, const WheelSc
                 static_cast<unsigned long long>(counts.invalid),
                 static_cast<unsigned long long>(step.ring.unmatched_samples),
                 static_cast<unsigned long long>(step.ring.unmatched_variances),
-                static_cast<unsigned long long>(step.ring.rejected));
+                static_cast<unsigned long long>(step.ring.rejected),
+                step.angular.raw(0),
+                step.angular.raw(1),
+                step.angular.raw(2),
+                step.angular.t0,
+                step.angular.t1,
+                step.angular.weights(0),
+                step.angular.weights(1),
+                measured ? step.measurement->noise.gyro(0, 0) : kNaN,
+                measured ? step.measurement->noise.gyro(0, 1) : kNaN,
+                measured ? step.measurement->noise.gyro(0, 2) : kNaN,
+                measured ? step.measurement->noise.gyro(1, 1) : kNaN,
+                measured ? step.measurement->noise.gyro(1, 2) : kNaN,
+                measured ? step.measurement->noise.gyro(2, 2) : kNaN,
+                fitted ? step.ring.fit->fit_order : -1,
+                fitted ? step.ring.fit->c_l1 : kNaN,
+                fitted ? step.ring.fit->c_l2_sq : kNaN,
+                measured ? step.measurement->noise.fit_vx : kNaN,
+                lateral ? step.measurement->noise.fit_vy : kNaN,
+                step.nis,
+                step.nis_dof,
+                step.reason);
   return text;
 }
 

@@ -2958,7 +2958,7 @@ TEST(FrontendPipelineContract, MeasurementM20Profile)
 
 // Every kalman_channels.csv row ends with the velocity block of the covariance its channel's update left, upper
 // triangle, world frame: on a lidar row, the posterior the filter holds right after the iterated lidar update.
-TEST(FrontendPipelineKalmanChannels, LidarRowsEndWithThePosteriorVelocityCovariance)
+TEST(FrontendPipelineContract, KalmanChannelsLidarRowsEndWithThePosteriorVelocityCovariance)
 {
   Scenario scenario = matchScenario();
   scenario.name = "kalman_channels";

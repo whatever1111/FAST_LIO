@@ -903,6 +903,9 @@ struct Scenario
   bool typed = false;  // the typed outputs on, with the fixed activation identity and repeat clock
   Cloud warm_up = Cloud::kDense;  // the cloud the warm-up scans carry: the scene the map starts from
   bool dump = false;  // the correspondence dump goes to the scenario's result directory; h_dump.v1 records its files
+  // kalman_channels.csv goes to the scenario's result directory; lidar_p_vel.v1 records the velocity block of the
+  // covariance each lidar update left
+  bool kalman = false;
   std::map<std::string, rclcpp::Parameter> params;
   std::vector<Slot> slots;          // after the warm-up
   std::vector<std::string> claims;  // the branches the scenario exists to reach
@@ -1516,7 +1519,7 @@ public:
     if (std::find(names.begin(), names.end(), kLaserMappingFactory) == names.end())
       error = "LaserMappingNode factory not found";
     // The constructor opens the dump files: their directory exists before it runs.
-    if (error.empty() && scenario_.dump) {
+    if (error.empty() && (scenario_.dump || scenario_.kalman)) {
       dump_dir_ =
         std::string(FASTLIO_CONTRACT_RESULTS) + "/frontend_contract/" + kFixture + "/" + scenario_.name + ".dump";
       if (!makeDirectories(dump_dir_))
@@ -1764,6 +1767,14 @@ private:
           << " P=23x23 P_sha256=" << bitsDigest(s.P, kDim * kDim) << " P_diag=" << bitsList(diagonal, kDim);
       if (note("afterLidarUpdate", out.str()))
         ++counts_["full_state_and_covariance"];
+      if (scenario_.kalman) {
+        const auto P = [&s](std::size_t row, std::size_t col) {
+          return s.P[row * kDim + col];
+        };
+        note("afterLidarUpdate",
+             "lidar_p_vel.v1 end=" + bits(end) +
+               " p=" + bitsList({P(12, 12), P(12, 13), P(12, 14), P(13, 13), P(13, 14), P(14, 14)}));
+      }
     };
     fast_lio_test::afterEmptyImuWindow =
       [this](std::uint64_t sequence, std::size_t borrowed, std::size_t pending, std::uint64_t first, bool faulted) {
@@ -2943,6 +2954,55 @@ TEST(FrontendPipelineContract, MeasurementCorrespondenceDump)
 TEST(FrontendPipelineContract, MeasurementM20Profile)
 {
   checkScenario(m20Scenario());
+}
+
+// Every kalman_channels.csv row ends with the velocity block of the covariance its channel's update left, upper
+// triangle, world frame: on a lidar row, the posterior the filter holds right after the iterated lidar update.
+TEST(FrontendPipelineKalmanChannels, LidarRowsEndWithThePosteriorVelocityCovariance)
+{
+  Scenario scenario = matchScenario();
+  scenario.name = "kalman_channels";
+  scenario.kalman = true;
+  setParam(scenario, rclcpp::Parameter("diagnostics.kalman_channel_enable", true));
+  const ChildRun run = runScenario(scenario);
+  ASSERT_TRUE(run.ok()) << run.describe();
+  std::vector<std::string> expected;
+  for (const auto & line : splitLines(run.record))
+    if (line.rfind("lidar_p_vel.v1 ", 0) == 0)
+      expected.push_back(valueOf(line, "p"));
+  ASSERT_FALSE(expected.empty()) << "no lidar update was recorded";
+
+  std::string text;
+  const std::string path = std::string(FASTLIO_CONTRACT_RESULTS) + "/frontend_contract/" + kFixture + "/" +
+                           scenario.name + ".dump/kalman_channels.csv";
+  ASSERT_TRUE(readFile(path, &text)) << path;
+  const auto fields = [](const std::string & line) {
+    std::vector<std::string> out;
+    std::istringstream in(line);
+    for (std::string field; std::getline(in, field, ',');)
+      out.push_back(field);
+    return out;
+  };
+  const auto lines = splitLines(text);
+  ASSERT_FALSE(lines.empty());
+  const auto header = fields(lines.front());
+  const std::vector<std::string> names = {"p_vel_xx", "p_vel_xy", "p_vel_xz", "p_vel_yy", "p_vel_yz", "p_vel_zz"};
+  ASSERT_GE(header.size(), names.size());
+  EXPECT_EQ(std::vector<std::string>(header.end() - static_cast<std::ptrdiff_t>(names.size()), header.end()), names);
+  const auto channel = std::find(header.begin(), header.end(), "channel") - header.begin();
+  ASSERT_LT(static_cast<std::size_t>(channel), header.size());
+  std::vector<std::string> actual;
+  for (std::size_t i = 1; i < lines.size(); ++i) {
+    const auto row = fields(lines[i]);
+    ASSERT_EQ(row.size(), header.size()) << "row " << i << ": " << lines[i];
+    if (row[static_cast<std::size_t>(channel)] != "lidar")
+      continue;
+    std::vector<double> values;
+    for (std::size_t k = row.size() - names.size(); k < row.size(); ++k)
+      values.push_back(std::strtod(row[k].c_str(), nullptr));
+    actual.push_back(bitsList(values.data(), values.size()));
+  }
+  EXPECT_EQ(actual, expected);
 }
 
 // The worker suite is what the front-end ThreadSanitizer phase runs. Here: the map worker and the reset that joins it.

@@ -3814,6 +3814,7 @@ private:
                 << pBefore(20) << ',' << pAfter(18) << ',' << pAfter(19) << ',' << pAfter(20) << ',' << drot.x() << ','
                 << drot.y() << ',' << drot.z() << ',' << measured.lidar_rot_obs_rp_min;
     writeWheelColumns(wheel);
+    writeVelocityCovarianceColumns();
     fout_kalman << '\n';
     fout_kalman.flush();
   }
@@ -3832,6 +3833,15 @@ private:
                 << (fitted ? wheel->ring.fit->residual_rms : kNaN) << ','
                 << (measured ? wheel->measurement->noise.var_vx : kNaN) << ','
                 << (measured && wheel->measurement->noise.lateral ? wheel->measurement->noise.var_vy : kNaN);
+  }
+
+  // The velocity block of the covariance the channel left, upper triangle, world frame, (m/s)^2: every row is written
+  // right after its channel's update, so the filter's P here is that update's posterior (the propagation row's prior).
+  void writeVelocityCovarianceColumns()
+  {
+    const auto & P = kf.get_P();
+    fout_kalman << ',' << P(12, 12) << ',' << P(12, 13) << ',' << P(12, 14) << ',' << P(13, 13) << ',' << P(13, 14)
+                << ',' << P(14, 14);
   }
 
   // The wheel update after the lidar update (design B.2): the paired samples of the scan's own span fitted at its
@@ -3976,7 +3986,13 @@ private:
     fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"), ios::out);
     fout_jump.open(DEBUG_FILE_DIR("jump_diag.txt"), ios::out);
     if (params_.values().kalman_channel_diag_en) {
-      fout_kalman.open(DEBUG_FILE_DIR("kalman_channels.csv"), ios::out);
+#ifdef FASTLIO_TEST_HOOKS
+      // A fixture's correspondenceDumpDir replaces Log/, as for the correspondence dump.
+      const std::string kalmanFile = fast_lio_test::correspondenceDumpFile("kalman_channels.csv");
+#else
+      const std::string kalmanFile = DEBUG_FILE_DIR("kalman_channels.csv");
+#endif
+      fout_kalman.open(kalmanFile, ios::out);
       fout_kalman << "schema_version,scan_index,time,channel,valid,converged,iterations,measurement_dim,"
                   << "residual_norm,weighted_residual_squared,effct_feat_num,res_mean,pos_obs_eig_min,"
                   << "pos_obs_eig_max,pos_obs_z_weak,z0,z1,z2,h0,h1,h2,"
@@ -3990,10 +4006,9 @@ private:
                   << "p_grav_diag0_before,p_grav_diag1_before,p_grav_diag0_after,p_grav_diag1_after,"
                   << "p_ba_x_before,p_ba_y_before,p_ba_z_before,p_ba_x_after,p_ba_y_after,p_ba_z_after,"
                   << "drot_x,drot_y,drot_z,rot_obs_rp_min,"
-                  << "wheel_raw_vx,wheel_phi,wheel_samples,wheel_fit_rms,wheel_r_vx,wheel_r_vy\n";
-      RCLCPP_INFO(this->get_logger(),
-                  "Kalman channel diagnostics enabled: %s (schema v1)",
-                  DEBUG_FILE_DIR("kalman_channels.csv").c_str());
+                  << "wheel_raw_vx,wheel_phi,wheel_samples,wheel_fit_rms,wheel_r_vx,wheel_r_vy,"
+                  << "p_vel_xx,p_vel_xy,p_vel_xz,p_vel_yy,p_vel_yz,p_vel_zz\n";
+      RCLCPP_INFO(this->get_logger(), "Kalman channel diagnostics enabled: %s (schema v1)", kalmanFile.c_str());
     }
     if (fout_pre && fout_out)
       cout << "~~~~" << ROOT_DIR << " file opened" << endl;

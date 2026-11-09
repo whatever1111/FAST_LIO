@@ -4,10 +4,9 @@
 // The same scene drives the filter's two dyn_share entries side by side: a model bound with a context
 // (init_dyn_share_context) must be called, and leave the filter, exactly as the plain entry does.
 //
-// Further down, the same estimator in a corridor with noisy plane normals: the floor projection
-// (normal_noise_floor.hpp: the residual shifted by what the removed information reads, then the position
-// columns projected) at every iteration, and the wheel update (wheel_measurement.hpp) after the lidar, for
-// design D.5 and F2 (a)-(c).
+// Further down, the same estimator in a corridor with noisy plane normals uses the joint-row floor
+// (normal_noise_floor.hpp) on the full Jacobian and residual at every iteration, followed by the wheel update
+// (wheel_measurement.hpp), for D.5 and the R36/R37 revisions of F2 (a)-(c).
 #include <Eigen/Dense>
 
 #include <algorithm>
@@ -498,6 +497,8 @@ struct Corridor
   Eigen::Vector3d gains = Eigen::Vector3d::Ones();
   Eigen::Matrix3d V = Eigen::Matrix3d::Identity();
   double zeroed_information = 0.0;  // largest sum_i (row_i . v_k)^2 over directions with g_k = 0, any call
+  double joint_mode_relative = 0.0;
+  double information_increase_relative = 0.0;
 };
 
 Corridor makeCorridor(double tilt_scale, double end_weight, bool noisy = true)
@@ -575,9 +576,46 @@ std::pair<std::vector<double>, std::vector<std::optional<Eigen::Matrix3d>>> floo
   return inputs;
 }
 
-// sceneModel's conventions, with the floor projection as part B is to run it when the corridor asks for it:
-// applyFloorProjection with the FloorParams defaults and the front end's Schur ridge, which shifts the residual
-// by what the removed information reads and then applies G to the position columns, at every iteration.
+struct JointOracle
+{
+  Eigen::Matrix3d M, K, S0, C_inverse;
+};
+
+// Independent symmetric-root J-ROW oracle. r2 numerical-d1.txt:L8,L35,L45 / E2.2.
+// This does not call the production decision or apply function and uses no QR factors from them.
+JointOracle jointOracle(const Eigen::MatrixXd & H, const Corridor & corridor)
+{
+  JointOracle out;
+  const Eigen::MatrixXd H_t = H.leftCols(3), H_r = H.middleCols(3, 3);
+  const Eigen::Matrix3d C = H_r.transpose() * H_r;
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> rotation(C);
+  const double tolerance = std::numeric_limits<double>::epsilon() * H.rows() * rotation.eigenvalues().maxCoeff();
+  Eigen::Vector3d inverse = Eigen::Vector3d::Zero();
+  for (int k = 0; k < 3; ++k) {
+    if (rotation.eigenvalues()(k) > tolerance)
+      inverse(k) = 1.0 / rotation.eigenvalues()(k);
+  }
+  out.C_inverse = rotation.eigenvectors() * inverse.asDiagonal() * rotation.eigenvectors().transpose();
+  const Eigen::MatrixXd perpendicular = H_t - H_r * out.C_inverse * (H_r.transpose() * H_t);
+  out.M = perpendicular.transpose() * perpendicular;
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> position(out.M);
+  const Eigen::Matrix3d root =
+    position.eigenvectors() * position.eigenvalues().cwiseSqrt().asDiagonal() * position.eigenvectors().transpose();
+  const Eigen::Matrix3d inverse_root = root.inverse();
+  out.S0.setZero();
+  for (const auto & point : corridor.points) {
+    if (point.cov)
+      out.S0 += point.weight * point.weight * *point.cov;
+  }
+  const fast_lio::FloorParams params;
+  const double a = 1.0 + *fast_lio::zFromFalseKeepRate(params.alpha) * params.rel_uncertainty;
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> floor(inverse_root * params.kappa * out.S0 * inverse_root);
+  const Eigen::Vector3d kept = (Eigen::Vector3d::Ones() - a * floor.eigenvalues()).cwiseMax(0.0);
+  out.K = root * floor.eigenvectors() * kept.asDiagonal() * floor.eigenvectors().transpose() * root;
+  return out;
+}
+
+// The same bounded row map acts on H and h at every IEKF iteration.
 void corridorModel(state_ikfom & s, esekfom::dyn_share_datastruct<double> & data)
 {
   Corridor & corridor = *g_corridor;
@@ -594,21 +632,36 @@ void corridorModel(state_ikfom & s, esekfom::dyn_share_datastruct<double> & data
     data.h(i) = -point.weight * (point.n.dot(p_w) + point.d);
   }
   if (corridor.project) {
+    const Eigen::MatrixXd original = data.h_x;
+    const JointOracle oracle = jointOracle(original, corridor);
     const auto inputs = floorInputs(corridor);
     const fast_lio::FloorProjectionResult projection = fast_lio::applyFloorProjection(
       data.h_x, data.h, inputs.first, inputs.second, fast_lio::FloorParams{}, fast_lio::DegeneracyParams{}.schur_ridge);
     if (!projection.valid) {
       ADD_FAILURE() << "the floor projection refused the corridor's rows";
     }
-    corridor.V = projection.eigenvectors;
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> position(projection.M0);
+    corridor.V = position.eigenvectors();
     corridor.lambda = projection.lambda;
-    corridor.noise_floor = projection.noise_floor;
-    corridor.gains = projection.gains;
-    for (int k = 0; k < 3; ++k) {
-      if (corridor.gains(k) == 0.0) {
-        corridor.zeroed_information =
-          std::max(corridor.zeroed_information, (data.h_x.leftCols(3) * corridor.V.col(k)).squaredNorm());
-      }
+    // This fixture's physical axes commute. These axis gains are distinct from telemetry's tau-ordered g_gen.
+    corridor.noise_floor = fast_lio::FloorParams{}.kappa * oracle.S0.diagonal();
+    corridor.gains = fast_lio::floorKeepGains(oracle.M.diagonal(),
+                                              corridor.noise_floor,
+                                              *fast_lio::zFromFalseKeepRate(fast_lio::FloorParams{}.alpha),
+                                              fast_lio::FloorParams{}.rel_uncertainty);
+    const Eigen::Matrix<double, 6, 6> raw = original.leftCols(6).transpose() * original.leftCols(6);
+    const Eigen::Matrix<double, 6, 6> kept = data.h_x.leftCols(6).transpose() * data.h_x.leftCols(6);
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> difference(kept - raw);
+    corridor.information_increase_relative =
+      std::max(corridor.information_increase_relative, difference.eigenvalues().maxCoeff() / std::max(1.0, raw.norm()));
+    if ((projection.gains.array() == 0.0).any()) {
+      corridor.zeroed_information = std::max(corridor.zeroed_information, data.h_x.col(0).squaredNorm());
+      const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> zero(oracle.K);
+      Eigen::Matrix<double, 6, 1> q;
+      q.head<3>() = zero.eigenvectors().col(0);
+      q.tail<3>() = -oracle.C_inverse * raw.bottomLeftCorner<3, 3>() * q.head<3>();
+      corridor.joint_mode_relative = std::max(
+        corridor.joint_mode_relative, (data.h_x.leftCols(6) * q).norm() / std::max(1.0, original.norm() * q.norm()));
     }
   }
   data.valid = true;
@@ -827,16 +880,11 @@ TEST(FloorProjection, WheelSetsTheAlongCorridorVelocityAndTheOtherDirectionsKeep
   EXPECT_LT(plain_gain, 0.015);
 }
 
-TEST(FloorProjection, ExactZeroTheLidarAddsNothingAlongTheCorridor)
+TEST(FloorProjection, RemovedJointModeAndNirWithPurePositionDiagnostics)
 {
-  // F2 (c), without the wheel. (1) At every iteration of every scan the projected rows carry no information
-  // along the zeroed direction: sum_i (row_i . u)^2 <= 3.2e-9 normals, the level that would already pin the
-  // velocity (calc.out:17); what is left is the rounding of V's orthonormality. (2) So the covariance does not
-  // shrink along u: the along-corridor position and velocity variances follow, scan for scan, those of the same
-  // corridor with exact normals, where the lidar has no along-corridor information by construction. Both grow
-  // by q per scan apart from the tilt-gravity coupling they share; what differs is the second-order change of
-  // the tilt information from the tilted normals (simulation: 1.4e-4 relative), within the 1e-3 bound.
-  // Without the projection the same noisy corridor pins them to a tenth.
+  // R36(4), r2 txt:L44. The former pure-position <=3.2e-9 and P/exact <=1e-3 guarantees are withdrawn.
+  // All 200 scans and their original pure-position/P/growth outputs remain diagnostics. Acceptance now checks
+  // H_new q approximately zero and the full Gram/NIR certificate at every iteration, relative tolerance 1e-12.
   const Filter::cov P0 = corridorPrior(1e-8, 1e-12);
   CorridorEstimator projected(makeCorridor(1.0, 0.0), P0, restingState());
   CorridorEstimator exact(makeCorridor(1.0, 0.0, false), P0, restingState());
@@ -866,9 +914,10 @@ TEST(FloorProjection, ExactZeroTheLidarAddsNothingAlongTheCorridor)
   std::cout << "F2(c): zeroed information " << projected.corridor().zeroed_information << " normals, P_vv vs exact "
             << worst_velocity << ", P_pp vs exact " << worst_position << ", last-scan growth / qT " << growth << "\n";
   EXPECT_EQ(projected.corridor().gains(0), 0.0);
-  EXPECT_LE(projected.corridor().zeroed_information, 3.2e-9);
-  EXPECT_LE(worst_velocity, 1e-3);
-  EXPECT_LE(worst_position, 1e-3);
+  RecordProperty("joint_mode_relative", text(projected.corridor().joint_mode_relative));
+  RecordProperty("information_increase_relative", text(projected.corridor().information_increase_relative));
+  EXPECT_LE(projected.corridor().joint_mode_relative, 1e-12);
+  EXPECT_LE(projected.corridor().information_increase_relative, 1e-12);
   EXPECT_LT(plain.filter().get_P()(kVelX, kVelX) / exact.filter().get_P()(kVelX, kVelX), 0.5);
 }
 
@@ -918,12 +967,11 @@ TEST(FloorProjection, PosteriorMatchesTheClosedFormAsTheInformationRisesThroughT
   // F2 (b): lambda_u swept from 0.5 f to 5 f in 450 steps of 0.01 f by end walls of growing weight, one lidar
   // update each from the same propagated prior (the fixture's priors and position offset, one scan of IMU). With
   // no attitude offset the point-to-plane residuals are linear in the error, so the update must land on the
-  // linear-Gaussian posterior of the projected model linearised at the prior: it absorbs g^2 lambda in mean and
-  // covariance alike, is the prior (plus its Kalman coupling) along u wherever g = 0, and is continuous in lambda.
+  // linear-Gaussian posterior of the joint-row model linearised at the prior. Mean and covariance use the same
+  // contracted information, with removed joint modes and the retained rotation-confounded position component.
   // Every error-state component within 1e-4 of the reference's sigma. The reference, from the unprojected rows
-  // H, h at the prior, with no residual shift in it:
-  //   J = H^T H, b = H^T h over position and rotation (H is zero elsewhere); V, lambda, f, g, G as the projection
-  //   takes them; e = J^-1 b; D = diag(G, I); J' = D J D, b' = J' e;
+  // H, h at the prior, independent joint oracle (r2 test contract section 3):
+  //   J = H^T H, b = H^T h; J' = J - diag(M0 - K, 0), b' = J' J^-1 b;
   //   Lambda = R P^-1 + J', delta = Lambda^-1 b', x_ref = x_prior [+] delta, P_ref = R Lambda^-1.
   const double tilt = std::sqrt(0.5);
   CorridorEstimator propagated(
@@ -934,9 +982,6 @@ TEST(FloorProjection, PosteriorMatchesTheClosedFormAsTheInformationRisesThroughT
   const Filter::cov prior_information = kLidarR * P_prior.inverse();
   const auto bare = alongCorridorInformation(tilt, 0.0);
   const auto unit = alongCorridorInformation(tilt, 1.0);
-  const fast_lio::FloorParams params;
-  const double z_alpha = *fast_lio::zFromFalseKeepRate(params.alpha);
-  const double ridge = fast_lio::DegeneracyParams{}.schur_ridge;
   const int steps = 450;
   std::vector<double> realised;
   double worst = 0.0;
@@ -957,17 +1002,9 @@ TEST(FloorProjection, PosteriorMatchesTheClosedFormAsTheInformationRisesThroughT
     const Eigen::MatrixXd H = rows.h_x.leftCols(6);
     const Eigen::Matrix<double, 6, 6> J = H.transpose() * H;
     const Eigen::Matrix<double, 6, 1> b = H.transpose() * rows.h;
-    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(
-      fast_lio::schurPositionInformation(J.block<3, 3>(0, 0), J.block<3, 3>(0, 3), J.block<3, 3>(3, 3), ridge));
-    fast_lio::DirectionFloorAccumulator accumulator(solver.eigenvectors());
-    for (const CorridorPoint & point : unprojected.points) {
-      accumulator.add(point.weight, point.cov);
-    }
-    const Eigen::Vector3d g =
-      fast_lio::floorKeepGains(solver.eigenvalues(), accumulator.floor(params.kappa), z_alpha, params.rel_uncertainty);
-    Eigen::Matrix<double, 6, 6> D = Eigen::Matrix<double, 6, 6>::Identity();
-    D.block<3, 3>(0, 0) = fast_lio::projectionFromGains(solver.eigenvectors(), g);
-    const Eigen::Matrix<double, 6, 6> J_projected = D * J * D;
+    const JointOracle oracle = jointOracle(rows.h_x, unprojected);
+    Eigen::Matrix<double, 6, 6> J_projected = J;
+    J_projected.topLeftCorner<3, 3>() -= oracle.M - oracle.K;
     const Eigen::Matrix<double, 6, 1> b_projected = J_projected * J.ldlt().solve(b);
     Filter::cov information = prior_information;
     information.block<6, 6>(0, 0) += J_projected;
@@ -987,7 +1024,7 @@ TEST(FloorProjection, PosteriorMatchesTheClosedFormAsTheInformationRisesThroughT
       worst_index = distance.second;
     }
     realised.push_back(estimator.corridor().lambda(0) / estimator.corridor().noise_floor(0));
-    zero_gain_steps += g(0) == 0.0 ? 1 : 0;
+    zero_gain_steps += estimator.corridor().gains(0) == 0.0 ? 1 : 0;
   }
   RecordProperty("worst_sigma_fraction_vs_closed_form", text(worst));
   RecordProperty("zero_gain_steps", std::to_string(zero_gain_steps));

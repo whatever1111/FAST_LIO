@@ -78,7 +78,7 @@ struct MeasurementTelemetry
   // The normal-noise floor (FrontendParams::degeneracy_floor_mode is the policy): on the current scan, the last
   // evaluation's decision and how many evaluations ran it and were refused, for the [FLOOR] line; over the node's
   // life, the rows of the evaluations whose projection changed them and the sum of the position information each of
-  // those rows kept (|G n| for its unit normal n), so the dose stays measurable.
+  // those rows kept (the actual transformed position-row norm), so the dose stays measurable.
   fast_lio::FloorScanRecord floor;
   long floor_rows_projected = 0;
   double floor_kept_sum = 0.0;
@@ -182,6 +182,12 @@ public:
                 esekfom::dyn_share_datastruct<double> & data,
                 const MeasurementInputs & inputs,
                 const MeasurementOutputs & outputs);
+
+  /// Condition already-weighted rows and record their actual dose. evaluate() calls this after row construction.
+  void applyFloorRows(esekfom::dyn_share_datastruct<double> & data,
+                      const std::vector<double> & weights,
+                      const std::vector<std::optional<Eigen::Matrix3d>> & covariances,
+                      int evaluation_iteration);
 
   const MeasurementTelemetry & telemetry() const { return telemetry_; }
   /// Each point's neighbours from its last search, for the map update.

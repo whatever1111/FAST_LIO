@@ -36,12 +36,66 @@ Inputs and goldens of the two contract fixtures of the legacy front-end node (la
   correspondence selection (`h_select.v1`: the search decision, the gate, kernel and ground recovery counts, and
   digests of the selection, the residuals and the rows) and its exit (`h_exit.v1`: position information, the
   hold's verdicts, roll/pitch information and consideration, and in its `degeneracy_*` fields the normal-noise
-  floor's decision: engaged when the projection changed the rows, M_eff's eigenvalues raw and over the rows, the
-  keep gains, and since construction the projected rows with the sum of what each kept); the dump scenario records
+  floor's decision with the schema-2 meanings below, and since construction the transformed rows and their actual
+  position-row norms); the dump scenario records
   its three files (`h_dump.v1`), which the test build writes to the scenario's result directory.
 
 Lines whose first word is a `.v1` name (`event.v1`, `effective.v1`, `h_matrix.v1`, ...) were added to records
 that existed before them; removing them gives each earlier record unchanged.
+
+## Joint-row floor telemetry
+
+The floor uses `schema=2 rule=joint_row_v1`. Its row contraction acts on all 12 Jacobian columns and the residual
+with the same L. D1 uses the exact rotation Schur M0. `M_ridge` remains a diagnostic of the former definition.
+R36 withdraws the former pure-position deletion guarantee and replaces it with deletion of the joint
+position-rotation mode. R37 accepts jumps at M0 and rotation-support rank boundaries. A nonzero floor with
+rank_m below three is invalid and leaves the rows unchanged. A zero floor is an exact byte-preserving no-op.
+
+`h_exit.v1` keeps its field names and order. With the mechanism off its values keep their original meanings
+and bytes. With observe or apply enabled, the floor fields have the following definitions.
+
+| Field | Schema-2 meaning |
+| --- | --- |
+| `degeneracy_engaged` | True only when apply actually commits the row contraction |
+| `degeneracy_lambdas` | Ascending eigenvalues of M0 |
+| `degeneracy_weights` | Generalized gains g_gen, ordered by ascending tau |
+| `degeneracy_shares` | Each M0 eigenvalue divided by the effective row count, or the existing invalid sentinel |
+| `degeneracy_weighted_points` | Cumulative count of rows in committed contractions |
+| `degeneracy_weight_sum` | Cumulative sum of actual transformed position-row norms |
+
+The lambda and gain arrays have independent ordering and their same-index entries are not paired. The versioned
+FLOOR line provides the rule identity for interpreting these compatibility fields. Invalid attempted evaluations
+carry nan gains and empty generalized spectra in the log. The floor-off neutral record retains zero lambdas and
+unit gains. The correspondence dump keeps its columns and ordering. On a projected evaluation its existing `w`
+column contains `floor_row_pos_norm`, the norm of the actual transformed position row. An unmatched point has
+`w=-1`. Row mixing allows an individual row norm to grow. Observe and off retain the existing dump values.
+
+Each enabled frame emits one `[FLOOR]` line after the final snapshot is fixed. All real values use `%.17g` and
+`stamp_ns` uses the same ROS conversion as `/Odometry`. Symmetric matrices use xx,xy,xz,yy,yz,zz and B is row-major
+with position rows and rotation columns. The row units are `normal_equivalent`. S0 excludes kappa and the margin.
+
+| Fields | Meaning |
+| --- | --- |
+| `schema rule mode t stamp_ns evaluation_iter` | Identity, scan end and last H-model iteration that evaluated the floor |
+| `valid reason projected` | Decision validity, failure reason and actual application |
+| `points points_without_covariance iterations invalid_iterations` | Row and per-scan evaluation counts |
+| `rank_m rank_r kappa sigma_rel z a m_definition units` | Supports, model constants and exact Schur identity |
+| `M M_ridge S0 lambda tau g_gen K F_sym transform_kind` | Full decision, with F_sym in the symmetric M0-root basis |
+| `u u_source u_valid` | R_world_imu times UnitX from the published frame-end quaternion |
+| `rD_num rD_den rD rD_valid rD_zero_denominator rD_reason` | u-transpose M0 u, u-transpose S0 u and their ratio |
+| `A B C A_keep B_keep C_keep` | Original and candidate-contracted six-state Gram blocks |
+| `shift_kind shift_coords_valid d_t d_r dh_norm` | Apply-only joint-shift diagnostics and actual removed residual norm |
+
+Observe computes the same candidate decision and keep blocks while preserving H and h byte for byte. It omits
+all shift fields. Off emits no FLOOR line. Invalid numerical fields are nan and invalid tau/g_gen arrays are
+empty. Successfully computed M0 and S0 remain available when apply is invalid, so rD_valid is independent of valid.
+The zero-floor fast path has K=M0, zero tau and unit gains, with spectrum length rank_m. Coordinate overflow marks
+both d arrays nan without rejecting a finite row update. Other invalid applies keep dh_norm zero and commit no rows.
+
+A coordinate-epoch mismatch emits `rD_reason=frame_mismatch`, invalid u and invalid rD. A zero denominator emits a
+per-frame `rD_zero_denominator=1`, which the reader sums separately. All other unavailable ratios retain their
+reason. Calibration readers include every computable ratio, including rank_m-invalid evaluations, and keep M0
+and historical ridge-Schur datasets separate.
 
 Each case is compared with its golden line for line, character for character. Doubles are written with 17
 significant digits and NaN with its bit pattern; nothing is compared with a tolerance. Masked: the package's

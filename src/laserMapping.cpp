@@ -3121,6 +3121,29 @@ void exportLostRecoveryEpoch(const FinalFrontendSnapshot & final)
     odomAftMapped.twist.covariance[6] = static_cast<double>(final.coordinateEpoch);
 }
 
+void logFloorFinal(double scan_end,
+                   fast_lio::FloorMode mode,
+                   const fast_lio::FloorScanRecord & record,
+                   const FinalFrontendSnapshot & final,
+                   std::uint64_t measurement_epoch)
+{
+  if (mode == fast_lio::FloorMode::kOff) {
+    return;
+  }
+  const auto & pose = final.frontend.pose;
+  const Eigen::Quaterniond rotation(pose[6], pose[3], pose[4], pose[5]);
+  const bool rotation_valid =
+    rotation.coeffs().allFinite() && std::isfinite(rotation.squaredNorm()) && rotation.squaredNorm() > 0.0;
+  const Eigen::Vector3d direction = rotation_valid
+                                      ? Eigen::Vector3d(rotation.toRotationMatrix() * Eigen::Vector3d::UnitX())
+                                      : Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
+  const bool same_frame = final.coordinateEpoch == measurement_epoch && !odom_frame_id.empty();
+  const auto stamp_ns = rclcpp::Time(get_ros_time(scan_end)).nanoseconds();
+  RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+              "%s",
+              fast_lio::floorLine(scan_end, stamp_ns, mode, record, direction, same_frame).c_str());
+}
+
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped,
                       std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br,
                       const FinalFrontendSnapshot & final)
@@ -5358,6 +5381,7 @@ private:
                                rp_consider_indefinite);
         }
       }
+      const auto floorCoordinateEpoch = lost_recovery.coordinate_epoch;
       kf.update_iterated_dyn_share_modified(
         LASER_POINT_COV, solve_H_time, p.kalman_channel_diag_en ? &lidarDiagnostics : nullptr);
 #ifdef FASTLIO_TEST_HOOKS
@@ -5428,15 +5452,6 @@ private:
         fout_corr.flush();
         fout_corr_iter.flush();
         fout_corr_scan.flush();
-      }
-
-      // The floor's decision on this scan's last evaluation, every scan, unthrottled: a released direction is
-      // otherwise invisible (the pose keeps coming out and the scan keeps matching), and a replay has to follow each
-      // direction's information against its floor scan by scan.
-      if (p.degeneracy_floor_mode != fast_lio::FloorMode::kOff) {
-        RCLCPP_INFO(this->get_logger(),
-                    "%s",
-                    fast_lio::floorLine(lidar_end_time, p.degeneracy_floor_mode, measured.floor).c_str());
       }
 
       /*** Divergence guard (P1) — two independent divergence signals:
@@ -6424,6 +6439,7 @@ private:
       anchor_final_frozen = true;
       reference_pending = reference_health_en;
       const auto & final = anchor_final_snapshot;
+      logFloorFinal(lidar_end_time, p.degeneracy_floor_mode, measured.floor, final, floorCoordinateEpoch);
       publish_odometry(pubOdomAftMapped_, tf_broadcaster_, final);
       if (anchor_scan_record_open) {
         anchor_scan_record.published = true;

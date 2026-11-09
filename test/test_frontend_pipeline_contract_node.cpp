@@ -113,6 +113,7 @@
 #include <rcl/error_handling.h>
 #include <rcl/timer.h>
 #include <rcl/wait.h>
+#include <rcl_interfaces/msg/log.hpp>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -125,6 +126,7 @@
 #include <vector>
 
 #include "anchor_trace.hpp"
+#include "frontend_measurement.hpp"
 #include "imu_process_outcome.hpp"
 #include "laser_mapping_test_hooks.hpp"
 #include "preprocess.h"
@@ -908,6 +910,7 @@ struct Scenario
   // kalman_channels.csv goes to the scenario's result directory; lidar_p_vel.v1 records the velocity block of the
   // covariance each lidar update left
   bool kalman = false;
+  bool floor_log_binding = false;  // assert schema-2 u/stamp against the actual /Odometry, without a new golden
   std::map<std::string, rclcpp::Parameter> params;
   std::vector<Slot> slots;          // after the warm-up
   std::vector<std::string> claims;  // the branches the scenario exists to reach
@@ -1552,6 +1555,18 @@ public:
         [this](nav_msgs::msg::Odometry::ConstSharedPtr message) {
           odom_by_ms_[msKey(rclcpp::Time(message->header.stamp).seconds())] = *message;
         });
+      if (scenario_.floor_log_binding) {
+        floor_log_ = observer_->create_subscription<rcl_interfaces::msg::Log>(
+          "/rosout",
+          rclcpp::QoS(rclcpp::KeepLast(1000)).reliable().transient_local(),
+          [this](rcl_interfaces::msg::Log::ConstSharedPtr message) {
+            if (message->msg.rfind("[FLOOR] schema=2 ", 0) == 0) {
+              const std::string stamp = valueOf(message->msg, "stamp_ns");
+              if (!stamp.empty())
+                floor_by_stamp_[std::stoll(stamp)] = message->msg;
+            }
+          });
+      }
       if (scenario_.typed) {
         const auto typed_qos = rclcpp::QoS(rclcpp::KeepLast(1000)).best_effort();
         frontend_sub_ = observer_->create_subscription<fast_lio_interfaces::msg::FrontendObservation>(
@@ -1569,6 +1584,7 @@ public:
       executor_->add_node(observer_);
       if (!spinUntil([&] {
             return imu_->get_subscription_count() == 1 && lidar_->get_subscription_count() == 1 &&
+                   (!scenario_.floor_log_binding || floor_log_->get_publisher_count() > 0) &&
                    (!scenario_.typed ||
                     (frontend_sub_->get_publisher_count() == 1 && reference_sub_->get_publisher_count() == 1));
           }))
@@ -1589,6 +1605,8 @@ public:
       error = appendTyped();
     if (error.empty() && scenario_.typed && (typed_frontend_total_ == 0 || typed_reference_total_ == 0))
       error = "the typed scenario received no FrontendObservation or no ReferenceHealth";
+    if (error.empty() && scenario_.floor_log_binding)
+      error = validateFloorBindings();
     teardown();
     finish();
     return error;
@@ -1616,6 +1634,34 @@ public:
   }
 
 private:
+  std::string validateFloorBindings()
+  {
+    if (odom_by_ms_.empty())
+      return "no odometry for the floor binding check";
+    if (!spinUntil([&] { return floor_by_stamp_.size() >= odom_by_ms_.size(); }))
+      return "missing FLOOR records for published odometry";
+    for (const auto & entry : odom_by_ms_) {
+      const auto stamp = rclcpp::Time(entry.second.header.stamp).nanoseconds();
+      const auto found = floor_by_stamp_.find(stamp);
+      if (found == floor_by_stamp_.end())
+        return "FLOOR stamp differs from /Odometry";
+      const auto & line = found->second;
+      const auto start = line.find(" u=[");
+      Eigen::Vector3d actual;
+      if (start == std::string::npos ||
+          std::sscanf(line.c_str() + start, " u=[%lf %lf %lf]", &actual.x(), &actual.y(), &actual.z()) != 3)
+        return "FLOOR u is missing";
+      const auto & q = entry.second.pose.pose.orientation;
+      const Eigen::Vector3d expected =
+        Eigen::Quaterniond(q.w, q.x, q.y, q.z).toRotationMatrix() * Eigen::Vector3d::UnitX();
+      if (!actual.allFinite() || (actual - expected).norm() > 1e-12)
+        return "FLOOR u differs from the published frame-end quaternion";
+      if (valueOf(line, "u_valid") != "1")
+        return "FLOOR u is invalid in an unchanged world frame";
+    }
+    return "";
+  }
+
   struct PendingScan
   {
     int scan = 0;
@@ -2368,6 +2414,7 @@ private:
     reference_sub_.reset();
     frontend_sub_.reset();
     odom_.reset();
+    floor_log_.reset();
     imu_.reset();
     lidar_.reset();
     observer_.reset();
@@ -2436,6 +2483,8 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_;
+  rclcpp::Subscription<rcl_interfaces::msg::Log>::SharedPtr floor_log_;
+  std::map<std::int64_t, std::string> floor_by_stamp_;
   rclcpp::Subscription<fast_lio_interfaces::msg::FrontendObservation>::SharedPtr frontend_sub_;
   rclcpp::Subscription<fast_lio_interfaces::msg::ReferenceHealth>::SharedPtr reference_sub_;
   std::chrono::steady_clock::time_point repeat_clock_{kRepeatClockStart};
@@ -2926,6 +2975,47 @@ TEST(FrontendPipelineContract, MeasurementNeighbourRefresh)
 TEST(FrontendPipelineContract, MeasurementGroundRecovery)
 {
   checkScenario(groundScenario());
+}
+
+TEST(FrontendPipelineContract, JointRowFloorMeasurementFixture)
+{
+  // Independent r2 numerical-d1.txt:L8. Exercise the actual measurement-stage entry and dose telemetry.
+  // This assertion fixture does not record or generate a golden.
+  fast_lio::FrontendParams params;
+  params.degeneracy_floor_mode = fast_lio::FloorMode::kApply;
+  params.degeneracy_floor.rel_uncertainty = 0.0;
+  fast_lio::FrontendMeasurement measurement(params);
+  esekfom::dyn_share_datastruct<double> data;
+  data.h_x = Eigen::MatrixXd::Zero(6, 12);
+  data.h_x.leftCols(6).setIdentity();
+  data.h_x(3, 0) = data.h_x(3, 1) = 1.0;
+  data.h_x.rightCols(6) = data.h_x.leftCols(6);
+  data.h = data.h_x.col(0);
+  Eigen::MatrixXd expected = data.h_x;
+  expected.row(0).setZero();
+  Eigen::VectorXd expected_h = Eigen::VectorXd::Zero(6);
+  expected_h(3) = 1.0;
+  const Eigen::Matrix3d S0 = Eigen::Vector3d(1, 0, 0).asDiagonal();
+  const std::vector<double> weights(6, 1.0);
+  const std::vector<std::optional<Eigen::Matrix3d>> covariances(6, Eigen::Matrix3d(S0 / 6.0));
+  measurement.applyFloorRows(data, weights, covariances, 7);
+  EXPECT_LT((data.h_x - expected).norm(), 1e-12);
+  EXPECT_LT((data.h - expected_h).norm(), 1e-12);
+  const auto & telemetry = measurement.telemetry();
+  EXPECT_TRUE(telemetry.floor.projected);
+  EXPECT_EQ(telemetry.floor.evaluation_iter, 7);
+  EXPECT_EQ(telemetry.floor_rows_projected, 6);
+  EXPECT_NEAR(telemetry.floor_kept_sum, 2.0 + std::sqrt(2.0), 1e-12);
+}
+
+TEST(FrontendPipelineContract, FloorSchema2UsesThePublishedFrameEndQuaternionAndStamp)
+{
+  Scenario scenario = degeneracyScenario();
+  scenario.name = "floor_schema2_binding";
+  scenario.floor_log_binding = true;
+  const ChildRun run = runScenario(scenario);
+  ASSERT_TRUE(run.ok()) << run.describe();
+  EXPECT_GT(run.count("odometry"), 0u);
 }
 
 TEST(FrontendPipelineContract, MeasurementNoiseFloorApplied)

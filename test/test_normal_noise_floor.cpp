@@ -1,7 +1,5 @@
-// test_normal_noise_floor.cpp — the per-point normal covariance, the scan's floor, the keep
-// gains, the projection built from them and the residual shift that goes with it, and the
-// lidar update's three modes with the per-scan record and log line they leave
-// (normal_noise_floor.hpp).
+// test_normal_noise_floor.cpp — TLS covariance, complete S0, the joint-row contraction,
+// independent information/shift oracles, and the three modes with schema-2 telemetry.
 
 #include <Eigen/Dense>
 
@@ -25,12 +23,11 @@
 #include "plane_fit.hpp"
 
 using fast_lio::applyFloorProjection;
-using fast_lio::DirectionFloorAccumulator;
+using fast_lio::FloorAccumulator;
 using fast_lio::floorKeepGains;
 using fast_lio::FloorMode;
 using fast_lio::FloorParams;
 using fast_lio::FloorProjectionResult;
-using fast_lio::floorResidualShift;
 using fast_lio::PlaneFitEigen;
 using fast_lio::planeNormalCovariance;
 using fast_lio::projectionFromGains;
@@ -158,18 +155,6 @@ FloorProjectionResult project(Rows & rows, const FloorParams & params = FloorPar
   return applyFloorProjection(rows.h_x, rows.h, rows.weights, rows.covariances, params, ridge);
 }
 
-// What rows (H_t, H_r) and a residual h read about the position once the rotation is solved for:
-// b_t - M_tr (M_rr + ridge trace(M_rr) / 3 I)^-1 b_r, with the regularisation M_eff is built with.
-Eigen::Vector3d profiledInformation(const Eigen::MatrixXd & H_t, const Eigen::MatrixXd & H_r, const Eigen::VectorXd & h)
-{
-  const Eigen::Matrix3d M_tr = H_t.transpose() * H_r;
-  const Eigen::Matrix3d M_rr = H_r.transpose() * H_r;
-  const Eigen::Matrix3d rr = M_rr + kRidge * M_rr.trace() / 3.0 * Eigen::Matrix3d::Identity();
-  const Eigen::Vector3d b_t = H_t.transpose() * h;
-  const Eigen::Vector3d b_r = H_r.transpose() * h;
-  return b_t - M_tr * rr.ldlt().solve(b_r);
-}
-
 template<typename Derived>
 bool sameBits(const Eigen::PlainObjectBase<Derived> & a, const Eigen::PlainObjectBase<Derived> & b)
 {
@@ -206,10 +191,10 @@ TEST(PlaneNormalCovariance, CoplanarPointsGiveNoFloor)
   ASSERT_TRUE(rounded.has_value());
   EXPECT_EQ(*rounded, Eigen::Matrix3d::Zero());
 
-  DirectionFloorAccumulator accumulator(orthonormalBasis());
+  FloorAccumulator accumulator;
   accumulator.add(1.0, cov);
   accumulator.add(3.0, rounded);
-  EXPECT_EQ(accumulator.floor(1.0), Eigen::Vector3d::Zero());
+  EXPECT_EQ(accumulator.matrix(), Eigen::Matrix3d::Zero());
   EXPECT_EQ(accumulator.pointsWithoutCovariance(), 0);
 
   // The same through fitPlane: five exactly coplanar points.
@@ -288,21 +273,21 @@ TEST(PlaneNormalCovariance, AgreesWithTheSpreadOfFittedNormalsUnderNoise)
   EXPECT_LT(std::abs(spread(0, 1)), mean_tolerance * std::sqrt(s2 / 0.36 * s2 / 0.09));
 }
 
-TEST(DirectionFloorAccumulator, AddsTheWeightedVarianceAlongEachDirection)
+TEST(FloorAccumulator, AddsTheCompleteWeightedCovariance)
 {
   // Along the axes: f_k = kappa sum w^2 C_kk.
-  DirectionFloorAccumulator axes(Eigen::Matrix3d::Identity());
+  FloorAccumulator axes;
   axes.add(0.5, Eigen::Matrix3d(Eigen::Vector3d(4e-3, 2e-3, 0.0).asDiagonal()));
   axes.add(2.0, Eigen::Matrix3d(Eigen::Vector3d(0.0, 1e-3, 3e-3).asDiagonal()));
-  const Eigen::Vector3d expected(0.25 * 4e-3, 0.25 * 2e-3 + 4.0 * 1e-3, 4.0 * 3e-3);
+  // Independent r2 numerical-d1.txt:L33, including the original 1e-18 tolerance.
+  const Eigen::Matrix3d expected = Eigen::Vector3d(0.001, 0.0045, 0.012).asDiagonal();
   EXPECT_LT((axes.floor(1.0) - expected).norm(), 1e-18);
   EXPECT_LT((axes.floor(1.5) - 1.5 * expected).norm(), 1e-18);
   EXPECT_EQ(axes.points(), 2);
   EXPECT_EQ(axes.pointsWithoutCovariance(), 0);
 
   // For any orthonormal V the floors add up to kappa sum w^2 trace(C): nothing is lost or counted twice.
-  const Eigen::Matrix3d V = orthonormalBasis();
-  DirectionFloorAccumulator rotated(V);
+  FloorAccumulator rotated;
   const auto cov_a = planeNormalCovariance(handBuilt(0.02, 1.0, 4.0));
   PlaneFitEigen tilted = handBuilt(0.004, 0.2, 0.5);
   tilted.e1 = Eigen::Vector3d(1.0, 1.0, 0.0).normalized();
@@ -312,16 +297,17 @@ TEST(DirectionFloorAccumulator, AddsTheWeightedVarianceAlongEachDirection)
   rotated.add(0.7, cov_a);
   rotated.add(1.3, cov_b);
   const double trace = 0.49 * cov_a->trace() + 1.69 * cov_b->trace();
-  EXPECT_NEAR(rotated.floor(2.0).sum(), 2.0 * trace, 1e-15);
-  EXPECT_GT(rotated.floor(2.0).minCoeff(), 0.0);
+  EXPECT_NEAR(rotated.floor(2.0).trace(), 2.0 * trace, 1e-15);
+  EXPECT_NEAR(rotated.matrix()(0, 1), 0.49 * (*cov_a)(0, 1) + 1.69 * (*cov_b)(0, 1), 1e-18);
+  EXPECT_NE(rotated.matrix()(0, 1), 0.0);
 }
 
-TEST(DirectionFloorAccumulator, PointsWithoutAKnownContributionAreCountedNotGuessed)
+TEST(FloorAccumulator, PointsWithoutAKnownContributionAreCountedNotGuessed)
 {
-  DirectionFloorAccumulator accumulator(Eigen::Matrix3d::Identity());
+  FloorAccumulator accumulator;
   const auto cov = planeNormalCovariance(handBuilt(0.02, 1.0, 4.0));
   accumulator.add(1.0, cov);
-  const Eigen::Vector3d known = accumulator.floor(1.0);
+  const Eigen::Matrix3d known = accumulator.matrix();
   accumulator.add(1.0, std::nullopt);
   accumulator.add(kNaN, cov);
   accumulator.add(kInf, cov);
@@ -443,210 +429,112 @@ TEST(FloorParams, DefaultsAreTheDesignValues)
 
 TEST(FloorResidualShift, AScanWithoutFloorKeepsItsResidualBitForBit)
 {
-  // Every gain exactly one: nothing is removed, so nothing is shifted, and the update gets the rows as built,
-  // bit for bit. The scan does read an offset; it is the gains, not the residual, that decide.
-  const Rows original = corridorRows(std::sqrt(0.5), 0.005, false);
-  Rows rows = original;
-  const FloorProjectionResult result = project(rows);
-  ASSERT_TRUE(result.valid);
-  EXPECT_EQ(result.noise_floor, Eigen::Vector3d::Zero());
-  EXPECT_EQ(result.gains, Eigen::Vector3d::Ones());
-  EXPECT_EQ(result.shift, Eigen::Vector3d::Zero());
-  EXPECT_TRUE(sameBits(rows.h, original.h));
-  EXPECT_TRUE(sameBits(rows.h_x, original.h_x));
-
-  const Eigen::MatrixXd H_t = original.h_x.leftCols(3);
-  const Eigen::MatrixXd H_r = original.h_x.middleCols(3, 3);
-  const Eigen::Vector3d b_t = H_t.transpose() * original.h;
-  const Eigen::Vector3d b_r = H_r.transpose() * original.h;
-  const Eigen::Matrix3d M_tr = H_t.transpose() * H_r;
-  const Eigen::Matrix3d M_rr = H_r.transpose() * H_r;
-  ASSERT_GT(b_t.norm(), 1.0);
-  EXPECT_EQ(floorResidualShift(result.eigenvectors,
-                               result.lambda,
-                               Eigen::Vector3d::Ones(),
-                               b_t,
-                               b_r,
-                               M_tr,
-                               M_rr,
-                               kRidge,
-                               static_cast<int>(original.h.size())),
-            Eigen::Vector3d::Zero());
+  // r2 numerical-d1.txt:L38. Zero S has priority even on a rank-deficient scan.
+  for (double tilt : {0.0, std::sqrt(0.5)}) {
+    const Rows original = corridorRows(tilt, 0.005, false);
+    Rows rows = original;
+    const auto result = project(rows);
+    ASSERT_TRUE(result.valid);
+    EXPECT_STREQ(result.reason, "zero_floor");
+    EXPECT_EQ(result.S0, Eigen::Matrix3d::Zero());
+    EXPECT_EQ(result.d_t, Eigen::Vector3d::Zero());
+    EXPECT_EQ(result.d_r, Eigen::Vector3d::Zero());
+    EXPECT_EQ(result.dh_norm, 0.0);
+    EXPECT_TRUE(sameBits(rows.h, original.h));
+    EXPECT_TRUE(sameBits(rows.h_x, original.h_x));
+  }
 }
 
-TEST(ApplyFloorProjection, TheShiftedRowsReadNothingAlongTheRemovedDirection)
+TEST(ApplyFloorProjection, TheShiftedRowsReadNothingAlongTheRemovedJointMode)
 {
-  // Design addendum 6.1 (ii). The noisy corridor keeps nothing along its axis (g = 0) and most of the other two
-  // directions (0 < g < 1). Before the shift the scan reads its along-corridor offset, mixed with what the
-  // rotation explains; after it, the residual against the rows as built reads nothing along the axis once the
-  // rotation is solved for (zero up to rounding: 1e-12 of the information vector), and g_k of its reading along
-  // a partly kept direction. The rotation and extrinsic columns stay as they are; a row without a normal
-  // covariance stays out of the floor and is counted.
-  const Rows original = corridorRows(std::sqrt(0.5), 0.005);
+  // Independent r2 numerical-d1.txt:L39 / numerical_d1.py:440.
+  // R36 withdraws the original pure-position/unchanged-extrinsic assertions.
+  Rows original = corridorRows(std::sqrt(0.5), 0.005);
+  original.covariances[7] = std::nullopt;
   Rows rows = original;
-  rows.covariances[7] = std::nullopt;
-  const FloorProjectionResult result = project(rows);
+  const auto result = project(rows);
   ASSERT_TRUE(result.valid);
-  const Eigen::Vector3d u = result.eigenvectors.col(0);
-  ASSERT_GT(std::abs(u.x()), 0.999);  // the removed direction is the corridor's axis
-  ASSERT_EQ(result.gains(0), 0.0);
-  for (int k = 1; k < 3; ++k) {
-    ASSERT_GT(result.gains(k), 0.9) << k;
-    ASSERT_LT(result.gains(k), 1.0) << k;
-  }
-  EXPECT_EQ(result.points, static_cast<int>(original.h.size()));
+  ASSERT_TRUE(result.shift_coords_valid);
+  EXPECT_EQ(result.points, 240);
   EXPECT_EQ(result.points_without_covariance, 1);
-
-  const Eigen::MatrixXd H_t = original.h_x.leftCols(3);
-  const Eigen::MatrixXd H_r = original.h_x.middleCols(3, 3);
-  const Eigen::Vector3d before = result.eigenvectors.transpose() * profiledInformation(H_t, H_r, original.h);
-  const Eigen::Vector3d after = result.eigenvectors.transpose() * profiledInformation(H_t, H_r, rows.h);
-  const Eigen::Vector3d raw = H_t.transpose() * original.h;
-  const double scale = before.norm();
-  // There is a reading to remove, and the rotation is part of it: the profiled one is not the raw one.
-  EXPECT_GT(std::abs(before(0)), 1e-3 * scale);
-  EXPECT_GT(std::abs(u.dot(raw) - before(0)), 0.1 * std::abs(before(0)));
-  EXPECT_LE(std::abs(after(0)), 1e-12 * scale);
-  for (int k = 1; k < 3; ++k) {
-    EXPECT_NEAR(after(k), result.gains(k) * before(k), 1e-12 * scale) << k;
-  }
-
-  EXPECT_TRUE((rows.h_x.rightCols(9).array() == original.h_x.rightCols(9).array()).all());
-  // The position columns carry nothing along u either, down to V's orthonormality (cf. ProjectionFromGains).
-  EXPECT_LT((rows.h_x.leftCols(3) * u).cwiseAbs().maxCoeff(), 1e-14);
+  EXPECT_LT((result.d_t - Eigen::Vector3d(0.05005830761725314, 0.0001378432894548538, -0.00011018954792048842)).norm(),
+            1e-10);
+  EXPECT_LT(
+    (result.d_r - Eigen::Vector3d(-0.00019813140066665571, -2.614213481652736e-06, 1.6477877902155545e-05)).norm(),
+    1e-10);
+  EXPECT_NEAR(result.dh_norm, 0.041811816569320696, 1e-10);
+  EXPECT_LT((rows.h_x.middleCols(3, 3) - original.h_x.middleCols(3, 3)).norm(), 1e-12);
+  const Eigen::VectorXd delta = original.h_x.leftCols(3) * result.d_t + original.h_x.middleCols(3, 3) * result.d_r;
+  EXPECT_LT((original.h - rows.h - delta).norm(), 1e-12);
+  Eigen::Matrix<double, 6, 6> expected = original.h_x.leftCols(6).transpose() * original.h_x.leftCols(6);
+  expected.topLeftCorner<3, 3>() -= result.M0 - result.K;
+  EXPECT_LT((rows.h_x.leftCols(6).transpose() * rows.h_x.leftCols(6) - expected).norm(), 1e-10 * expected.norm());
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> kept(result.K);
+  const Eigen::Vector3d u = kept.eigenvectors().col(0);
+  Eigen::Matrix<double, 6, 1> q;
+  q.head<3>() = u;
+  q.tail<3>() = -result.C.ldlt().solve(result.B.transpose() * u);
+  EXPECT_LT((rows.h_x.leftCols(6) * q).norm(), 1e-12 * original.h_x.norm());
 }
 
-TEST(FloorResidualShift, ADirectionWithoutInformationIsNotShifted)
+TEST(FloorResidualShift, ADirectionWithoutInformationIsRefusedAtomically)
 {
-  // A direction the scan does not see has nothing to divide its reading by. Hand-built, lambda_0 = 0 and then
-  // lambda_0 below the rank tolerance eps N lambda_max, each with a reading a division would blow up; the partly
-  // kept direction is shifted by (1 - g) beta / lambda as ever, the kept one not at all.
-  const Eigen::Matrix3d V = Eigen::Matrix3d::Identity();
-  const Eigen::Vector3d gains(0.0, 0.5, 1.0);
-  const Eigen::Vector3d b_t(1e-3, 0.4, 0.3);
-  const Eigen::Matrix3d no_rotation = Eigen::Matrix3d::Zero();  // trace(M_rr) = 0: b_eff = b_t
-  for (double lambda0 : {0.0, 1e-20}) {
-    const Eigen::Vector3d shift = floorResidualShift(V,
-                                                     Eigen::Vector3d(lambda0, 2.0, 3.0),
-                                                     gains,
-                                                     b_t,
-                                                     Eigen::Vector3d::Zero(),
-                                                     no_rotation,
-                                                     no_rotation,
-                                                     kRidge,
-                                                     100);
-    ASSERT_TRUE(shift.allFinite()) << lambda0;
-    EXPECT_EQ(shift(0), 0.0) << lambda0;
-    EXPECT_DOUBLE_EQ(shift(1), 0.5 * 0.4 / 2.0) << lambda0;
-    EXPECT_EQ(shift(2), 0.0) << lambda0;
-  }
-
-  // From rows: a corridor with exact normals has no along-corridor information at all, lambda_0 and the reading
-  // both zero up to rounding. Everything stays finite, the directions the scan sees are still shifted, and
-  // nothing is shifted along the corridor.
-  Rows rows = corridorRows(0.0, 0.005);
-  const FloorProjectionResult result = project(rows);
-  ASSERT_TRUE(result.valid);
-  const Eigen::Vector3d u = result.eigenvectors.col(0);
-  ASSERT_GT(std::abs(u.x()), 1.0 - 1e-12);
-  ASSERT_LE(result.lambda(0),
-            std::numeric_limits<double>::epsilon() * static_cast<double>(rows.h.size()) * result.lambda(2));
-  EXPECT_EQ(result.gains(0), 0.0);
-  EXPECT_TRUE(result.shift.allFinite());
-  EXPECT_TRUE(rows.h.allFinite());
-  EXPECT_TRUE(rows.h_x.allFinite());
-  EXPECT_GT(result.shift.norm(), 0.0);
-  EXPECT_LE(std::abs(u.dot(result.shift)), 1e-14 * result.shift.norm());
+  // R37 / r2 numerical-d1.txt:L40. The old support-extension shift is withdrawn.
+  const Rows original = corridorRows(0.0, 0.005);
+  Rows rows = original;
+  const auto result = project(rows);
+  EXPECT_FALSE(result.valid);
+  EXPECT_STREQ(result.reason, "rank_m");
+  EXPECT_LT(result.rank_m, 3);
+  EXPECT_TRUE(sameBits(rows.h_x, original.h_x));
+  EXPECT_TRUE(sameBits(rows.h, original.h));
 }
 
-TEST(FloorResidualShift, NonFiniteInputsGiveNoShift)
+TEST(FloorResidualShift, NonFiniteInputsRefuseTheWholeUpdate)
 {
-  // The conservative side for the residual is to leave it: any non-finite input, or a negative row count, gives
-  // the zero vector. The same inputs, finite, do shift.
-  struct Inputs
-  {
-    Eigen::Matrix3d V;
-    Eigen::Vector3d lambda, gains, b_t, b_r;
-    Eigen::Matrix3d M_tr, M_rr;
-    double ridge;
-    int rows;
-  };
-  const auto shift = [](const Inputs & in) {
-    return floorResidualShift(in.V, in.lambda, in.gains, in.b_t, in.b_r, in.M_tr, in.M_rr, in.ridge, in.rows);
-  };
-  Eigen::Matrix3d M_tr;
-  M_tr << 0.1, -0.2, 0.05, 0.0, 0.3, -0.1, 0.2, 0.1, 0.0;
-  const Inputs finite{orthonormalBasis(),
-                      Eigen::Vector3d(0.5, 2.0, 3.0),
-                      Eigen::Vector3d(0.0, 0.5, 1.0),
-                      Eigen::Vector3d(0.3, -0.2, 0.1),
-                      Eigen::Vector3d(0.05, 0.02, -0.01),
-                      M_tr,
-                      Eigen::Matrix3d(Eigen::Vector3d(4.0, 5.0, 6.0).asDiagonal()),
-                      kRidge,
-                      10};
-  ASSERT_GT(shift(finite).norm(), 0.0);
-  for (double bad : {kNaN, kInf, -kInf}) {
-    std::vector<Inputs> broken(8, finite);
-    broken[0].V(1, 2) = bad;
-    broken[1].lambda(1) = bad;
-    broken[2].gains(1) = bad;
-    broken[3].b_t(0) = bad;
-    broken[4].b_r(2) = bad;
-    broken[5].M_tr(2, 0) = bad;
-    broken[6].M_rr(1, 1) = bad;
-    broken[7].ridge = bad;
-    for (std::size_t i = 0; i < broken.size(); ++i) {
-      EXPECT_EQ(shift(broken[i]), Eigen::Vector3d::Zero()) << "argument " << i << " = " << bad;
-    }
-  }
-  Inputs negative_rows = finite;
-  negative_rows.rows = -1;
-  EXPECT_EQ(shift(negative_rows), Eigen::Vector3d::Zero());
-
-  // applyFloorProjection: rows or parameters it cannot use leave the rows as they are and say so; rows that do not
-  // match each other in size are a programming error.
+  // r2 numerical-d1.txt:L37. Invalid matrices do not masquerade as healthy gains.
   const Rows original = corridorRows(std::sqrt(0.5), 0.005);
   const auto refused = [](Rows rows, const FloorParams & params, double ridge) {
     const Rows given = rows;
-    const FloorProjectionResult result = project(rows, params, ridge);
-    return !result.valid && result.gains == Eigen::Vector3d::Ones() && result.shift == Eigen::Vector3d::Zero() &&
-           sameBits(rows.h_x, given.h_x) && sameBits(rows.h, given.h);
+    const auto result = project(rows, params, ridge);
+    return !result.valid && !result.shift_coords_valid && result.dh_norm == 0.0 && sameBits(rows.h_x, given.h_x) &&
+           sameBits(rows.h, given.h);
   };
-  Rows bad_row = original;
-  bad_row.h_x(5, 1) = kNaN;
-  EXPECT_TRUE(refused(bad_row, FloorParams{}, kRidge));
-  Rows bad_residual = original;
-  bad_residual.h(3) = kInf;
-  EXPECT_TRUE(refused(bad_residual, FloorParams{}, kRidge));
-  FloorParams no_alpha;
-  no_alpha.alpha = 0.0;
-  EXPECT_TRUE(refused(original, no_alpha, kRidge));
-  FloorParams bad_kappa;
-  bad_kappa.kappa = kNaN;
-  EXPECT_TRUE(refused(original, bad_kappa, kRidge));
-  FloorParams negative_margin;
-  negative_margin.rel_uncertainty = -0.1;
-  EXPECT_TRUE(refused(original, negative_margin, kRidge));
-  EXPECT_TRUE(refused(original, FloorParams{}, kInf));
-  Rows usable = original;
-  ASSERT_TRUE(project(usable).valid);
-
+  for (double bad : {kNaN, kInf, -kInf}) {
+    for (int col = 0; col < 12; ++col) {
+      Rows broken = original;
+      broken.h_x(5, col) = bad;
+      EXPECT_TRUE(refused(broken, FloorParams{}, kRidge));
+    }
+    Rows broken = original;
+    broken.h(3) = bad;
+    EXPECT_TRUE(refused(broken, FloorParams{}, kRidge));
+    FloorParams params;
+    params.kappa = bad;
+    EXPECT_TRUE(refused(original, params, kRidge));
+    params = FloorParams{};
+    params.rel_uncertainty = bad;
+    EXPECT_TRUE(refused(original, params, kRidge));
+    EXPECT_TRUE(refused(original, FloorParams{}, bad));
+  }
+  FloorParams params;
+  params.alpha = 0.0;
+  EXPECT_TRUE(refused(original, params, kRidge));
+  params = FloorParams{};
+  params.rel_uncertainty = -0.1;
+  EXPECT_TRUE(refused(original, params, kRidge));
   Rows rows = original;
   Eigen::MatrixXd narrow = rows.h_x.leftCols(11);
   EXPECT_THROW(applyFloorProjection(narrow, rows.h, rows.weights, rows.covariances, FloorParams{}, kRidge),
                std::invalid_argument);
-  Eigen::VectorXd short_residual = rows.h.head(rows.h.size() - 1);
-  EXPECT_THROW(applyFloorProjection(rows.h_x, short_residual, rows.weights, rows.covariances, FloorParams{}, kRidge),
+  Eigen::VectorXd short_h = rows.h.head(rows.h.size() - 1);
+  EXPECT_THROW(applyFloorProjection(rows.h_x, short_h, rows.weights, rows.covariances, FloorParams{}, kRidge),
                std::invalid_argument);
-  std::vector<double> long_weights = rows.weights;
-  long_weights.push_back(1.0);
-  EXPECT_THROW(applyFloorProjection(rows.h_x, rows.h, long_weights, rows.covariances, FloorParams{}, kRidge),
-               std::invalid_argument);
-  std::vector<std::optional<Eigen::Matrix3d>> short_covariances = rows.covariances;
-  short_covariances.pop_back();
-  EXPECT_THROW(applyFloorProjection(rows.h_x, rows.h, rows.weights, short_covariances, FloorParams{}, kRidge),
-               std::invalid_argument);
+  rows.weights.push_back(1.0);
+  EXPECT_THROW(project(rows), std::invalid_argument);
+  rows = original;
+  rows.covariances.pop_back();
+  EXPECT_THROW(project(rows), std::invalid_argument);
 }
 
 // --- the lidar update's modes (degeneracy_floor_mode), the scan's record and its [FLOOR] line ---------------------
@@ -705,16 +593,20 @@ TEST(FloorStep, ObserveReachesTheDecisionApplyActsOnAndLeavesTheRowsBitForBit)
   ASSERT_TRUE(apply.last.valid);
   EXPECT_FALSE(observe.projected);
   EXPECT_TRUE(apply.projected);
-  EXPECT_EQ(observe.last.shift, Eigen::Vector3d::Zero());
-  EXPECT_EQ(observe.last.gains(0), 0.0);
+  EXPECT_FALSE(observe.last.shift_coords_valid);
+  EXPECT_EQ(observe.last.gains(2), 0.0);  // gains are ordered by ascending tau
   EXPECT_EQ(observe.last.points, apply.last.points);
   EXPECT_EQ(observe.last.points_without_covariance, apply.last.points_without_covariance);
   for (int k = 0; k < 3; ++k) {
     EXPECT_NEAR(observe.last.lambda(k), apply.last.lambda(k), 1e-12 * apply.last.lambda.maxCoeff()) << k;
-    EXPECT_NEAR(observe.last.noise_floor(k), apply.last.noise_floor(k), 1e-12 * apply.last.noise_floor.maxCoeff()) << k;
     EXPECT_NEAR(observe.last.gains(k), apply.last.gains(k), 1e-12) << k;
-    EXPECT_NEAR(std::abs(observe.last.eigenvectors.col(k).dot(apply.last.eigenvectors.col(k))), 1.0, 1e-12) << k;
   }
+  EXPECT_LT((observe.last.M0 - apply.last.M0).norm(), 1e-12);
+  EXPECT_LT((observe.last.M_ridge - apply.last.M_ridge).norm(), 1e-12);
+  EXPECT_LT((observe.last.S0 - apply.last.S0).norm(), 1e-12);
+  EXPECT_LT((observe.last.K - apply.last.K).norm(), 1e-12);
+  EXPECT_LT((observe.last.tau - apply.last.tau).norm(), 1e-12);
+  EXPECT_LT((observe.last.F_sym - apply.last.F_sym).norm(), 1e-12);
   EXPECT_EQ(observe.evaluations, 1);
   EXPECT_EQ(observe.invalid_evaluations, 0);
 }
@@ -760,56 +652,752 @@ TEST(FloorStep, ApplyWithoutFloorIsNotAProjection)
   EXPECT_TRUE(sameBits(rows.h, original.h));
 }
 
+namespace
+{
+// Independent fixtures/oracles from r2 numerical_d1.py and numerical-d1.txt.
+// All spectral roots below belong to the test oracle, never to the row-update API.
+using Matrix6 = Eigen::Matrix<double, 6, 6>;
+
+Eigen::MatrixXd psdRoot(const Eigen::MatrixXd & matrix)
+{
+  const Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(matrix);
+  return solver.eigenvectors() * solver.eigenvalues().cwiseMax(0.0).cwiseSqrt().asDiagonal() *
+         solver.eigenvectors().transpose();
+}
+
+Eigen::MatrixXd supportInverse(const Eigen::MatrixXd & matrix)
+{
+  const Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(matrix);
+  const double tolerance =
+    std::numeric_limits<double>::epsilon() * matrix.rows() * solver.eigenvalues().cwiseAbs().maxCoeff();
+  Eigen::VectorXd inverse = Eigen::VectorXd::Zero(matrix.rows());
+  for (Eigen::Index i = 0; i < inverse.size(); ++i) {
+    if (solver.eigenvalues()(i) > tolerance) {
+      inverse(i) = 1.0 / solver.eigenvalues()(i);
+    }
+  }
+  return solver.eigenvectors() * inverse.asDiagonal() * solver.eigenvectors().transpose();
+}
+
+Rows fixtureRows(const Eigen::MatrixXd & H6, const Eigen::Matrix3d & S)
+{
+  Rows rows;
+  rows.h_x = Eigen::MatrixXd::Zero(H6.rows(), 12);
+  rows.h_x.leftCols(H6.cols()) = H6;
+  rows.h = Eigen::VectorXd::LinSpaced(H6.rows(), -0.3, 0.4);
+  rows.weights.assign(static_cast<std::size_t>(H6.rows()), 1.0);
+  rows.covariances.assign(static_cast<std::size_t>(H6.rows()), Eigen::Matrix3d(S / H6.rows()));
+  return rows;
+}
+
+Matrix6 handRows()
+{
+  // r2 numerical-d1.txt:L8 / py:197, explicit coupled six-row Jacobian.
+  Matrix6 H = Matrix6::Identity();
+  H(3, 0) = 1.0;
+  H(3, 1) = 1.0;
+  return H;
+}
+
+Rows orthogonalRows(const Eigen::Matrix3d & M, const Eigen::Matrix3d & S)
+{
+  Matrix6 H = Matrix6::Identity();
+  H.topLeftCorner<3, 3>() = psdRoot(M);
+  return fixtureRows(H, S);
+}
+
+FloorParams unitMargin()
+{
+  FloorParams params;
+  params.rel_uncertainty = 0.0;
+  return params;
+}
+
+Eigen::Matrix3d effectiveInformation(const Matrix6 & J, double precision)
+{
+  const Eigen::Matrix3d C = J.bottomRightCorner<3, 3>() + precision * Eigen::Matrix3d::Identity();
+  return J.topLeftCorner<3, 3>() - J.topRightCorner<3, 3>() * C.ldlt().solve(J.bottomLeftCorner<3, 3>());
+}
+
+double maxEigenvalue(const Eigen::MatrixXd & matrix)
+{
+  return Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd>(0.5 * (matrix + matrix.transpose())).eigenvalues().maxCoeff();
+}
+
+// Independent symmetric-root oracle for K, with no production decision/apply call.
+Eigen::Matrix3d jointKeptOracle(const Eigen::Matrix3d & M, const Eigen::Matrix3d & S, double a)
+{
+  const Eigen::Matrix3d root = psdRoot(M);
+  const Eigen::Matrix3d inverse = root.inverse();
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(inverse * S * inverse);
+  const Eigen::Vector3d kept = (Eigen::Vector3d::Ones() - a * solver.eigenvalues()).cwiseMax(0.0);
+  return root * solver.eigenvectors() * kept.asDiagonal() * solver.eigenvectors().transpose() * root;
+}
+
+// Historical wrong coordinate rules, retained only as counterexample oracles.
+Eigen::Matrix3d legacyCoordinateRule(const Eigen::Matrix3d & M, const Eigen::Matrix3d & S, double a, int kind)
+{
+  const Eigen::Matrix3d root = psdRoot(M);
+  const Eigen::Matrix3d inverse = root.inverse();
+  if (kind == 0) {
+    const Eigen::Matrix3d T = inverse * S * inverse;
+    return inverse * psdRoot(Eigen::Matrix3d::Identity() - a * T) * root;
+  }
+  if (kind == 1) {
+    return inverse * psdRoot(root * jointKeptOracle(M, S, a) * root) * inverse;
+  }
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(M);
+  Eigen::Vector3d gains;
+  for (int k = 0; k < 3; ++k) {
+    const Eigen::Vector3d v = solver.eigenvectors().col(k);
+    gains(k) = std::sqrt(std::max(1.0 - a * v.dot(S * v) / solver.eigenvalues()(k), 0.0));
+  }
+  return solver.eigenvectors() * gains.asDiagonal() * solver.eigenvectors().transpose();
+}
+
+void expectJointCertificate(const Rows & original,
+                            const Rows & updated,
+                            const FloorProjectionResult & result,
+                            double tolerance = 1e-10,
+                            const FloorParams & params = FloorParams{})
+{
+  const Eigen::MatrixXd raw = original.h_x.transpose() * original.h_x;
+  const Eigen::MatrixXd kept = updated.h_x.transpose() * updated.h_x;
+  EXPECT_LE(maxEigenvalue(kept - raw), tolerance * std::max(1.0, raw.norm()));
+  const Eigen::Matrix3d M =
+    raw.topLeftCorner<3, 3>() - raw.block<3, 3>(0, 3) * supportInverse(raw.block<3, 3>(3, 3)) * raw.block<3, 3>(3, 0);
+  Eigen::Matrix3d S0 = Eigen::Matrix3d::Zero();
+  for (std::size_t i = 0; i < original.weights.size(); ++i) {
+    if (original.covariances[i])
+      S0 += original.weights[i] * original.weights[i] * *original.covariances[i];
+  }
+  const Eigen::Matrix3d K = jointKeptOracle(M, params.kappa * S0, 1.0 + kZ * params.rel_uncertainty);
+  EXPECT_LE((result.M0 - M).norm(), tolerance * std::max(1.0, raw.norm()));
+  EXPECT_LE((result.K - K).norm(), tolerance * std::max(1.0, raw.norm()));
+  Matrix6 target = raw.topLeftCorner<6, 6>();
+  target.topLeftCorner<3, 3>() -= M - K;
+  EXPECT_LE((kept.topLeftCorner<6, 6>() - target).norm(), tolerance * std::max(1.0, target.norm()));
+  for (double variance : {1e-2, 1e-4, 1e-6}) {
+    EXPECT_LE(maxEigenvalue(effectiveInformation(kept.topLeftCorner<6, 6>(), 1.0 / variance) -
+                            effectiveInformation(raw.topLeftCorner<6, 6>(), 1.0 / variance)),
+              tolerance * std::max(1.0, raw.norm()));
+  }
+}
+}  // namespace
+
+TEST(JointFloor, CommutingCouplingCannotUseB1)
+{
+  // r2 txt:L7-L8 / py:184,197. Old B.1 invents (sqrt(13)-3)/4 information.
+  Rows original = fixtureRows(handRows(), Eigen::Vector3d(1.0, 0.0, 0.0).asDiagonal());
+  Matrix6 D = Matrix6::Identity();
+  D(0, 0) = 0.0;
+  const Matrix6 J = handRows().transpose() * handRows();
+  EXPECT_NEAR(
+    maxEigenvalue(effectiveInformation(D * J * D, 1.0) - effectiveInformation(J, 1.0)), 0.1513878188659973, 1e-12);
+  Rows rows = original;
+  const auto result = project(rows, unitMargin());
+  ASSERT_TRUE(result.valid);
+  Matrix6 expected = handRows();
+  expected.row(0).setZero();
+  EXPECT_LT((rows.h_x.leftCols(6) - expected).norm(), 1e-12);
+  expectJointCertificate(original, rows, result, 1e-12, unitMargin());
+}
+
+TEST(JointFloor, ConfoundingDoesNotInventInformation)
+{
+  // r2 txt:L17-L26 / py:292-312. Fixed a=1.927 and the three prescribed priors.
+  FloorParams params;
+  params.rel_uncertainty = 0.927 / kZ;
+  for (double e : {10.0, 0.001}) {
+    const Eigen::Matrix3d A = 1e5 * Eigen::Matrix3d::Identity();
+    Eigen::Matrix3d B = Eigen::Matrix3d::Zero();
+    B(0, 0) = std::sqrt(1e5 * (1e5 - e));
+    Matrix6 J = Matrix6::Zero();
+    J.topLeftCorner<3, 3>() = A;
+    J.topRightCorner<3, 3>() = B;
+    J.bottomLeftCorner<3, 3>() = B.transpose();
+    J.bottomRightCorner<3, 3>() = A;
+    Eigen::Matrix3d S = Eigen::Matrix3d::Zero();
+    S(0, 0) = 0.95 * e / 1.927;
+    S(1, 1) = 1000.0;
+    S(0, 1) = S(1, 0) = 0.3 * std::sqrt(S(0, 0) * S(1, 1));
+    const Rows original = fixtureRows(psdRoot(J), S);
+    Rows rows = original;
+    const auto result = project(rows, params);
+    ASSERT_TRUE(result.valid) << result.reason;
+    expectJointCertificate(original, rows, result, 1e-10, params);
+    const Matrix6 kept = rows.h_x.leftCols(6).transpose() * rows.h_x.leftCols(6);
+    for (double variance : {1e-2, 1e-4, 1e-6}) {
+      EXPECT_LE(maxEigenvalue(effectiveInformation(kept, 1.0 / variance) - effectiveInformation(J, 1.0 / variance)),
+                1e-5);
+    }
+  }
+}
+
+TEST(JointFloor, WedgeChecksDirectionalInformation)
+{
+  // r2 txt:L27-L32 / py:313-338, fixed A/B/C/S independent of the implementation.
+  Eigen::Matrix3d A, B, C, S;
+  A << 362.7711786561752, 304.7590478799027, -102.37354886317999, 304.7590478799027, 268635.41837121884,
+    276.601029831832, -102.37354886317999, 276.601029831832, 131001.81045012521;
+  B << -26.245607192768148, 669.2716173167973, 1880.0937720196182, -128050.34115833661, -5893.207528012879,
+    4925285.459320568, -17977.19766437482, -2456764.8291369206, 5919.45313520565;
+  C << 19572835.253681567, -485075.8472770165, -2330240.9627771494, -485075.8472770165, 49142554.62689758,
+    -106212.64232883297, -2330240.9627771494, -106212.64232883297, 96801734.03439139;
+  S << 177.9004345230022, -2.3582873759913228, -35.06697876735646, -2.3582873759913228, 0.034937384873912326,
+    0.9841251809141385, -35.06697876735646, 0.9841251809141385, 80.27579059746604;
+  Matrix6 J;
+  J << A, B, B.transpose(), C;
+  const Eigen::Matrix3d M = A - B * C.ldlt().solve(B.transpose());
+  const double wrong_increases[] = {1.5259708237476637, 1.646154144923794, 1.520403799462299};
+  for (int kind = 0; kind < 3; ++kind) {
+    Matrix6 D = Matrix6::Identity();
+    D.topLeftCorner<3, 3>() = legacyCoordinateRule(M, S, 1.927, kind);
+    EXPECT_NEAR(maxEigenvalue(effectiveInformation(D.transpose() * J * D, 1e6) - effectiveInformation(J, 1e6)),
+                wrong_increases[kind],
+                1e-5);
+  }
+  const Rows original = fixtureRows(psdRoot(J), S);
+  Rows rows = original;
+  FloorParams params;
+  params.rel_uncertainty = 0.927 / kZ;
+  const auto result = project(rows, params);
+  ASSERT_TRUE(result.valid) << result.reason;
+  const Matrix6 kept = rows.h_x.leftCols(6).transpose() * rows.h_x.leftCols(6);
+  Matrix6 target = J;
+  target.topLeftCorner<3, 3>() -= M - jointKeptOracle(M, S, 1.927);
+  EXPECT_LT((kept - target).norm(), 1e-6);
+  for (double variance : {1e-2, 1e-4, 1e-6}) {
+    EXPECT_LE(maxEigenvalue(effectiveInformation(kept, 1.0 / variance) - effectiveInformation(J, 1.0 / variance)),
+              1e-5);
+  }
+}
+
+TEST(JointFloor, ZeroFloorRowsStayUnchanged)
+{
+  // r2 txt:L15 / py:239. The GM coordinate rule moves the zero-floor y row.
+  Eigen::Matrix3d M;
+  M << 2.0, 1.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 3.0;
+  const Eigen::Matrix3d S = Eigen::Vector3d(0.2, 0.0, 0.0).asDiagonal();
+  EXPECT_NEAR((legacyCoordinateRule(M, S, 1.0, 1) * Eigen::Vector3d::UnitY() - Eigen::Vector3d::UnitY()).norm(),
+              0.0198638978616585,
+              1e-12);
+  const Rows original = orthogonalRows(M, S);
+  Rows rows = original;
+  const auto result = project(rows, unitMargin());
+  ASSERT_TRUE(result.valid);
+  EXPECT_LT((rows.h_x.col(1) - original.h_x.col(1)).norm(), 1e-12);
+  EXPECT_LT((result.K - (M - S)).norm(), 1e-12);
+}
+
+TEST(JointFloor, RepeatedRootTwoPaths)
+{
+  // r2 txt:L10 / py:221, production a. No eigengap branch is allowed.
+  const Eigen::Matrix3d S = Eigen::Vector3d(8.0, 0.5, 0.0).asDiagonal();
+  Eigen::Matrix3d Ma = Eigen::Vector3d(10.0 - 1e-8, 10.0, 1000.0 + 1e-8).asDiagonal();
+  Eigen::Matrix3d Mb = Eigen::Vector3d(10.0, 10.0, 1000.0).asDiagonal();
+  Mb(0, 1) = Mb(1, 0) = 1e-8;
+  Rows ra = orthogonalRows(Ma, S);
+  Rows rb = orthogonalRows(Mb, S);
+  const auto a = project(ra);
+  const auto b = project(rb);
+  ASSERT_TRUE(a.valid && b.valid);
+  EXPECT_NEAR(a.K(1, 1), 9.036465154074829, 1e-10);
+  EXPECT_NEAR(b.K(1, 1), 9.036465154074829, 1e-10);
+  EXPECT_LT((a.K - b.K).norm(), 2e-8);
+  Rows exact = orthogonalRows(Eigen::Vector3d(10.0, 10.0, 1000.0).asDiagonal(), S);
+  const auto r = project(exact);
+  ASSERT_TRUE(r.valid);
+  EXPECT_NEAR(r.K(1, 1), 9.036465154074829, 1e-10);
+}
+
+TEST(JointFloor, CrossRepeatedRootContinuity)
+{
+  // r2 txt:L11-L14 / py:231, fixture-specific bound 1.081, no runtime threshold.
+  for (double step : {1e-3, 1e-4, 1e-5, 1e-6}) {
+    Eigen::Matrix3d previous = Eigen::Matrix3d::Zero();
+    for (int j = -10; j <= 10; ++j) {
+      const double t = j * step;
+      Eigen::Matrix3d M = Eigen::Vector3d(10.0 + t, 10.0 - t, 1000.0).asDiagonal();
+      M(0, 1) = M(1, 0) = 0.3 * t;
+      Rows rows = orthogonalRows(M, Eigen::Vector3d(8.0, 0.5, 0.0).asDiagonal());
+      const auto result = project(rows);
+      ASSERT_TRUE(result.valid);
+      if (j > -10) {
+        EXPECT_LE((result.K - previous).norm() / step, 1.081);
+      }
+      previous = result.K;
+    }
+  }
+}
+
+TEST(JointFloor, OrthogonalEquivarianceAndReflection)
+{
+  // r2 txt:L16 / py:288. Seed/count fixed, independent Gaussian fixtures and algebraic oracle.
+  std::mt19937_64 rng(71319);
+  for (int trial = 0; trial < 128; ++trial) {
+    Matrix6 H;
+    Eigen::Matrix3d Z, axes;
+    for (int i = 0; i < H.size(); ++i)
+      H.data()[i] = gaussian(rng);
+    for (int i = 0; i < 9; ++i) {
+      Z.data()[i] = gaussian(rng);
+      axes.data()[i] = gaussian(rng);
+    }
+    H += 4.0 * Matrix6::Identity();
+    const Eigen::Matrix3d S = 0.1 * Z * Z.transpose();
+    const Eigen::HouseholderQR<Eigen::Matrix3d> qr(axes);
+    Eigen::Matrix3d Q = qr.householderQ();
+    if (trial % 2 == 0)
+      Q.col(0) *= -1.0;
+    if (trial == 0) {
+      Q = Eigen::Matrix3d::Identity();
+      Q.col(0).swap(Q.col(1));
+    }
+    const Rows original = fixtureRows(H, S);
+    Rows rows = original;
+    Rows rotated = original;
+    rotated.h_x.leftCols(3) = original.h_x.leftCols(3) * Q.transpose();
+    for (auto & covariance : rotated.covariances)
+      covariance = Q * *covariance * Q.transpose();
+    const auto a = project(rows);
+    const auto b = project(rotated);
+    ASSERT_TRUE(a.valid && b.valid) << trial;
+    EXPECT_LT((b.K - Q * a.K * Q.transpose()).norm(), 1e-10 * std::max(1.0, a.K.norm()));
+    EXPECT_LT((rotated.h_x.leftCols(3) - rows.h_x.leftCols(3) * Q.transpose()).norm(), 1e-10 * rows.h_x.norm());
+    EXPECT_LT((rotated.h_x.rightCols(9) - rows.h_x.rightCols(9)).norm(), 1e-10 * rows.h_x.norm());
+    EXPECT_LT((rotated.h - rows.h).norm(), 1e-10);
+    expectJointCertificate(original, rows, a);
+    Rows nuisance = original;
+    nuisance.h_x.middleCols(3, 3) = original.h_x.middleCols(3, 3) * Q.transpose();
+    ASSERT_TRUE(project(nuisance).valid);
+    EXPECT_LT((nuisance.h_x.leftCols(3) - rows.h_x.leftCols(3)).norm(), 1e-10 * rows.h_x.norm());
+    EXPECT_LT((nuisance.h_x.middleCols(3, 3) - rows.h_x.middleCols(3, 3) * Q.transpose()).norm(),
+              1e-10 * rows.h_x.norm());
+    EXPECT_LT((nuisance.h - rows.h).norm(), 1e-10);
+    // A coupled rank-one floor also preserves every physical zero-floor row.
+    Rows zero = fixtureRows(H, Eigen::Vector3d(0.2, 0.0, 0.0).asDiagonal());
+    const Eigen::VectorXd before = zero.h_x.col(1);
+    ASSERT_TRUE(project(zero).valid);
+    EXPECT_LT((zero.h_x.col(1) - before).norm(), 1e-10 * before.norm());
+  }
+}
+
+TEST(JointFloor, AppliedOperatorIsBoundedNearRankLoss)
+{
+  // r2 txt:L3-L6 / py:174. W coordinates diverge, while the actual row map stays bounded.
+  for (double epsilon : {1e-2, 1e-4, 1e-8, 1e-12}) {
+    const Eigen::Matrix3d M = Eigen::Vector3d(epsilon, 1.0, 1.0).asDiagonal();
+    Eigen::Matrix3d S = Eigen::Matrix3d::Zero();
+    S(0, 0) = epsilon;
+    S(0, 1) = S(1, 0) = 0.5 * std::sqrt(epsilon);
+    S(1, 1) = 1.0;
+    Rows rows = orthogonalRows(M, S);
+    const Matrix6 original = rows.h_x.leftCols(6);
+    const auto result = project(rows, unitMargin());
+    ASSERT_TRUE(result.valid);
+    const Matrix6 L = rows.h_x.leftCols(6) * original.inverse();
+    EXPECT_LE(L.jacobiSvd().singularValues().maxCoeff(), 1.0 + 1e-12);
+    EXPECT_NEAR(result.K(1, 1), 0.25, 1e-12);
+  }
+  Rows rank = orthogonalRows(Eigen::Vector3d(0.0, 1.0, 1.0).asDiagonal(), Eigen::Vector3d(0.0, 1.0, 0.0).asDiagonal());
+  const Rows before = rank;
+  const auto result = project(rank, unitMargin());
+  EXPECT_FALSE(result.valid);
+  EXPECT_STREQ(result.reason, "rank_m");
+  EXPECT_TRUE(sameBits(rank.h_x, before.h_x));
+  EXPECT_TRUE(sameBits(rank.h, before.h));
+}
+
+TEST(JointFloor, FixedShapeScaleMonotonic)
+{
+  // r2 txt:L16, R31. Only scalar shape scaling is ordered.
+  Eigen::Matrix3d M;
+  M << 2.0, 1.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 3.0;
+  Eigen::Matrix3d S;
+  S << 0.5, 0.1, 0.0, 0.1, 0.3, 0.05, 0.0, 0.05, 0.2;
+  const Rows original = orthogonalRows(M, S);
+  Eigen::MatrixXd previous = original.h_x.transpose() * original.h_x;
+  Eigen::Matrix3d previous_K = M;
+  for (double scale : {0.0, 0.1, 0.5, 1.0, 2.0, 4.0}) {
+    FloorParams params = unitMargin();
+    params.kappa = scale;
+    Rows rows = original;
+    const auto result = project(rows, params);
+    ASSERT_TRUE(result.valid);
+    const Eigen::MatrixXd J = rows.h_x.transpose() * rows.h_x;
+    EXPECT_LE(maxEigenvalue(J - previous), 1e-10 * std::max(1.0, previous.norm()));
+    EXPECT_LE(maxEigenvalue(result.K - previous_K), 1e-10 * std::max(1.0, previous_K.norm()));
+    previous = J;
+    previous_K = result.K;
+    EXPECT_LT((result.S0 - S).norm(), 1e-12);
+    if (scale >= 1.0) {
+      Rows equivalent = original;
+      params.kappa = 1.0;
+      params.rel_uncertainty = (scale - 1.0) / kZ;
+      ASSERT_TRUE(project(equivalent, params).valid);
+      EXPECT_LT((equivalent.h_x - rows.h_x).norm(), 1e-12);
+    }
+  }
+}
+
+TEST(JointFloor, RemovedJointModeAndPurePositionAreDistinct)
+{
+  // r2 txt:L8. R36 removes q=(e_x,-e_x), and retains the rotation-confounded pure-position row.
+  Rows joint = fixtureRows(handRows(), Eigen::Vector3d(1.0, 0.0, 0.0).asDiagonal());
+  Eigen::Matrix<double, 6, 1> q;
+  q << 1, 0, 0, -1, 0, 0;
+  joint.h = handRows() * q;
+  Rows pure = joint;
+  pure.h = handRows().col(0);
+  ASSERT_TRUE(project(joint, unitMargin()).valid);
+  ASSERT_TRUE(project(pure, unitMargin()).valid);
+  EXPECT_LT(joint.h.norm(), 1e-12);
+  EXPECT_LT((joint.h_x.leftCols(6) * q).norm(), 1e-12);
+  EXPECT_LT((pure.h - Matrix6::Identity().col(3)).norm(), 1e-12);
+  EXPECT_LT((joint.h_x.col(1) - handRows().col(1)).norm(), 1e-12);
+}
+
+TEST(JointFloor, ResidualAndJacobianUseTheSameMap)
+{
+  // r2 txt:L8/L35. Independent linear slope/normal-equation oracle.
+  const Matrix6 H = handRows();
+  Rows original = fixtureRows(H, Eigen::Vector3d(1.0, 0.0, 0.0).asDiagonal());
+  Rows first = original;
+  Rows second = original;
+  const Eigen::Matrix<double, 6, 1> dx = Eigen::Matrix<double, 6, 1>::LinSpaced(-0.2, 0.3);
+  second.h -= H * dx;
+  ASSERT_TRUE(project(first, unitMargin()).valid);
+  ASSERT_TRUE(project(second, unitMargin()).valid);
+  EXPECT_LT((second.h - first.h + first.h_x.leftCols(6) * dx).norm(), 1e-12);
+  Matrix6 L = Matrix6::Identity();
+  L(0, 0) = 0.0;
+  EXPECT_LT((first.h_x.transpose() * first.h - original.h_x.transpose() * L * L * original.h).norm(), 1e-12);
+  EXPECT_LT((first.h_x.transpose() * first.h_x - original.h_x.transpose() * L * L * original.h_x).norm(), 1e-12);
+}
+
+TEST(JointFloor, NoncommutingHandOracle)
+{
+  // r2 txt:L35 / py:364. Neither old V/g nor GM reproduces these actual rows.
+  Eigen::Matrix3d S;
+  S << 4, -6, 0, -6, 9, 0, 0, 0, 1.6;
+  Rows rows = orthogonalRows(Eigen::Vector3d(4.0, 9.0, 16.0).asDiagonal(), S);
+  rows.h << 0.05, -0.09, 0.08, 0.0, 0.0, 0.0;
+  const auto result = project(rows);
+  ASSERT_TRUE(result.valid);
+  Eigen::Matrix3d expected_H, expected_K;
+  expected_H << 1, 1.5, 0, 1, 1.5, 0, 0, 0, 3.593979478661425;
+  expected_K << 2, 3, 0, 3, 4.5, 0, 0, 0, 12.91668849303945;
+  EXPECT_LT((rows.h_x.topLeftCorner<3, 3>() - expected_H).norm(), 1e-12);
+  EXPECT_LT((result.K - expected_K).norm(), 1e-12);
+  EXPECT_LT((rows.h.head<3>() - Eigen::Vector3d(0.005, 0.005, 0.0718795895732285)).norm(), 1e-12);
+}
+
+TEST(JointFloor, AllColumnsShareTheRowMap)
+{
+  // r2 txt:L45 / py:489. Keeping extrinsic columns unchanged invents 0.618... information.
+  Rows original = fixtureRows(handRows(), Eigen::Vector3d(1.0, 0.0, 0.0).asDiagonal());
+  original.h_x.rightCols(6) = original.h_x.leftCols(6);
+  Rows rows = original;
+  const auto result = project(rows, unitMargin());
+  ASSERT_TRUE(result.valid);
+  expectJointCertificate(original, rows, result, 1e-12, unitMargin());
+  EXPECT_LT((rows.h_x.rightCols(6) - rows.h_x.leftCols(6)).norm(), 1e-12);
+  Eigen::MatrixXd wrong = rows.h_x;
+  wrong.rightCols(6) = original.h_x.rightCols(6);
+  EXPECT_NEAR(
+    maxEigenvalue(wrong.transpose() * wrong - original.h_x.transpose() * original.h_x), 0.6180339887498948, 1e-12);
+}
+
+TEST(JointFloor, ArbitraryFullPriorCertificate)
+{
+  // r2 txt:L16. Full 12-state priors include PSD singular and zero cases.
+  std::mt19937_64 rng(71319);
+  for (int trial = 0; trial < 128; ++trial) {
+    Eigen::MatrixXd H(18, 12), Z(12, 12);
+    for (Eigen::Index i = 0; i < H.size(); ++i)
+      H.data()[i] = gaussian(rng);
+    for (Eigen::Index i = 0; i < Z.size(); ++i)
+      Z.data()[i] = gaussian(rng);
+    if (trial % 3 == 0)
+      Z.setZero();
+    if (trial % 3 == 1)
+      Z.rightCols(8).setZero();
+    const Rows original = fixtureRows(H, 2.0 * Eigen::Matrix3d::Identity());
+    Rows rows = original;
+    ASSERT_TRUE(project(rows).valid);
+    const Eigen::MatrixXd prior = Z * Z.transpose();
+    const Eigen::MatrixXd raw = H.transpose() * H + prior;
+    const Eigen::MatrixXd kept = rows.h_x.transpose() * rows.h_x + prior;
+    const auto schur = [](const Eigen::MatrixXd & J) -> Eigen::Matrix3d {
+      return J.topLeftCorner<3, 3>() -
+             J.block(0, 3, 3, 9) * supportInverse(J.bottomRightCorner(9, 9)) * J.block(3, 0, 9, 3);
+    };
+    EXPECT_LE(maxEigenvalue(kept - raw), 1e-10 * raw.norm());
+    EXPECT_LE(maxEigenvalue(schur(kept) - schur(raw)), 1e-10 * raw.norm());
+  }
+}
+
+TEST(JointFloor, ZeroAllPartialAndRankCases)
+{
+  // r2 txt:L38,L40-L42 / py:504. Zero floor bypasses rank refusal exactly.
+  const Eigen::Matrix3d M = Eigen::Vector3d(1.0, 4.0, 9.0).asDiagonal();
+  for (bool all : {false, true}) {
+    const Eigen::Matrix3d S = Eigen::Vector3d(2.0, all ? 8.0 : 0.0, all ? 18.0 : 0.0).asDiagonal();
+    Rows rows = orthogonalRows(M, S);
+    rows.h.setOnes();
+    const auto result = project(rows, unitMargin());
+    ASSERT_TRUE(result.valid);
+    const Eigen::Matrix3d K = Eigen::Vector3d(0.0, all ? 0.0 : 4.0, all ? 0.0 : 9.0).asDiagonal();
+    EXPECT_LT((result.K - K).norm(), 1e-12);
+    EXPECT_LT(rows.h.head(all ? 3 : 1).norm(), 1e-12);
+    EXPECT_EQ(rows.h.tail<3>(), Eigen::Vector3d::Ones());
+  }
+  Rows rank = orthogonalRows(Eigen::Vector3d(0.0, 4.0, 9.0).asDiagonal(), Eigen::Matrix3d::Zero());
+  const Rows original = rank;
+  const auto result = project(rank);
+  ASSERT_TRUE(result.valid);
+  EXPECT_STREQ(result.reason, "zero_floor");
+  EXPECT_EQ(result.spectral_count, 2);
+  EXPECT_TRUE(sameBits(rank.h_x, original.h_x));
+  EXPECT_TRUE(sameBits(rank.h, original.h));
+  Rows empty;
+  empty.h_x.resize(0, 12);
+  empty.h.resize(0);
+  const auto no_rows = project(empty);
+  EXPECT_TRUE(no_rows.valid);
+  EXPECT_STREQ(no_rows.reason, "zero_floor");
+  EXPECT_EQ(no_rows.points, 0);
+  // r2 txt:L34 / py:351. The production row map retains the original commuting fractions too.
+  Rows commuting = orthogonalRows(Eigen::Vector3d(1000, 780, 100).asDiagonal(), 25.0 * Eigen::Matrix3d::Identity());
+  const auto fractions = project(commuting);
+  ASSERT_TRUE(fractions.valid);
+  const Eigen::Vector3d expected(951.8232577037414, 731.8232577037413, 51.823257703741405);
+  EXPECT_LT((fractions.K.diagonal() - expected).norm(), 1e-10);
+}
+
+TEST(JointFloor, RotationSupportRankMayChangeM0AtFullPositionRank)
+{
+  // R37(4) / r2 E2.4. Exact nuisance support changes can jump while M0 remains full rank.
+  for (double scale : {1.0, 1e-10, 0.0}) {
+    Matrix6 H = Matrix6::Zero();
+    H.topLeftCorner<3, 3>().setIdentity();
+    H(0, 3) = H(3, 3) = scale;
+    Rows rows = fixtureRows(H, 0.1 * Eigen::Matrix3d::Identity());
+    const auto result = project(rows, unitMargin());
+    ASSERT_TRUE(result.valid);
+    EXPECT_EQ(result.rank_m, 3);
+    EXPECT_EQ(result.rank_r, scale == 0.0 ? 0 : 1);
+    EXPECT_NEAR(result.M0(0, 0), scale == 0.0 ? 1.0 : 0.5, 1e-12);
+  }
+}
+
+TEST(JointFloor, RidgeIsNotAnOrthogonalProjection)
+{
+  // r2 txt:L9 / py:207. Ridge is diagnostic only for D1.
+  Rows rows = fixtureRows(handRows(), Eigen::Vector3d(1.0, 0.0, 0.0).asDiagonal());
+  const auto result = project(rows, unitMargin(), 0.1);
+  ASSERT_TRUE(result.valid);
+  EXPECT_LT((result.M0 - Eigen::Matrix3d::Identity()).norm(), 1e-12);
+  EXPECT_NEAR(result.M_ridge(0, 0), 1.0909090909090908, 1e-12);
+  EXPECT_NEAR(result.M_ridge(0, 1), 0.09090909090909094, 1e-12);
+  EXPECT_LT((result.K - Eigen::Matrix3d(Eigen::Vector3d(0, 1, 1).asDiagonal())).norm(), 1e-12);
+}
+
+TEST(JointFloor, InvalidIsAtomic)
+{
+  // r2 txt:L37,L40. Also overflow an unused-by-Schur extrinsic column late in staging.
+  const Rows original = fixtureRows(handRows(), Eigen::Vector3d(1.0, 0.0, 0.0).asDiagonal());
+  for (int kind = 0; kind < 4; ++kind) {
+    Rows rows = original;
+    if (kind == 0)
+      rows.covariances[0] = -Eigen::Matrix3d::Identity();
+    if (kind == 1)
+      rows.h_x.col(0).setZero();
+    if (kind == 2)
+      rows.h_x(0, 11) = kNaN;
+    if (kind == 3) {
+      const double c = std::sqrt(0.5);
+      rows.h_x.row(0) = c * (original.h_x.row(0) - original.h_x.row(1));
+      rows.h_x.row(1) = c * (original.h_x.row(0) + original.h_x.row(1));
+      rows.h_x.col(11).setConstant(std::numeric_limits<double>::max());
+    }
+    const Rows before = rows;
+    for (const FloorMode mode : {FloorMode::kObserve, FloorMode::kApply}) {
+      rows = before;
+      fast_lio::FloorScanRecord record;
+      fast_lio::floorStep(mode, rows.h_x, rows.h, rows.weights, rows.covariances, unitMargin(), kRidge, record);
+      EXPECT_FALSE(record.last.valid) << kind;
+      EXPECT_EQ(record.invalid_evaluations, 1);
+      EXPECT_FALSE(record.projected);
+      EXPECT_TRUE(sameBits(rows.h_x, before.h_x));
+      EXPECT_TRUE(sameBits(rows.h, before.h));
+    }
+  }
+}
+
+TEST(JointFloor, OverflowingShiftCoordinatesDoNotRejectFiniteRows)
+{
+  // E2.3 diagnostic overflow contract. The applied L/delta_h remain finite.
+  Matrix6 H = Matrix6::Zero();
+  H.topLeftCorner<3, 3>() = 1e-155 * Eigen::Matrix3d::Identity();
+  Rows rows = fixtureRows(H, 2e-310 * Eigen::Matrix3d::Identity());
+  rows.h.setConstant(1e200);
+  const auto result = project(rows, unitMargin());
+  ASSERT_TRUE(result.valid) << result.reason;
+  EXPECT_FALSE(result.shift_coords_valid);
+  EXPECT_TRUE(result.d_t.array().isNaN().all());
+  EXPECT_TRUE(result.d_r.array().isNaN().all());
+  EXPECT_TRUE(std::isfinite(result.dh_norm));
+  EXPECT_TRUE(rows.h_x.allFinite());
+  EXPECT_TRUE(rows.h.allFinite());
+  EXPECT_EQ(rows.h.head<3>(), Eigen::Vector3d::Zero());
+}
+
+TEST(DesignLimits, ArbitraryPsdFloorOrderingIsNotPromised)
+{
+  // r2 numerical-d1.txt:L1 / py:154. Preserve the explicit impossibility oracle.
+  const Eigen::Matrix3d M = Eigen::Matrix3d::Identity();
+  const Eigen::Matrix3d S1 = Eigen::Vector3d(0.5, 2, 0).asDiagonal();
+  const Eigen::Vector3d v(1, 1, 0);
+  const Eigen::Matrix3d S2 = S1 + 0.1 * v * v.transpose();
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> difference(jointKeptOracle(M, S1, 1.0) -
+                                                                  jointKeptOracle(M, S2, 1.0));
+  EXPECT_NEAR(difference.eigenvalues().minCoeff(), -0.00873447902177305, 1e-12);
+}
+
+TEST(DesignLimits, SupportChangesMayJumpAndCoordinateMapsAreUnbounded)
+{
+  // r2 numerical-d1.txt:L2-L6 / py:167,174. These are retained limitations, not production fallbacks.
+  const Eigen::Matrix2d M = Eigen::Vector2d(1, 0).asDiagonal();
+  for (double theta : {0.1, 0.01, 0.001, 0.0}) {
+    const Eigen::Vector2d q(-std::sin(theta), std::cos(theta));
+    const double weight = q.dot(M * q);
+    const double forced = weight > 0.0 ? 1.0 : 0.0;
+    EXPECT_EQ(forced, theta == 0.0 ? 0.0 : 1.0);
+  }
+  double previous_norm = 0.0;
+  for (double epsilon : {1e-2, 1e-6, 1e-10, 1e-12}) {
+    const Eigen::Matrix3d information = Eigen::Vector3d(epsilon, 1, 1).asDiagonal();
+    Eigen::Matrix3d S = Eigen::Matrix3d::Zero();
+    S(0, 0) = epsilon;
+    S(0, 1) = S(1, 0) = 0.5 * std::sqrt(epsilon);
+    S(1, 1) = 1.0;
+    const double norm = legacyCoordinateRule(information, S, 1.0, 0).jacobiSvd().singularValues().maxCoeff();
+    EXPECT_GT(norm, previous_norm);
+    previous_norm = norm;
+  }
+  EXPECT_NEAR(previous_norm, 353553.3905936273, 1e-5);
+}
+
+TEST(FloorSchema2, R35UsesFullMatricesAndFrameEndDirection)
+{
+  // r2 txt:L43 / py:509, and complete schema field/roundtrip checks.
+  fast_lio::FloorScanRecord record;
+  auto & r = record.last;
+  r.M0 << 4, 1, 0, 1, 3, 0, 0, 0, 2;
+  r.S0 = Eigen::Vector3d(2, 1, 0).asDiagonal();
+  const Eigen::Vector3d u = Eigen::Vector3d(1, 1, 0).normalized();
+  for (double kappa : {0.0, 1.0, 4.0}) {
+    r.kappa = kappa;
+    const auto calibration = fast_lio::floorCalibration(r, u, true);
+    EXPECT_NEAR(calibration.numerator, 4.5, 1e-12);
+    EXPECT_NEAR(calibration.denominator, 1.5, 1e-12);
+    EXPECT_NEAR(calibration.ratio, 3.0, 1e-12);
+    EXPECT_TRUE(calibration.valid);
+  }
+  const auto zero = fast_lio::floorCalibration(r, Eigen::Vector3d::UnitZ(), true);
+  EXPECT_FALSE(zero.valid);
+  EXPECT_EQ(zero.zero_denominator, 1);
+  const auto mismatch = fast_lio::floorCalibration(r, u, false);
+  EXPECT_FALSE(mismatch.valid);
+  EXPECT_STREQ(mismatch.reason, "frame_mismatch");
+  EXPECT_FALSE(fast_lio::floorCalibration(r, Eigen::Vector3d(kNaN, 0, 0), true).valid);
+  const std::string encoded = fast_lio::floorMatrix(r.M0);
+  double xx, xy, xz, yy, yz, zz;
+  ASSERT_EQ(std::sscanf(encoded.c_str(), "[%lf %lf %lf %lf %lf %lf]", &xx, &xy, &xz, &yy, &yz, &zz), 6);
+  EXPECT_DOUBLE_EQ(xx, 4.0);
+  EXPECT_DOUBLE_EQ(xy, 1.0);
+  for (double value : {0.0, 1.2345678901234567, -1.2345678901234567e-100, 1.2345678901234567e100}) {
+    const double decoded = std::stod(fast_lio::floorNumber(value));
+    EXPECT_LE(std::abs(decoded - value), 1e-15 * std::max(1.0, std::abs(value)));
+  }
+}
+
+TEST(FloorSchema2, InvalidApplyDoesNotDropValidCalibration)
+{
+  // r2 txt:L40,L43 / E4.2. rank_m is an apply gate, never a calibration filter.
+  Rows rows = orthogonalRows(Eigen::Vector3d(0, 4, 9).asDiagonal(), Eigen::Matrix3d::Identity());
+  const auto result = project(rows);
+  ASSERT_FALSE(result.valid);
+  ASSERT_STREQ(result.reason, "rank_m");
+  const auto calibration = fast_lio::floorCalibration(result, Eigen::Vector3d::UnitY(), true);
+  EXPECT_TRUE(calibration.valid);
+  EXPECT_NEAR(calibration.ratio, 4.0, 1e-12);
+}
+
 TEST(FloorLine, CarriesTheDecisionAndTheScansCountsInItsFormat)
 {
-  // The [FLOOR] line the replay reader parses: the fixed fields in order, every number read back to its 9 digits,
-  // and the shift's length and coordinates only in apply mode.
-  const Rows original = corridorRows(std::sqrt(0.5), 0.005);
-  Rows rows = original;
-  rows.covariances[7] = std::nullopt;
+  // r2 txt:L37,L43 and E4.2. Historical schema-1 field meanings are not reused.
+  Rows rows = fixtureRows(handRows(), Eigen::Vector3d(1.0, 0.0, 0.0).asDiagonal());
   fast_lio::FloorScanRecord record;
   fast_lio::floorStep(
-    FloorMode::kApply, rows.h_x, rows.h, rows.weights, rows.covariances, FloorParams{}, kRidge, record);
-  ASSERT_TRUE(record.projected);
-  const std::string line = fast_lio::floorLine(1234.5, FloorMode::kApply, record);
-  const std::string head = "[FLOOR] t=1234.500000 mode=apply valid=1 points=" + std::to_string(original.h.size()) +
-                           " points_without_covariance=1 iterations=1 invalid_iterations=0 lambda=[";
-  ASSERT_EQ(line.rfind(head, 0), 0u) << line;
-  const std::size_t numbers = line.find(" lambda=[");
-  ASSERT_NE(numbers, std::string::npos) << line;
-  double lambda[3], noise[3], gains[3], shift = 0.0, coef[3];
-  ASSERT_EQ(std::sscanf(line.c_str() + numbers,
-                        " lambda=[%lf %lf %lf] f=[%lf %lf %lf] g=[%lf %lf %lf] d=%lf coef=[%lf %lf %lf]",
-                        &lambda[0],
-                        &lambda[1],
-                        &lambda[2],
-                        &noise[0],
-                        &noise[1],
-                        &noise[2],
-                        &gains[0],
-                        &gains[1],
-                        &gains[2],
-                        &shift,
-                        &coef[0],
-                        &coef[1],
-                        &coef[2]),
-            13)
-    << line;
-  const auto matches = [](double printed, double value) {
-    return std::abs(printed - value) <= 1e-8 * std::max(1.0, std::abs(value));
-  };
-  const Eigen::Vector3d expected_coef = record.last.eigenvectors.transpose() * record.last.shift;
-  for (int k = 0; k < 3; ++k) {
-    EXPECT_TRUE(matches(lambda[k], record.last.lambda(k))) << k << ' ' << line;
-    EXPECT_TRUE(matches(noise[k], record.last.noise_floor(k))) << k << ' ' << line;
-    EXPECT_TRUE(matches(gains[k], record.last.gains(k))) << k << ' ' << line;
-    EXPECT_TRUE(matches(coef[k], expected_coef(k))) << k << ' ' << line;
+    FloorMode::kApply, rows.h_x, rows.h, rows.weights, rows.covariances, unitMargin(), kRidge, record);
+  const auto stamp = INT64_C(1234567890123456789);
+  const std::string line =
+    fast_lio::floorLine(1234.5, stamp, FloorMode::kApply, record, Eigen::Vector3d::UnitX(), true);
+  for (const char * field : {"schema=2",
+                             "rule=joint_row_v1",
+                             "mode=apply",
+                             "stamp_ns=1234567890123456789",
+                             "evaluation_iter=1",
+                             "valid=1",
+                             "reason=ok",
+                             "points=6",
+                             "iterations=1",
+                             "points_without_covariance=0",
+                             "invalid_iterations=0",
+                             "projected=1",
+                             "rank_m=3",
+                             "rank_r=3",
+                             "kappa=",
+                             "sigma_rel=",
+                             "z=",
+                             "a=",
+                             "m_definition=exact_rotation_schur",
+                             "M=[",
+                             "M_ridge=[",
+                             "S0=[",
+                             "lambda=[",
+                             "tau=[",
+                             "g_gen=[",
+                             "K=[",
+                             "F_sym=[",
+                             "transform_kind=row_contraction",
+                             "u=[1 0 0]",
+                             "u_source=odom_frame_end",
+                             "u_valid=1",
+                             "rD_num=",
+                             "rD_den=",
+                             "rD=",
+                             "rD_valid=1",
+                             "A=[",
+                             "B=[",
+                             "C=[",
+                             "A_keep=[",
+                             "B_keep=[",
+                             "C_keep=[",
+                             "shift_kind=joint_schur",
+                             "shift_coords_valid=1",
+                             "d_t=[",
+                             "d_r=[",
+                             "dh_norm="}) {
+    EXPECT_NE(line.find(field), std::string::npos) << field << " in " << line;
   }
-  EXPECT_TRUE(matches(shift, record.last.shift.norm())) << line;
-  EXPECT_GT(shift, 0.0);
-
-  const std::string observed = fast_lio::floorLine(1234.5, FloorMode::kObserve, record);
-  EXPECT_EQ(observed.rfind("[FLOOR] t=1234.500000 mode=observe valid=1 ", 0), 0u) << observed;
-  EXPECT_EQ(observed.find(" d="), std::string::npos) << observed;
-  EXPECT_EQ(observed.find(" coef="), std::string::npos) << observed;
+  const std::string observed =
+    fast_lio::floorLine(1234.5, stamp, FloorMode::kObserve, record, Eigen::Vector3d::UnitX(), true);
+  EXPECT_EQ(observed.find(" d_t="), std::string::npos);
+  EXPECT_EQ(observed.find(" d_r="), std::string::npos);
+  EXPECT_EQ(observed.find(" shift_kind="), std::string::npos);
+  EXPECT_TRUE(fast_lio::floorLine(1234.5, stamp, FloorMode::kOff, record, Eigen::Vector3d::UnitX(), true).empty());
 }

@@ -296,6 +296,13 @@ inline bool floorGeometry(const Eigen::Ref<const Eigen::MatrixXd> & H,
     r.reason = "nonfinite";
     return false;
   }
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> scale_solver;
+  int rank_a = 0;
+  if (!floorSpectrum(r.A, H.rows(), scale_solver, rank_a, r.reason)) {
+    return false;
+  }
+  const double position_tolerance =
+    std::numeric_limits<double>::epsilon() * H.rows() * scale_solver.eigenvalues().maxCoeff();
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> rotation_solver;
   if (!floorSpectrum(r.C, H.rows(), rotation_solver, r.rank_r, r.reason)) {
     return false;
@@ -308,6 +315,8 @@ inline bool floorGeometry(const Eigen::Ref<const Eigen::MatrixXd> & H,
     const Eigen::HouseholderQR<Eigen::MatrixXd> qr(supported);
     const Eigen::MatrixXd Q_r = qr.householderQ() * Eigen::MatrixXd::Identity(H.rows(), r.rank_r);
     perpendicular -= Q_r * (Q_r.transpose() * H_t);
+    // R39: remove the rotation-space rounding residue before a small complement is normalized by QR.
+    perpendicular -= (Q_r * (Q_r.transpose() * perpendicular)).eval();
   }
   r.M0 = floorSymmetric(perpendicular.transpose() * perpendicular);
   r.M_ridge = schurPositionInformation(r.A, r.B, r.C, ridge);
@@ -318,6 +327,8 @@ inline bool floorGeometry(const Eigen::Ref<const Eigen::MatrixXd> & H,
     return false;
   }
   r.lambda = position_solver.eigenvalues().cwiseMax(0.0);
+  r.rank_m = static_cast<int>(std::min<Eigen::Index>((r.lambda.array() > position_tolerance).count(),
+                                                     std::max<Eigen::Index>(H.rows() - r.rank_r, 0)));
   return true;
 }
 
@@ -368,8 +379,6 @@ inline FloorDecision decideFloor(const Eigen::Ref<const Eigen::MatrixXd> & H,
   Eigen::MatrixXd perpendicular;
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> position_solver;
   const bool geometry_valid = floorGeometry(H, ridge, decision, perpendicular, position_solver);
-  // A Gram matrix cannot have more supported columns than measurement rows.
-  r.rank_m = static_cast<int>(std::min<Eigen::Index>(r.rank_m, H.rows()));
   if (zero_floor) {
     r.valid = true;
     r.reason = "zero_floor";

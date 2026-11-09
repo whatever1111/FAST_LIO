@@ -1191,6 +1191,83 @@ TEST(JointFloor, ZeroAllPartialAndRankCases)
   EXPECT_LT((fractions.K.diagonal() - expected).norm(), 1e-10);
 }
 
+namespace
+{
+void expectRotationSpanRefusal(int repetitions)
+{
+  // R39 / independent numerical-review.json F4_three_rows and F4_six_rows.
+  Eigen::Matrix3d rotation;
+  rotation << 0, 2, 3, 4, 0, 6, 7, 8, 0;
+  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3 * repetitions, 6);
+  for (int block = 0; block < repetitions; ++block) {
+    H.block<3, 3>(3 * block, 0).setIdentity();
+    H.block<3, 3>(3 * block, 3) = rotation;
+  }
+  Rows original = fixtureRows(H, Eigen::Matrix3d::Zero());
+  for (int row = 0; row < H.rows(); ++row) {
+    const Eigen::Vector3d normal = Eigen::Vector3d::Unit(row % 3);
+    original.covariances[row] = 0.005 * (Eigen::Matrix3d::Identity() - normal * normal.transpose());
+  }
+  for (FloorMode mode : {FloorMode::kObserve, FloorMode::kApply}) {
+    SCOPED_TRACE(fast_lio::floorModeName(mode));
+    Rows rows = original;
+    for (int block = 0; block < repetitions; ++block) {
+      rows.h.segment<3>(3 * block) = Eigen::Vector3d(0.01, -0.02, 0.03);
+    }
+    const Rows before = rows;
+    fast_lio::FloorScanRecord record;
+    fast_lio::floorStep(mode, rows.h_x, rows.h, rows.weights, rows.covariances, unitMargin(), kRidge, record);
+    EXPECT_FALSE(record.last.valid);
+    EXPECT_STREQ(record.last.reason, "rank_m");
+    EXPECT_EQ(record.last.rank_r, 3);
+    EXPECT_EQ(record.last.rank_m, 0);
+    EXPECT_EQ(record.invalid_evaluations, 1);
+    EXPECT_FALSE(record.projected);
+    EXPECT_TRUE(sameBits(rows.h_x, before.h_x));
+    EXPECT_TRUE(sameBits(rows.h, before.h));
+    const double rotation_information = rows.h_x.middleCols(3, 3).squaredNorm();
+    EXPECT_DOUBLE_EQ(rotation_information, 178.0 * repetitions);
+    ::testing::Test::RecordProperty("rotation_information_trace_after", std::to_string(rotation_information));
+  }
+}
+}  // namespace
+
+TEST(JointFloor, ThreeRowsInRotationSpanAreRefusedAtomically)
+{
+  expectRotationSpanRefusal(1);
+}
+
+TEST(JointFloor, SixRepeatedRowsInRotationSpanAreRefusedAtomically)
+{
+  expectRotationSpanRefusal(2);
+}
+
+TEST(JointFloor, SmallResolvedComplementPreservesTheRotationRows)
+{
+  // R39: a real, full-rank complement about 1e-6 of Ht must remain usable.
+  const double delta = std::ldexp(1.0, -20);
+  Eigen::Matrix3d rotation;
+  rotation << 0, 2, 3, 4, 0, 6, 7, 8, 0;
+  Matrix6 H;
+  H.topLeftCorner<3, 3>() = (1.0 + delta) * Eigen::Matrix3d::Identity();
+  H.bottomLeftCorner<3, 3>() = (1.0 - delta) * Eigen::Matrix3d::Identity();
+  H.topRightCorner<3, 3>() = rotation;
+  H.bottomRightCorner<3, 3>() = rotation;
+  Rows rows = fixtureRows(H, delta * delta * Eigen::Matrix3d::Identity());
+  const Rows before = rows;
+  const auto result = project(rows, unitMargin());
+  ASSERT_TRUE(result.valid) << result.reason;
+  EXPECT_EQ(result.rank_m, 3);
+  EXPECT_EQ(result.rank_r, 3);
+  EXPECT_GT((rows.h_x.leftCols(3) - before.h_x.leftCols(3)).norm(), 0.0);
+  const double relative_rotation_change =
+    (rows.h_x.middleCols(3, 3) - before.h_x.middleCols(3, 3)).norm() / before.h_x.middleCols(3, 3).norm();
+  EXPECT_LE(relative_rotation_change, 1e-12);
+  EXPECT_LE((result.C_keep - result.C).norm(), 1e-12 * result.C.norm());
+  RecordProperty("relative_rotation_change", fast_lio::floorNumber(relative_rotation_change));
+  RecordProperty("m0_to_A_trace", fast_lio::floorNumber(result.M0.trace() / result.A.trace()));
+}
+
 TEST(JointFloor, RotationSupportRankMayChangeM0AtFullPositionRank)
 {
   // R37(4) / r2 E2.4. Exact nuisance support changes can jump while M0 remains full rank.

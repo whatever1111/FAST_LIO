@@ -50,9 +50,12 @@ with the same L. D1 uses the exact rotation Schur M0. `M_ridge` remains a diagno
 R36 withdraws the former pure-position deletion guarantee and replaces it with deletion of the joint
 position-rotation mode. R37 accepts jumps at M0 and rotation-support rank boundaries. A nonzero floor with
 rank_m below three is invalid and leaves the rows unchanged. A zero floor is an exact byte-preserving no-op.
+R39 measures position rank against epsilon times the row count times lambda_max(Ht-transpose Ht), before rotation
+elimination. The complement is orthogonalized twice and its rank is bounded by the rows minus the rotation rank.
 
-`h_exit.v1` keeps its field names and order. With the mechanism off its values keep their original meanings
-and bytes. With observe or apply enabled, the floor fields have the following definitions.
+`h_exit.v1` keeps its existing field names and order. With the mechanism off its values keep their original meanings
+and bytes. With observe or apply enabled, each serialized exit appends `schema=2 rule=joint_row_v1`,
+`gain_order=tau_ascending` and `lambda_gain_pairing=independent`. The floor fields then have these definitions.
 
 | Field | Schema-2 meaning |
 | --- | --- |
@@ -63,12 +66,15 @@ and bytes. With observe or apply enabled, the floor fields have the following de
 | `degeneracy_weighted_points` | Cumulative count of rows in committed contractions |
 | `degeneracy_weight_sum` | Cumulative sum of actual transformed position-row norms |
 
-The lambda and gain arrays have independent ordering and their same-index entries are not paired. The versioned
-FLOOR line provides the rule identity for interpreting these compatibility fields. Invalid attempted evaluations
+The lambda and gain arrays have independent ordering and their same-index entries are not paired. Each exit record
+carries the identity needed to interpret its compatibility fields. Invalid attempted evaluations
 carry nan gains and empty generalized spectra in the log. The floor-off neutral record retains zero lambdas and
 unit gains. The correspondence dump keeps its columns and ordering. On a projected evaluation its existing `w`
-column contains `floor_row_pos_norm`, the norm of the actual transformed position row. An unmatched point has
-`w=-1`. Row mixing allows an individual row norm to grow. Observe and off retain the existing dump values.
+column contains `floor_row_pos_norm`, the norm of the actual transformed position row. Each projected iteration is
+preceded by `# schema=2 rule=joint_row_v1 column_w=floor_row_pos_norm t=... iter=...`. This versioned mapping applies
+only to rows with the same `(t,iter)` CSV key. Readers map their `w` column to `floor_row_pos_norm`; rows without a
+mapping retain the legacy `w` meaning. An unmatched point has `w=-1`. Row mixing allows an individual row norm to
+grow. Observe and off retain the existing dump values and CSV bytes.
 
 Each enabled frame emits one `[FLOOR]` line after the final snapshot is fixed. All real values use `%.17g` and
 `stamp_ns` uses the same ROS conversion as `/Odometry`. Symmetric matrices use xx,xy,xz,yy,yz,zz and B is row-major

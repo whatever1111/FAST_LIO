@@ -764,6 +764,11 @@ void writeDump(const fast_lio::MeasurementScratch & scratch,
                const esekfom::dyn_share_datastruct<double> & data)
 {
   const int iter = outputs.dump_iteration++;
+  if (telemetry.floor.projected) {
+    // This per-iteration mapping versions w without changing legacy, unprojected CSV records.
+    outputs.dump_rows << "# schema=2 rule=joint_row_v1 column_w=floor_row_pos_norm t=" << std::setprecision(15)
+                      << inputs.scan_end_time << " iter=" << iter << '\n';
+  }
   const V3D sensor_w = s.rot * s.offset_T_L_I + s.pos;
   outputs.dump_iterations << std::setprecision(15) << inputs.scan_end_time << ',' << iter << ','
                           << outputs.effective_rows << ',' << int(hold_rows) << ',' << std::setprecision(6)

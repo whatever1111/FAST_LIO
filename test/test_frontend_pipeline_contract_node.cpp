@@ -693,7 +693,7 @@ std::string formatSelection(const fast_lio_test::HModelSelection & s, std::size_
 }
 
 // The h_exit.v1 line of one H-model exit.
-std::string formatExit(const fast_lio_test::HModelExit & e)
+std::string formatExit(const fast_lio_test::HModelExit & e, bool floor_enabled)
 {
   std::ostringstream out;
   out << "h_exit.v1 end=" << bits(e.scan_end) << " call=" << e.call << " valid=" << (e.valid ? 1 : 0)
@@ -708,6 +708,9 @@ std::string formatExit(const fast_lio_test::HModelExit & e)
       << " degeneracy_weights=" << bitsList(e.degeneracy_weights, 3)
       << " degeneracy_weighted_points=" << e.degeneracy_weighted_points
       << " degeneracy_weight_sum=" << bits(e.degeneracy_weight_sum) << " dump_written=" << (e.dump_written ? 1 : 0);
+  if (floor_enabled) {
+    out << " schema=2 rule=joint_row_v1 gain_order=tau_ascending lambda_gain_pairing=independent";
+  }
   return out.str();
 }
 
@@ -1788,7 +1791,10 @@ private:
         ++counts_["h_ground_rows"];
     };
     fast_lio_test::afterHModelExit = [this](const fast_lio_test::HModelExit & e) {
-      if (!note("afterHModelExit", formatExit(e)))
+      // These immutable overrides are the same map supplied to the node constructor.
+      const auto floor = scenario_.params.find("degeneracy_floor_mode");
+      const bool floor_enabled = floor != scenario_.params.end() && floor->second.as_string() != "off";
+      if (!note("afterHModelExit", formatExit(e, floor_enabled)))
         return;
       // The floor's decision of the call itself: every call with rows runs the floor while it is on.
       if (e.valid && e.degeneracy_engaged)
@@ -3008,6 +3014,92 @@ TEST(FrontendPipelineContract, JointRowFloorMeasurementFixture)
   EXPECT_EQ(telemetry.floor.evaluation_iter, 7);
   EXPECT_EQ(telemetry.floor_rows_projected, 6);
   EXPECT_NEAR(telemetry.floor_kept_sum, 2.0 + std::sqrt(2.0), 1e-12);
+}
+
+TEST(FrontendPipelineContract, FloorExitRecordVersionsEnabledMode)
+{
+  // R39-2: the serialized record alone identifies the ordering and preserves its legacy payload.
+  fast_lio_test::HModelExit exit;
+  exit.degeneracy_lambdas[0] = 4.0;
+  exit.degeneracy_weights[0] = 0.5;
+  const std::string legacy = formatExit(exit, false);
+  const std::string enabled = formatExit(exit, true);
+  EXPECT_EQ(enabled, legacy + " schema=2 rule=joint_row_v1 gain_order=tau_ascending lambda_gain_pairing=independent");
+  EXPECT_TRUE(valueOf(legacy, "schema").empty());
+  EXPECT_TRUE(valueOf(legacy, "rule").empty());
+  EXPECT_EQ(valueOf(enabled, "schema"), "2");
+  EXPECT_EQ(valueOf(enabled, "rule"), "joint_row_v1");
+  EXPECT_EQ(valueOf(enabled, "gain_order"), "tau_ascending");
+  EXPECT_EQ(valueOf(enabled, "lambda_gain_pairing"), "independent");
+  EXPECT_EQ(valueOf(enabled, "degeneracy_lambdas"), valueOf(legacy, "degeneracy_lambdas"));
+  EXPECT_EQ(valueOf(enabled, "degeneracy_weights"), valueOf(legacy, "degeneracy_weights"));
+}
+
+TEST(FrontendPipelineContract, VersionedFloorDumpMapsOnlyProjectedRows)
+{
+  // R39-2: consume actual node exits and the per-(t,iter) mapping, without recording another golden.
+  for (const std::string mode : {"apply", "observe"}) {
+    SCOPED_TRACE(mode);
+    Scenario scenario = degeneracyScenario();
+    scenario.name = "floor_dump_schema2_" + mode;
+    scenario.dump = true;
+    setParam(scenario, rclcpp::Parameter("degeneracy_floor_mode", mode));
+    setParam(scenario, rclcpp::Parameter("corr_dump_en", true));
+    setParam(scenario, rclcpp::Parameter("corr_dump_windows", "0:10"));
+    const ChildRun run = runScenario(scenario);
+    ASSERT_TRUE(run.ok()) << run.describe();
+    std::istringstream records(run.record);
+    std::string line;
+    std::size_t exits = 0;
+    while (std::getline(records, line)) {
+      if (line.rfind("h_exit.v1 ", 0) != 0)
+        continue;
+      EXPECT_EQ(valueOf(line, "schema"), "2");
+      EXPECT_EQ(valueOf(line, "rule"), "joint_row_v1");
+      EXPECT_EQ(valueOf(line, "gain_order"), "tau_ascending");
+      EXPECT_EQ(valueOf(line, "lambda_gain_pairing"), "independent");
+      ++exits;
+    }
+    EXPECT_GT(exits, 0u);
+    std::string text;
+    ASSERT_TRUE(readFile(std::string(FASTLIO_CONTRACT_RESULTS) + "/frontend_contract/" + kFixture + "/" +
+                           scenario.name + ".dump/corr_dump.csv",
+                         &text));
+    std::istringstream csv(text);
+    std::getline(csv, line);  // the existing CSV column header
+    ASSERT_NE(line.find(",w,"), std::string::npos);
+    std::map<std::string, std::string> meanings;
+    std::size_t mapped_rows = 0;
+    while (std::getline(csv, line)) {
+      if (line.rfind("# ", 0) == 0) {
+        ASSERT_EQ(valueOf(line, "schema"), "2");
+        ASSERT_EQ(valueOf(line, "rule"), "joint_row_v1");
+        const std::string key = valueOf(line, "t") + "," + valueOf(line, "iter");
+        meanings[key] = valueOf(line, "column_w");
+        continue;
+      }
+      std::istringstream row(line);
+      std::vector<std::string> fields;
+      std::string field;
+      while (std::getline(row, field, ','))
+        fields.push_back(field);
+      ASSERT_EQ(fields.size(), 29u);
+      const double w = std::stod(fields[25]);
+      const auto mapping = meanings.find(fields[0] + "," + fields[1]);
+      if (mapping == meanings.end()) {
+        EXPECT_DOUBLE_EQ(w, 1.0);
+      } else {
+        EXPECT_EQ(mapping->second, "floor_row_pos_norm");
+        EXPECT_TRUE(std::isfinite(w) && (w >= 0.0 || w == -1.0));
+        ++mapped_rows;
+      }
+    }
+    if (mode == "apply") {
+      EXPECT_GT(mapped_rows, 0u);
+    } else {
+      EXPECT_EQ(mapped_rows, 0u);
+    }
+  }
 }
 
 TEST(FrontendPipelineContract, FloorSchema2UsesThePublishedFrameEndQuaternionAndStamp)

@@ -368,6 +368,8 @@ inline FloorDecision decideFloor(const Eigen::Ref<const Eigen::MatrixXd> & H,
   Eigen::MatrixXd perpendicular;
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> position_solver;
   const bool geometry_valid = floorGeometry(H, ridge, decision, perpendicular, position_solver);
+  // A Gram matrix cannot have more supported columns than measurement rows.
+  r.rank_m = static_cast<int>(std::min<Eigen::Index>(r.rank_m, H.rows()));
   if (zero_floor) {
     r.valid = true;
     r.reason = "zero_floor";
@@ -615,6 +617,9 @@ floorCalibration(const FloorProjectionResult & result, const Eigen::Vector3d & d
 
 inline std::string floorNumber(double value)
 {
+  if (!std::isfinite(value)) {
+    return "nan";
+  }
   char text[64];
   std::snprintf(text, sizeof text, "%.17g", value);
   return text;

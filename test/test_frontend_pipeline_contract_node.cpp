@@ -1558,7 +1558,7 @@ public:
       if (scenario_.floor_log_binding) {
         floor_log_ = observer_->create_subscription<rcl_interfaces::msg::Log>(
           "/rosout",
-          rclcpp::QoS(rclcpp::KeepLast(1000)).reliable().transient_local(),
+          rclcpp::QoS(rclcpp::KeepLast(1000)).reliable(),
           [this](rcl_interfaces::msg::Log::ConstSharedPtr message) {
             if (message->msg.rfind("[FLOOR] schema=2 ", 0) == 0) {
               const std::string stamp = valueOf(message->msg, "stamp_ns");
@@ -1584,7 +1584,8 @@ public:
       executor_->add_node(observer_);
       if (!spinUntil([&] {
             return imu_->get_subscription_count() == 1 && lidar_->get_subscription_count() == 1 &&
-                   (!scenario_.floor_log_binding || floor_log_->get_publisher_count() > 0) &&
+                   // The subject and observer each advertise /rosout. Wait for both before sending scans.
+                   (!scenario_.floor_log_binding || floor_log_->get_publisher_count() >= 2) &&
                    (!scenario_.typed ||
                     (frontend_sub_->get_publisher_count() == 1 && reference_sub_->get_publisher_count() == 1));
           }))
@@ -2997,7 +2998,8 @@ TEST(FrontendPipelineContract, JointRowFloorMeasurementFixture)
   expected_h(3) = 1.0;
   const Eigen::Matrix3d S0 = Eigen::Vector3d(1, 0, 0).asDiagonal();
   const std::vector<double> weights(6, 1.0);
-  const std::vector<std::optional<Eigen::Matrix3d>> covariances(6, Eigen::Matrix3d(S0 / 6.0));
+  std::vector<std::optional<Eigen::Matrix3d>> covariances(6, Eigen::Matrix3d::Zero());
+  covariances.front() = S0;
   measurement.applyFloorRows(data, weights, covariances, 7);
   EXPECT_LT((data.h_x - expected).norm(), 1e-12);
   EXPECT_LT((data.h - expected_h).norm(), 1e-12);

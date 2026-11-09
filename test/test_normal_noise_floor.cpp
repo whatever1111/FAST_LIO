@@ -280,7 +280,7 @@ TEST(FloorAccumulator, AddsTheCompleteWeightedCovariance)
   axes.add(0.5, Eigen::Matrix3d(Eigen::Vector3d(4e-3, 2e-3, 0.0).asDiagonal()));
   axes.add(2.0, Eigen::Matrix3d(Eigen::Vector3d(0.0, 1e-3, 3e-3).asDiagonal()));
   // Independent r2 numerical-d1.txt:L33, including the original 1e-18 tolerance.
-  const Eigen::Matrix3d expected = Eigen::Vector3d(0.001, 0.0045, 0.012).asDiagonal();
+  const Eigen::Matrix3d expected = Eigen::Vector3d(0.25 * 4e-3, 0.25 * 2e-3 + 4.0 * 1e-3, 4.0 * 3e-3).asDiagonal();
   EXPECT_LT((axes.floor(1.0) - expected).norm(), 1e-18);
   EXPECT_LT((axes.floor(1.5) - 1.5 * expected).norm(), 1e-18);
   EXPECT_EQ(axes.points(), 2);
@@ -686,7 +686,10 @@ Rows fixtureRows(const Eigen::MatrixXd & H6, const Eigen::Matrix3d & S)
   rows.h_x.leftCols(H6.cols()) = H6;
   rows.h = Eigen::VectorXd::LinSpaced(H6.rows(), -0.3, 0.4);
   rows.weights.assign(static_cast<std::size_t>(H6.rows()), 1.0);
-  rows.covariances.assign(static_cast<std::size_t>(H6.rows()), Eigen::Matrix3d(S / H6.rows()));
+  // Supply the exact aggregate from the oracle, including its a*tau=1 boundary.
+  // Splitting 1 into six rounded 1/6 contributions would change that input.
+  rows.covariances.assign(static_cast<std::size_t>(H6.rows()), Eigen::Matrix3d::Zero());
+  rows.covariances.front() = S;
   return rows;
 }
 
@@ -1082,7 +1085,7 @@ TEST(JointFloor, NoncommutingHandOracle)
   Eigen::Matrix3d S;
   S << 4, -6, 0, -6, 9, 0, 0, 0, 1.6;
   Rows rows = orthogonalRows(Eigen::Vector3d(4.0, 9.0, 16.0).asDiagonal(), S);
-  rows.h << 0.05, -0.09, 0.08, 0.0, 0.0, 0.0;
+  rows.h << 0.1, -0.09, 0.08, 0.0, 0.0, 0.0;
   const auto result = project(rows);
   ASSERT_TRUE(result.valid);
   Eigen::Matrix3d expected_H, expected_K;
@@ -1168,6 +1171,18 @@ TEST(JointFloor, ZeroAllPartialAndRankCases)
   EXPECT_TRUE(no_rows.valid);
   EXPECT_STREQ(no_rows.reason, "zero_floor");
   EXPECT_EQ(no_rows.points, 0);
+  for (int count : {1, 2}) {
+    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(count, 6);
+    H.leftCols(count).setIdentity();
+    Rows short_scan = fixtureRows(H, Eigen::Matrix3d::Identity());
+    const Rows before = short_scan;
+    const auto refused = project(short_scan);
+    EXPECT_FALSE(refused.valid);
+    EXPECT_STREQ(refused.reason, "rank_m");
+    EXPECT_LE(refused.rank_m, count);
+    EXPECT_TRUE(sameBits(short_scan.h_x, before.h_x));
+    EXPECT_TRUE(sameBits(short_scan.h, before.h));
+  }
   // r2 txt:L34 / py:351. The production row map retains the original commuting fractions too.
   Rows commuting = orthogonalRows(Eigen::Vector3d(1000, 780, 100).asDiagonal(), 25.0 * Eigen::Matrix3d::Identity());
   const auto fractions = project(commuting);
@@ -1322,6 +1337,9 @@ TEST(FloorSchema2, R35UsesFullMatricesAndFrameEndDirection)
     const double decoded = std::stod(fast_lio::floorNumber(value));
     EXPECT_LE(std::abs(decoded - value), 1e-15 * std::max(1.0, std::abs(value)));
   }
+  EXPECT_EQ(fast_lio::floorNumber(kNaN), "nan");
+  EXPECT_EQ(fast_lio::floorNumber(std::numeric_limits<double>::infinity()), "nan");
+  EXPECT_EQ(fast_lio::floorNumber(-std::numeric_limits<double>::infinity()), "nan");
 }
 
 TEST(FloorSchema2, InvalidApplyDoesNotDropValidCalibration)

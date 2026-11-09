@@ -1,5 +1,6 @@
 // test_wheel_measurement.cpp — the bridge-sample ring, the per-scan speed fit, the slip
-// correction and the measurement model of the wheel update (wheel_measurement.hpp).
+// correction and the measurement model of the wheel update (wheel_measurement.hpp), and the
+// front end's holder of the wheel samples with its per-scan step (wheel_speed_input.hpp).
 
 #include <Eigen/Geometry>
 
@@ -10,11 +11,13 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "gravity_align_kinematics.hpp"
 #include "wheel_measurement.hpp"
+#include "wheel_speed_input.hpp"
 
 using fast_lio::composeR;
 using fast_lio::slipCorrect;
@@ -445,4 +448,289 @@ TEST(WheelMeasurementModel, NonFiniteInputsGiveNoMeasurement)
   EXPECT_FALSE(modelAt(fine, params).has_value());
   EXPECT_FALSE(modelAt(fine, WheelModelParams{}, kNaN).has_value());
   EXPECT_TRUE(modelAt(fine, WheelModelParams{}).has_value());
+}
+
+// The front end's holder of the wheel samples (wheel_speed_input.hpp): the two callbacks' halves paired by the
+// integer header stamp, the scan's own span fitted at its end, the slip regressor from the raw IMU, and why a scan
+// makes no update.
+namespace
+{
+using fast_lio::WheelOutcome;
+using fast_lio::WheelSpeedInput;
+
+constexpr std::int64_t kNsPerSecond = 1000000000;
+
+std::int32_t stampSec(std::int64_t stamp_ns)
+{
+  return static_cast<std::int32_t>(stamp_ns / kNsPerSecond);
+}
+
+std::uint32_t stampNanosec(std::int64_t stamp_ns)
+{
+  return static_cast<std::uint32_t>(stamp_ns % kNsPerSecond);
+}
+
+void addTwistAt(WheelSpeedInput & input, std::int64_t stamp_ns, double v)
+{
+  input.addTwist(stampSec(stamp_ns), stampNanosec(stamp_ns), v);
+}
+
+void addVariancesAt(WheelSpeedInput & input, std::int64_t stamp_ns, double var_vx, double var_lat)
+{
+  input.addVariances(stampSec(stamp_ns), stampNanosec(stamp_ns), var_vx, var_lat);
+}
+
+// One 10 Hz scan starting at the epoch: [kEpochNs, kEpochNs + 100 ms].
+const double kScanBegin = seconds(kEpochNs);
+const double kScanEnd = seconds(kEpochNs + 100000000);
+
+fast_lio::WheelStep stepOf(WheelSpeedInput & input,
+                           const WheelModelParams & params,
+                           const std::optional<Eigen::Vector3d> & omega_mean = ModelState().omega_mean)
+{
+  const ModelState s;
+  return input.step(input.read(kScanBegin, kScanEnd),
+                    kScanEnd,
+                    omega_mean,
+                    s.R_world_imu,
+                    s.velocity_world,
+                    s.gyro_bias,
+                    s.R_robot_to_imu,
+                    params);
+}
+
+Eigen::Matrix3d skew(const Eigen::Vector3d & v)
+{
+  Eigen::Matrix3d m;
+  m << 0.0, -v(2), v(1), v(2), 0.0, -v(0), -v(1), v(0), 0.0;
+  return m;
+}
+}  // namespace
+
+TEST(WheelSpeedInput, PairsTheTwoTopicsByStampInEitherArrivalOrder)
+{
+  WheelSpeedInput input;
+  input.configure(true, 0.075, 0.05);
+  const std::int64_t first = kEpochNs + 20000000;
+  const std::int64_t second = kEpochNs + 40000000;
+  const std::int64_t third = kEpochNs + 60000000;
+  addTwistAt(input, first, 0.70);  // the gated speed first
+  addVariancesAt(input, first, 0.003, kUnobserved);
+  addVariancesAt(input, second, 0.004, kUnobserved);  // the variances first
+  addTwistAt(input, second, 0.74);
+  addTwistAt(input, third, 0.78);  // its variances have not arrived
+
+  const fast_lio::WheelRingRead ring = input.read(kScanBegin, kScanEnd);
+  ASSERT_TRUE(ring.fit.has_value());
+  EXPECT_EQ(ring.fit->samples, 2);  // only the paired samples enter the update
+  EXPECT_EQ(ring.unpaired, 1);
+  EXPECT_EQ(ring.fit->var_vx, 0.004);
+  EXPECT_EQ(ring.unmatched_samples, 0u);
+  EXPECT_EQ(ring.rejected, 0u);
+
+  addVariancesAt(input, third, 0.003, kUnobserved);  // late, but in time for the next read
+  const fast_lio::WheelRingRead later = input.read(kScanBegin, kScanEnd);
+  ASSERT_TRUE(later.fit.has_value());
+  EXPECT_EQ(later.fit->samples, 3);
+  EXPECT_EQ(later.unpaired, 0);
+}
+
+TEST(WheelSpeedInput, HalvesPushedOutUnpairedAreCountedAndGone)
+{
+  WheelSpeedInput input;
+  input.configure(true, 0.075, 0.05);
+  const std::int64_t period = kNsPerSecond / static_cast<std::int64_t>(fast_lio::kWheelBridgeRateHz);
+  const std::size_t extra = 3;
+  for (std::size_t i = 0; i < fast_lio::kWheelSampleCapacity + extra; ++i) {
+    addTwistAt(input, kEpochNs + static_cast<std::int64_t>(i) * period, 0.5);  // no variance ever arrives
+  }
+  fast_lio::WheelRingRead ring = input.read(kScanBegin, kScanEnd);
+  EXPECT_EQ(ring.unmatched_samples, extra);
+  EXPECT_FALSE(ring.fit.has_value());  // nothing of the scan's span is paired
+
+  // Variances arriving after their samples were pushed out are older than everything held: counted and gone.
+  for (std::size_t i = 0; i < extra; ++i) {
+    addVariancesAt(input, kEpochNs + static_cast<std::int64_t>(i) * period, 0.003, kUnobserved);
+  }
+  ring = input.read(kScanBegin, kScanEnd);
+  EXPECT_EQ(ring.unmatched_variances, extra);
+  EXPECT_EQ(ring.unmatched_samples, extra);
+  EXPECT_EQ(ring.rejected, 0u);
+}
+
+TEST(WheelSpeedInput, MalformedStampsAndDuplicateHalvesAreRefusedAndCounted)
+{
+  WheelSpeedInput input;
+  input.configure(true, 0.075, 0.05);
+  input.addTwist(stampSec(kEpochNs), 1000000000u, 0.5);  // a nanosecond field of a whole second
+  input.addVariances(stampSec(kEpochNs), 1000000000u, 0.003, kUnobserved);
+  addTwistAt(input, kEpochNs + 50000000, 0.5);
+  addTwistAt(input, kEpochNs + 50000000, 0.6);  // the same stamp twice
+  const fast_lio::WheelRingRead ring = input.read(kScanBegin, kScanEnd);
+  EXPECT_EQ(ring.rejected, 3u);
+  EXPECT_EQ(ring.unpaired, 1);
+}
+
+TEST(WheelSpeedInput, WithoutAVarianceTopicTheUpdateIsTodays)
+{
+  // Today's update: the gated sample with R = diag(vx^2, vy^2, vz^2) of the parameter sigmas, z = v * scale,
+  // h = R_robot<-imu R_world<-imu^T v and H on the rotation and velocity columns. Without a variance topic, a zero
+  // lever arm and no lever uncertainty, one sample in the scan gives the same R, bit for bit, and the same model.
+  const double sigma_vx = 0.10;
+  const double sigma_vy = 0.05;
+  const double sigma_vz = 0.20;
+  const double scale = 1.02;
+  const double v = 0.83;
+  WheelSpeedInput input;
+  input.configure(false, sigma_vx, sigma_vy);
+  addTwistAt(input, kEpochNs + 40000000, v);
+  WheelModelParams params;
+  params.speed_scale = scale;
+  params.sigma_vx_floor = sigma_vx;
+  params.sigma_vz = sigma_vz;
+  const fast_lio::WheelStep step = stepOf(input, params);
+  ASSERT_EQ(step.outcome, WheelOutcome::kUpdate);
+  ASSERT_TRUE(step.measurement.has_value());
+  EXPECT_EQ(step.ring.fit->samples, 1);
+  EXPECT_EQ(step.ring.unpaired, 0);
+
+  Eigen::Matrix<double, Eigen::Dynamic, fast_lio::kWheelStateDim> H;
+  Eigen::VectorXd residual;
+  Eigen::VectorXd variances;
+  step.measurement->pack(H, residual, variances);
+  ASSERT_EQ(variances.size(), 3);
+  EXPECT_EQ(bits(variances(0)), bits(sigma_vx * sigma_vx));
+  EXPECT_EQ(bits(variances(1)), bits(sigma_vy * sigma_vy));
+  EXPECT_EQ(bits(variances(2)), bits(sigma_vz * sigma_vz));
+  EXPECT_EQ(bits(step.measurement->z(0)), bits(v * scale));
+
+  const ModelState s;
+  const Eigen::Matrix3d Re_T = s.R_robot_to_imu.transpose();
+  const Eigen::Vector3d v_imu = s.R_world_imu.transpose() * s.velocity_world;
+  EXPECT_TRUE(step.measurement->h.isApprox(Re_T * v_imu, 1e-14));
+  Eigen::Matrix<double, 3, fast_lio::kWheelStateDim> today = Eigen::Matrix<double, 3, fast_lio::kWheelStateDim>::Zero();
+  today.block<3, 3>(0, fast_lio::kWheelRotIndex) = Re_T * skew(v_imu);
+  today.block<3, 3>(0, fast_lio::kWheelVelIndex) = Re_T * s.R_world_imu.transpose();
+  EXPECT_TRUE(H.isApprox(today, 1e-14)) << H << "\n\n" << today;
+  EXPECT_EQ(H.block<3, 3>(0, fast_lio::kWheelGyroBiasIndex), Eigen::Matrix3d::Zero());
+}
+
+TEST(WheelSpeedInput, AScanWithoutAPairedSampleInItsSpanMakesNoUpdate)
+{
+  WheelSpeedInput input;
+  input.configure(true, 0.075, 0.05);
+  addTwistAt(input, kEpochNs - 20000000, 0.5);  // before the scan
+  addVariancesAt(input, kEpochNs - 20000000, 0.003, kUnobserved);
+  addTwistAt(input, kEpochNs + 50000000, 0.5);  // in the scan, never paired
+  const fast_lio::WheelStep step = stepOf(input, WheelModelParams{});
+  EXPECT_EQ(step.outcome, WheelOutcome::kNoSample);
+  EXPECT_FALSE(step.measurement.has_value());
+  EXPECT_EQ(step.ring.unpaired, 1);
+  EXPECT_EQ(input.counts().no_sample, 1u);
+  EXPECT_EQ(input.counts().updates, 0u);
+}
+
+TEST(WheelSpeedInput, AScanWithoutImuSamplesMakesNoUpdate)
+{
+  WheelSpeedInput input;
+  input.configure(false, 0.10, 0.05);
+  addTwistAt(input, kEpochNs + 50000000, 0.5);
+  const fast_lio::WheelStep step = stepOf(input, WheelModelParams{}, std::nullopt);
+  EXPECT_EQ(step.outcome, WheelOutcome::kNoImu);
+  EXPECT_FALSE(step.measurement.has_value());
+  EXPECT_EQ(input.counts().no_imu, 1u);
+}
+
+TEST(WheelSpeedInput, TheSlipNeedsPhiOnlyWhenKIsNotZero)
+{
+  const double v = 0.9;
+  WheelModelParams slip;
+  slip.slip_k = 0.128;
+  slip.slip_phi0 = -0.011;
+  slip.slip_window_s = 1.0;
+
+  // No IMU sample in the slip window: k != 0 makes no update and counts it, k = 0 updates without phi.
+  WheelSpeedInput without_imu;
+  without_imu.configure(false, 0.10, 0.05);
+  addTwistAt(without_imu, kEpochNs + 50000000, v);
+  const fast_lio::WheelStep refused = stepOf(without_imu, slip);
+  EXPECT_EQ(refused.outcome, WheelOutcome::kPhiUnavailable);
+  EXPECT_FALSE(refused.phi.has_value());
+  EXPECT_FALSE(refused.measurement.has_value());
+  EXPECT_EQ(without_imu.counts().phi_unavailable, 1u);
+  const fast_lio::WheelStep plain = stepOf(without_imu, WheelModelParams{});
+  EXPECT_EQ(plain.outcome, WheelOutcome::kUpdate);
+  EXPECT_FALSE(plain.phi.has_value());
+  ASSERT_TRUE(plain.measurement.has_value());
+  EXPECT_EQ(bits(plain.measurement->z(0)), bits(v));
+
+  // 200 Hz over the 1.5 s before the scan end, a_x = 0.5 m/s^2: phi is the window mean in g minus phi0, and the
+  // samples older than the window are forgotten.
+  WheelSpeedInput with_imu;
+  with_imu.configure(false, 0.10, 0.05);
+  addTwistAt(with_imu, kEpochNs + 50000000, v);
+  const std::int64_t imu_period = 5000000;
+  for (std::int64_t i = 300; i >= 0; --i) {
+    with_imu.recordImu(seconds(kEpochNs + 100000000 - i * imu_period), 0.5);
+  }
+  const fast_lio::WheelStep corrected = stepOf(with_imu, slip);
+  ASSERT_EQ(corrected.outcome, WheelOutcome::kUpdate);
+  ASSERT_TRUE(corrected.phi.has_value());
+  const double phi = 0.5 / fast_lio::kSlipGravity + 0.011;
+  EXPECT_NEAR(*corrected.phi, phi, 1e-12);
+  EXPECT_NEAR(corrected.measurement->z(0), v / (1.0 + 0.128 * phi), 1e-12);
+  EXPECT_LE(with_imu.imuHistorySize(), 201u);
+  EXPECT_GE(with_imu.imuHistorySize(), 200u);
+
+  // k = 0 with phi at hand: the speed itself, bit for bit, and phi still reported.
+  const fast_lio::WheelStep level = stepOf(with_imu, WheelModelParams{});
+  ASSERT_TRUE(level.measurement.has_value());
+  EXPECT_EQ(bits(level.measurement->z(0)), bits(v));
+  EXPECT_TRUE(level.phi.has_value());
+}
+
+TEST(WheelSpeedInput, ImuHistoryStartsAgainWhenTimeGoesBack)
+{
+  WheelSpeedInput input;
+  input.recordImu(10.0, 0.1);
+  input.recordImu(10.0, 0.2);  // a repeated stamp is kept
+  input.recordImu(10.005, 0.3);
+  EXPECT_EQ(input.imuHistorySize(), 3u);
+  input.recordImu(5.0, 0.4);  // the input started again
+  EXPECT_EQ(input.imuHistorySize(), 1u);
+}
+
+TEST(WheelSpeedInput, WheelLineCarriesTheOutcomeAndEveryCounter)
+{
+  WheelSpeedInput input;
+  input.configure(true, 0.075, 0.05);
+  addTwistAt(input, kEpochNs + 50000000, 0.5);
+  addVariancesAt(input, kEpochNs + 50000000, 0.003, 0.004);
+  const fast_lio::WheelStep updated = stepOf(input, WheelModelParams{});
+  ASSERT_EQ(updated.outcome, WheelOutcome::kUpdate);
+  const std::string line = fast_lio::wheelLine(kScanEnd, updated, input.counts());
+  EXPECT_EQ(line.rfind("[WHEEL] t=", 0), 0u) << line;
+  for (const char * field : {" outcome=update ",
+                             " samples=1 ",
+                             " unpaired=0 ",
+                             " phi=nan ",
+                             " updates=1 ",
+                             " no_sample=0 ",
+                             " no_imu=0 ",
+                             " phi_unavailable=0 ",
+                             " invalid=0 ",
+                             " unmatched_samples=0 ",
+                             " unmatched_variances=0 "}) {
+    EXPECT_NE(line.find(field), std::string::npos) << field << " in " << line;
+  }
+  EXPECT_NE(line.find(" rejected=0"), std::string::npos) << line;
+  EXPECT_EQ(line.find("r_vy=nan"), std::string::npos) << line;  // the lateral axis was observed
+
+  WheelSpeedInput empty;
+  empty.configure(true, 0.075, 0.05);
+  const fast_lio::WheelStep none = stepOf(empty, WheelModelParams{});
+  const std::string skipped = fast_lio::wheelLine(kScanEnd, none, empty.counts());
+  EXPECT_NE(skipped.find(" outcome=no_sample samples=0 unpaired=0 raw_vx=nan fit_rms=nan "), std::string::npos)
+    << skipped;
+  EXPECT_NE(skipped.find(" z=nan r_vx=nan r_vy=nan r_vz=nan "), std::string::npos) << skipped;
 }

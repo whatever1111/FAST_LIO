@@ -34,6 +34,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
+#include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -68,6 +69,7 @@
 #include "laser_mapping_test_hooks.hpp"
 #endif
 #include <atomic>
+#include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -117,9 +119,9 @@
 #include "imu_gap_prior.hpp"
 #include "lost_recovery_policy.hpp"
 #include "map_backend_reference.hpp"
+#include "normal_noise_floor.hpp"
 #include "parked_hold.hpp"
 #include "preprocess.h"
-#include "normal_noise_floor.hpp"
 #include "prior_map_load.hpp"
 #include "reanchor_gate.hpp"
 #include "recovery_view_match.hpp"
@@ -130,6 +132,7 @@
 #include "stationary_anchor_policy.hpp"
 #include "timing_log_ring.hpp"
 #include "voxel_downsample.hpp"
+#include "wheel_speed_input.hpp"
 #include "zupt_policy.hpp"
 
 #define INIT_TIME (0.1)
@@ -468,7 +471,14 @@ SteadyTimePoint current_lidar_receive_time;
 SteadyTimePoint last_latency_log_time;
 LatencyStats sensor_to_odom_latency_stats;
 
-deque<Eigen::Vector3d> twist_buffer;
+// The wheel update's samples live in the node's wheel_speed_ (wheel_speed_input.hpp); the two wheel callbacks are
+// free functions and reach it through this pointer. It owns nothing. The node sets it in subscribeInputs, only with
+// wheel_odom_en and before the twist subscription exists, and clears it first thing in its destructor, both under
+// mtx_twist: the destructor body runs before the members go, so a callback holding mtx_twist sees either a live
+// object or null. One node per process, as for the rest of this file's state.
+// mtx_twist guards this pointer, what the callbacks fill through it, last_twist_* and gravity_align_leg_hist. It is
+// taken alone: no other lock is acquired while it is held, and it is never acquired under another lock.
+fast_lio::WheelSpeedInput * wheel_speed_input = nullptr;
 mutex mtx_twist;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
@@ -1163,9 +1173,8 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
   // absence of one means is decided once, in static_evidence.hpp, which is why
   // the stamp and speed below are still recorded as they arrive.
   if (fast_lio::wheelSampleIsEvidence(v(0), v(1), v(2))) {
-    twist_buffer.push_back(v);
-    while (twist_buffer.size() > 100)
-      twist_buffer.pop_front();
+    if (wheel_speed_input != nullptr)
+      wheel_speed_input->addTwist(msg_in->header.stamp.sec, msg_in->header.stamp.nanosec, v(0));
   }
   // Stamped newest sample for the static hold: the wheel-odom fusion below
   // consumes the buffer, but the hold needs to know how OLD the evidence is.
@@ -1182,6 +1191,16 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
       gravity_align_leg_hist.pop_front();
     }
   }
+}
+
+// The variances of the wheel samples (wheel_cov_topic): cov[0] forward and cov[7] lateral, paired with the gated
+// twist of the same stamp. Subscribed only while wheel_speed_input is set; it feeds nothing else.
+void twist_cov_cbk(const geometry_msgs::msg::TwistWithCovarianceStamped::UniquePtr msg_in)
+{
+  std::lock_guard<std::mutex> lk(mtx_twist);
+  if (wheel_speed_input != nullptr)
+    wheel_speed_input->addVariances(
+      msg_in->header.stamp.sec, msg_in->header.stamp.nanosec, msg_in->twist.covariance[0], msg_in->twist.covariance[7]);
 }
 
 // Independent, front-end-agnostic evidence that the platform is parked. The
@@ -3658,6 +3677,12 @@ public:
   {
     // kf outlives the node: unbind measurement_ before any member goes.
     kf.clear_dyn_share_context();
+    {
+      // The wheel callbacks reach wheel_speed_ through this pointer: detach it before the member goes.
+      std::lock_guard<std::mutex> lk(mtx_twist);
+      if (wheel_speed_input == &wheel_speed_)
+        wheel_speed_input = nullptr;
+    }
     emitAnchorTraceCounters();
     {
       std::lock_guard<std::mutex> lock(mtx_buffer);
@@ -3744,7 +3769,8 @@ private:
                           const Eigen::Matrix<double, 23, 23> & covarianceBefore,
                           const EkfUpdateDiagnostics & diagnostics,
                           const V3D & measurement,
-                          const V3D & prediction)
+                          const V3D & prediction,
+                          const fast_lio::WheelStep * wheel = nullptr)
   {
     if (!params_.values().kalman_channel_diag_en || !fout_kalman.is_open())
       return;
@@ -3786,8 +3812,83 @@ private:
                 << covarianceBlockNorm(covarianceBefore, 18, 3, 12, 3) << ',' << pBefore(21) << ',' << pBefore(22)
                 << ',' << pAfter(21) << ',' << pAfter(22) << ',' << pBefore(18) << ',' << pBefore(19) << ','
                 << pBefore(20) << ',' << pAfter(18) << ',' << pAfter(19) << ',' << pAfter(20) << ',' << drot.x() << ','
-                << drot.y() << ',' << drot.z() << ',' << measured.lidar_rot_obs_rp_min << '\n';
+                << drot.y() << ',' << drot.z() << ',' << measured.lidar_rot_obs_rp_min;
+    writeWheelColumns(wheel);
+    fout_kalman << '\n';
     fout_kalman.flush();
+  }
+
+  // The wheel channel's own columns: the fitted gated speed before the scale and the slip correction, the slip
+  // regressor phi (nan when the scan had none), the samples fitted with their scatter, and R of the forward and the
+  // lateral row (nan without a lateral row). nan on every other channel's row.
+  void writeWheelColumns(const fast_lio::WheelStep * wheel)
+  {
+    constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+    const bool fitted = wheel != nullptr && wheel->ring.fit.has_value();
+    const bool measured = wheel != nullptr && wheel->measurement.has_value();
+    fout_kalman << ',' << (fitted ? wheel->ring.fit->v : kNaN) << ','
+                << (wheel != nullptr && wheel->phi ? *wheel->phi : kNaN) << ','
+                << (fitted ? static_cast<double>(wheel->ring.fit->samples) : kNaN) << ','
+                << (fitted ? wheel->ring.fit->residual_rms : kNaN) << ','
+                << (measured ? wheel->measurement->noise.var_vx : kNaN) << ','
+                << (measured && wheel->measurement->noise.lateral ? wheel->measurement->noise.var_vy : kNaN);
+  }
+
+  // The wheel update after the lidar update (design B.2): the paired samples of the scan's own span fitted at its
+  // end, the slip regressor from the raw IMU, one non-iterated update, and one [WHEEL] line per scan.
+  void updateWheelSpeed(const fast_lio::FrontendParams & p)
+  {
+    fast_lio::WheelRingRead ring;
+    {
+      std::lock_guard<std::mutex> lk(mtx_twist);
+      ring = wheel_speed_.read(Measures.lidar_beg_time, lidar_end_time);
+    }
+    V3D omega_sum = V3D::Zero();
+    for (const auto & imu : Measures.imu) {
+      const auto & a = imu->linear_acceleration;
+      const auto & w = imu->angular_velocity;
+      wheel_speed_.recordImu(get_time_sec(imu->header.stamp),
+                             fast_lio::wheelForward(p.R_robot_to_imu, V3D(a.x, a.y, a.z)));
+      omega_sum += V3D(w.x, w.y, w.z);
+    }
+    std::optional<Eigen::Vector3d> omega_mean;
+    if (!Measures.imu.empty())
+      omega_mean = Eigen::Vector3d(omega_sum / static_cast<double>(Measures.imu.size()));
+    fast_lio::WheelModelParams model;
+    model.speed_scale = p.wheel_speed_scale;
+    model.slip_k = p.wheel_slip_k;
+    model.slip_phi0 = p.wheel_slip_phi0;
+    model.slip_window_s = p.wheel_slip_fx_window_s;
+    model.sigma_vx_floor = p.wheel_vel_noise_vx;
+    model.sigma_vz = p.wheel_vel_noise_vz;
+    model.sigma_lever = p.wheel_lever_sigma;
+    model.lever_arm = p.wheel_lever_arm;
+    const state_ikfom st = kf.get_x();
+    const fast_lio::WheelStep step = wheel_speed_.step(
+      ring, lidar_end_time, omega_mean, st.rot.toRotationMatrix(), st.vel, st.bg, p.R_robot_to_imu, model);
+    if (step.measurement) {
+      Eigen::Matrix<double, Eigen::Dynamic, fast_lio::kWheelStateDim> H;
+      Eigen::VectorXd residual;
+      Eigen::VectorXd R_diag;
+      step.measurement->pack(H, residual, R_diag);
+      EkfUpdateDiagnostics wheelDiagnostics;
+      Eigen::Matrix<double, 23, 23> wheelCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
+      if (p.kalman_channel_diag_en)
+        wheelCovarianceBefore = kf.get_P();
+      kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &wheelDiagnostics : nullptr);
+      state_point = kf.get_x();  // re-read corrected state
+      if (p.kalman_channel_diag_en) {
+        writeKalmanChannel("wheel",
+                           st,
+                           state_point,
+                           wheelCovarianceBefore,
+                           wheelDiagnostics,
+                           step.measurement->z,
+                           step.measurement->h,
+                           &step);
+      }
+    }
+    RCLCPP_INFO(this->get_logger(), "%s", fast_lio::wheelLine(lidar_end_time, step, wheel_speed_.counts()).c_str());
   }
 
   // The typed observation outputs, once publish.frontend_observation has been declared on and validated.
@@ -3888,7 +3989,8 @@ private:
                   << "p_grav_pos,p_grav_rot,p_grav_vel,p_grav_ba,p_ba_pos,p_ba_rot,p_ba_vel,"
                   << "p_grav_diag0_before,p_grav_diag1_before,p_grav_diag0_after,p_grav_diag1_after,"
                   << "p_ba_x_before,p_ba_y_before,p_ba_z_before,p_ba_x_after,p_ba_y_after,p_ba_z_after,"
-                  << "drot_x,drot_y,drot_z,rot_obs_rp_min\n";
+                  << "drot_x,drot_y,drot_z,rot_obs_rp_min,"
+                  << "wheel_raw_vx,wheel_phi,wheel_samples,wheel_fit_rms,wheel_r_vx,wheel_r_vy\n";
       RCLCPP_INFO(this->get_logger(),
                   "Kalman channel diagnostics enabled: %s (schema v1)",
                   DEBUG_FILE_DIR("kalman_channels.csv").c_str());
@@ -3950,6 +4052,8 @@ private:
       sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(startup.imu_topic, 1000, imu_cbk);
       RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", startup.imu_topic.c_str());
     }
+    if (params_.values().wheel_odom_en)
+      attachWheelSpeedInput(startup);
     if (params_.values().wheel_odom_en || params_.values().zupt_en || params_.values().parked_hold.enabled) {
       sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(startup.wheel_topic, 2000, twist_cbk);
       RCLCPP_INFO(this->get_logger(),
@@ -3960,6 +4064,39 @@ private:
                   params_.values().zupt_en ? "on" : "off",
                   params_.values().parked_hold.enabled ? "on" : "off");
     }
+  }
+
+  // The wheel update's input (wheel_speed_input.hpp): where its variances come from, the pointer the wheel callbacks
+  // fill it through, and with wheel_cov_topic the variance subscription. Before the twist subscription exists.
+  void attachWheelSpeedInput(const fast_lio::FrontendStartup & startup)
+  {
+    const fast_lio::FrontendParams & p = params_.values();
+    const bool variances_from_topic = !p.wheel_cov_topic.empty();
+    wheel_speed_.configure(variances_from_topic, p.wheel_vel_noise_vx, p.wheel_vel_noise_vy);
+    {
+      std::lock_guard<std::mutex> lk(mtx_twist);
+      assert(wheel_speed_input == nullptr && "one LaserMappingNode per process");
+      wheel_speed_input = &wheel_speed_;
+    }
+    if (!variances_from_topic) {
+      RCLCPP_INFO(this->get_logger(),
+                  "Wheel speed variances: the parameter sigmas, vx %.3f m/s lateral %.3f m/s (no wheel_cov_topic)",
+                  p.wheel_vel_noise_vx,
+                  p.wheel_vel_noise_vy);
+      return;
+    }
+    // Reliable like the bridge's publisher (rclcpp::QoS(10)), and as deep as the ring: every sample of the longest
+    // stall the front end rides through (kWheelSampleCapacity), since an unpaired sample is a lost update.
+    const rclcpp::QoS cov_qos = rclcpp::SensorDataQoS(rclcpp::KeepLast(fast_lio::kWheelSampleCapacity)).reliable();
+    sub_twist_cov_ = this->create_subscription<geometry_msgs::msg::TwistWithCovarianceStamped>(
+      p.wheel_cov_topic, cov_qos, twist_cov_cbk);
+    RCLCPP_INFO(this->get_logger(),
+                "Wheel speed variances subscribed: topic=%s depth=%zu, paired with %s by stamp; forward sigma "
+                "floor %.3f m/s",
+                p.wheel_cov_topic.c_str(),
+                fast_lio::kWheelSampleCapacity,
+                startup.wheel_topic.c_str(),
+                p.wheel_vel_noise_vx);
   }
 
   void subscribeMappingGates()
@@ -4138,9 +4275,14 @@ private:
     record.value("gravity_align_leg_edge_window_s", params_.values().gravity_align_leg_edge_window_s);
     record.value("wheel_odom_en", params_.values().wheel_odom_en);
     record.value("wheel_speed_scale", params_.values().wheel_speed_scale);
+    record.value("wheel_cov_topic", params_.values().wheel_cov_topic);
     record.value("wheel_vel_noise_vx", params_.values().wheel_vel_noise_vx);
     record.value("wheel_vel_noise_vy", params_.values().wheel_vel_noise_vy);
     record.value("wheel_vel_noise_vz", params_.values().wheel_vel_noise_vz);
+    record.value("wheel_slip_k", params_.values().wheel_slip_k);
+    record.value("wheel_slip_phi0", params_.values().wheel_slip_phi0);
+    record.value("wheel_slip_fx_window_s", params_.values().wheel_slip_fx_window_s);
+    record.value("wheel_lever_sigma", params_.values().wheel_lever_sigma);
   }
   void effectiveDiagnosticsForTest(fast_lio_test::EffectiveRecorder & record)
   {
@@ -4306,6 +4448,7 @@ private:
     record.value("derived:initial_pose_alias:initial_pose_full_rpy_override_",
                  params_.values().initial_pose_full_rpy_override);
     record.matrix("derived:wheel_extrinsic:R_robot_to_imu", params_.values().R_robot_to_imu);
+    record.matrix("derived:lever_arm:wheel_lever_arm", params_.values().wheel_lever_arm);
     record.value("derived:filter_setters:downSizeFilterSurf.leaf", downSizeFilterSurf.leaf());
     record.matrix("derived:filter_setters:downSizeFilterMap.leaf_size", downSizeFilterMap.getLeafSize());
     record.matrix("derived:extrinsic_and_noise:p_imu->Lidar_T_wrt_IMU", p_imu->lidarTranslationForTest());
@@ -6230,53 +6373,8 @@ private:
       }
 
       /*** Wheel velocity update (after ICP, constrains along-track drift) ***/
-      if (p.wheel_odom_en) {
-        Eigen::Vector3d twist_v;
-        bool have_twist = false;
-        {
-          std::lock_guard<std::mutex> lk(mtx_twist);
-          if (!twist_buffer.empty()) {
-            twist_v = twist_buffer.back();
-            twist_buffer.clear();
-            have_twist = true;
-          }
-        }
-        // Belt and braces: twist_cbk already refuses non-finite samples, but one
-        // NaN reaching update_simple poisons every state and never leaves.
-        if (have_twist && fast_lio::wheelSampleIsEvidence(twist_v(0), twist_v(1), twist_v(2)) &&
-            std::isfinite(p.wheel_speed_scale)) {
-          state_ikfom st = kf.get_x();
-          M3D Rw = st.rot.toRotationMatrix();     // R_{world←IMU}
-          M3D Re_T = p.R_robot_to_imu.transpose();  // R_{robot←IMU}
-          V3D v_imu = Rw.transpose() * st.vel;    // vel in IMU frame
-
-          // Predicted: h(x) = R_ext^T * R_w^T * vel (robot frame)
-          V3D h_pred = Re_T * v_imu;
-          // Measured: z = [vx*scale, 0, 0] (non-holonomic: vy=vz=0)
-          V3D z_meas(twist_v(0) * p.wheel_speed_scale, 0.0, 0.0);
-          V3D residual = z_meas - h_pred;
-
-          // Jacobian H (3×23): non-zero at rot(3-5) and vel(12-14)
-          Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
-          H.block<3, 3>(0, 3) = Re_T * skew_sym_mat(v_imu);  // dh/d(rot)
-          H.block<3, 3>(0, 12) = Re_T * Rw.transpose();      // dh/d(vel)
-
-          // Diagonal noise variances
-          Eigen::Vector3d R_diag(p.wheel_vel_noise_vx * p.wheel_vel_noise_vx,
-                                 p.wheel_vel_noise_vy * p.wheel_vel_noise_vy,
-                                 p.wheel_vel_noise_vz * p.wheel_vel_noise_vz);
-
-          EkfUpdateDiagnostics wheelDiagnostics;
-          Eigen::Matrix<double, 23, 23> wheelCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
-          if (p.kalman_channel_diag_en)
-            wheelCovarianceBefore = kf.get_P();
-          kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &wheelDiagnostics : nullptr);
-          state_point = kf.get_x();  // re-read corrected state
-          if (p.kalman_channel_diag_en) {
-            writeKalmanChannel("wheel", st, state_point, wheelCovarianceBefore, wheelDiagnostics, z_meas, h_pred);
-          }
-        }
-      }
+      if (p.wheel_odom_en)
+        updateWheelSpeed(p);
 
       euler_cur = SO3ToEuler(state_point.rot);
       pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -6654,6 +6752,7 @@ private:
   rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
   rclcpp::Subscription<shm_msgs::msg::PointCloud8mAndPose>::SharedPtr sub_pcl_shm_;
   rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr sub_twist_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr sub_twist_cov_;
 
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   rclcpp::TimerBase::SharedPtr timer_;
@@ -6666,6 +6765,9 @@ private:
 
   fast_lio::FrontendParameters params_;  // the configuration the constructor read; read through values()
   fast_lio::FrontendMeasurement measurement_{params_.values()};  // the filter's measurement model; kf holds its address
+  // The wheel update's samples and counts. The callbacks fill it through wheel_speed_input under mtx_twist; the scan
+  // thread reads it under mtx_twist and keeps its slip-window IMU history and counts without a lock.
+  fast_lio::WheelSpeedInput wheel_speed_;
   int effect_feat_num = 0, frame_num = 0;
   double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0,
                          aver_time_solve = 0, aver_time_const_H_time = 0;

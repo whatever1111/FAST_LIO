@@ -333,6 +333,12 @@ void FrontendParameters::declareImuGapToWheel(rclcpp::Node & node)
   declareOnly(node, constraints.wheel_vel_noise_vy);
   declareOnly(node, constraints.wheel_vel_noise_vz);
   declareOnly(node, constraints.wheel_extrinsic_R);
+  declareOnly(node, constraints.wheel_cov_topic);
+  declareOnly(node, constraints.wheel_slip_k);
+  declareOnly(node, constraints.wheel_slip_phi0);
+  declareOnly(node, constraints.wheel_slip_fx_window_s);
+  declareOnly(node, constraints.wheel_lever_arm);
+  declareOnly(node, constraints.wheel_lever_sigma);
 }
 
 void FrontendParameters::readOutputs(const rclcpp::Node & node,
@@ -407,12 +413,6 @@ void FrontendParameters::readDownsampleAndDegeneracy(const rclcpp::Node & node, 
   readInto(node, measurement.degeneracy_floor_model_scale, floor_params.kappa);
   readInto(node, measurement.degeneracy_floor_rel_uncertainty, floor_params.rel_uncertainty);
   readInto(node, measurement.degeneracy_schur_ridge, values_.degeneracy_params.schur_ridge);
-}
-
-void FrontendParameters::readConstraints(const rclcpp::Node & node, bool & health_pub_en)
-{
-  const OutputParameterSpecs output{};
-  const ConstraintParameterSpecs constraints{};
   if (!(floor_params.alpha > 0.0 && floor_params.alpha < 0.5)) {
     RCLCPP_FATAL(node.get_logger(), "degeneracy_false_keep_rate must lie in (0, 0.5), got %g", floor_params.alpha);
     throw std::invalid_argument("degeneracy_false_keep_rate");
@@ -435,6 +435,12 @@ void FrontendParameters::readConstraints(const rclcpp::Node & node, bool & healt
 #ifdef FASTLIO_TEST_HOOKS
   locals_for_test_.value("degeneracy_floor_mode", floor_mode_name);
 #endif
+}
+
+void FrontendParameters::readConstraints(const rclcpp::Node & node, bool & health_pub_en)
+{
+  const OutputParameterSpecs output{};
+  const ConstraintParameterSpecs constraints{};
   const MeasurementParameterSpecs measurement{};
   readInto(node, output.health_pub_en, health_pub_en);
   readInto(node, constraints.planar_constraint_en, values_.planar_constraint_en);
@@ -1093,6 +1099,50 @@ void FrontendParameters::readPriorMapAndPose(const rclcpp::Node & node)
   }
 }
 
+namespace
+{
+// The wheel measurement model's entry checks (wheel_measurement.hpp): every value finite, the slip window positive,
+// the sigmas nonnegative. Without a variance topic the two parameter sigmas are every sample's variances, which the
+// sample ring takes only when positive.
+void checkWheelModel(const rclcpp::Node & node, const FrontendParams & v)
+{
+  const auto require = [&node](bool ok, const char * key, const char * rule, double value) {
+    if (ok)
+      return;
+    RCLCPP_FATAL(node.get_logger(), "%s must be %s, got %g", key, rule, value);
+    throw std::invalid_argument(key);
+  };
+  require(std::isfinite(v.wheel_slip_k), "wheel_slip_k", "finite", v.wheel_slip_k);
+  require(std::isfinite(v.wheel_slip_phi0), "wheel_slip_phi0", "finite", v.wheel_slip_phi0);
+  require(std::isfinite(v.wheel_slip_fx_window_s) && v.wheel_slip_fx_window_s > 0.0,
+          "wheel_slip_fx_window_s",
+          "finite and > 0",
+          v.wheel_slip_fx_window_s);
+  for (int i = 0; i < 3; ++i)
+    require(std::isfinite(v.wheel_lever_arm(i)), "wheel_lever_arm", "finite in every element", v.wheel_lever_arm(i));
+  require(std::isfinite(v.wheel_lever_sigma) && v.wheel_lever_sigma >= 0.0,
+          "wheel_lever_sigma",
+          "finite and >= 0",
+          v.wheel_lever_sigma);
+  require(std::isfinite(v.wheel_vel_noise_vx) && v.wheel_vel_noise_vx >= 0.0,
+          "wheel_vel_noise_vx",
+          "finite and >= 0",
+          v.wheel_vel_noise_vx);
+  require(std::isfinite(v.wheel_vel_noise_vy) && v.wheel_vel_noise_vy >= 0.0,
+          "wheel_vel_noise_vy",
+          "finite and >= 0",
+          v.wheel_vel_noise_vy);
+  require(std::isfinite(v.wheel_vel_noise_vz) && v.wheel_vel_noise_vz >= 0.0,
+          "wheel_vel_noise_vz",
+          "finite and >= 0",
+          v.wheel_vel_noise_vz);
+  if (v.wheel_odom_en && v.wheel_cov_topic.empty()) {
+    require(v.wheel_vel_noise_vx > 0.0, "wheel_vel_noise_vx", "> 0 without wheel_cov_topic", v.wheel_vel_noise_vx);
+    require(v.wheel_vel_noise_vy > 0.0, "wheel_vel_noise_vy", "> 0 without wheel_cov_topic", v.wheel_vel_noise_vy);
+  }
+}
+}  // namespace
+
 void FrontendParameters::readWheel(const rclcpp::Node & node, FrontendStartup & startup)
 {
   const ConstraintParameterSpecs constraints{};
@@ -1106,9 +1156,23 @@ void FrontendParameters::readWheel(const rclcpp::Node & node, FrontendStartup & 
   readInto(node, constraints.wheel_extrinsic_R, wext);
   if (wext.size() == 9)
     values_.R_robot_to_imu = Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(wext.data());
+  readInto(node, constraints.wheel_cov_topic, values_.wheel_cov_topic);
+  readInto(node, constraints.wheel_slip_k, values_.wheel_slip_k);
+  readInto(node, constraints.wheel_slip_phi0, values_.wheel_slip_phi0);
+  readInto(node, constraints.wheel_slip_fx_window_s, values_.wheel_slip_fx_window_s);
+  std::vector<double> lever;
+  readInto(node, constraints.wheel_lever_arm, lever);
+  readInto(node, constraints.wheel_lever_sigma, values_.wheel_lever_sigma);
+  if (lever.size() != 3u) {
+    RCLCPP_FATAL(node.get_logger(), "wheel_lever_arm must have exactly 3 elements, got %zu", lever.size());
+    throw std::invalid_argument("wheel_lever_arm size mismatch");
+  }
+  values_.wheel_lever_arm = Eigen::Vector3d(lever[0], lever[1], lever[2]);
+  checkWheelModel(node, values_);
 #ifdef FASTLIO_TEST_HOOKS
   locals_for_test_.value("wheel_extrinsic_R", wext);
   locals_for_test_.value("wheel_topic", startup.wheel_topic);
+  locals_for_test_.value("wheel_lever_arm", lever);
 #endif
 }
 

@@ -232,10 +232,23 @@ struct FrontendParams
 
   bool wheel_odom_en = false;
   double wheel_speed_scale = 1.0;
+  // The topic of the wheel samples' variances (TwistWithCovarianceStamped, paired with wheel_topic by stamp); empty:
+  // every sample carries the parameter sigmas below.
+  std::string wheel_cov_topic;
+  // With wheel_cov_topic the forward sigma floor, without it every sample's forward sigma (m/s).
   double wheel_vel_noise_vx = 0.10;
+  // Without wheel_cov_topic every sample's lateral sigma (m/s); with it unused.
   double wheel_vel_noise_vy = 0.05;
   double wheel_vel_noise_vz = 0.10;
   Eigen::Matrix3d R_robot_to_imu = Eigen::Matrix3d::Identity();
+  // The wheel measurement model (wheel_measurement.hpp): the slip coefficient k with the platform's level intercept
+  // phi0 and the window of the slip regressor (s); the legs' lever arm, the IMU point minus their reference point in
+  // the IMU frame (m), and its uncertainty (m).
+  double wheel_slip_k = 0.0;
+  double wheel_slip_phi0 = 0.0;
+  double wheel_slip_fx_window_s = 1.0;
+  Eigen::Vector3d wheel_lever_arm = Eigen::Vector3d::Zero();
+  double wheel_lever_sigma = 0.0;
 
   bool prior_map_pinned = false;  // prior map goes into its own non-evictable tier
   double prior_map_voxel = 0.0;   // leaf the prior map is downsampled to (0 = filter_size_map)

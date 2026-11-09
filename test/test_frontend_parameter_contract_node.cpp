@@ -1526,8 +1526,10 @@ TEST(FrontendParameterContract, TwoInvalidLostRecoveryThenAnchor)
   checkCase(c);
 }
 
-// The normal-noise floor refuses at the entry what it cannot use: an unknown mode, a false-keep rate outside
-// (0, 0.5), a model scale that is not positive and a value that is not finite. The refusal names the parameter.
+// The normal-noise floor and the wheel measurement model refuse at the entry what they cannot use: an unknown mode,
+// a false-keep rate outside (0, 0.5), a model scale that is not positive, a value that is not finite, a lever arm
+// that is not three elements, a slip window that is not positive, a negative sigma, and a zero parameter sigma that
+// would be every wheel sample's variance. The refusal names the parameter.
 void expectRefused(const std::string & record, const std::string & key)
 {
   EXPECT_NE(record.find("\noutcome threw std::invalid_argument: \"" + key), std::string::npos) << record;
@@ -1592,6 +1594,55 @@ TEST(FrontendParameterContract, FloorModeObserve)
   checkCase(c, &record);
   EXPECT_NE(record.find("\nlog INFO laser_mapping \"[FLOOR] normal-noise floor observe: "), std::string::npos)
     << record;
+}
+
+TEST(FrontendParameterContract, WheelLeverArmLength)
+{
+  checkRefused(
+    "wheel_lever_arm_length", "wheel_lever_arm", {rclcpp::Parameter("wheel_lever_arm", std::vector<double>{0.3, 0.0})});
+}
+
+TEST(FrontendParameterContract, NanWheelSlipK)
+{
+  checkRefused(
+    "nan_wheel_slip_k", "wheel_slip_k", {rclcpp::Parameter("wheel_slip_k", std::numeric_limits<double>::quiet_NaN())});
+}
+
+TEST(FrontendParameterContract, WheelSlipWindowZero)
+{
+  checkRefused("wheel_slip_window_zero", "wheel_slip_fx_window_s", {rclcpp::Parameter("wheel_slip_fx_window_s", 0.0)});
+}
+
+TEST(FrontendParameterContract, NegativeWheelLeverSigma)
+{
+  checkRefused("negative_wheel_lever_sigma", "wheel_lever_sigma", {rclcpp::Parameter("wheel_lever_sigma", -0.04)});
+}
+
+TEST(FrontendParameterContract, WheelZeroSigmaWithoutVarianceTopic)
+{
+  checkRefused("wheel_zero_sigma_without_variance_topic",
+               "wheel_vel_noise_vy",
+               {rclcpp::Parameter("wheel_odom_en", true), rclcpp::Parameter("wheel_vel_noise_vy", 0.0)});
+}
+
+// The wheel update with the bridge's variance topic, the M20 lever arm and its uncertainty: both wheel subscriptions,
+// and the model's values in effect.
+TEST(FrontendParameterContract, WheelVarianceTopic)
+{
+  ParameterCase c = overridesCase("wheel_variance_topic", Expect::kConstructed);
+  setOverride(c, rclcpp::Parameter("wheel_odom_en", true));
+  setOverride(c, rclcpp::Parameter("wheel_topic", std::string("/wheel_odom/twist")));
+  setOverride(c, rclcpp::Parameter("wheel_cov_topic", std::string("/wheel_odom/twist_cov")));
+  setOverride(c, rclcpp::Parameter("wheel_vel_noise_vx", 0.075));
+  setOverride(c, rclcpp::Parameter("wheel_lever_arm", std::vector<double>{0.3238, 0.0, 0.2793}));
+  setOverride(c, rclcpp::Parameter("wheel_lever_sigma", 0.04));
+  std::string record;
+  checkCase(c, &record);
+  EXPECT_NE(record.find("\nlog INFO laser_mapping \"Wheel speed variances subscribed: topic=/wheel_odom/twist_cov "
+                        "depth=250, paired with /wheel_odom/twist by stamp"),
+            std::string::npos)
+    << record;
+  EXPECT_EQ(effectiveValue(record, "wheel_odom_en"), "1");
 }
 
 }  // namespace

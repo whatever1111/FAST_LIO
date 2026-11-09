@@ -49,5 +49,12 @@ struct ConstraintParameterSpecs
   const ParameterSpec<double> wheel_vel_noise_vz{"wheel_vel_noise_vz", 0.10, 0.10};
   const ParameterSpec<std::vector<double>> wheel_extrinsic_R{
     "wheel_extrinsic_R", std::vector<double>(), std::vector<double>()};
+  const ParameterSpec<std::string> wheel_cov_topic{"wheel_cov_topic", "", std::string("")};
+  const ParameterSpec<double> wheel_slip_k{"wheel_slip_k", 0.0, 0.0};
+  const ParameterSpec<double> wheel_slip_phi0{"wheel_slip_phi0", 0.0, 0.0};
+  const ParameterSpec<double> wheel_slip_fx_window_s{"wheel_slip_fx_window_s", 1.0, 1.0};
+  const ParameterSpec<std::vector<double>> wheel_lever_arm{
+    "wheel_lever_arm", std::vector<double>{0.0, 0.0, 0.0}, std::vector<double>{0.0, 0.0, 0.0}};
+  const ParameterSpec<double> wheel_lever_sigma{"wheel_lever_sigma", 0.0, 0.0};
 };
 }  // namespace fast_lio

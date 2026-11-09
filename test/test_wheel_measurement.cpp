@@ -612,7 +612,7 @@ TEST(WheelSpeedInput, WithoutAVarianceTopicTheUpdateIsTodays)
   today.block<3, 3>(0, fast_lio::kWheelRotIndex) = Re_T * skew(v_imu);
   today.block<3, 3>(0, fast_lio::kWheelVelIndex) = Re_T * s.R_world_imu.transpose();
   EXPECT_TRUE(H.isApprox(today, 1e-14)) << H << "\n\n" << today;
-  EXPECT_EQ(H.block<3, 3>(0, fast_lio::kWheelGyroBiasIndex), Eigen::Matrix3d::Zero());
+  EXPECT_TRUE(H.middleCols(fast_lio::kWheelGyroBiasIndex, 3).isZero(0.0));
 }
 
 TEST(WheelSpeedInput, AScanWithoutAPairedSampleInItsSpanMakesNoUpdate)

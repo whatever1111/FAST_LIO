@@ -182,7 +182,8 @@ void matchPoints(fast_lio::MeasurementScratch & scratch,
   {
     static const int omp_threads = []() {
       const char * e = std::getenv("OMP_NUM_THREADS");
-      return (e && std::atoi(e) > 0) ? std::atoi(e) : MP_PROC_NUM;
+      const int n = (e != nullptr) ? static_cast<int>(std::strtol(e, nullptr, 10)) : 0;
+      return n > 0 ? n : MP_PROC_NUM;
     }();
     omp_set_num_threads(omp_threads);
   }

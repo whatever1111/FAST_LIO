@@ -187,6 +187,11 @@ target_include_directories(frontend_correlated_update PUBLIC
 target_link_libraries(frontend_correlated_update PUBLIC Eigen3::Eigen)
 target_compile_features(frontend_correlated_update PUBLIC cxx_std_17)
 
+# Independent frame-conditional observer; production mapping does not link it.
+add_library(frontend_lidar_joint_adapter STATIC src/frontend_lidar_joint_adapter.cpp)
+target_link_libraries(frontend_lidar_joint_adapter PUBLIC frontend_correlated_update Eigen3::Eigen)
+target_compile_features(frontend_lidar_joint_adapter PUBLIC cxx_std_17)
+
 # ─────────── Test-only sanitizer instrumentation ───────────────────────────────
 # FASTLIO_TEST_SANITIZER is empty by default and then changes no target. With
 # -DFASTLIO_TEST_SANITIZER=thread, fastlio_test_sanitize() adds -fsanitize=thread to the compile
@@ -488,6 +493,15 @@ ${sanitizer_tests}
   target_include_directories(test_frontend_source_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   ament_add_gtest(test_frontend_correlated_update test/test_frontend_correlated_update.cpp)
   target_link_libraries(test_frontend_correlated_update frontend_correlated_update)
+  ament_add_gtest(test_frontend_lidar_joint_adapter test/test_frontend_lidar_joint_adapter.cpp TIMEOUT 300)
+  target_link_libraries(test_frontend_lidar_joint_adapter frontend_lidar_joint_adapter ${PCL_LIBRARIES})
+  target_include_directories(test_frontend_lidar_joint_adapter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${PCL_INCLUDE_DIRS})
+  ament_target_dependencies(test_frontend_lidar_joint_adapter ${dependencies})
+  if(cpp_typesupport_target)
+    target_link_libraries(test_frontend_lidar_joint_adapter ${cpp_typesupport_target})
+  else()
+    rosidl_target_interfaces(test_frontend_lidar_joint_adapter ${PROJECT_NAME} "rosidl_typesupport_cpp")
+  endif()
   ament_add_gtest(test_reference_health_contract test/test_reference_health_contract.cpp)
   target_include_directories(test_reference_health_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_include_directories(test_frontend_observation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

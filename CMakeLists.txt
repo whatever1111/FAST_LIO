@@ -710,11 +710,6 @@ ${sanitizer_tests}
 endif()
 
 # ---------------- Install --------------- #
-install(TARGETS frontend_correlated_update EXPORT frontend_correlated_update_targets ARCHIVE DESTINATION lib)
-install(FILES include/frontend_source_contract.hpp include/frontend_correlated_update.hpp DESTINATION include/fast_lio)
-ament_export_targets(frontend_correlated_update_targets HAS_LIBRARY_TARGET)
-ament_export_dependencies(Eigen3)
-
 install(TARGETS fastlio_mapping
   DESTINATION lib/${PROJECT_NAME}
 )

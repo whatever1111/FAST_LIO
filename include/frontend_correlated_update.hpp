@@ -35,6 +35,8 @@ struct LinearFactor
 struct ProcessNoise
 {
   MomentKnowledge knowledge = MomentKnowledge::kUnknown;
+  // Required bounded, nonempty validation input. The caller retains the
+  // supporting evidence outside the numerical state.
   std::string evidence;
   Eigen::VectorXd mean;
   Eigen::MatrixXd covariance;
@@ -99,6 +101,7 @@ public:
                  const Eigen::MatrixXd & generator,
                  const Eigen::VectorXd & offset,
                  const ProcessNoise & noise);
+  // Evidence is checked as bounded and nonempty. The caller retains it.
   Status marginalize(const std::vector<std::string> & sourceKeys, bool willNeverReuse, const std::string & evidence);
 
   GainResult appliedGain(const std::vector<LinearFactor> & factors, const Eigen::MatrixXd & activeGain) const;

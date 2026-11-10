@@ -11,11 +11,13 @@ namespace fastlio::joint_source
 namespace
 {
 
+constexpr double kRootReconstructionErrorFactor = 64.0;
+
 // This is an arithmetic backward-error budget, never covariance inflation.
 // Negative LDLT pivots are rejected, including small negative pivots. No clipping.
 double arithmeticTolerance(Eigen::Index dimension)
 {
-  return 64.0 * static_cast<double>(dimension) * std::numeric_limits<double>::epsilon();
+  return kRootReconstructionErrorFactor * static_cast<double>(dimension) * std::numeric_limits<double>::epsilon();
 }
 
 Status covarianceRoot(const Eigen::MatrixXd & covariance, Eigen::MatrixXd & root)
@@ -121,10 +123,15 @@ Status validateBinding(const JointMoments & moments, const LinearFactor & factor
     if (!resolveSource(moments.sources, key))
       return Status::kSourceHistoryUnavailable;
   }
-  if (!sameCoordinates(factor.active, moments.active) || factor.sourceKeys.size() != moments.sources.size())
+  if (factor.active.components.size() != moments.active.components.size() ||
+      factor.sourceKeys.size() != moments.sources.size())
     return Status::kDimensionMismatch;
+  if (!sameCoordinates(factor.active, moments.active))
+    return Status::kIdentityConflict;
   for (std::size_t i = 0; i < moments.sources.size(); ++i) {
     const auto * resolved = resolveSource(moments.sources, factor.sourceKeys[i]);
+    if (factor.sourceCoordinates[i].components.size() != resolved->coordinates.components.size())
+      return Status::kDimensionMismatch;
     if (resolved != &moments.sources[i] || !sameCoordinates(factor.sourceCoordinates[i], resolved->coordinates))
       return Status::kIdentityConflict;
   }
@@ -580,6 +587,7 @@ Status JointSourceFilter::marginalize(const std::vector<std::string> & sourceKey
     return Status::kModelCapacityExceeded;
   auto candidate = std::make_shared<Snapshot>(*current_);
   std::vector<const Source *> removed;
+  removed.reserve(sourceKeys.size());
   for (const auto & key : sourceKeys) {
     const auto * source = resolveSource(current_->moments.sources, key);
     if (!source)
@@ -589,10 +597,11 @@ Status JointSourceFilter::marginalize(const std::vector<std::string> & sourceKey
     removed.push_back(source);
   }
   std::vector<Eigen::Index> kept;
+  kept.reserve(static_cast<std::size_t>(current_->moments.mean.size()));
   for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(current_->moments.active.components.size()); ++i)
     kept.push_back(i);
   candidate->moments.sources.clear();
-  Eigen::Index column = static_cast<Eigen::Index>(kept.size());
+  auto column = static_cast<Eigen::Index>(kept.size());
   for (const auto & source : current_->moments.sources) {
     const auto count = static_cast<Eigen::Index>(source.coordinates.components.size());
     if (std::find(removed.begin(), removed.end(), &source) != removed.end())
@@ -647,6 +656,10 @@ GainResult JointSourceFilter::appliedGain(const std::vector<LinearFactor> & fact
     return result;
   auto ledger = current_->ledger;
   const auto consumed = ledger.consume(identities);
+  if (consumed.status != Status::kOk && consumed.status != Status::kNoOp) {
+    result.status = consumed.status;
+    return result;
+  }
   if (consumed.status != Status::kOk || consumed.fresh.size() != factors.size()) {
     result.status = Status::kUnsupportedNoiseStructure;
     return result;
@@ -655,8 +668,7 @@ GainResult JointSourceFilter::appliedGain(const std::vector<LinearFactor> & fact
   Eigen::MatrixXd remainder(active, rows);
   result.mean = current_->moments.mean.head(active);
   Eigen::Index column = 0;
-  for (std::size_t index = 0; index < factors.size(); ++index) {
-    const auto & factor = factors[index];
+  for (const auto & factor : factors) {
     const auto count = factor.observation.size();
     const auto gain = activeGain.middleCols(column, count);
     const auto loading = jointLoading(factor);

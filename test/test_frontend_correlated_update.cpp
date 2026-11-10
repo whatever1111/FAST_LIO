@@ -1,3 +1,5 @@
+#include <Eigen/Cholesky>
+
 #include <cmath>
 #include <gtest/gtest.h>
 #include <limits>
@@ -856,6 +858,80 @@ TEST(FrontendCorrelatedUpdate, ReviewF3FreshFactorsCheckLiveAndRetiredRawAncestr
   EXPECT_EQ(filter.ledger()->entries(), beforeRetirement);
   EXPECT_EQ(filter.commit(filter.propose({valid})), Status::kNoOp);
   expectExact(*filter.moments(), snapshot);
+}
+
+TEST(FrontendCorrelatedUpdate, ReviewF4AppliedGainPreservesLedgerErrorReasons)
+{
+  const auto initial = prior(1, 0);
+  JointSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial), Status::kOk);
+  const auto first = measurement(initial, "first");
+  update(filter, {first});
+  auto conflict = first;
+  conflict.observation(0) += 1.0;
+  EXPECT_EQ(filter.appliedGain({conflict}, Eigen::MatrixXd::Zero(1, 1)).status, Status::kIdentityConflict);
+  EXPECT_EQ(filter.appliedGain({first}, Eigen::MatrixXd::Zero(1, 1)).status, Status::kUnsupportedNoiseStructure);
+  EXPECT_EQ(filter.appliedGain({first, measurement(initial, "new")}, Eigen::MatrixXd::Zero(1, 2)).status,
+            Status::kUnsupportedNoiseStructure);
+  for (std::size_t i = 1; i < kMaxLedger; ++i)
+    update(filter, {measurement(initial, std::to_string(i))});
+  const auto snapshot = *filter.moments();
+  const auto entries = filter.ledger()->entries();
+  EXPECT_EQ(filter.appliedGain({measurement(initial, "overflow")}, Eigen::MatrixXd::Zero(1, 1)).status,
+            Status::kModelCapacityExceeded);
+  expectExact(*filter.moments(), snapshot);
+  EXPECT_EQ(filter.ledger()->entries(), entries);
+}
+
+TEST(FrontendCorrelatedUpdate, ReviewF6DistinctLoadingsAcrossSeveralSourceBlocks)
+{
+  auto initial = prior(1, 3);
+  initial.sources = {source("a"), source("b", 2)};
+  initial.sources[1].rawAncestry = {"second-block-raw"};
+  auto factor = measurement(initial, "multiblock", 2);
+  factor.identity.rawAncestry = {"second-block-raw"};
+  factor.identity.shared = {{"second-block-raw", "b/alias"}};
+  factor.h << 1.0, 2.0;
+  factor.a << 1.0, 2.0, -1.0, 0.0, 1.0, 3.0;
+  factor.observation << 1.0, 2.0;
+  // Independent exact batch algebra. S=[[8,1],[1,15]], det(S)=119.
+  // J' S^-1 y = [43,13,41,32]/119, P+=I-J'S^-1J.
+  Eigen::Vector4d expectedMean(43.0, 13.0, 41.0, 32.0);
+  expectedMean /= 119.0;
+  Eigen::Matrix4d expected;
+  expected << 76.0, -13.0, -41.0, -32.0, -13.0, 104.0, -29.0, 18.0, -41.0, -29.0, 55.0, 11.0, -32.0, 18.0, 11.0, 26.0;
+  expected /= 119.0;
+  JointSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial), Status::kOk);
+  Eigen::RowVector2d gain(0.25, -0.125);
+  const auto applied = filter.appliedGain({factor}, gain);
+  ASSERT_EQ(applied.status, Status::kOk);
+  EXPECT_NEAR(applied.covariance(0, 0), 107.0 / 64.0, kTolerance);
+  EXPECT_NEAR(applied.mean(0), 0.0, kTolerance);
+  auto wrongBlock = factor;
+  wrongBlock.a.rightCols(2).setZero();
+  EXPECT_EQ(filter.propose({wrongBlock}).status(), Status::kUnsupportedNoiseStructure);
+  update(filter, {factor});
+  expectMatrix(filter.moments()->mean, expectedMean);
+  expectMatrix(filter.moments()->covariance, expected);
+}
+
+TEST(FrontendCorrelatedUpdate, ReviewF9CoordinateIdentityMismatchHasIdentityStatus)
+{
+  const auto initial = prior();
+  JointSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial), Status::kOk);
+  for (const bool active : {true, false}) {
+    auto mismatched = measurement(initial);
+    if (active)
+      mismatched.active.epoch = "wrong-epoch";
+    else
+      mismatched.sourceCoordinates[0].frame = "wrong-frame";
+    EXPECT_EQ(filter.propose({mismatched}).status(), Status::kIdentityConflict);
+    EXPECT_EQ(filter.appliedGain({mismatched}, Eigen::MatrixXd::Zero(1, 1)).status, Status::kIdentityConflict);
+    expectExact(*filter.moments(), initial);
+    EXPECT_TRUE(filter.ledger()->entries().empty());
+  }
 }
 
 }  // namespace

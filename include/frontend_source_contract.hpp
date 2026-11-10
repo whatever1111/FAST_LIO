@@ -17,7 +17,7 @@ inline constexpr Eigen::Index kMaxSourceDof = 32;
 inline constexpr Eigen::Index kMaxRows = 64;
 inline constexpr std::size_t kMaxLedger = 128;
 inline constexpr std::size_t kMaxIdentityBytes = 256;
-inline constexpr std::size_t kMaxFactorPayloadBytes = std::size_t{256} * 1024;
+inline constexpr std::size_t kMaxFactorPayloadBytes = static_cast<std::size_t>(256) * 1024;
 
 enum class Status
 {

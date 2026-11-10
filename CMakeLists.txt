@@ -476,6 +476,8 @@ ${sanitizer_tests}
     TIMEOUT 120
     ENV FASTLIO_SCAN_CONTRACT_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/test_results/fast_lio/scan_contract)
   ament_add_gtest(test_frontend_observation test/test_frontend_observation.cpp)
+  ament_add_gtest(test_frontend_source_contract test/test_frontend_source_contract.cpp)
+  target_include_directories(test_frontend_source_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   ament_add_gtest(test_reference_health_contract test/test_reference_health_contract.cpp)
   target_include_directories(test_reference_health_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_include_directories(test_frontend_observation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

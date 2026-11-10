@@ -30,6 +30,8 @@ struct LinearFactor
 
 // Cov([old joint; noise]) must be complete and PSD. A known structural zero
 // noise/cross is legal here. Measurement remainders have a stricter D > 0 domain.
+// Zero priorCross reuses the retained prior root. Nonzero priorCross requires
+// covariance refactorization, which can reject a rounded singular prior.
 struct ProcessNoise
 {
   MomentKnowledge knowledge = MomentKnowledge::kUnknown;

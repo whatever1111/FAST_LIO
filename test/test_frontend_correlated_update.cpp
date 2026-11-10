@@ -727,5 +727,136 @@ TEST(FrontendCorrelatedUpdate, I26MarginalPreservesOtherSourcesCrossWithoutCondi
   EXPECT_GT(std::abs(filter.moments()->covariance(0, 0) - 1.75), 0.24);  // conditioning is different
 }
 
+// Independent covariance-form batch oracle. The product updates roots one row at
+// a time. This fixture solves the three-row innovation system directly instead.
+TEST(FrontendCorrelatedUpdate, ReviewF1DensePosteriorSurvivesEveryLifecycleStep)
+{
+  for (const Eigen::Index sources : {1, 3, 9, 10, 21, 31}) {
+    const Eigen::Index dimension = 23 + sources;
+    auto initial = prior(23, sources);
+    for (Eigen::Index row = 0; row < dimension; ++row) {
+      for (Eigen::Index column = 0; column < dimension; ++column)
+        initial.covariance(row, column) = std::ldexp(1.0, -static_cast<int>(std::abs(row - column)));
+    }
+    auto factor = measurement(initial, "dense", 3);
+    for (Eigen::Index row = 0; row < 3; ++row) {
+      for (Eigen::Index column = 0; column < 23; ++column)
+        factor.h(row, column) = 1.0 / static_cast<double>(1 + row + column);
+      for (Eigen::Index column = 0; column < sources; ++column)
+        factor.a(row, column) = 1.0 / static_cast<double>(2 + row + 2 * column);
+    }
+    Eigen::MatrixXd loading(3, dimension);
+    loading << factor.h, factor.a;
+    const Eigen::MatrixXd cross = initial.covariance * loading.transpose();
+    const Eigen::Matrix3d innovation = loading * cross + Eigen::Matrix3d::Identity();
+    const Eigen::MatrixXd expectedPosterior = initial.covariance - cross * innovation.ldlt().solve(cross.transpose());
+    const Eigen::VectorXd expectedMean = cross * innovation.ldlt().solve(Eigen::Vector3d::Ones());
+    JointSourceFilter filter;
+    ASSERT_EQ(filter.initialize(initial), Status::kOk);
+    update(filter, {factor});
+    const Eigen::MatrixXd posterior = filter.moments()->covariance;
+    EXPECT_TRUE((posterior.array() == posterior.transpose().array()).all());
+    expectMatrix(posterior, expectedPosterior);
+    expectMatrix(filter.moments()->mean, expectedMean);
+    const Eigen::MatrixXd identity = Eigen::MatrixXd::Identity(dimension, dimension);
+    const Eigen::VectorXd zero = Eigen::VectorXd::Zero(dimension);
+    std::vector<Coordinates> blocks{initial.sources[0].coordinates};
+    ASSERT_EQ(filter.reset(identity, zero, initial.active, blocks), Status::kOk);
+    expectMatrix(filter.moments()->covariance, expectedPosterior);
+    auto correlated = zeroNoise(dimension, dimension);
+    correlated.covariance.setIdentity();
+    correlated.priorCross(0, 0) = 0.125;
+    ASSERT_EQ(filter.propagate(identity, zero, correlated, initial.active, blocks), Status::kOk);
+    Eigen::MatrixXd expected = expectedPosterior + identity;
+    expected(0, 0) += 0.25;
+    expectMatrix(filter.moments()->covariance, expected);
+    const Eigen::MatrixXd generator = Eigen::MatrixXd::Constant(1, dimension, 0.5);
+    ASSERT_EQ(filter.augment(source("derived"), generator, Eigen::VectorXd::Zero(1), zeroNoise(dimension, 1)),
+              Status::kOk);
+    Eigen::VectorXd null = Eigen::VectorXd::Constant(dimension + 1, 0.5);
+    null(dimension) = -1.0;
+    EXPECT_LE((filter.moments()->covariance * null).norm(), kTolerance * expected.norm());
+    blocks.push_back(source("derived").coordinates);
+    ASSERT_EQ(filter.reset(Eigen::MatrixXd::Identity(dimension + 1, dimension + 1),
+                           Eigen::VectorXd::Zero(dimension + 1),
+                           initial.active,
+                           blocks),
+              Status::kOk);
+    expectMatrix(filter.moments()->covariance.topLeftCorner(dimension, dimension), expected);
+    auto independent = zeroNoise(dimension + 1, dimension + 1);
+    independent.covariance(0, 0) = 1.0;
+    ASSERT_EQ(filter.propagate(Eigen::MatrixXd::Identity(dimension + 1, dimension + 1),
+                               Eigen::VectorXd::Zero(dimension + 1),
+                               independent,
+                               initial.active,
+                               blocks),
+              Status::kOk);
+    EXPECT_NEAR(filter.moments()->covariance(0, 0), expected(0, 0) + 1.0, kTolerance * expected.norm());
+  }
+}
+
+TEST(FrontendCorrelatedUpdate, ReviewF2DeterministicSourcesSurviveRepeatedLifecycleSteps)
+{
+  for (const Eigen::Index seed : {1, 2, 3, 4, 5, 6, 7, 8}) {
+    auto initial = prior(2, 1);
+    initial.covariance << 2.0, 0.5, 0.25, 0.5, 1.0, 0.125, 0.25, 0.125, 1.0;
+    auto factor = measurement(initial);
+    factor.h << 1.0, 0.2;
+    factor.a << 0.3;
+    const Eigen::Vector3d loading(1.0, 0.2, 0.3);
+    const Eigen::Vector3d cross = initial.covariance * loading;
+    const Eigen::Matrix3d posterior = initial.covariance - cross * cross.transpose() / (1.0 + loading.dot(cross));
+    JointSourceFilter filter;
+    ASSERT_EQ(filter.initialize(initial), Status::kOk);
+    update(filter, {factor});
+    Eigen::RowVector3d generator(1.0 / static_cast<double>(seed + 2), 0.4, -1.0 / 7.0);
+    ASSERT_EQ(filter.augment(source("deterministic"), generator, Eigen::VectorXd::Zero(1), zeroNoise(3, 1)),
+              Status::kOk);
+    Eigen::Matrix4d expected;
+    expected << posterior, posterior * generator.transpose(), generator * posterior,
+      generator * posterior * generator.transpose();
+    std::vector<Coordinates> blocks{initial.sources[0].coordinates, source("deterministic").coordinates};
+    ASSERT_EQ(filter.reset(Eigen::Matrix4d::Identity(), Eigen::Vector4d::Zero(), initial.active, blocks), Status::kOk);
+    expectMatrix(filter.moments()->covariance, expected);
+    auto independent = zeroNoise(4, 4);
+    independent.covariance(0, 0) = 0.25;
+    ASSERT_EQ(
+      filter.propagate(Eigen::Matrix4d::Identity(), Eigen::Vector4d::Zero(), independent, initial.active, blocks),
+      Status::kOk);
+    expected(0, 0) += 0.25;
+    expectMatrix(filter.moments()->covariance, expected);
+  }
+}
+
+TEST(FrontendCorrelatedUpdate, ReviewF3FreshFactorsCheckLiveAndRetiredRawAncestry)
+{
+  auto initial = prior();
+  initial.sources[0].rawAncestry = {"carried-raw"};
+  JointSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial), Status::kOk);
+  auto unshared = measurement(initial, "unshared");
+  unshared.identity.rawAncestry = {"carried-raw"};
+  unshared.a.setZero();
+  EXPECT_EQ(filter.propose({unshared}).status(), Status::kUnsupportedNoiseStructure);
+  EXPECT_EQ(filter.appliedGain({unshared}, Eigen::MatrixXd::Zero(1, 1)).status, Status::kUnsupportedNoiseStructure);
+  expectExact(*filter.moments(), initial);
+  EXPECT_TRUE(filter.ledger()->entries().empty());
+  auto valid = measurement(initial, "shared");
+  valid.identity.rawAncestry = {"carried-raw"};
+  valid.identity.shared = {{"carried-raw", "z/alias"}};
+  update(filter, {valid});
+  const auto beforeRetirement = filter.ledger()->entries();
+  ASSERT_EQ(filter.marginalize({"z"}, true, "finished source"), Status::kOk);
+  const auto snapshot = *filter.moments();
+  auto reentry = measurement(snapshot, "reentry");
+  reentry.identity.rawAncestry = {"carried-raw"};
+  EXPECT_EQ(filter.propose({reentry}).status(), Status::kSourceHistoryUnavailable);
+  EXPECT_EQ(filter.appliedGain({reentry}, Eigen::MatrixXd::Zero(1, 1)).status, Status::kSourceHistoryUnavailable);
+  expectExact(*filter.moments(), snapshot);
+  EXPECT_EQ(filter.ledger()->entries(), beforeRetirement);
+  EXPECT_EQ(filter.commit(filter.propose({valid})), Status::kNoOp);
+  expectExact(*filter.moments(), snapshot);
+}
+
 }  // namespace
 }  // namespace fastlio::joint_source

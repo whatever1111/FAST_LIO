@@ -93,6 +93,9 @@ struct SharedRawSource
 
 struct FactorIdentity
 {
+  // Fresh raw ancestry carried by a live source requires a shared entry naming
+  // that source with nonzero loading. Retired ancestry is unavailable. Exact
+  // retransmissions are checked by the ledger before fresh ancestry validation.
   std::string key;      // complete canonical likelihood identity, excluding delivery aliases
   std::string payload;  // exact canonical bytes, including all numeric inputs
   std::vector<std::string> rawAncestry;

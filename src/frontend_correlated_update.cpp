@@ -268,8 +268,11 @@ Status updateRows(const LinearFactor & factor, Eigen::VectorXd & mean, Eigen::Ma
   return mean.allFinite() && root.allFinite() ? Status::kOk : Status::kNumericalFailure;
 }
 
-Status
-jointNoiseRoot(const JointMoments & moments, const ProcessNoise & noise, Eigen::Index noiseDof, Eigen::MatrixXd & root)
+Status jointNoiseRoot(const JointMoments & moments,
+                      const Eigen::MatrixXd & priorRoot,
+                      const ProcessNoise & noise,
+                      Eigen::Index noiseDof,
+                      Eigen::MatrixXd & root)
 {
   if (noise.knowledge != MomentKnowledge::kKnown || !validKey(noise.evidence))
     return Status::kUnknownMoment;
@@ -279,6 +282,17 @@ jointNoiseRoot(const JointMoments & moments, const ProcessNoise & noise, Eigen::
     return Status::kDimensionMismatch;
   if (!noise.mean.allFinite())
     return Status::kNonFinite;
+  // Preserve deterministic support in the retained root for independent noise.
+  // Reconstructing and refactorizing the prior would introduce rounding pivots.
+  if (noise.priorCross.isZero(0.0)) {
+    Eigen::MatrixXd noiseRoot;
+    if (const auto status = covarianceRoot(noise.covariance, noiseRoot); status != Status::kOk)
+      return status;
+    root = Eigen::MatrixXd::Zero(dimension + noiseDof, priorRoot.cols() + noiseDof);
+    root.topLeftCorner(dimension, priorRoot.cols()) = priorRoot;
+    root.bottomRightCorner(noiseDof, noiseDof) = noiseRoot;
+    return Status::kOk;
+  }
   Eigen::MatrixXd joint(dimension + noiseDof, dimension + noiseDof);
   joint << moments.covariance, noise.priorCross, noise.priorCross.transpose(), noise.covariance;
   return covarianceRoot(joint, root);
@@ -291,6 +305,29 @@ bool ancestryOverlaps(const Source & source, const Source & other)
       return true;
   }
   return false;
+}
+
+Status validateAncestry(const std::vector<Source> & live,
+                        const std::vector<Source> & retired,
+                        const FactorIdentity & canonical)
+{
+  for (const auto & raw : canonical.rawAncestry) {
+    const auto carries = [&raw](const Source & source) {
+      return contains(source.rawAncestry, raw);
+    };
+    if (std::any_of(retired.begin(), retired.end(), carries))
+      return Status::kSourceHistoryUnavailable;
+    if (!std::any_of(live.begin(), live.end(), carries))
+      continue;
+    const bool loaded = std::any_of(live.begin(), live.end(), [&](const Source & source) {
+      return carries(source) &&
+             std::find(canonical.shared.begin(), canonical.shared.end(), SharedRawSource{raw, source.key}) !=
+               canonical.shared.end();
+    });
+    if (!loaded)
+      return Status::kUnsupportedNoiseStructure;
+  }
+  return Status::kOk;
 }
 
 }  // namespace
@@ -309,11 +346,35 @@ struct JointSourceFilter::Snapshot
     return sources;
   }
 
+  Status validateFreshFactors(const std::vector<LinearFactor> & factors,
+                              const std::vector<FactorIdentity> & identities) const
+  {
+    for (std::size_t index = 0; index < factors.size(); ++index) {
+      const auto & identity = identities[index];
+      const auto previous = std::find_if(ledger.entries().begin(),
+                                         ledger.entries().end(),
+                                         [&](const FactorIdentity & entry) { return entry.key == identity.key; });
+      if (previous != ledger.entries().end()) {
+        if (!(*previous == identity))
+          return Status::kIdentityConflict;
+        continue;
+      }
+      if (const auto status = validateBinding(moments, factors[index]); status != Status::kOk)
+        return status;
+      if (const auto status = validateAncestry(moments.sources, retired, identity); status != Status::kOk)
+        return status;
+    }
+    return Status::kOk;
+  }
+
   Status finish()
   {
     if (!moments.mean.allFinite() || !root.allFinite())
       return Status::kNumericalFailure;
-    moments.covariance = root * root.transpose();
+    // Copy one rounded triangle to both halves. GEMM may accumulate mirrored
+    // entries differently, while subsequent inputs require exact symmetry.
+    const Eigen::MatrixXd product = root * root.transpose();
+    moments.covariance = product.selfadjointView<Eigen::Lower>();
     return moments.covariance.allFinite() ? Status::kOk : Status::kNumericalFailure;
   }
 };
@@ -358,6 +419,11 @@ JointSourceFilter::Proposal JointSourceFilter::propose(const std::vector<LinearF
   proposal.status_ = validateBatch(current_->dictionary(), factors, identities);
   if (proposal.status_ != Status::kOk)
     return proposal;
+  // Exact identities bypass fresh-source checks. Fresh ancestry is validated
+  // before cross-factor raw checks so retirement retains its specific reason.
+  proposal.status_ = current_->validateFreshFactors(factors, identities);
+  if (proposal.status_ != Status::kOk)
+    return proposal;
   auto candidate = std::make_shared<Snapshot>(*current_);
   const auto consumed = candidate->ledger.consume(identities);
   proposal.status_ = consumed.status;
@@ -369,9 +435,6 @@ JointSourceFilter::Proposal JointSourceFilter::propose(const std::vector<LinearF
     return proposal;
   }
   for (const auto index : consumed.fresh) {
-    proposal.status_ = validateBinding(current_->moments, factors[index]);
-    if (proposal.status_ != Status::kOk)
-      return proposal;
     proposal.status_ = updateRows(factors[index], candidate->moments.mean, candidate->root);
     if (proposal.status_ != Status::kOk)
       return proposal;
@@ -420,7 +483,7 @@ Status JointSourceFilter::propagate(const Eigen::MatrixXd & transform,
   if (const auto status = validateSources(candidate->moments.sources); status != Status::kOk)
     return status;
   Eigen::MatrixXd jointRoot;
-  const auto status = jointNoiseRoot(current_->moments, noise, dimension, jointRoot);
+  const auto status = jointNoiseRoot(current_->moments, current_->root, noise, dimension, jointRoot);
   if (status != Status::kOk)
     return status;
   Eigen::MatrixXd mapping(dimension, 2 * dimension);
@@ -486,7 +549,8 @@ Status JointSourceFilter::augment(const Source & source,
   if (!generator.allFinite() || !offset.allFinite())
     return Status::kNonFinite;
   Eigen::MatrixXd jointRoot;
-  if (const auto status = jointNoiseRoot(current_->moments, noise, count, jointRoot); status != Status::kOk)
+  if (const auto status = jointNoiseRoot(current_->moments, current_->root, noise, count, jointRoot);
+      status != Status::kOk)
     return status;
   Eigen::MatrixXd mapping = Eigen::MatrixXd::Identity(dimension + count, dimension + count);
   mapping.bottomLeftCorner(count, dimension) = generator;
@@ -578,6 +642,9 @@ GainResult JointSourceFilter::appliedGain(const std::vector<LinearFactor> & fact
   }
   // Validate independence/duplicates before constructing D. This helper does
   // not consume anything and accepts only a fresh independent factor batch.
+  result.status = current_->validateFreshFactors(factors, identities);
+  if (result.status != Status::kOk)
+    return result;
   auto ledger = current_->ledger;
   const auto consumed = ledger.consume(identities);
   if (consumed.status != Status::kOk || consumed.fresh.size() != factors.size()) {
@@ -588,10 +655,8 @@ GainResult JointSourceFilter::appliedGain(const std::vector<LinearFactor> & fact
   Eigen::MatrixXd remainder(active, rows);
   result.mean = current_->moments.mean.head(active);
   Eigen::Index column = 0;
-  for (const auto & factor : factors) {
-    result.status = validateBinding(current_->moments, factor);
-    if (result.status != Status::kOk)
-      return result;
+  for (std::size_t index = 0; index < factors.size(); ++index) {
+    const auto & factor = factors[index];
     const auto count = factor.observation.size();
     const auto gain = activeGain.middleCols(column, count);
     const auto loading = jointLoading(factor);

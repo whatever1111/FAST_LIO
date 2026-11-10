@@ -934,5 +934,87 @@ TEST(FrontendCorrelatedUpdate, ReviewF9CoordinateIdentityMismatchHasIdentityStat
   }
 }
 
+TEST(FrontendCorrelatedUpdate, RecheckR1LiveUnloadedSharedRemainsUnsupported)
+{
+  auto initial = prior();
+  initial.sources[0].rawAncestry = {"carried-raw"};
+  JointSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial), Status::kOk);
+  auto factor = measurement(initial, "unloaded-live");
+  factor.identity.rawAncestry = {"carried-raw"};
+  factor.identity.shared = {{"carried-raw", "z/alias"}};
+  factor.a.setZero();
+  EXPECT_EQ(filter.propose({factor}).status(), Status::kUnsupportedNoiseStructure);
+  EXPECT_EQ(filter.appliedGain({factor}, Eigen::MatrixXd::Zero(1, 1)).status, Status::kUnsupportedNoiseStructure);
+  expectExact(*filter.moments(), initial);
+  EXPECT_TRUE(filter.ledger()->entries().empty());
+}
+
+TEST(FrontendCorrelatedUpdate, RecheckR1RetiredUnloadedSharedIsUnavailable)
+{
+  auto initial = prior();
+  initial.sources[0].rawAncestry = {"carried-raw"};
+  JointSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial), Status::kOk);
+  ASSERT_EQ(filter.marginalize({"z"}, true, "source lifetime ended"), Status::kOk);
+  const auto snapshot = *filter.moments();
+  auto factor = measurement(snapshot, "unloaded-retired");
+  factor.identity.rawAncestry = {"carried-raw"};
+  factor.identity.shared = {{"carried-raw", "z/alias"}};
+  EXPECT_EQ(filter.propose({factor}).status(), Status::kSourceHistoryUnavailable);
+  EXPECT_EQ(filter.appliedGain({factor}, Eigen::MatrixXd::Zero(1, 1)).status, Status::kSourceHistoryUnavailable);
+  expectExact(*filter.moments(), snapshot);
+  EXPECT_TRUE(filter.ledger()->entries().empty());
+}
+
+TEST(FrontendCorrelatedUpdate, RecheckR1RetiredAndLiveCarrierRemainUnavailable)
+{
+  auto initial = prior();
+  initial.sources[0].rawAncestry = {"carried-raw"};
+  JointSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial), Status::kOk);
+  auto child = source("derived");
+  child.rawAncestry = {"carried-raw"};
+  Eigen::RowVector2d generator(0.0, 1.0);
+  ASSERT_EQ(filter.augment(child, generator, Eigen::VectorXd::Zero(1), zeroNoise(2, 1)), Status::kOk);
+  ASSERT_EQ(filter.marginalize({"derived"}, true, "derived lifetime ended"), Status::kOk);
+  const auto snapshot = *filter.moments();
+  auto factor = measurement(snapshot, "live-with-retired-carrier");
+  factor.identity.rawAncestry = {"carried-raw"};
+  factor.identity.shared = {{"carried-raw", "z"}};
+  EXPECT_EQ(filter.propose({factor}).status(), Status::kSourceHistoryUnavailable);
+  EXPECT_EQ(filter.appliedGain({factor}, Eigen::MatrixXd::Zero(1, 1)).status, Status::kSourceHistoryUnavailable);
+  expectExact(*filter.moments(), snapshot);
+  EXPECT_TRUE(filter.ledger()->entries().empty());
+}
+
+TEST(FrontendCorrelatedUpdate, RecheckR2AppliedGainIsBitwiseSymmetric)
+{
+  for (const Eigen::Index dimension : {7, 12, 23}) {
+    auto initial = prior(dimension, 0);
+    Eigen::MatrixXd generator(dimension, dimension);
+    for (Eigen::Index row = 0; row < dimension; ++row)
+      for (Eigen::Index col = 0; col < dimension; ++col)
+        generator(row, col) = static_cast<double>((row * 11 + col * 7) % 19 - 9) / 23.0;
+    const Eigen::MatrixXd gram = generator * generator.transpose();
+    initial.covariance = gram.selfadjointView<Eigen::Lower>();
+    initial.covariance.diagonal().array() += 1.0;
+    JointSourceFilter filter;
+    ASSERT_EQ(filter.initialize(initial), Status::kOk);
+    auto factor = measurement(initial, "dense-gain", kMaxRows);
+    Eigen::MatrixXd gain(dimension, kMaxRows);
+    for (Eigen::Index row = 0; row < kMaxRows; ++row)
+      for (Eigen::Index col = 0; col < dimension; ++col) {
+        factor.h(row, col) = static_cast<double>((row * 13 + col * 3) % 17 - 8) / 19.0;
+        gain(col, row) = static_cast<double>((row * 5 + col * 11) % 29 - 14) / 37.0;
+      }
+    const auto result = filter.appliedGain({factor}, gain);
+    ASSERT_EQ(result.status, Status::kOk);
+    EXPECT_TRUE((result.covariance.array() == result.covariance.transpose().array()).all()) << dimension;
+    expectExact(*filter.moments(), initial);
+    EXPECT_TRUE(filter.ledger()->entries().empty());
+  }
+}
+
 }  // namespace
 }  // namespace fastlio::joint_source

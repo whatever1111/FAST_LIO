@@ -138,8 +138,11 @@ Status validateBinding(const JointMoments & moments, const LinearFactor & factor
   return Status::kOk;
 }
 
-Status
-canonicalizeSources(const std::vector<Source> & dictionary, const LinearFactor & factor, FactorIdentity & identity)
+// Snapshot::dictionary lists live sources first, followed by retired tombstones.
+Status canonicalizeSources(const std::vector<Source> & dictionary,
+                           std::size_t liveSources,
+                           const LinearFactor & factor,
+                           FactorIdentity & identity)
 {
   for (auto & shared : identity.shared) {
     const auto * source = resolveSource(dictionary, shared.source);
@@ -154,13 +157,18 @@ canonicalizeSources(const std::vector<Source> & dictionary, const LinearFactor &
         covered = true;
       column += count;
     }
-    if (!covered)
-      return Status::kUnsupportedNoiseStructure;
+    if (!covered) {
+      const bool retired = static_cast<std::size_t>(source - dictionary.data()) >= liveSources;
+      return retired ? Status::kSourceHistoryUnavailable : Status::kUnsupportedNoiseStructure;
+    }
   }
   return Status::kOk;
 }
 
-Status validateFactor(const std::vector<Source> & dictionary, const LinearFactor & factor, FactorIdentity & identity)
+Status validateFactor(const std::vector<Source> & dictionary,
+                      std::size_t liveSources,
+                      const LinearFactor & factor,
+                      FactorIdentity & identity)
 {
   const Eigen::Index rows = factor.observation.size();
   if (rows > kMaxRows || factor.active.components.size() > static_cast<std::size_t>(kMaxActiveDof) ||
@@ -198,7 +206,7 @@ Status validateFactor(const std::vector<Source> & dictionary, const LinearFactor
   identity = factor.identity;
   if (const auto status = validateIdentity(identity); status != Status::kOk)
     return status;
-  if (const auto status = canonicalizeSources(dictionary, factor, identity); status != Status::kOk)
+  if (const auto status = canonicalizeSources(dictionary, liveSources, factor, identity); status != Status::kOk)
     return status;
   if (const auto status = validateIdentity(identity); status != Status::kOk)
     return status;
@@ -227,6 +235,7 @@ Status validateFactor(const std::vector<Source> & dictionary, const LinearFactor
 }
 
 Status validateBatch(const std::vector<Source> & dictionary,
+                     std::size_t liveSources,
                      const std::vector<LinearFactor> & factors,
                      std::vector<FactorIdentity> & identities)
 {
@@ -238,7 +247,7 @@ Status validateBatch(const std::vector<Source> & dictionary,
     if (rows > kMaxRows)
       return Status::kModelCapacityExceeded;
     FactorIdentity identity;
-    const auto status = validateFactor(dictionary, factor, identity);
+    const auto status = validateFactor(dictionary, liveSources, factor, identity);
     if (status != Status::kOk)
       return status;
     identities.push_back(std::move(identity));
@@ -423,7 +432,7 @@ JointSourceFilter::Proposal JointSourceFilter::propose(const std::vector<LinearF
   if (!current_)
     return proposal;
   std::vector<FactorIdentity> identities;
-  proposal.status_ = validateBatch(current_->dictionary(), factors, identities);
+  proposal.status_ = validateBatch(current_->dictionary(), current_->moments.sources.size(), factors, identities);
   if (proposal.status_ != Status::kOk)
     return proposal;
   // Exact identities bypass fresh-source checks. Fresh ancestry is validated
@@ -634,7 +643,7 @@ GainResult JointSourceFilter::appliedGain(const std::vector<LinearFactor> & fact
   if (!current_)
     return result;
   std::vector<FactorIdentity> identities;
-  result.status = validateBatch(current_->dictionary(), factors, identities);
+  result.status = validateBatch(current_->dictionary(), current_->moments.sources.size(), factors, identities);
   if (result.status != Status::kOk)
     return result;
   const auto active = static_cast<Eigen::Index>(current_->moments.active.components.size());
@@ -678,7 +687,9 @@ GainResult JointSourceFilter::appliedGain(const std::vector<LinearFactor> & fact
     column += count;
   }
   const Eigen::MatrixXd errorRoot = mapping * current_->root;
-  result.covariance = errorRoot * errorRoot.transpose() + remainder * remainder.transpose();
+  // Publish one rounded triangle, as Snapshot::finish does for joint moments.
+  const Eigen::MatrixXd product = errorRoot * errorRoot.transpose() + remainder * remainder.transpose();
+  result.covariance = product.selfadjointView<Eigen::Lower>();
   result.status = result.mean.allFinite() && result.covariance.allFinite() ? Status::kOk : Status::kNumericalFailure;
   return result;
 }

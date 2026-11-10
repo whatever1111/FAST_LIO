@@ -96,6 +96,9 @@ struct FactorIdentity
   // Fresh raw ancestry carried by a live source requires a shared entry naming
   // that source with nonzero loading. Retired ancestry is unavailable. Exact
   // retransmissions are checked by the ledger before fresh ancestry validation.
+  // If live and retired sources both carry the same raw item, a fresh factor
+  // conservatively returns kSourceHistoryUnavailable, even when it loads the
+  // live carrier: the retired dependency cannot be reconstructed.
   std::string key;      // complete canonical likelihood identity, excluding delivery aliases
   std::string payload;  // exact canonical bytes, including all numeric inputs
   std::vector<std::string> rawAncestry;

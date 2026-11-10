@@ -17,6 +17,7 @@ inline constexpr Eigen::Index kMaxSourceDof = 32;
 inline constexpr Eigen::Index kMaxRows = 64;
 inline constexpr std::size_t kMaxLedger = 128;
 inline constexpr std::size_t kMaxIdentityBytes = 256;
+inline constexpr std::size_t kMaxFactorPayloadBytes = 256 * 1024;
 
 enum class Status
 {
@@ -162,6 +163,8 @@ inline Status validateSources(const std::vector<Source> & sources)
 
 inline Status validateIdentity(const FactorIdentity & factor)
 {
+  if (factor.payload.size() > kMaxFactorPayloadBytes)
+    return Status::kModelCapacityExceeded;
   if (!validKey(factor.key) || factor.payload.empty() || !validKey(factor.remainderKey) ||
       !validKey(factor.independenceEvidence) || factor.rawAncestry.empty() || !uniqueKeys(factor.rawAncestry))
     return Status::kInvalidIdentity;

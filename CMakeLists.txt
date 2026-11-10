@@ -179,6 +179,14 @@ endif()
 ament_target_dependencies(fastlio_mapping_component ${dependencies})
 rclcpp_components_register_nodes(fastlio_mapping_component "LaserMappingNode")
 
+# Bounded pure-math library. Runtime adapters can link it after separate acceptance.
+add_library(frontend_correlated_update STATIC src/frontend_correlated_update.cpp)
+target_include_directories(frontend_correlated_update PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include/fast_lio>)
+target_link_libraries(frontend_correlated_update PUBLIC Eigen3::Eigen)
+target_compile_features(frontend_correlated_update PUBLIC cxx_std_17)
+
 # ─────────── Test-only sanitizer instrumentation ───────────────────────────────
 # FASTLIO_TEST_SANITIZER is empty by default and then changes no target. With
 # -DFASTLIO_TEST_SANITIZER=thread, fastlio_test_sanitize() adds -fsanitize=thread to the compile
@@ -478,6 +486,8 @@ ${sanitizer_tests}
   ament_add_gtest(test_frontend_observation test/test_frontend_observation.cpp)
   ament_add_gtest(test_frontend_source_contract test/test_frontend_source_contract.cpp)
   target_include_directories(test_frontend_source_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
+  ament_add_gtest(test_frontend_correlated_update test/test_frontend_correlated_update.cpp)
+  target_link_libraries(test_frontend_correlated_update frontend_correlated_update)
   ament_add_gtest(test_reference_health_contract test/test_reference_health_contract.cpp)
   target_include_directories(test_reference_health_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_include_directories(test_frontend_observation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -700,6 +710,11 @@ ${sanitizer_tests}
 endif()
 
 # ---------------- Install --------------- #
+install(TARGETS frontend_correlated_update EXPORT frontend_correlated_update_targets ARCHIVE DESTINATION lib)
+install(FILES include/frontend_source_contract.hpp include/frontend_correlated_update.hpp DESTINATION include/fast_lio)
+ament_export_targets(frontend_correlated_update_targets HAS_LIBRARY_TARGET)
+ament_export_dependencies(Eigen3)
+
 install(TARGETS fastlio_mapping
   DESTINATION lib/${PROJECT_NAME}
 )

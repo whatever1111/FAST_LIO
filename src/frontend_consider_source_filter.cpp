@@ -481,7 +481,7 @@ struct ConsiderSourceFilter::Impl
       Eigen::MatrixXd sample(n + count, n + count);
       sample.topLeftCorner(n, n) = active;
       sample.topRightCorner(n, count) = cross.middleCols(start, count);
-      sample.bottomLeftCorner(count, n) = sample.topRightCorner(n, count).transpose();
+      sample.bottomLeftCorner(count, n) = cross.middleCols(start, count).transpose();
       sample.bottomRightCorner(count, count) = sources.block(start, start, count, count);
       if (const auto status = detail::auditCovariance(sample); status != Status::kOk)
         return status;
@@ -1334,8 +1334,9 @@ Status ConsiderSourceFilter::augment(const Source & source, const Eigen::MatrixX
     Eigen::MatrixXd c(s + d, s + d);
     c.topLeftCorner(s, s) = impl_->c;
     c.bottomLeftCorner(d, s).noalias() = activeGenerator * impl_->k;
-    c.topRightCorner(s, d) = c.bottomLeftCorner(d, s).transpose();
     c.bottomRightCorner(d, d).noalias() = activeGenerator * impl_->p * activeGenerator.transpose();
+    // mirrorLower also fills the upper cross without a transposed self-block
+    // assignment, which Eigen 3.3 diagnoses as aliasing even for disjoint blocks.
     mirrorLower(c);
     Eigen::MatrixXd k(n, s + d);
     k.leftCols(s) = impl_->k;

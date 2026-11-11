@@ -69,6 +69,43 @@ std::vector<float> nearestXs(const Ivox & v, const pcl::PointXYZ & query, bool i
 }
 }  // namespace
 
+TEST(IvoxVoxelOccupancy, PointsPastTheCapLeaveNoIdentity)
+{
+  Ivox v = alignedGrid(2);
+  ASSERT_TRUE(v.enablePointIdentity());
+  auto points = cloudOf({{0.01f, 0, 0}, {0.05f, 0, 0}, {0.1f, 0, 0}, {0.15f, 0, 0}});
+  EXPECT_EQ(v.Add_Points(points, false, fast_lio::seedLabel(7)), 2);
+  Cloud near;
+  std::vector<float> distances;
+  std::vector<fast_lio::MapPointIdentity> ids;
+  EXPECT_EQ(v.Nearest_Search_Identified(points[0], 10, near, distances, ids), fast_lio::MapIdentityStatus::kOk);
+  ASSERT_EQ(ids.size(), 2u);
+  EXPECT_EQ(ids[0].point_index, 0u);
+  EXPECT_EQ(ids[1].point_index, 1u);
+  EXPECT_EQ(v.unlabelledPoints(), 0u);
+}
+
+TEST(IvoxEntryView, TheViewSearchIsUnchangedByIdentity)
+{
+  auto off = fineGrid(), on = fineGrid();
+  ASSERT_TRUE(on.enablePointIdentity());
+  auto entry = cloudOf({{0.05f, 0.05f, 0.05f}, {0.55f, 0.05f, 0.05f}});
+  off.Add_Points(entry, true);
+  on.Add_Points(entry, true, fast_lio::seedLabel(1));
+  ASSERT_TRUE(off.BeginEntryView());
+  ASSERT_TRUE(on.BeginEntryView());
+  auto later = cloudOf({{0.25f, 0.05f, 0.05f}, {1.25f, 0.05f, 0.05f}});
+  auto direct = cloudOf({{0.35f, 0.05f, 0.05f}});
+  off.Add_Points(later, true);
+  on.Add_Points(later, true, fast_lio::seedLabel(2));
+  off.Add_Points(direct, false);
+  on.Add_Points(direct, false, fast_lio::seedLabel(3));
+  const auto query = pointAt(0.6f, 0.05f, 0.05f);
+  EXPECT_EQ(nearestXs(on, query, true), nearestXs(off, query, true));
+  EXPECT_EQ(nearestXs(on, query, true), (std::vector<float>{0.05f, 0.55f}));
+  EXPECT_EQ(nearestXs(on, query, false), nearestXs(off, query, false));
+}
+
 TEST(IvoxVoxelOccupancy, AlignedGridKeepsOnePointPerVoxel)
 {
   Ivox v = alignedGrid();

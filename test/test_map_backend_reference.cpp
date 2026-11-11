@@ -103,3 +103,66 @@ TEST(MapBackendReference, IkdTreeHoldsPointsOnlyWhenTheBuildHadOne)
   map->Build(Points());
   EXPECT_FALSE(fast_lio::mapBackendHoldsPoints(*map));
 }
+
+TEST(MapBackendReference, IkdTreeReportsPointIdentityUnsupported)
+{
+  auto map = std::make_unique<KdTree>();
+  auto directMap = std::make_unique<KdTree>();
+  auto points = ground();
+  EXPECT_EQ(fast_lio::enableMapPointIdentity(*map, true), fast_lio::MapIdentityStatus::kUnsupportedBackend);
+  EXPECT_EQ(fast_lio::mapPointIdentityStatus(*map), fast_lio::MapIdentityStatus::kUnsupportedBackend);
+  EXPECT_FALSE(fast_lio::mapGeneration(*map));
+  EXPECT_FALSE(fast_lio::priorBatchSeq(*map));
+  fast_lio::buildScanMap(*map, points, 12, 2);
+  directMap->Build(points);
+  EXPECT_EQ(map->size(), directMap->size());
+  Points seed{at(10, 0, 0)}, downsampled{at(20, 0, 0)}, direct{at(30, 0, 0)};
+  fast_lio::addScanSeed(*map, seed, 13);
+  directMap->Add_Points(seed, true);
+  EXPECT_EQ(map->size(), directMap->size());
+  fast_lio::stageMapProvenance(*map, fast_lio::beginScanProvenance(true, 14, 1));
+  fast_lio::addStagedPoints(*map, downsampled, direct);
+  directMap->Add_Points(downsampled, true);
+  directMap->Add_Points(direct, false);
+  EXPECT_EQ(map->size(), directMap->size());
+  Points near, expected;
+  std::vector<float> distances, expectedDistances;
+  std::vector<fast_lio::MapPointIdentity> ids(1);
+  EXPECT_EQ(fast_lio::nearestSearchIdentified(*map, points[0], 5, near, distances, ids),
+            fast_lio::MapIdentityStatus::kUnsupportedBackend);
+  map->Nearest_Search(points[0], 5, expected, expectedDistances);
+  EXPECT_TRUE(ids.empty());
+  ASSERT_EQ(near.size(), expected.size());
+  for (std::size_t i = 0; i < near.size(); ++i) {
+    EXPECT_FLOAT_EQ(near[i].x, expected[i].x);
+    EXPECT_FLOAT_EQ(near[i].y, expected[i].y);
+    EXPECT_FLOAT_EQ(near[i].z, expected[i].z);
+  }
+  EXPECT_EQ(distances, expectedDistances);
+}
+
+TEST(MapBackendReference, IvoxSeedsCarryTheScanThatBuiltThem)
+{
+  Ivox map;
+  configure(&map);
+  EXPECT_EQ(fast_lio::enableMapPointIdentity(map, false), fast_lio::MapIdentityStatus::kDisabled);
+  EXPECT_EQ(fast_lio::enableMapPointIdentity(map, true), fast_lio::MapIdentityStatus::kOk);
+  EXPECT_EQ(fast_lio::mapPointIdentityStatus(map), fast_lio::MapIdentityStatus::kOk);
+  Points points{at(0, 0, 0), at(10, 0, 0)};
+  fast_lio::buildScanMap(map, points, 12);
+  EXPECT_EQ(fast_lio::mapGeneration(map), 1u);
+  EXPECT_EQ(fast_lio::priorBatchSeq(map), 0u);
+  Points extra{at(20, 0, 0)};
+  fast_lio::addScanSeed(map, extra, 13);
+  for (std::uint32_t i = 0; i < points.size(); ++i) {
+    Points near;
+    std::vector<float> distances;
+    std::vector<fast_lio::MapPointIdentity> ids;
+    EXPECT_EQ(fast_lio::nearestSearchIdentified(map, points[i], 1, near, distances, ids),
+              fast_lio::MapIdentityStatus::kOk);
+    ASSERT_EQ(ids.size(), 1u);
+    EXPECT_EQ(ids[0].origin, fast_lio::MapPointOrigin::kScanSeed);
+    EXPECT_EQ(ids[0].frame_seq, 12u);
+    EXPECT_EQ(ids[0].point_index, i);
+  }
+}

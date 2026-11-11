@@ -37,4 +37,116 @@ bool mapBackendHoldsPoints(const KD_TREE<PointType> & map)
   return map.Root_Node != nullptr;
 }
 
+template<typename PointType>
+MapIdentityStatus enableMapPointIdentity(lio_ivox::IVox<PointType> & map, bool requested)
+{
+  return requested && map.enablePointIdentity() ? MapIdentityStatus::kOk : MapIdentityStatus::kDisabled;
+}
+template<typename PointType>
+MapIdentityStatus enableMapPointIdentity(KD_TREE<PointType> &, bool)
+{
+  return MapIdentityStatus::kUnsupportedBackend;
+}
+template<typename PointType>
+MapIdentityStatus mapPointIdentityStatus(const lio_ivox::IVox<PointType> & map)
+{
+  return map.pointIdentityEnabled() ? MapIdentityStatus::kOk : MapIdentityStatus::kDisabled;
+}
+template<typename PointType>
+MapIdentityStatus mapPointIdentityStatus(const KD_TREE<PointType> &)
+{
+  return MapIdentityStatus::kUnsupportedBackend;
+}
+
+// These counters are maintained even with identity disabled. Only the scan thread resets
+// the map or installs priors, so reads on that thread need no join. ikd has neither counter.
+template<typename PointType>
+std::optional<std::uint32_t> mapGeneration(const lio_ivox::IVox<PointType> & map)
+{
+  return map.mapGeneration();
+}
+template<typename PointType>
+std::optional<std::uint32_t> mapGeneration(const KD_TREE<PointType> &)
+{
+  return std::nullopt;
+}
+// Each pinned installation passing preflight and each merged Build with a nonempty prior
+// prefix advances the batch, including unpinned priors. clearPinned() does not advance it.
+template<typename PointType>
+std::optional<std::uint32_t> priorBatchSeq(const lio_ivox::IVox<PointType> & map)
+{
+  return map.priorBatchSeq();
+}
+template<typename PointType>
+std::optional<std::uint32_t> priorBatchSeq(const KD_TREE<PointType> &)
+{
+  return std::nullopt;
+}
+
+template<typename PointType, typename Points>
+void buildScanMap(lio_ivox::IVox<PointType> & map,
+                  Points & points,
+                  std::uint64_t lifecycle_scan_seq,
+                  std::size_t prior_prefix = 0)
+{
+  map.Build(points, seedLabel(lifecycle_scan_seq, prior_prefix));
+}
+template<typename PointType, typename Points>
+void buildScanMap(KD_TREE<PointType> & map, Points & points, std::uint64_t, std::size_t = 0)
+{
+  map.Build(points);
+}
+template<typename PointType, typename Points>
+void addScanSeed(lio_ivox::IVox<PointType> & map, Points & points, std::uint64_t lifecycle_scan_seq)
+{
+  map.Add_Points(points, true, seedLabel(lifecycle_scan_seq));
+}
+template<typename PointType, typename Points>
+void addScanSeed(KD_TREE<PointType> & map, Points & points, std::uint64_t)
+{
+  map.Add_Points(points, true);
+}
+template<typename PointType>
+void stageMapProvenance(lio_ivox::IVox<PointType> & map, MapInsertProvenance && provenance)
+{
+  map.stagePointProvenance(std::move(provenance));
+}
+template<typename PointType>
+void stageMapProvenance(KD_TREE<PointType> &, MapInsertProvenance &&)
+{}
+template<typename PointType, typename Points>
+int addStagedPoints(lio_ivox::IVox<PointType> & map, Points & downsampled, Points & direct)
+{
+  return map.addStagedPoints(downsampled, direct);
+}
+template<typename PointType, typename Points>
+int addStagedPoints(KD_TREE<PointType> & map, Points & downsampled, Points & direct)
+{
+  const int added = map.Add_Points(downsampled, true);
+  map.Add_Points(direct, false);
+  return added;
+}
+template<typename PointType, typename Points>
+MapIdentityStatus nearestSearchIdentified(lio_ivox::IVox<PointType> & map,
+                                          const PointType & point,
+                                          int k,
+                                          Points & nearest,
+                                          std::vector<float> & sqdist,
+                                          std::vector<MapPointIdentity> & identities)
+{
+  return map.Nearest_Search_Identified(point, k, nearest, sqdist, identities);
+}
+template<typename PointType, typename Points>
+MapIdentityStatus nearestSearchIdentified(KD_TREE<PointType> & map,
+                                          const PointType & point,
+                                          int k,
+                                          Points & nearest,
+                                          std::vector<float> & sqdist,
+                                          std::vector<MapPointIdentity> & identities)
+{
+  identities.clear();
+  map.Nearest_Search(point, k, nearest, sqdist);
+  return MapIdentityStatus::kUnsupportedBackend;
+}
+
 }  // namespace fast_lio

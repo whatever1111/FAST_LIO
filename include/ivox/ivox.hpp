@@ -31,6 +31,8 @@
 #include <utility>
 #include <vector>
 
+#include "map_point_identity.hpp"
+
 namespace lio_ivox
 {
 
@@ -81,6 +83,49 @@ public:
     view_n_.clear();  // an open entry view reopens on the rebuilt map, the built points included
   }
 
+  // Enable once on an empty map; point storage and search ordering stay unchanged.
+  bool enablePointIdentity()
+  {
+    if (!empty())
+      return false;
+    identity_enabled_ = true;
+    return true;
+  }
+  bool pointIdentityEnabled() const { return identity_enabled_; }
+  // Scan-thread counters: reads there need no join. Mutations must follow join-before-write.
+  // clear()/Build() and clearLive() advance generation; eviction and clearPinned() do not.
+  std::uint32_t mapGeneration() const { return generation_; }
+  // Advances after each accepted pinned preflight, and for a merged Build with a prior prefix,
+  // including unpinned priors. Only the scan thread installs priors and may read this counter.
+  std::uint32_t priorBatchSeq() const { return prior_batch_seq_; }
+  std::size_t unlabelledPoints() const { return unlabelled_points_; }
+
+  void Build(PointVector & points, const fast_lio::MapInsertLabel & label)
+  {
+    clear();
+    addPoints(points, true, false, label);
+    view_n_.clear();
+  }
+  int Add_Points(PointVector & points, bool downsample_on, const fast_lio::MapInsertLabel & label)
+  {
+    return addPoints(points, downsample_on, false, label);
+  }
+  // The caller stages only while the worker is idle, then publishes through its existing
+  // map-add mutex. The worker consumes before that caller's next join completes.
+  void stagePointProvenance(fast_lio::MapInsertProvenance && provenance)
+  {
+    if (identity_enabled_)
+      staged_ = std::move(provenance);
+  }
+  int addStagedPoints(PointVector & downsampled, PointVector & direct)
+  {
+    auto provenance = std::move(staged_);
+    staged_ = {};
+    const int added = addPoints(downsampled, true, false, fast_lio::incrementalLabel(provenance, true));
+    addPoints(direct, false, false, fast_lio::incrementalLabel(provenance, false));
+    return added;
+  }
+
   // Drop everything the live scans put here, keep the pinned tier (a preloaded prior map).
   // This is what the guard's recovery wants once a prior map is loaded: the local map that
   // no longer fits goes away, the map the operator delivered stays.
@@ -94,9 +139,11 @@ public:
       for (const auto & q : it->second.pts)
         eraseOwnedFine(q, it->first);
       num_points_ -= it->second.pts.size();
+      ids_.erase(k);
       map_.erase(it);
     }
     lru_.clear();
+    ++generation_;
   }
 
   // Drop the pinned tier, keep what the live scans put here. The counterpart of
@@ -113,6 +160,7 @@ public:
       for (const auto & q : it->second.pts)
         eraseOwnedFine(q, it->first);
       num_points_ -= it->second.pts.size();
+      ids_.erase(it->first);
       it = map_.erase(it);
     }
     pinned_voxels_ = 0;
@@ -126,6 +174,8 @@ public:
     num_points_ = 0;
     pinned_voxels_ = 0;
     view_n_.clear();  // an open entry view reopens on the empty map
+    ids_.clear();
+    ++generation_;
   }
 
   // Add points that must survive both eviction and clearLive(): a prior map is not something
@@ -138,10 +188,11 @@ public:
   {
     if (!canAddPinnedPoints(points))
       throw std::length_error("iVox pinned coarse-voxel demand exceeds capacity");
-    return addPoints(points, true, true);
+    ++prior_batch_seq_;
+    return addPoints(points, true, true, {fast_lio::MapPointOrigin::kPrior});
   }
 
-  int Add_Points(PointVector & points, bool downsample_on) { return addPoints(points, downsample_on, false); }
+  int Add_Points(PointVector & points, bool downsample_on) { return addPoints(points, downsample_on, false, {}); }
 
   // --- Entry view --------------------------------------------------------------------------
   // The map as it stood when the view was opened, kept while the map itself goes on growing:
@@ -181,8 +232,10 @@ public:
   std::size_t entryViewFrames() const { return view_frames_; }
 
 private:
-  int addPoints(PointVector & points, bool downsample_on, bool pinned)
+  int addPoints(PointVector & points, bool downsample_on, bool pinned, const fast_lio::MapInsertLabel & label)
   {
+    if (label.prior_prefix > 0)
+      ++prior_batch_seq_;
     int added = 0;
     for (const auto & p : points) {
       if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
@@ -250,6 +303,8 @@ private:
         }
       }
       if (was_added) {
+        if (identity_enabled_)
+          recordIdentity(k, label, &p - points.data(), points.size());
         ++num_points_;
         ++added;
         if (downsample_on)
@@ -282,13 +337,26 @@ public:
     search(point, k, nearest, sqdist, max_dist, view_active_);
   }
 
+  fast_lio::MapIdentityStatus Nearest_Search_Identified(const PointType & point,
+                                                        int k,
+                                                        PointVector & nearest,
+                                                        std::vector<float> & sqdist,
+                                                        std::vector<fast_lio::MapPointIdentity> & identities,
+                                                        float max_dist = std::numeric_limits<float>::infinity()) const
+  {
+    identities.clear();
+    search(point, k, nearest, sqdist, max_dist, false, identity_enabled_ ? &identities : nullptr);
+    return identity_enabled_ ? fast_lio::MapIdentityStatus::kOk : fast_lio::MapIdentityStatus::kDisabled;
+  }
+
 private:
   void search(const PointType & point,
               int k,
               PointVector & nearest,
               std::vector<float> & sqdist,
               float max_dist,
-              bool in_view) const
+              bool in_view,
+              std::vector<fast_lio::MapPointIdentity> * identities = nullptr) const
   {
     nearest.clear();
     sqdist.clear();
@@ -333,6 +401,8 @@ private:
       nearest[i] = *cand[i].second;
       sqdist[i] = cand[i].first;
     }
+    if (identities != nullptr)
+      resolveIdentities(cand, m, *identities);
   }
 
 public:
@@ -504,7 +574,38 @@ private:
       for (const auto & q : it->second.pts)
         eraseOwnedFine(q, it->first);  // free its fine boxes
       num_points_ -= it->second.pts.size();
+      ids_.erase(old);
       map_.erase(it);
+    }
+  }
+
+  void
+  recordIdentity(const Key & k, const fast_lio::MapInsertLabel & label, std::ptrdiff_t position, std::size_t batch_size)
+  {
+    const auto id =
+      fast_lio::identityOf(label, static_cast<std::size_t>(position), batch_size, generation_, prior_batch_seq_);
+    if (id.origin == fast_lio::MapPointOrigin::kUnlabelled)
+      ++unlabelled_points_;
+    ids_[k].push_back(id);
+  }
+
+  template<typename Candidates>
+  void resolveIdentities(const Candidates & cand, int m, std::vector<fast_lio::MapPointIdentity> & identities) const
+  {
+    identities.resize(m);
+    for (int i = 0; i < m; ++i) {
+      const PointType * p = cand[i].second;
+      const Key k = key(*p);
+      const auto voxel = map_.find(k);
+      const auto ids = ids_.find(k);
+      fast_lio::MapPointIdentity id;
+      id.generation = generation_;
+      if (voxel != map_.end() && ids != ids_.end()) {
+        const auto index = static_cast<std::size_t>(p - voxel->second.pts.data());
+        if (index < ids->second.size())
+          id = ids->second[index];
+      }
+      identities[i] = id;
     }
   }
 
@@ -528,6 +629,12 @@ private:
   bool view_active_ = false;
   bool view_pinned_ = false;
   std::size_t view_frames_ = 0;
+  bool identity_enabled_ = false;
+  std::uint32_t generation_ = 0;
+  std::uint32_t prior_batch_seq_ = 0;
+  std::size_t unlabelled_points_ = 0;
+  robin_hood::unordered_flat_map<Key, std::vector<fast_lio::MapPointIdentity>, KeyHash> ids_;
+  fast_lio::MapInsertProvenance staged_;
 };
 
 }  // namespace lio_ivox

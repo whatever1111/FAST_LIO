@@ -2,7 +2,9 @@
 
 #include <pcl/point_types.h>
 
+#include <cstring>
 #include <gtest/gtest.h>
+#include <limits>
 #include <vector>
 
 #include "ivox/ivox.hpp"
@@ -333,4 +335,316 @@ TEST(IvoxLayering, PinnedPreflightCountsUniqueCoarseBucketsNotPoints)
   EXPECT_EQ(v.AddPinnedPoints(duplicates), 1);
   EXPECT_EQ(v.pinnedVoxels(), 2u);
   EXPECT_EQ(v.size(), 2);
+}
+
+namespace
+{
+using Origin = fast_lio::MapPointOrigin;
+using Status = fast_lio::MapIdentityStatus;
+using Ids = std::vector<fast_lio::MapPointIdentity>;
+
+Ids identitiesAt(const Ivox & map, const pcl::PointXYZ & point, int k = 1)
+{
+  Cloud near;
+  std::vector<float> distances;
+  Ids ids;
+  EXPECT_EQ(map.Nearest_Search_Identified(point, k, near, distances, ids), Status::kOk);
+  EXPECT_EQ(ids.size(), near.size());
+  return ids;
+}
+
+void expectIdentity(const fast_lio::MapPointIdentity & id,
+                    Origin origin,
+                    std::uint32_t frame,
+                    std::uint32_t index,
+                    std::uint32_t generation)
+{
+  EXPECT_EQ(id.origin, origin);
+  EXPECT_EQ(id.frame_seq, frame);
+  EXPECT_EQ(id.point_index, index);
+  EXPECT_EQ(id.generation, generation);
+  for (auto byte : id.reserved)
+    EXPECT_EQ(byte, 0);
+}
+}  // namespace
+
+TEST(IvoxIdentity, AdmittedPointsCarryTheirLabel)
+{
+  auto map = makeIvox(100);
+  ASSERT_TRUE(map.enablePointIdentity());
+  auto points = lattice(0, 3);
+  const std::vector<std::uint32_t> index{4, 9, 12};
+  ASSERT_EQ(map.Add_Points(points, true, {Origin::kScanIncremental, 7, &index}), 3);
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    Cloud near;
+    std::vector<float> distances;
+    Ids ids;
+    ASSERT_EQ(map.Nearest_Search_Identified(points[i], 1, near, distances, ids), Status::kOk);
+    ASSERT_EQ(near.size(), 1u);
+    ASSERT_EQ(ids.size(), 1u);
+    EXPECT_FLOAT_EQ(near[0].x, points[i].x);
+    expectIdentity(ids[0], Origin::kScanIncremental, 7, index[i], map.mapGeneration());
+  }
+}
+
+TEST(IvoxIdentity, RejectedOffersLeaveNoIdentity)
+{
+  auto map = makeIvox(100);
+  ASSERT_TRUE(map.enablePointIdentity());
+  auto points = lattice(0, 2);
+  points.insert(points.begin() + 1, points.front());
+  points.push_back(lattice(std::numeric_limits<float>::quiet_NaN(), 1).front());
+  points.push_back(lattice(std::numeric_limits<float>::max(), 1).front());
+  const std::vector<std::uint32_t> index{4, 9, 12, 15, 18};
+  EXPECT_EQ(map.Add_Points(points, true, {Origin::kScanIncremental, 7, &index}), 2);
+  EXPECT_EQ(map.size(), 2);
+  for (const auto & point : {points[0], points[2]}) {
+    const auto ids = identitiesAt(map, point, 20);
+    ASSERT_FALSE(ids.empty());
+    for (const auto & id : ids) {
+      EXPECT_NE(id.point_index, 9u);
+      EXPECT_NE(id.point_index, 15u);
+      EXPECT_NE(id.point_index, 18u);
+    }
+  }
+  EXPECT_EQ(map.unlabelledPoints(), 0u);
+  // With no evictable voxel, a rejected live offer cannot acquire an identity either.
+  auto pinned = makeIvox(1);
+  ASSERT_TRUE(pinned.enablePointIdentity());
+  auto prior = lattice(0, 1);
+  pinned.AddPinnedPoints(prior);
+  auto live = lattice(10, 1);
+  EXPECT_EQ(pinned.Add_Points(live, false, fast_lio::seedLabel(8)), 0);
+  EXPECT_TRUE(identitiesAt(pinned, live.front()).empty());
+}
+
+TEST(IvoxIdentity, EvictedVoxelTakesItsIdentitiesAway)
+{
+  auto map = makeIvox(2);
+  ASSERT_TRUE(map.enablePointIdentity());
+  auto a = lattice(0, 1), b = lattice(10, 1), c = lattice(20, 1);
+  map.Add_Points(a, true, fast_lio::seedLabel(1));
+  map.Add_Points(b, true, fast_lio::seedLabel(2));
+  map.Add_Points(c, true, fast_lio::seedLabel(3));
+  EXPECT_TRUE(identitiesAt(map, a.front()).empty());
+  ASSERT_EQ(identitiesAt(map, b.front()).size(), 1u);
+  EXPECT_EQ(identitiesAt(map, b.front())[0].frame_seq, 2u);
+  ASSERT_EQ(identitiesAt(map, c.front()).size(), 1u);
+  EXPECT_EQ(identitiesAt(map, c.front())[0].frame_seq, 3u);
+  map.Add_Points(a, true, fast_lio::seedLabel(4));
+  const auto ids = identitiesAt(map, a.front());
+  ASSERT_EQ(ids.size(), 1u);
+  EXPECT_EQ(ids[0].frame_seq, 4u);
+}
+
+TEST(IvoxIdentity, ClearLiveKeepsThePinnedTierWithItsIdentities)
+{
+  auto map = makeIvox(100);
+  ASSERT_TRUE(map.enablePointIdentity());
+  auto prior = lattice(0, 2), live = lattice(50, 1), mixed = lattice(0.25f, 1);
+  map.AddPinnedPoints(prior);
+  map.Add_Points(live, true, {Origin::kScanIncremental, 5});
+  map.Add_Points(mixed, false, {Origin::kScanIncremental, 6});
+  const auto g = map.mapGeneration();
+  map.clearLive();
+  EXPECT_EQ(map.mapGeneration(), g + 1);
+  for (std::size_t i = 0; i < prior.size(); ++i) {
+    const auto ids = identitiesAt(map, prior[i]);
+    ASSERT_EQ(ids.size(), 1u);
+    expectIdentity(ids[0], Origin::kPrior, 1, i, g);
+  }
+  const auto ids = identitiesAt(map, mixed.front());
+  ASSERT_EQ(ids.size(), 1u);
+  expectIdentity(ids[0], Origin::kScanIncremental, 6, 0, g);
+  EXPECT_TRUE(identitiesAt(map, live.front()).empty());
+}
+
+TEST(IvoxIdentity, EveryResetAdvancesTheGeneration)
+{
+  const auto sequence = [](bool enabled) {
+    auto map = makeIvox(1);
+    if (enabled)
+      EXPECT_TRUE(map.enablePointIdentity());
+    std::vector<std::uint32_t> values{map.mapGeneration()};
+    map.clear();
+    values.push_back(map.mapGeneration());
+    auto points = lattice(0, 1);
+    map.Build(points, fast_lio::seedLabel(1));
+    values.push_back(map.mapGeneration());
+    map.clearLive();
+    values.push_back(map.mapGeneration());
+    map.clearPinned();
+    values.push_back(map.mapGeneration());
+    map.Add_Points(points, true);
+    auto other = lattice(10, 1);
+    map.Add_Points(other, true);
+    EXPECT_EQ(map.evictedVoxels(), 1u);
+    values.push_back(map.mapGeneration());
+    map.Add_Points(other, false);
+    values.push_back(map.mapGeneration());
+    return values;
+  };
+  const std::vector<std::uint32_t> expected{0, 1, 2, 3, 3, 3, 3};
+  EXPECT_EQ(sequence(false), expected);
+  EXPECT_EQ(sequence(true), expected);
+}
+
+TEST(IvoxIdentity, SearchIsBitIdenticalWithAndWithoutIdentity)
+{
+  auto off = makeIvox(128), on = makeIvox(128);
+  ASSERT_TRUE(on.enablePointIdentity());
+  std::uint32_t state = 17;
+  const auto coordinate = [&state]() {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(state % 1000) * 0.003f;
+  };
+  Cloud queries;
+  for (int batch = 1; batch <= 8; ++batch) {
+    Cloud points;
+    for (int i = 0; i < 400; ++i) {
+      pcl::PointXYZ p;
+      p.x = coordinate();
+      p.y = coordinate();
+      p.z = coordinate();
+      points.push_back(p);
+      if (i < 40)
+        queries.push_back(p);
+    }
+    EXPECT_EQ(off.Add_Points(points, batch % 2 == 0),
+              on.Add_Points(points, batch % 2 == 0, fast_lio::seedLabel(batch)));
+  }
+  // Equal distances and exact duplicates exercise ordering and storage-position resolution.
+  auto ties = lattice(0, 1);
+  ties.front().y = ties.front().z = 0.1f;
+  auto left = ties.front(), right = ties.front();
+  left.x = 0.25f;
+  right.x = -0.25f;
+  ties = {left, right, left};
+  off.Add_Points(ties, false);
+  on.Add_Points(ties, false, fast_lio::seedLabel(9));
+  queries.push_back(ties.front());
+  auto center = left;
+  center.x = 0.0f;
+  queries.push_back(center);
+  ASSERT_TRUE(off.BeginEntryView());
+  ASSERT_TRUE(on.BeginEntryView());
+  auto later = lattice(0.1f, 2);
+  off.Add_Points(later, false);
+  on.Add_Points(later, false, fast_lio::seedLabel(10));
+  const auto sameBytes = [](const auto & a, const auto & b) {
+    ASSERT_EQ(a.size(), b.size());
+    if (!a.empty())
+      EXPECT_EQ(std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])), 0);
+  };
+  for (const auto & query : queries) {
+    Cloud a, b, identified;
+    std::vector<float> da, db, di;
+    Ids ids;
+    off.Nearest_Search(query, 5, a, da);
+    on.Nearest_Search(query, 5, b, db);
+    ASSERT_EQ(on.Nearest_Search_Identified(query, 5, identified, di, ids), Status::kOk);
+    sameBytes(a, b);
+    sameBytes(a, identified);
+    sameBytes(da, db);
+    sameBytes(da, di);
+    ASSERT_EQ(ids.size(), identified.size());
+    off.Nearest_Search_View(query, 5, a, da);
+    on.Nearest_Search_View(query, 5, b, db);
+    sameBytes(a, b);
+    sameBytes(da, db);
+  }
+  const auto duplicateIds = identitiesAt(on, left, 2);
+  ASSERT_EQ(duplicateIds.size(), 2u);
+  EXPECT_EQ(duplicateIds[0].frame_seq, 9u);
+  EXPECT_EQ(duplicateIds[1].frame_seq, 9u);
+  EXPECT_NE(duplicateIds[0].point_index, duplicateIds[1].point_index);
+  EXPECT_EQ(off.size(), on.size());
+  EXPECT_EQ(off.numVoxels(), on.numVoxels());
+  EXPECT_EQ(off.evictedVoxels(), on.evictedVoxels());
+  EXPECT_GT(on.evictedVoxels(), 0u);
+}
+
+TEST(IvoxIdentity, DisabledSearchSaysSoAndReturnsNone)
+{
+  auto map = makeIvox(100);
+  auto points = lattice(0, 2);
+  map.Add_Points(points, true);
+  Cloud near, expected;
+  std::vector<float> distances, expectedDistances;
+  Ids ids(1);
+  EXPECT_EQ(map.Nearest_Search_Identified(points[0], 2, near, distances, ids), Status::kDisabled);
+  EXPECT_TRUE(ids.empty());
+  map.Nearest_Search(points[0], 2, expected, expectedDistances);
+  ASSERT_EQ(near.size(), expected.size());
+  EXPECT_EQ(std::memcmp(near.data(), expected.data(), near.size() * sizeof(near[0])), 0);
+  EXPECT_EQ(distances, expectedDistances);
+}
+
+TEST(IvoxIdentity, TurnsOnOnlyOnAnEmptyMap)
+{
+  auto map = makeIvox(100);
+  auto points = lattice(0, 1);
+  map.Add_Points(points, true);
+  EXPECT_FALSE(map.enablePointIdentity());
+  EXPECT_FALSE(map.pointIdentityEnabled());
+  map.clear();
+  EXPECT_TRUE(map.enablePointIdentity());
+  Cloud near;
+  std::vector<float> distances;
+  Ids ids(1);
+  const auto invalid = lattice(std::numeric_limits<float>::quiet_NaN(), 1).front();
+  EXPECT_EQ(map.Nearest_Search_Identified(invalid, 5, near, distances, ids), Status::kOk);
+  EXPECT_TRUE(near.empty());
+  EXPECT_TRUE(distances.empty());
+  EXPECT_TRUE(ids.empty());
+}
+
+TEST(IvoxIdentity, UnlabelledAdditionsAreMarkedNotGuessed)
+{
+  auto map = makeIvox(100);
+  ASSERT_TRUE(map.enablePointIdentity());
+  auto points = lattice(0, 2), malformed = lattice(10, 2);
+  map.Add_Points(points, true);
+  const std::vector<std::uint32_t> wrongSize{3};
+  map.Add_Points(malformed, true, {Origin::kScanIncremental, 8, &wrongSize});
+  for (const auto & p : {points[0], points[1], malformed[0], malformed[1]}) {
+    const auto ids = identitiesAt(map, p);
+    ASSERT_EQ(ids.size(), 1u);
+    expectIdentity(ids[0], Origin::kUnlabelled, 0, 0, map.mapGeneration());
+  }
+  EXPECT_EQ(map.unlabelledPoints(), 4u);
+}
+
+TEST(IvoxIdentity, MergedPriorBuildSplitsTheOrigins)
+{
+  auto map = makeIvox(100);
+  ASSERT_TRUE(map.enablePointIdentity());
+  auto points = lattice(0, 5);
+  map.Build(points, fast_lio::seedLabel(3, 2));
+  EXPECT_EQ(map.priorBatchSeq(), 1u);
+  for (std::uint32_t i = 0; i < points.size(); ++i) {
+    const auto ids = identitiesAt(map, points[i]);
+    ASSERT_EQ(ids.size(), 1u);
+    expectIdentity(
+      ids[0], i < 2 ? Origin::kPrior : Origin::kScanSeed, i < 2 ? 1 : 3, i < 2 ? i : i - 2, map.mapGeneration());
+  }
+}
+
+TEST(IvoxIdentity, AReinstalledPriorMapIsANewBatch)
+{
+  auto map = makeIvox(100);
+  ASSERT_TRUE(map.enablePointIdentity());
+  auto points = lattice(0, 2);
+  map.AddPinnedPoints(points);
+  const auto g = map.mapGeneration();
+  EXPECT_EQ(map.priorBatchSeq(), 1u);
+  map.clearPinned();
+  map.AddPinnedPoints(points);
+  EXPECT_EQ(map.priorBatchSeq(), 2u);
+  EXPECT_EQ(map.mapGeneration(), g);
+  for (std::uint32_t i = 0; i < points.size(); ++i) {
+    const auto ids = identitiesAt(map, points[i]);
+    ASSERT_EQ(ids.size(), 1u);
+    expectIdentity(ids[0], Origin::kPrior, 2, i, g);
+  }
 }

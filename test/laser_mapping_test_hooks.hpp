@@ -3,6 +3,7 @@
 #include <Eigen/Core>
 
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "anchor_trace.hpp"
+#include "map_point_identity.hpp"
 #include "time_admission_accounting.hpp"
 
 // Only the non-installed test component defines or references these callbacks.
@@ -132,6 +134,28 @@ struct HModelExit
 };
 /// Every H-model call right after afterHModelRows.
 extern std::function<void(const HModelSelection &)> afterHModelSelection;
+/// The same evaluation's neighbour identities: end, call, lifecycle scan, map generation, [query][neighbour].
+extern std::function<void(
+  double, int, std::uint64_t, std::uint32_t, const std::vector<std::vector<fast_lio::MapPointIdentity>> &)>
+  afterHModelIdentities;
+
+// TEST_PRE_REFERENCE uses the previous scan's cloud. A returned seed must never claim the
+// current scan; surviving points in pinned voxels may still name an earlier scan or prior.
+template<typename Map, typename Points>
+void assertPreReferenceSeedUnlabelled(const Map & map, const Points & seeds, std::uint64_t current_scan)
+{
+  if (!map.pointIdentityEnabled())
+    return;
+  typename Map::PointVector nearest;
+  std::vector<float> distances;
+  std::vector<fast_lio::MapPointIdentity> identities;
+  for (const auto & point : seeds) {
+    map.Nearest_Search_Identified(point, 1, nearest, distances, identities);
+    for (const auto & id : identities)
+      assert(id.origin == fast_lio::MapPointOrigin::kUnlabelled || id.origin == fast_lio::MapPointOrigin::kPrior ||
+             id.frame_seq < current_scan);
+  }
+}
 /// Every H-model exit, right after afterHModelMatrices.
 extern std::function<void(const HModelExit &)> afterHModelExit;
 /// The directory the correspondence dump writes its files to; empty: the package's Log/ directory. The constructor

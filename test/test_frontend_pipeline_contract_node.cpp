@@ -912,6 +912,8 @@ struct Scenario
 {
   std::string name;
   bool async_map = false;
+  bool map_point_identity = false;
+  bool pre_reference_reset = false;
   bool typed = false;  // the typed outputs on, with the fixed activation identity and repeat clock
   Cloud warm_up = Cloud::kDense;  // the cloud the warm-up scans carry: the scene the map starts from
   bool dump = false;  // the correspondence dump goes to the scenario's result directory; h_dump.v1 records its files
@@ -1522,6 +1524,10 @@ public:
   {
     // The map worker as the scenario says; one OpenMP thread; nothing else from the environment.
     ::setenv("FLIO_ASYNC_MAP", scenario_.async_map ? "1" : "0", 1);
+    if (scenario_.map_point_identity)
+      ::setenv("FLIO_MAP_POINT_IDENTITY", "1", 1);
+    else
+      ::unsetenv("FLIO_MAP_POINT_IDENTITY");
     ::setenv("OMP_NUM_THREADS", "1", 1);
     for (const char * name : {"FLIO_OFFLINE_STEP", "FLIO_LIDAR_QDEPTH", "FLIO_IKD_PROFILE"})
       ::unsetenv(name);
@@ -1794,7 +1800,8 @@ private:
     // The first call of every scan that has its input; its answer schedules no reset.
     fast_lio_test::resetBeforeReference = [this](double end) {
       note("resetBeforeReference", "scan_begin end=" + formatDouble(end));
-      return false;
+      const Slot * s = slotAt(end);
+      return scenario_.pre_reference_reset && s != nullptr && s->label == "test_pre_reference";
     };
     fast_lio_test::beforeImuProcess = [this] {
       if (note("beforeImuProcess", "imu_process") && throw_next_imu_process_) {
@@ -1884,6 +1891,32 @@ private:
       if (s.ground_rows > 0)
         ++counts_["h_ground_rows"];
     };
+    fast_lio_test::afterHModelIdentities =
+      [this](double end,
+             int call,
+             std::uint64_t scan,
+             std::uint32_t generation,
+             const std::vector<std::vector<fast_lio::MapPointIdentity>> & identities) {
+        std::array<std::size_t, 4> origins{};
+        std::uint32_t max_incremental = 0;
+        std::ostringstream payload;
+        for (std::size_t i = 0; i < identities.size(); ++i) {
+          for (std::size_t j = 0; j < identities[i].size(); ++j) {
+            const auto & id = identities[i][j];
+            ++origins.at(static_cast<std::size_t>(id.origin));
+            if (id.origin == fast_lio::MapPointOrigin::kScanIncremental)
+              max_incremental = std::max(max_incremental, id.frame_seq);
+            payload << i << ',' << j << ',' << static_cast<unsigned>(id.origin) << ',' << id.frame_seq << ','
+                    << id.point_index << ',' << id.generation << ';';
+          }
+        }
+        std::ostringstream out;
+        out << "h_identity.v1 end=" << bits(end) << " call=" << call << " scan=" << scan << " generation=" << generation
+            << " unlabelled=" << origins[0] << " seed=" << origins[1] << " incremental=" << origins[2]
+            << " prior=" << origins[3] << " max_incremental=" << max_incremental
+            << " identities_sha256=" << sha256Hex(payload.str());
+        note("afterHModelIdentities", out.str());
+      };
     fast_lio_test::afterHModelExit = [this](const fast_lio_test::HModelExit & e) {
       // These immutable overrides are the same map supplied to the node constructor.
       const auto floor = scenario_.params.find("degeneracy_floor_mode");
@@ -2038,6 +2071,7 @@ private:
     fast_lio_test::afterHModelRows = {};
     fast_lio_test::afterHModelMatrices = {};
     fast_lio_test::afterHModelSelection = {};
+    fast_lio_test::afterHModelIdentities = {};
     fast_lio_test::afterHModelExit = {};
     fast_lio_test::correspondenceDumpDir.clear();
     fast_lio_test::afterLidarUpdate = {};
@@ -3506,6 +3540,108 @@ TEST(FrontendPipelineWorker, EntryViewRecoveryRecordsWhatTheSynchronousPathRecor
   const Comparison comparison = compareLines(expected.record, withoutMapAdds(actual.record));
   EXPECT_EQ(comparison.result, "equal") << "line " << comparison.line << "\n  synchronous: " << comparison.expected
                                         << "\n  worker: " << comparison.actual;
+}
+
+std::string withoutIdentities(const std::string & record)
+{
+  std::string out;
+  for (const auto & line : splitLines(record))
+    if (line.rfind("h_identity.v1 ", 0) != 0)
+      out += line + '\n';
+  return out;
+}
+
+void expectIdentityGolden(const Scenario & scenario, const ChildRun & run)
+{
+  ASSERT_TRUE(run.ok()) << run.describe();
+  std::string golden;
+  ASSERT_TRUE(readFile(goldenDir() + "/" + scenario.name + ".golden", &golden));
+  const auto comparison = compareLines(bodyOf(golden), withoutIdentities(run.record));
+  EXPECT_EQ(comparison.result, "equal") << scenario.name << " line " << comparison.line
+                                        << "\n  golden: " << comparison.expected
+                                        << "\n  identity: " << comparison.actual;
+  EXPECT_NE(run.record.find("h_identity.v1 "), std::string::npos) << "identity switch did not take effect";
+  for (const auto & line : splitLines(run.record))
+    if (line.rfind("h_identity.v1 ", 0) == 0)
+      EXPECT_EQ(valueOf(line, "unlabelled"), "0") << line;
+}
+
+TEST(FrontendPipelineContract, EnabledRunsRecordWhatTheGoldensRecord)
+{
+  for (auto scenario : {matchScenario(), pinScenario(), entryViewScenario(), refreshScenario(), m20Scenario()}) {
+    SCOPED_TRACE(scenario.name);
+    scenario.map_point_identity = true;
+    expectIdentityGolden(scenario, runScenario(scenario));
+  }
+  // This hook rebuilds before downsampling the current scan; its previous cloud has no current-scan label.
+  auto pre_reference = matchScenario();
+  pre_reference.name = "identity_pre_reference";
+  pre_reference.map_point_identity = true;
+  pre_reference.pre_reference_reset = true;
+  pre_reference.slots.front().label = "test_pre_reference";
+  const auto run = runScenario(pre_reference);
+  ASSERT_TRUE(run.ok()) << run.describe();
+  EXPECT_GT(run.count("map_reset"), 0u);
+  bool unlabelled = false;
+  for (const auto & line : splitLines(run.record))
+    if (line.rfind("h_identity.v1 ", 0) == 0 && valueOf(line, "unlabelled") != "0")
+      unlabelled = true;
+  EXPECT_TRUE(unlabelled) << "TEST_PRE_REFERENCE seeds were not observed as unlabelled";
+}
+
+// The insertion delay is two scans; a staged point cannot be searched before scan j+3.
+bool expectStagingBound(const ChildRun & run)
+{
+  bool tight = false;
+  for (const auto & line : splitLines(run.record)) {
+    if (line.rfind("h_identity.v1 ", 0) != 0)
+      continue;
+    const auto scan = std::stoull(valueOf(line, "scan"));
+    const auto frame = std::stoull(valueOf(line, "max_incremental"));
+    if (frame == 0)
+      continue;
+    EXPECT_GE(scan, 3u) << line;
+    EXPECT_LE(frame + 3, scan) << line;
+    tight = tight || frame + 3 == scan;
+  }
+  return tight;
+}
+
+TEST(FrontendPipelineWorker, IdentityUnderTheWorkerIsTheSynchronousRuns)
+{
+  auto worker = workerScenario();
+  worker.map_point_identity = true;
+  auto synchronous = worker;
+  synchronous.async_map = false;
+  const auto expected = runScenario(synchronous);
+  const auto actual = runScenario(worker);
+  ASSERT_TRUE(expected.ok()) << expected.describe();
+  ASSERT_TRUE(actual.ok()) << actual.describe();
+  for (const auto & claim : worker.claims)
+    EXPECT_GT(actual.count(claim), 0u) << claim;
+  const auto comparison = compareLines(expected.record, withoutMapAdds(actual.record));
+  EXPECT_EQ(comparison.result, "equal") << "line " << comparison.line << "\n  synchronous: " << comparison.expected
+                                        << "\n  worker: " << comparison.actual;
+  expectIdentityGolden(worker, actual);
+  std::string first_generation;
+  bool advanced = false;
+  for (const auto & line : splitLines(actual.record)) {
+    if (line.rfind("h_identity.v1 ", 0) != 0)
+      continue;
+    const auto generation = valueOf(line, "generation");
+    if (first_generation.empty())
+      first_generation = generation;
+    advanced = advanced || generation != first_generation;
+  }
+  EXPECT_TRUE(advanced) << "reset did not advance the evaluation's generation";
+  if (!expectStagingBound(expected)) {
+    auto moving = entryViewScenario();
+    moving.map_point_identity = true;
+    setParam(moving, rclcpp::Parameter("mapping.map_insert_delay_scans", 2));
+    const auto delayed = runScenario(moving);
+    ASSERT_TRUE(delayed.ok()) << delayed.describe();
+    EXPECT_TRUE(expectStagingBound(delayed)) << "the staging bound was never tight";
+  }
 }
 
 }  // namespace

@@ -2657,6 +2657,9 @@ std::function<void()> beforeResetJoin;
 std::function<void()> afterPendingReset;
 std::function<void(std::size_t, double)> afterScanPrepared;
 std::function<void(std::size_t, double, int)> afterHModelRows;
+std::function<void(
+  double, int, std::uint64_t, std::uint32_t, const std::vector<std::vector<fast_lio::MapPointIdentity>> &)>
+  afterHModelIdentities;
 std::function<void(std::uint64_t, int, int, std::size_t, std::size_t, std::uint64_t)> afterImuConsumption;
 std::function<void()> beforeImuProcess;
 std::function<int(double)> overrideGuardDegraded;
@@ -2942,7 +2945,7 @@ void readMapEnvironment(const rclcpp::Logger & logger)
 
 // The recovery callback and the worker-ordering fixture use this exact boundary.
 // Join precedes every map read/write and discarding delayed world-frame batches.
-bool rebuildLocalMapStorage(int & map_before, fast_lio::TimeAdmissionAccounting * observer)
+bool rebuildLocalMapStorage(int & map_before, std::uint64_t seed_scan_seq, fast_lio::TimeAdmissionAccounting * observer)
 {
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::beforeResetJoin)
@@ -2977,7 +2980,7 @@ bool rebuildLocalMapStorage(int & map_before, fast_lio::TimeAdmissionAccounting 
       observer,
       fast_lio::AdmissionMapKind::kRecoveryAdd,
       [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
-      [] { return fast_lio::addScanSeed(ikdtree, feats_down_world->points, lifecycle_scan_seq); });
+      [&] { return fast_lio::addScanSeed(ikdtree, feats_down_world->points, seed_scan_seq); });
     kept_prior = true;
   } else
 #endif
@@ -2986,8 +2989,12 @@ bool rebuildLocalMapStorage(int & map_before, fast_lio::TimeAdmissionAccounting 
       observer,
       fast_lio::AdmissionMapKind::kRecoveryBuild,
       [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
-      [] { return fast_lio::buildScanMap(ikdtree, feats_down_world->points, lifecycle_scan_seq); });
+      [&] { return fast_lio::buildScanMap(ikdtree, feats_down_world->points, seed_scan_seq); });
   }
+#if defined(FASTLIO_TEST_HOOKS) && defined(USE_IVOX)
+  if (seed_scan_seq == 0)
+    fast_lio_test::assertPreReferenceSeedUnlabelled(ikdtree, feats_down_world->points, lifecycle_scan_seq);
+#endif
   Localmap_Initialized = false;
   return kept_prior;
 }
@@ -3002,9 +3009,9 @@ void dispatchMapAdd(PointVector & downsampled, PointVector & direct)
 {
   dispatchMapAdd(downsampled, direct, nullptr);
 }
-bool rebuildLocalMapStorage(int & before)
+bool rebuildLocalMapStorage(int & before, std::uint64_t seed_scan_seq)
 {
-  return rebuildLocalMapStorage(before, nullptr);
+  return rebuildLocalMapStorage(before, seed_scan_seq, nullptr);
 }
 #endif
 
@@ -4901,7 +4908,12 @@ private:
       fast_lio::resetRecoveryReference(&recovery_state, fast_lio::traceNs(lidar_end_time), recovery_params),
       fast_lio::traceNs(lidar_end_time));
     int map_before = 0;
-    const bool kept_prior = rebuildLocalMapStorage(map_before, admissionObserver());
+    std::uint64_t seed_scan_seq = lifecycle_scan_seq;
+#ifdef FASTLIO_TEST_HOOKS
+    if (std::strcmp(tag, "TEST_PRE_REFERENCE") == 0)
+      seed_scan_seq = 0;
+#endif
+    const bool kept_prior = rebuildLocalMapStorage(map_before, seed_scan_seq, admissionObserver());
     const auto prior =
       fast_lio::priorMapAfterReset(prior_map_installed_, kept_prior, params_.values().prior_map_freeze);
 #ifdef FASTLIO_TEST_HOOKS

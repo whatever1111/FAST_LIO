@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -35,6 +36,7 @@
 
 // The node's roll/pitch consider verdict for its scan, which the H-model exit record carries.
 extern bool rp_consider_active;
+extern std::uint64_t lifecycle_scan_seq;
 
 namespace fast_lio_test
 {
@@ -173,6 +175,18 @@ bool gatePrior(fast_lio::MeasurementTelemetry & telemetry,
   return gate_on;
 }
 
+void prepareIdentities(fast_lio::MeasurementScratch & scratch, const fast_lio::MeasurementInputs & inputs)
+{
+  scratch.identity_status = fast_lio::mapPointIdentityStatus(inputs.map);
+  if (scratch.identity_status != fast_lio::MapIdentityStatus::kOk)
+    return;
+  const std::size_t count = scratch.Nearest_Points.size();
+  if (scratch.Nearest_Identities.size() != count)
+    scratch.Nearest_Identities.resize(count);
+  for (auto & identities : scratch.Nearest_Identities)
+    identities.reserve(NUM_MATCH_POINTS);
+}
+
 /** closest surface search and residual computation **/
 void matchPoints(fast_lio::MeasurementScratch & scratch,
                  const fast_lio::FrontendParams & params,
@@ -217,7 +231,11 @@ void matchPoints(fast_lio::MeasurementScratch & scratch,
     if (searching) {
       // A failed search/fit must not leave the previous neighbourhood usable.
       cached_plane.invalidate();
-      inputs.map.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+      if (scratch.identity_status == fast_lio::MapIdentityStatus::kOk)
+        fast_lio::nearestSearchIdentified(
+          inputs.map, point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis, scratch.Nearest_Identities[i]);
+      else
+        inputs.map.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
       if (points_near.size() >= NUM_MATCH_POINTS && pointSearchSqDis[NUM_MATCH_POINTS - 1] <= 5) {
         cached_plane.fit<NUM_MATCH_POINTS>(points_near, 0.1f, std::sqrt(p_body.norm()));
       }
@@ -919,6 +937,7 @@ void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state,
   const bool searching = decideSearch(scratch_, telemetry_, params_, outputs, state, data);
   Eigen::Matrix<double, 6, 6> gate_P6 = Eigen::Matrix<double, 6, 6>::Zero();
   const bool gate_on = gatePrior(telemetry_, params_, inputs, gate_P6);
+  prepareIdentities(scratch_, inputs);
   matchPoints(scratch_, params_, inputs, state, searching, gate_on, gate_P6);
   applyGateAndKernels(scratch_, telemetry_, params_, inputs, gate_on);
   recoverGround(scratch_, telemetry_, params_, inputs);
@@ -930,6 +949,15 @@ void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state,
       static_cast<std::size_t>(inputs.point_count), inputs.scan_end_time, outputs.effective_rows);
   if (fast_lio_test::afterHModelSelection)
     fast_lio_test::reportHModelSelection(scratch_, telemetry_, inputs, outputs, data.converge, searching);
+  if (scratch_.identity_status == fast_lio::MapIdentityStatus::kOk && fast_lio_test::afterHModelIdentities) {
+    for (std::size_t i = 0; i < scratch_.Nearest_Points.size(); ++i)
+      assert(scratch_.Nearest_Identities[i].size() == scratch_.Nearest_Points[i].size());
+    fast_lio_test::afterHModelIdentities(inputs.scan_end_time,
+                                         outputs.iterations,
+                                         lifecycle_scan_seq,
+                                         *fast_lio::mapGeneration(inputs.map),
+                                         scratch_.Nearest_Identities);
+  }
 #endif
 
   observePosition(scratch_, telemetry_, outputs);

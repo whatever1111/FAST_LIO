@@ -121,6 +121,8 @@ struct MeasurementScratch
   std::vector<double> corr_weight;                 // per effective row
   double total_residual = 0.0;                     // the effective rows' residual sum on this evaluation
   std::vector<PointVector> Nearest_Points;         // each point's neighbours from its last search
+  std::vector<std::vector<fast_lio::MapPointIdentity>> Nearest_Identities;
+  fast_lio::MapIdentityStatus identity_status = fast_lio::MapIdentityStatus::kDisabled;
   // The neighbour set only moves on the iterations that search, so the 5x3 plane fit and the body-range scale in the
   // residual gate are invariant in between and are kept per point.
   std::vector<fast_lio::CachedPlane, Eigen::aligned_allocator<fast_lio::CachedPlane>> plane_cache;
@@ -192,6 +194,16 @@ public:
   const MeasurementTelemetry & telemetry() const { return telemetry_; }
   /// Each point's neighbours from its last search, for the map update.
   const std::vector<PointVector> & nearestPoints() const { return scratch_.Nearest_Points; }
+  fast_lio::MapIdentityStatus identityStatus() const { return scratch_.identity_status; }
+  /// kOk: [i][j] identifies nearestPoints()[i][j], in the same search order. Cached searches
+  /// reuse both arrays. Disabled/unsupported: empty, without allocating identity storage.
+  /// Value copies, readable on the scan thread even during worker additions, valid until
+  /// the next scan's first evaluate(). Ground-recovery neighbours are not fitted supports.
+  /// Any unlabelled fitted support makes the entire update unavailable to ancestry consumers.
+  const std::vector<std::vector<fast_lio::MapPointIdentity>> & nearestIdentities() const
+  {
+    return scratch_.Nearest_Identities;
+  }
   /// The last evaluation's effective points, body frame.
   const PointCloudXYZI & effectCloud() const { return scratch_.laserCloudOri; }
 

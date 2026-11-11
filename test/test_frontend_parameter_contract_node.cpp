@@ -519,7 +519,8 @@ void appendEffective(std::ostringstream & record, const std::string & case_name)
 std::string recordCase(const ParameterCase & c)
 {
   // The node reads these at construction; the configuration under test is only what the case gives.
-  for (const char * name : {"FLIO_ASYNC_MAP", "FLIO_OFFLINE_STEP", "FLIO_LIDAR_QDEPTH", "FLIO_IKD_PROFILE"})
+  for (const char * name :
+       {"FLIO_ASYNC_MAP", "FLIO_OFFLINE_STEP", "FLIO_LIDAR_QDEPTH", "FLIO_IKD_PROFILE", "FLIO_MAP_POINT_IDENTITY"})
     ::unsetenv(name);
   const std::string raw_effective =
     std::string(FASTLIO_CONTRACT_RESULTS) + "/frontend_contract/" + kFixture + "/" + c.name + ".effective_raw.tsv";

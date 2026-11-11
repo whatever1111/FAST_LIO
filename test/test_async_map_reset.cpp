@@ -2,6 +2,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <gtest/gtest.h>
 #include <mutex>
@@ -21,7 +22,7 @@ extern int feats_down_size;
 extern void startMapWorker();
 extern void stopMapWorker();
 extern void dispatchMapAdd(PointVector &, PointVector &);
-extern bool rebuildLocalMapStorage(int &);
+extern bool rebuildLocalMapStorage(int &, std::uint64_t);
 
 namespace
 {
@@ -113,7 +114,7 @@ void expectResetWaitsForTheWorker(int delayScans)
   }
   auto reset = std::async(std::launch::async, [&] {
     int before = 0;
-    const bool kept = rebuildLocalMapStorage(before);
+    const bool kept = rebuildLocalMapStorage(before, 0);  // fixture cloud: no staging scan
     return std::make_pair(before, kept);
   });
   const auto resetArrived = resetEntered.get_future().wait_for(5s);
@@ -174,7 +175,7 @@ void expectResetWithoutTheWorker(int delayScans)
     pendingAtDiscard = map_insert_pending.pendingSize();
   };
   int before = 0;
-  const bool kept = rebuildLocalMapStorage(before);
+  const bool kept = rebuildLocalMapStorage(before, 0);  // fixture cloud: no staging scan
   fast_lio_test::beforeResetJoin = {};
   fast_lio_test::afterPendingReset = {};
 

@@ -703,6 +703,66 @@ TEST(ConsiderSourceFilter, X6TypedRawCannotChangeNamesOrReturnAsFresh)
   EXPECT_EQ(filter.proposeAppliedGain({old}, Eigen::MatrixXd::Constant(1, 1, 0.5)).status(), Status::kIdentityConflict);
 }
 
+TEST(ConsiderSourceFilter, X6FirstReuseRegistrationCannotBypassRawWatermark)
+{
+  const auto initial = prior();
+  ConsiderSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial, budget()), Status::kOk);
+  auto first = factor(initial.active, {}, "first");
+  first.identity.typedRaw = {{"first/raw", {7, 10, 0}}};
+  apply(filter, first, 0.5);
+  auto old = factor(initial.active, {}, "old");
+  auto copy = reuse(old, "echo", {8, 11, 0}, 1);
+  // reuse() names ordinal 1: it is not fresh and has no earlier budget record.
+  const auto before = filter.ledgerIdentity();
+  EXPECT_EQ(filter.proposeAppliedGain({old}, Eigen::MatrixXd::Constant(1, 1, 0.5), {copy}).status(),
+            Status::kLedgerCompacted);
+  EXPECT_EQ(filter.ledgerIdentity(), before);
+  EXPECT_EQ(filter.reuseCount(copy.use.raw), 0U);
+}
+
+TEST(ConsiderSourceFilter, X6CompactionFollowsTheWholeTypedBatch)
+{
+  const auto initial = prior();
+  auto limits = budget();
+  limits.recentLedger = 1;
+  ConsiderSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial, limits), Status::kOk);
+  std::vector<LinearFactor> inputs;
+  constexpr std::uint32_t kFactors = 3;
+  for (std::uint32_t sub = 0; sub < kFactors; ++sub) {
+    inputs.push_back(factor(initial.active, {}, "factor" + std::to_string(sub)));
+    inputs.back().identity.sequence = RawId{10, 1, sub};
+    inputs.back().identity.typedRaw = {{inputs.back().identity.rawAncestry.front(), {20, 1, sub}}};
+  }
+  auto candidate = filter.proposeAppliedGain(inputs, Eigen::MatrixXd::Constant(1, kFactors, 0.25));
+  ASSERT_EQ(candidate.status(), Status::kOk);
+  ASSERT_EQ(filter.commit(std::move(candidate)), Status::kOk);
+  EXPECT_DOUBLE_EQ((*filter.activeCovariance())(0, 0), 0.25);
+  EXPECT_EQ(filter.proposeAppliedGain({inputs.back()}, Eigen::MatrixXd::Constant(1, 1, 0.25)).status(), Status::kNoOp);
+  const auto before = filter.ledgerIdentity();
+  EXPECT_EQ(filter.proposeAppliedGain({inputs.front()}, Eigen::MatrixXd::Constant(1, 1, 0.25)).status(),
+            Status::kLedgerCompacted);
+  EXPECT_EQ(filter.ledgerIdentity(), before);
+}
+
+TEST(ConsiderSourceFilter, X6OpaqueHistoryCannotEvictTheNewestTypedPayload)
+{
+  const auto initial = prior();
+  auto limits = budget();
+  limits.recentLedger = 1;
+  ConsiderSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial, limits), Status::kOk);
+  apply(filter, factor(initial.active, {}, "opaque"), 0.5);
+  auto input = factor(initial.active, {}, "typed");
+  input.identity.sequence = RawId{1, 1, 0};
+  input.identity.typedRaw = {{"typed/raw", {2, 1, 0}}};
+  const auto before = filter.ledgerIdentity();
+  EXPECT_EQ(filter.proposeAppliedGain({input}, Eigen::MatrixXd::Constant(1, 1, 0.5)).status(),
+            Status::kModelCapacityExceeded);
+  EXPECT_EQ(filter.ledgerIdentity(), before);
+}
+
 TEST(ConsiderSourceFilter, X7TypedRetirementHasNoPerSource128TombstoneCap)
 {
   ConsiderSourceFilter filter;

@@ -795,8 +795,11 @@ Status ancestry(const Metadata & data, const FactorIdentity & identity, const Wa
     const auto typed = std::find_if(
       identity.typedRaw.begin(), identity.typedRaw.end(), [&](const TypedRaw & binding) { return binding.raw == raw; });
     const bool reused = typed != identity.typedRaw.end() &&
-                        std::any_of(identity.reuse.begin(), identity.reuse.end(), [&](const ReuseUse & use) {
-                          return use.raw == typed->identity;
+                        std::any_of(identity.reuse.begin(),
+                                    identity.reuse.end(),
+                                    [&](const ReuseUse & use) { return use.raw == typed->identity; }) &&
+                        std::any_of(data.noises.begin(), data.noises.end(), [&](const NoiseModel & model) {
+                          return model.use.raw == typed->identity;
                         });
     if (!routed && !reused) {
       if (typed != identity.typedRaw.end() && atOrBelow(priorHigh, typed->identity))
@@ -808,7 +811,20 @@ Status ancestry(const Metadata & data, const FactorIdentity & identity, const Wa
   return Status::kOk;
 }
 
-Status appendLedger(Metadata & data, const FactorIdentity & identity, const Budget & budget)
+Status compactRecent(Metadata & data, const Budget & budget)
+{
+  while (data.recent.size() > budget.recentLedger) {
+    const auto old = std::find_if(
+      data.recent.begin(), data.recent.end(), [](const FactorIdentity & item) { return item.sequence.has_value(); });
+    if (old == data.recent.end() || old == std::prev(data.recent.end()))
+      return Status::kModelCapacityExceeded;
+    raise(data.compacted, *old->sequence);
+    data.recent.erase(old);
+  }
+  return Status::kOk;
+}
+
+Status appendLedger(Metadata & data, const FactorIdentity & identity)
 {
   if (data.remainders.count(identity.remainderKey) != 0)
     return Status::kUnsupportedNoiseStructure;
@@ -818,14 +834,6 @@ Status appendLedger(Metadata & data, const FactorIdentity & identity, const Budg
       })) >= kMaxLedger)
     return Status::kModelCapacityExceeded;
   data.recent.push_back(identity);
-  while (data.recent.size() > budget.recentLedger) {
-    const auto old = std::find_if(
-      data.recent.begin(), data.recent.end(), [](const FactorIdentity & item) { return item.sequence.has_value(); });
-    if (old == data.recent.end())
-      return Status::kModelCapacityExceeded;
-    raise(data.compacted, *old->sequence);
-    data.recent.erase(old);
-  }
   data.remainders.insert(identity.remainderKey);
   for (const auto & raw : identity.rawAncestry)
     data.consumedRaw.insert(raw);
@@ -858,7 +866,8 @@ Status sideFormats(const std::vector<LinearFactor> & factors,
       return RawLess{}(a.first, b.first) || (a.first == b.first && RawLess{}(a.second, b.second));
     });
   for (const auto & noise : noises) {
-    if (!copies.insert({noise.use.raw, noise.use.frame}).second || !validCoordinates(noise.coordinates) ||
+    if (!validKey(noise.use.owner.key) || noise.use.totalUses == 0 ||
+        !copies.insert({noise.use.raw, noise.use.frame}).second || !validCoordinates(noise.coordinates) ||
         !validKey(noise.evidence) || noise.factors.empty())
       return Status::kInvalidIdentity;
     if (noise.knowledge != MomentKnowledge::kKnown)
@@ -1034,12 +1043,12 @@ Status consume(Metadata & data,
       return status;
     if (const auto status = sensitivityBindings(data, identity, sensitivities); status != Status::kOk)
       return status;
-    if (const auto status = appendLedger(data, identity, budget); status != Status::kOk)
+    if (const auto status = appendLedger(data, identity); status != Status::kOk)
       return status;
     selected += input.h.rows();
     batch.fresh.push_back(i);
   }
-  return batch.fresh.empty() ? Status::kNoOp : Status::kOk;
+  return batch.fresh.empty() ? Status::kNoOp : compactRecent(data, budget);
 }
 
 Status assemble(const Metadata & data,
@@ -1422,7 +1431,7 @@ Status processSensitivities(const Metadata & data,
 {
   std::set<std::string> keys;
   for (const auto & input : inputs) {
-    if (!keys.insert(input.sensitivity).second)
+    if (!validKey(input.sensitivity) || !keys.insert(input.sensitivity).second)
       return Status::kInvalidIdentity;
     const auto model =
       std::find_if(data.sensitivities.begin(), data.sensitivities.end(), [&](const SensitivityModel & value) {
@@ -1506,7 +1515,7 @@ Status ConsiderSourceFilter::propagate(const Eigen::MatrixXd & phi,
     const auto auditDof = sumBytes(copiesDof, static_cast<std::size_t>(n + n + std::min(s, kMaxSourceDof)));
     std::size_t sensitivityBytes = 0;
     for (const auto & input : sensitivities)
-      sensitivityBytes = sumBytes(sensitivityBytes, matrixBytes(input.loading));
+      sensitivityBytes = sumBytes(sensitivityBytes, matrixBytes(input.loading) + textBytes(input.sensitivity));
     Reservation reservation;
     if (!reservation.acquire(
           impl_->account,

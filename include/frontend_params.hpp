@@ -215,6 +215,10 @@ struct FrontendParams
   // reset_map = rebuild the local map here, fault_exit = die and let the
   // supervisor restart the pipeline.
   std::string runaway_on_trip = "hold";
+  // An input stamp more than a second behind its stream's newest latches the input-epoch guard: estimator and map
+  // state hold the old clock epoch, and only a restart clears them. hold = stop input and odometry and log it every
+  // 10 s, fault_exit = die and let the supervisor restart the pipeline.
+  std::string input_epoch_on_fault = "hold";
   // [v10] The covariance side of a velocity assignment (covariance_reset.hpp); laserMapping.cpp documents it beside
   // zupt_vel_reset_sigma.
   double guard_vel_reset_sigma = 0.0;  // m/s; a discarded velocity: engulfment release, hole clamp, runaway/parked

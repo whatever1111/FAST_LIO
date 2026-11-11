@@ -227,8 +227,9 @@ struct Scenario
   bool capture_raw_state = false;    // startup-only: snapshot at scope exit or an unlocked empty-IMU drop
   bool capture_tf_graph = false;     // independent old-output and disabled-publisher evidence
   bool wait_for_reference_repeat = false;
-  int external_pose_ack = -1;  // DDS observer in a separate process; warm-up must be acknowledged before stimuli
-  bool view_probe = false;     // the entry view's matches and every map insertion, as [VIEW-PROBE] lines
+  bool final_scan_path = false;  // the scan path runs once more after the last slot, unless the context has ended
+  int external_pose_ack = -1;    // DDS observer in a separate process; warm-up must be acknowledged before stimuli
+  bool view_probe = false;       // the entry view's matches and every map insertion, as [VIEW-PROBE] lines
 };
 
 struct Observation
@@ -301,6 +302,7 @@ struct ChildResult
   std::vector<PosePublication> pose_publications;
   std::vector<geometry_msgs::msg::TransformStamped> transforms;
   std::uint64_t reference_publishers_before = 0, reference_publishers_after = 0;
+  std::uint8_t context_ok = 0;  // the producer's context was still valid after the last slot
 
   bool ok() const { return WIFEXITED(status) && WEXITSTATUS(status) == 0 && error.empty(); }
   std::string describe() const
@@ -691,6 +693,9 @@ public:
       if (target == 0 || !spinUntil([&] { return repeated_reference_states_.count(target) != 0; }))
         error = "the final no-pose reference state was never actually repeated without input";
     }
+    if (error.empty() && scenario_.final_scan_path && rclcpp::ok())
+      error = runScanPath("the scan path after the last slot");
+    context_ok_ = rclcpp::ok() ? 1u : 0u;
     if (rclcpp::ok())
       reference_publishers_after_ = observer_->count_publishers("/lio_slam/reference_health");
     teardown();
@@ -736,6 +741,7 @@ public:
       writeString(fd, bytes);
     writeAll(fd, &reference_publishers_before_, sizeof(reference_publishers_before_));
     writeAll(fd, &reference_publishers_after_, sizeof(reference_publishers_after_));
+    writeAll(fd, &context_ok_, sizeof(context_ok_));
   }
 
 private:
@@ -1492,6 +1498,7 @@ private:
   std::vector<std::string> tf_cdr_;
   std::set<std::int64_t> tf_stamps_;
   std::uint64_t reference_publishers_before_ = 0, reference_publishers_after_ = 0;
+  std::uint8_t context_ok_ = 0;
   std::uint64_t last_reference_state_ = 0;
   std::set<std::uint64_t> repeated_reference_states_;
   std::set<std::uint64_t> reference_scans_;
@@ -1820,7 +1827,8 @@ ChildResult runScenario(const Scenario & scenario)
     result.transforms.push_back(std::move(message));
   }
   if (!reader.take(&result.reference_publishers_before, sizeof(result.reference_publishers_before)) ||
-      !reader.take(&result.reference_publishers_after, sizeof(result.reference_publishers_after)))
+      !reader.take(&result.reference_publishers_after, sizeof(result.reference_publishers_after)) ||
+      !reader.take(&result.context_ok, sizeof(result.context_ok)))
     result.error = "child publisher graph counts truncated";
   // Every R1 message a scenario receives, a StateRepeat included, is one the consumer can decode.
   if (scenario.reference && !faultsInputEpoch(scenario)) {
@@ -4750,6 +4758,32 @@ TEST(AnchorLifecycleInputs, AnInputClockFaultEndsTheAnchorAndStopsTheScanPath)
   EXPECT_EQ(counterValue(r, "time_epoch"), "1");
   EXPECT_EQ(counterValue(r, "invalidated_time_epoch"), "1");
   EXPECT_EQ(counterValue(r, "scans"), std::to_string(r.observations.size()));
+}
+
+// What the latched guard does next is input_epoch_on_fault's: hold keeps the stopped node up, fault_exit shuts its
+// context down from the scan path so the supervisor restarts the pipeline. The fault's slot sends no cloud, which
+// could not be delivered once the context has ended.
+TEST(AnchorLifecycleInputs, AnInputClockFaultShutsTheNodeDownOnlyUnderFaultExit)
+{
+  for (const std::string policy : {"hold", "fault_exit"}) {
+    SCOPED_TRACE(policy);
+    Scenario scenario = inputScenario("input_epoch_" + policy);
+    append(scenario, 5, slot(Phase::kBefore));
+    Step event = slot(Phase::kEvent);
+    event.clock_back = true;
+    event.cloud = Cloud::kNone;
+    event.expect_scan = false;
+    scenario.steps.push_back(event);
+    scenario.final_scan_path = true;
+    setParam(scenario, rclcpp::Parameter("input_epoch_on_fault", policy));
+    const ChildResult r = runScenario(scenario);
+    SCOPED_TRACE(describeRun(r));
+    ASSERT_TRUE(r.ok());
+    EXPECT_FALSE(r.phase(Phase::kBefore).empty());
+    EXPECT_TRUE(r.phase(Phase::kEvent).empty()) << "a scan was taken after the fault";
+    EXPECT_EQ(counterValue(r, "time_epoch"), "1");
+    EXPECT_EQ(r.context_ok != 0, policy == "hold");
+  }
 }
 
 // With a wheel sample required, the static verdict is "unknown" without one, and whenever the newest one is stale,

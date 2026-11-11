@@ -96,4 +96,31 @@ private:
   bool faulted_ = false;
 };
 
+// One per input stream, consulted before InputEpochGuard with the same baseline: the stream's last accepted stamp
+// (< 0 before the first one). A stamp more than max_lead_s past it is held back instead of becoming the baseline.
+// Taken as it is, one corrupt stamp ahead would make every later sample look like a rollback past the guard's bound
+// and latch it. The next sample decides. Back within max_lead_s of the baseline, the held stamp was a lone bad one
+// and only that sample is lost. Within max_lead_s after the held stamp, the stream really moved on (an outage ended,
+// or its clock stepped forward): it continues from there, one sample short. Any other sample is held in its place.
+// A rollback is not this filter's business; it passes, and the guard judges it.
+class InputLeadFilter
+{
+public:
+  bool admit(double previous, double current, double max_lead_s)
+  {
+    const bool lead = previous >= 0.0 && std::isfinite(current) && current - previous > max_lead_s;
+    if (!lead) {
+      held_ = kNone;
+      return true;
+    }
+    const bool confirms = held_ >= 0.0 && current >= held_ && current - held_ <= max_lead_s;
+    held_ = confirms ? kNone : current;
+    return confirms;
+  }
+
+private:
+  static constexpr double kNone = -1.0;
+  double held_ = kNone;
+};
+
 }  // namespace fast_lio

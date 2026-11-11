@@ -72,6 +72,7 @@ struct RecoveryParameterSpecs
   const ParameterSpec<double> runaway_wheel_speed_margin{"runaway_wheel_speed_margin", 1.0, 1.0};
   const ParameterSpec<double> runaway_hold_sec{"runaway_hold_sec", 3.0, 3.0};
   const ParameterSpec<std::string> runaway_on_trip{"runaway_on_trip", "hold", std::string("hold")};
+  const ParameterSpec<std::string> input_epoch_on_fault{"input_epoch_on_fault", "hold", std::string("hold")};
   const DeclaredValueSpec<bool> lost_recovery_en{"lost_recovery_en", false, true};
   const DeclaredValueSpec<double> lost_recovery_stable_sec{"lost_recovery_stable_sec", 2.0, true};
 };

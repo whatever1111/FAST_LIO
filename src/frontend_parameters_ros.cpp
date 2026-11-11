@@ -249,6 +249,7 @@ void FrontendParameters::declareRunawayToPreprocess(rclcpp::Node & node)
   declareOnly(node, recovery.runaway_wheel_speed_margin);
   declareOnly(node, recovery.runaway_hold_sec);
   declareOnly(node, recovery.runaway_on_trip);
+  declareOnly(node, recovery.input_epoch_on_fault);
   declareOnly(node, measurement.canopy_near_range);
   declareOnly(node, measurement.canopy_ground_z);
   declareOnly(node, measurement.canopy_ground_halfband);
@@ -763,6 +764,13 @@ void FrontendParameters::readRunaway(const rclcpp::Node & node,
   readInto(node, recovery.runaway_wheel_speed_margin, values_.runaway.wheel_speed_margin);
   readInto(node, recovery.runaway_hold_sec, values_.runaway.hold_sec);
   readInto(node, recovery.runaway_on_trip, values_.runaway_on_trip);
+  readInto(node, recovery.input_epoch_on_fault, values_.input_epoch_on_fault);
+  if (values_.input_epoch_on_fault != "hold" && values_.input_epoch_on_fault != "fault_exit") {
+    RCLCPP_FATAL(node.get_logger(),
+                 "input_epoch_on_fault must be 'hold' or 'fault_exit', got '%s'",
+                 values_.input_epoch_on_fault.c_str());
+    throw std::invalid_argument("input_epoch_on_fault");
+  }
   values_.runaway.wheel_max_age = zupt_wheel_max_age;
   // 轮速要先自己报出运动,才有资格指认跑飞:恒 0 的速度源(m20 的 /lio/twist 是 GNSS
   // 代理,拒止段整段读 0)否则会把正常行走判成跑飞。

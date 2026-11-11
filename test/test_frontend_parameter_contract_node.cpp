@@ -1559,6 +1559,23 @@ TEST(FrontendParameterContract, FloorModeUnknown)
                {rclcpp::Parameter("degeneracy_floor_mode", std::string("weighting"))});
 }
 
+TEST(FrontendParameterContract, InputEpochOnFaultUnknown)
+{
+  // reset_map is a runaway action, not an input-epoch one: a typo must not fall back to hold.
+  checkRefused("input_epoch_on_fault_unknown",
+               "input_epoch_on_fault",
+               {rclcpp::Parameter("input_epoch_on_fault", std::string("reset_map"))});
+}
+
+TEST(FrontendParameterContract, InputEpochOnFaultExit)
+{
+  ParameterCase c = overridesCase("input_epoch_on_fault_exit", Expect::kConstructed);
+  setOverride(c, rclcpp::Parameter("input_epoch_on_fault", std::string("fault_exit")));
+  std::string record;
+  checkCase(c, &record);
+  EXPECT_NE(record.find("\neffective.v1 input_epoch_on_fault string[10] \"fault_exit\""), std::string::npos) << record;
+}
+
 TEST(FrontendParameterContract, FloorFalseKeepRateOutOfRange)
 {
   checkRefused("floor_false_keep_rate_out_of_range",

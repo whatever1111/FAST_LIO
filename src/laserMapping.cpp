@@ -851,8 +851,9 @@ void clearBufferedInputsLocked()
 
 // Caller holds mtx_buffer; all ingestion/sync callbacks share one mutually
 // exclusive group. A full estimator/map reset requires explicit restart, not
-// an automatic gravity reinitialization on a possibly moving platform.
-bool acceptInputEpoch(double previous, double current, const char * source)
+// an automatic gravity reinitialization on a possibly moving platform. `lead`
+// is the calling stream's own filter for stamps far ahead (scan_time_policy.hpp).
+bool acceptInputEpoch(double previous, double current, const char * source, fast_lio::InputLeadFilter & lead)
 {
   if (!imu_fifo_transaction.acceptsInput(input_epoch_guard.faulted())) {
     if (std::strcmp(source, "imu") == 0)
@@ -864,6 +865,22 @@ bool acceptInputEpoch(double previous, double current, const char * source)
   }
   const bool already_faulted = input_epoch_guard.faulted();
   constexpr double kInputEpochRollbackSec = 1.0;
+  // Longer than any hole the front end bridges on its own (the IMU backlog bound is 10 s as well), so a normal
+  // stream never meets it; a stamp far in the future only costs its own sample.
+  constexpr double kInputEpochLeadSec = 10.0;
+  if (!lead.admit(previous, current, kInputEpochLeadSec)) {
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
+                         input_time_log_clock,
+                         5000,
+                         "[INPUT-TIME] %s stamp %.9f is %.3f s past the stream's newest %.9f: dropped, and the next "
+                         "sample shows whether the stream moved on",
+                         source,
+                         current,
+                         current - previous,
+                         previous);
+    frontendDrop();
+    return false;
+  }
   if (input_epoch_guard.observe(previous, current, kInputEpochRollbackSec))
     return true;
   frontendDrop(lidar_buffer.size() + imu_buffer.size() + 1);
@@ -883,7 +900,7 @@ bool acceptInputEpoch(double previous, double current, const char * source)
   return false;
 }
 
-void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
+void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg, fast_lio::InputLeadFilter & lead)
 {
   const auto receive_time = SteadyClock::now();
   if (!diag_first_lidar_cb_logged) {
@@ -895,7 +912,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
   mtx_buffer.lock();
   scan_count++;
   double cur_time = get_time_sec(msg->header.stamp);
-  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar")) {
+  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar", lead)) {
     mtx_buffer.unlock();
     if (frontend_observation_en)
       publishFrontendObservation(false);
@@ -943,7 +960,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 // Direct subscriber for shm_msgs/PointCloud8mAndPose (/pre/all_point). Decodes the
 // fixed 8MB buffer in place (no relay node, no extra DDS hop) — same buffering path
 // as standard_pcl_cbk, just a different message type handed to Preprocess.
-void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
+void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg, fast_lio::InputLeadFilter & lead)
 {
   const auto receive_time = SteadyClock::now();
   if (!diag_first_lidar_cb_logged) {
@@ -955,7 +972,7 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
   mtx_buffer.lock();
   scan_count++;
   double cur_time = get_time_sec(msg->header.stamp);
-  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar")) {
+  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar", lead)) {
     mtx_buffer.unlock();
     if (frontend_observation_en)
       publishFrontendObservation(false);
@@ -994,7 +1011,7 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg)
 
 double timediff_lidar_wrt_imu = 0.0;
 bool timediff_set_flg = false;
-void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg, fast_lio::InputLeadFilter & lead)
 {
   const auto receive_time = SteadyClock::now();
   if (!diag_first_lidar_cb_logged) {
@@ -1005,7 +1022,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
   }
   mtx_buffer.lock();
   double cur_time = get_time_sec(msg->header.stamp);
-  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar")) {
+  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar", lead)) {
     mtx_buffer.unlock();
     if (frontend_observation_en)
       publishFrontendObservation(false);
@@ -1058,7 +1075,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
 void checkAnchorEvidenceOnImu(double imu_stamp, bool scan_waiting);
 
-void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stamp)
+void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stamp, fast_lio::InputLeadFilter & lead)
 {
   publish_count++;
   if (!diag_first_imu_cb_logged) {
@@ -1072,7 +1089,7 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
   double timestamp = get_time_sec(msg->header.stamp);
 
   mtx_buffer.lock();
-  if (!acceptInputEpoch(last_timestamp_imu, timestamp, "imu")) {
+  if (!acceptInputEpoch(last_timestamp_imu, timestamp, "imu", lead)) {
     mtx_buffer.unlock();
     if (frontend_observation_en)
       publishFrontendObservation(false);
@@ -1105,14 +1122,14 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
     publishFrontendObservation(false);
 }
 
-void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in, fast_lio::InputLeadFilter & lead)
 {
   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
   msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
   if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en) {
     msg->header.stamp = rclcpp::Time(timediff_lidar_wrt_imu + get_time_sec(msg_in->header.stamp));
   }
-  enqueue_imu_msg(msg, get_time_sec(msg_in->header.stamp));
+  enqueue_imu_msg(msg, get_time_sec(msg_in->header.stamp), lead);
 }
 
 void imu_bias_cbk(const fixposition_driver_msgs::msg::FpaImubias::UniquePtr msg_in)
@@ -1136,7 +1153,7 @@ void imu_bias_cbk(const fixposition_driver_msgs::msg::FpaImubias::UniquePtr msg_
   }
 }
 
-void imu_fpa_cbk(const fixposition_driver_msgs::msg::FpaImu::UniquePtr msg_in)
+void imu_fpa_cbk(const fixposition_driver_msgs::msg::FpaImu::UniquePtr msg_in, fast_lio::InputLeadFilter & lead)
 {
   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(msg_in->data));
   msg->header.stamp = get_ros_time(get_time_sec(msg_in->data.header.stamp) + imu_time_offset);
@@ -1161,7 +1178,7 @@ void imu_fpa_cbk(const fixposition_driver_msgs::msg::FpaImu::UniquePtr msg_in)
                 get_time_sec(msg->header.stamp));
     diag_first_fixposition_bias_applied_logged = true;
   }
-  enqueue_imu_msg(msg, get_time_sec(msg_in->data.header.stamp));
+  enqueue_imu_msg(msg, get_time_sec(msg_in->data.header.stamp), lead);
 }
 
 void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
@@ -4038,15 +4055,19 @@ private:
   {
     /*** ROS subscribe initialization ***/
     if (p_pre->lidar_type == AVIA) {
-      sub_pcl_livox_ =
-        this->create_subscription<livox_ros_driver2::msg::CustomMsg>(startup.lid_topic, 20, livox_pcl_cbk);
+      sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+        startup.lid_topic, 20, [this](livox_ros_driver2::msg::CustomMsg::UniquePtr msg) {
+          livox_pcl_cbk(std::move(msg), lidar_input_lead_);
+        });
     } else if (p_pre->lidar_type == ALLPOINT) {
       // /pre/all_point is published RELIABLE with fixed 8MB messages; a small
       // reliable KeepLast queue matches the bag publisher and bounds memory
       // (a few buffered scans) while avoiding silent drops of whole scans.
       rclcpp::QoS shm_qos(rclcpp::KeepLast(5));
-      sub_pcl_shm_ =
-        this->create_subscription<shm_msgs::msg::PointCloud8mAndPose>(startup.lid_topic, shm_qos, shm_allpoint_cbk);
+      sub_pcl_shm_ = this->create_subscription<shm_msgs::msg::PointCloud8mAndPose>(
+        startup.lid_topic, shm_qos, [this](shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg) {
+          shm_allpoint_cbk(std::move(msg), lidar_input_lead_);
+        });
       RCLCPP_INFO(this->get_logger(),
                   "shm allpoint mode: subscribing %s (shm_msgs/PointCloud8mAndPose)",
                   startup.lid_topic.c_str());
@@ -4067,13 +4088,17 @@ private:
       // best-effort deep-queue diagnostic override.
       rclcpp::QoS pc_qos = qdepth > 0 ? rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(qdepth))).best_effort()
                                       : rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
-      sub_pcl_pc_ =
-        this->create_subscription<sensor_msgs::msg::PointCloud2>(startup.lid_topic, pc_qos, standard_pcl_cbk);
+      sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+        startup.lid_topic, pc_qos, [this](sensor_msgs::msg::PointCloud2::UniquePtr msg) {
+          standard_pcl_cbk(std::move(msg), lidar_input_lead_);
+        });
     }
     if (startup.imu_input_type == "fixposition_fpa") {
       auto imu_qos = rclcpp::SensorDataQoS();
-      sub_imu_fpa_ =
-        this->create_subscription<fixposition_driver_msgs::msg::FpaImu>(startup.imu_topic, imu_qos, imu_fpa_cbk);
+      sub_imu_fpa_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImu>(
+        startup.imu_topic, imu_qos, [this](fixposition_driver_msgs::msg::FpaImu::UniquePtr msg) {
+          imu_fpa_cbk(std::move(msg), imu_input_lead_);
+        });
       sub_imu_bias_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImubias>(
         startup.imu_bias_topic, imu_qos, imu_bias_cbk);
       RCLCPP_INFO(this->get_logger(),
@@ -4082,7 +4107,10 @@ private:
                   startup.imu_bias_topic.c_str(),
                   imu_time_offset);
     } else {
-      sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(startup.imu_topic, 1000, imu_cbk);
+      sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
+        startup.imu_topic, 1000, [this](sensor_msgs::msg::Imu::UniquePtr msg) {
+          imu_cbk(std::move(msg), imu_input_lead_);
+        });
       RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", startup.imu_topic.c_str());
     }
     if (params_.values().wheel_odom_en)
@@ -4383,6 +4411,7 @@ private:
     record.value("runaway_wheel_speed_margin", params_.values().runaway.wheel_speed_margin);
     record.value("runaway_hold_sec", params_.values().runaway.hold_sec);
     record.value("runaway_on_trip", params_.values().runaway_on_trip);
+    record.value("input_epoch_on_fault", params_.values().input_epoch_on_fault);
   }
   void effectiveImuForTest(fast_lio_test::EffectiveRecorder & record)
   {
@@ -4736,6 +4765,27 @@ private:
     return true;
   }
 
+  // The latched input-epoch guard stops input and odometry until a restart (acceptInputEpoch), and the scan path
+  // calls here every cycle while it is latched. fault_exit asks for that restart: the node shuts its context down and
+  // the supervisor restarts the pipeline. hold keeps saying it is stopped. True when the node is shutting down.
+  bool exitOnInputEpochFault()
+  {
+    if (params_.values().input_epoch_on_fault == "fault_exit") {
+      RCLCPP_FATAL(
+        this->get_logger(),
+        "[INPUT-EPOCH] exiting so the supervisor can restart the pipeline (input_epoch_on_fault=fault_exit)");
+      rclcpp::shutdown();
+      return true;
+    }
+    RCLCPP_ERROR_THROTTLE(this->get_logger(),
+                          input_time_log_clock,
+                          10000,
+                          "[INPUT-EPOCH] still latched since the sample stamped %.9f: input and odometry stay stopped "
+                          "until the node restarts (input_epoch_on_fault=hold)",
+                          input_epoch_fault_stamp);
+    return false;
+  }
+
   void timer_callback()
   {
     const fast_lio::FrontendParams & p = params_.values();
@@ -4748,6 +4798,8 @@ private:
                                         disableReferencePublication);
       }
       publishReferenceRepeat();
+      if (input_epoch_guard.faulted() && exitOnInputEpochFault())
+        return;
     }
     if (ready) {
       AnchorScanScope anchor_scan_scope(Measures);
@@ -6771,6 +6823,10 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+  // Each input stream's filter for stamps far ahead (acceptInputEpoch), declared before the subscriptions whose
+  // callbacks use it, under mtx_buffer.
+  fast_lio::InputLeadFilter lidar_input_lead_;
+  fast_lio::InputLeadFilter imu_input_lead_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
   rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImu>::SharedPtr sub_imu_fpa_;
   rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImubias>::SharedPtr sub_imu_bias_;

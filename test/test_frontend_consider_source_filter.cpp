@@ -371,23 +371,25 @@ TEST(ConsiderSourceFilter, X4ProcessCopyCrossUsesTheSameAuditRule)
   auto query = factor(initial.active, {}, "query");
   auto copy = reuse(query, "echo", {8, 1, 0}, 1);
   apply(filter, query, -1, {copy});
-  // Independent unit primitives e0, eta: e = 2 e0 + eta. Choose
-  // w = eta - e0/2, so Cov(e,w)=0, Var(w)=5/4 and Cov(w,eta)=1.
-  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 5));
+  // Independent unit primitives e0, eta, epsQuery, epsSupport. Query gives
+  // e = 2 e0 + eta + epsQuery. Choose w = eta - e0/2, so Cov(e,w)=0,
+  // Var(w)=5/4 and Cov(w,eta)=1. The positive fresh remainders stay independent.
+  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 6));
   const auto process = noise(1, 1, 5.0 / 4.0);
   CopyNoiseCross cross{{7, 1, 0}, {8, 1, 0}, Eigen::MatrixXd::Constant(1, 1, 2)};
   const auto ledger = filter.ledgerIdentity();
   EXPECT_EQ(filter.propagate(Eigen::MatrixXd::Ones(1, 1), process, {cross}), Status::kInvalidCovariance);
   EXPECT_EQ(filter.ledgerIdentity(), ledger);
-  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 5));
+  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 6));
   cross.covariance.setOnes();
   ASSERT_EQ(filter.propagate(Eigen::MatrixXd::Ones(1, 1), process, {cross}), Status::kOk);
-  // e' = 3 e0/2 + 2 eta; the next same-frame update is e'' = 3 e0/4 + eta/2.
-  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 25.0 / 4.0));
+  // e' = 3 e0/2 + 2 eta + epsQuery; the next update is
+  // e'' = 3 e0/4 + eta/2 + epsQuery/2 - epsSupport/2.
+  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 29.0 / 4.0));
   auto support = factor(initial.active, {}, "support");
   copy = reuse(support, "echo", {8, 1, 0}, 1);
   apply(filter, support, 0.5, {copy});
-  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 13.0 / 16.0));
+  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 21.0 / 16.0));
 }
 
 TEST(ConsiderSourceFilter, X5YoungOracleDoesNotAuthorizeReentry)

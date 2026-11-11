@@ -739,6 +739,36 @@ TEST(ConsiderSourceFilter, ConstructiveAuditHandlesInteriorZeroPivotsWithoutClip
   EXPECT_EQ(detail::auditCovariance(invalid), Status::kInvalidCovariance);
 }
 
+TEST(ConsiderSourceFilter, AllSourcesReferencedKeepsUpdateWorkspaceLinear)
+{
+  constexpr Eigen::Index kBlocks = 32, kBlockDof = 32, kDof = kBlocks * kBlockDof;
+  constexpr std::size_t kLimit = static_cast<std::size_t>(22U) * 1024U * 1024U;
+  auto limits = budget();
+  limits.sourceDof = kDof;
+  limits.liveSources = kBlocks;
+  limits.memoryBytes = kLimit;
+  const auto initial = prior();
+  ConsiderSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial, limits), Status::kOk);
+  std::vector<Source> sources;
+  for (Eigen::Index i = 0; i < kBlocks; ++i) {
+    sources.push_back(source("block" + std::to_string(i), "raw" + std::to_string(i), kBlockDof));
+    ASSERT_EQ(filter.augment(sources.back(), Eigen::MatrixXd::Ones(kBlockDof, 1)), Status::kOk);
+  }
+  auto input = factor(initial.active, sources, "all-sources");
+  input.a.setOnes();
+  const double gain = 1.0 / static_cast<double>(kDof);
+  auto candidate = filter.proposeAppliedGain({input}, Eigen::MatrixXd::Constant(1, 1, gain));
+  ASSERT_EQ(candidate.status(), Status::kOk);
+  EXPECT_LT(filter.memoryBytes(), kLimit);
+  ASSERT_EQ(filter.commit(std::move(candidate)), Status::kOk);
+  // Every clone is exactly the original scalar e; e+ = -e/1024 - eps/1024.
+  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 2 * gain * gain));
+  Eigen::MatrixXd cross;
+  ASSERT_EQ(filter.cross("block0", cross), Status::kOk);
+  expectMatrix(cross, Eigen::MatrixXd::Constant(1, kBlockDof, -gain));
+}
+
 template<class Function>
 void measure(const std::string & entry, Function && operation, const ConsiderSourceFilter & filter)
 {

@@ -445,7 +445,8 @@ struct ConsiderSourceFilter::Impl
     const auto s = static_cast<std::size_t>(k.cols());
     // P/K candidates, sampled audit, operation replay, and simultaneous GEMM
     // temporaries. No C-sized term is reserved by an actual-gain proposal.
-    const auto terms = productBytes(8, productBytes(n + static_cast<std::size_t>(kMaxSourceDof), n + s));
+    const auto sampled = static_cast<std::size_t>(kMaxSourceDof);
+    const auto terms = productBytes(8, productBytes(n + sampled, n + std::max(s, sampled)));
     return sumBytes(metadataBytes(metadata), sumBytes(extra, productBytes(sizeof(double), terms)));
   }
 
@@ -1204,11 +1205,16 @@ ConsiderSourceFilter::proposeAppliedGain(const std::vector<LinearFactor> & facto
       prepared->k.noalias() = t * impl_->k;
       prepared->p.noalias() = t * impl_->p * t.transpose();
       if (!batch.sourceRows.empty()) {
-        const Eigen::MatrixXd rowsC = selectRows(impl_->c, batch.sourceRows);
+        // Accumulate V*C by retained rows, never materializing C_J,* or C_J,J.
+        // In particular J may contain every source: update workspace still
+        // scales as n*s, rather than silently copying the entire retained C.
+        Eigen::MatrixXd vC = Eigen::MatrixXd::Zero(impl_->p.rows(), impl_->c.cols());
+        for (std::size_t j = 0; j < batch.sourceRows.size(); ++j)
+          vC.noalias() += v.col(static_cast<Eigen::Index>(j)) * impl_->c.row(batch.sourceRows[j]);
         const Eigen::MatrixXd selectedK = selectRows(impl_->k.transpose(), batch.sourceRows).transpose();
-        const Eigen::MatrixXd selectedC = selectRows(rowsC.transpose(), batch.sourceRows).transpose();
-        prepared->k.noalias() += v * rowsC;
-        prepared->p.noalias() += v * selectedC * v.transpose();
+        const Eigen::MatrixXd selectedVC = selectRows(vC.transpose(), batch.sourceRows).transpose();
+        prepared->k += vC;
+        prepared->p.noalias() += selectedVC * v.transpose();
         const Eigen::MatrixXd term = t * selectedK * v.transpose();
         prepared->p += term + term.transpose();
       }

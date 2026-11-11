@@ -560,6 +560,37 @@ TEST(ConsiderSourceFilter, X12UnknownAmplitudeSensitivityMatchesExplicitConstant
   expectMatrix(retained, expected);
 }
 
+TEST(ConsiderSourceFilter, X12ProcessSensitivityIsExplicitThroughCloneResetAndUpdate)
+{
+  const auto initial = prior();
+  ConsiderSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial, budget()), Status::kOk);
+  const auto calibration = source("cal", "cal/raw");
+  ASSERT_EQ(filter.registerSensitivity(calibration, Eigen::MatrixXd::Zero(1, 1)), Status::kOk);
+  const auto before = filter.ledgerIdentity();
+  EXPECT_EQ(filter.propagate(Eigen::MatrixXd::Ones(1, 1), noise(1, 1)), Status::kUnknownMoment);
+  EXPECT_EQ(filter.ledgerIdentity(), before);
+  ASSERT_EQ(filter.propagate(Eigen::MatrixXd::Ones(1, 1), noise(1, 1), {}, {{"cal", Eigen::MatrixXd::Ones(1, 1)}}),
+            Status::kOk);
+  const auto z = source("frame");
+  ASSERT_EQ(filter.augment(z, Eigen::MatrixXd::Ones(1, 1)), Status::kOk);
+  ASSERT_EQ(filter.reset(Eigen::MatrixXd::Constant(1, 1, 2)), Status::kOk);
+  auto input = factor(initial.active, {z}, "support");
+  input.a.setConstant(-1);
+  apply(filter, input, 0.5, {}, {{"support", "cal", Eigen::MatrixXd::Zero(1, 1)}});
+  Eigen::MatrixXd activeLoading, sourceLoading;
+  ASSERT_EQ(filter.sensitivity("cal", activeLoading), Status::kOk);
+  ASSERT_EQ(filter.sourceSensitivity("frame", "cal", sourceLoading), Status::kOk);
+  expectMatrix(activeLoading, Eigen::MatrixXd::Constant(1, 1, 1.5));
+  expectMatrix(sourceLoading, Eigen::MatrixXd::Ones(1, 1));
+  const Eigen::Vector2d loading(activeLoading(0, 0), sourceLoading(0, 0));
+  // Independent primitives: e0~(0,1), cal~(0,1/4), eps~(0,1).
+  // z=e0+cal; e+=3/2*(e0+cal)-eps/2. No amplitude enters the random P/K/C.
+  Eigen::Matrix2d expected;
+  expected << 49.0 / 16.0, 15.0 / 8.0, 15.0 / 8.0, 5.0 / 4.0;
+  expectMatrix(joint(filter, {z}) + 0.25 * loading * loading.transpose(), expected);
+}
+
 TEST(ConsiderSourceFilter, IndependentInformationReducesPAndCommitIsSingleUse)
 {
   ConsiderSourceFilter filter, other;

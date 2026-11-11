@@ -1384,6 +1384,31 @@ processCopies(const Metadata & data, Eigen::Index n, const std::vector<CopyNoise
   return count == crosses.size() ? Status::kOk : Status::kInvalidIdentity;
 }
 
+Status processSensitivities(const Metadata & data,
+                            Eigen::Index n,
+                            const std::vector<ProcessSensitivity> & inputs,
+                            Operation & operation)
+{
+  std::set<std::string> keys;
+  for (const auto & input : inputs) {
+    if (!keys.insert(input.sensitivity).second)
+      return Status::kInvalidIdentity;
+    const auto model =
+      std::find_if(data.sensitivities.begin(), data.sensitivities.end(), [&](const SensitivityModel & value) {
+        return value.source.key == input.sensitivity;
+      });
+    if (model == data.sensitivities.end())
+      return Status::kSourceHistoryUnavailable;
+    if (input.loading.rows() != n ||
+        input.loading.cols() != static_cast<Eigen::Index>(model->source.coordinates.components.size()))
+      return Status::kDimensionMismatch;
+    if (!input.loading.allFinite())
+      return Status::kNonFinite;
+    operation.sensitivities.emplace_back(input.sensitivity, input.loading);
+  }
+  return keys.size() == data.sensitivities.size() ? Status::kOk : Status::kUnknownMoment;
+}
+
 Status processCopyAudit(const Metadata & data,
                         const Eigen::MatrixXd & p,
                         const Eigen::MatrixXd & k,
@@ -1429,7 +1454,8 @@ Status processCopyAudit(const Metadata & data,
 
 Status ConsiderSourceFilter::propagate(const Eigen::MatrixXd & phi,
                                        const ProcessNoise & noise,
-                                       const std::vector<CopyNoiseCross> & crosses)
+                                       const std::vector<CopyNoiseCross> & crosses,
+                                       const std::vector<ProcessSensitivity> & sensitivities)
 {
   try {
     if (!impl_->version)
@@ -1447,15 +1473,22 @@ Status ConsiderSourceFilter::propagate(const Eigen::MatrixXd & phi,
       copiesDof =
         sumBytes(copiesDof, productBytes(static_cast<std::size_t>(model.covariance.rows()), model.frames.size()));
     const auto auditDof = sumBytes(copiesDof, static_cast<std::size_t>(n + n + std::min(s, kMaxSourceDof)));
+    std::size_t sensitivityBytes = 0;
+    for (const auto & input : sensitivities)
+      sensitivityBytes = sumBytes(sensitivityBytes, matrixBytes(input.loading));
     Reservation reservation;
-    if (!reservation.acquire(impl_->account,
-                             impl_->workspace(productBytes(4 * sizeof(double), productBytes(auditDof, auditDof)))))
+    if (!reservation.acquire(
+          impl_->account,
+          impl_->workspace(sumBytes(productBytes(8 * sizeof(double), productBytes(auditDof, auditDof)),
+                                    productBytes(4, sensitivityBytes)))))
       return Status::kModelCapacityExceeded;
     auto operation = std::make_shared<Operation>();
     operation->kind = OperationKind::kProcess;
     operation->oldSourceDof = s;
     operation->active = phi;
     if (const auto status = processCopies(impl_->metadata, n, crosses, *operation); status != Status::kOk)
+      return status;
+    if (const auto status = processSensitivities(impl_->metadata, n, sensitivities, *operation); status != Status::kOk)
       return status;
     if (const auto status =
           processCopyAudit(impl_->metadata, impl_->p, impl_->k, impl_->c, noise.covariance, *operation);

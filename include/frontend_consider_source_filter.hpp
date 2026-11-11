@@ -56,6 +56,12 @@ struct SensitivityLoading
   Eigen::MatrixXd loading;
 };
 
+struct ProcessSensitivity
+{
+  std::string sensitivity;
+  Eigen::MatrixXd loading;
+};
+
 // Thread-confined covariance companion for given production states and gains.
 // It never estimates a new state or chooses an optimal gain. Means, observations
 // and linearizations are validated/identified inputs, not a second trajectory.
@@ -97,9 +103,12 @@ public:
                                const std::vector<SensitivityLoading> & sensitivities = {}) const;
   Status commit(Candidate && candidate);
 
+  // Every registered unknown-amplitude source needs an explicit direct process
+  // loading, including zero; known random Q does not establish that derivative.
   Status propagate(const Eigen::MatrixXd & phi,
                    const ProcessNoise & noise,
-                   const std::vector<CopyNoiseCross> & copyCross = {});
+                   const std::vector<CopyNoiseCross> & copyCross = {},
+                   const std::vector<ProcessSensitivity> & sensitivities = {});
   Status reset(const Eigen::MatrixXd & transport);
   Status augment(const Source & source, const Eigen::MatrixXd & activeGenerator);
   Status retire(const std::vector<std::string> & keys, bool willNeverReuse, const std::string & evidence);

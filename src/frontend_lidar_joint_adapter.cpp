@@ -384,13 +384,43 @@ private:
   Eigen::SimplicialLDLT<SparseMatrix, Eigen::Lower, Eigen::NaturalOrdering<int>> factor_;
 };
 
+double scaledError(const Eigen::MatrixXd & value, const Eigen::MatrixXd & expected, const Eigen::MatrixXd & scale)
+{
+  if (value.rows() != expected.rows() || value.cols() != expected.cols() || scale.rows() != expected.rows() ||
+      scale.cols() != expected.cols() || !value.allFinite() || !expected.allFinite() || !scale.allFinite() ||
+      (scale.array() < 0.0).any())
+    return std::numeric_limits<double>::infinity();
+  double error = 0.0;
+  for (Eigen::Index column = 0; column < value.cols(); ++column)
+    for (Eigen::Index row = 0; row < value.rows(); ++row) {
+      const double difference = std::abs(value(row, column) - expected(row, column));
+      if (scale(row, column) == 0.0) {
+        if (difference != 0.0)
+          return std::numeric_limits<double>::infinity();
+      } else {
+        error = std::max(error, difference / scale(row, column));
+      }
+    }
+  return error;
+}
+
 double relativeError(const Eigen::MatrixXd & value, const Eigen::MatrixXd & expected)
 {
-  if (!value.allFinite() || !expected.allFinite())
-    return std::numeric_limits<double>::infinity();
-  if (value.size() == 0 && expected.size() == 0)
-    return 0.0;
-  return (value - expected).cwiseAbs().maxCoeff() / std::max(1.0, expected.cwiseAbs().maxCoeff());
+  const double magnitude = expected.size() == 0 ? 0.0 : expected.cwiseAbs().maxCoeff();
+  return scaledError(value, expected, Eigen::MatrixXd::Constant(expected.rows(), expected.cols(), magnitude));
+}
+
+Eigen::VectorXd coordinateScales(const Eigen::MatrixXd & covariance)
+{
+  // Magnitudes are comparison units only. An invalid signed prior is still
+  // passed unchanged to K2, which owns its covariance rejection/classification.
+  return covariance.diagonal().cwiseAbs().cwiseSqrt();
+}
+
+double scaledCovarianceError(const Eigen::MatrixXd & value, const Eigen::MatrixXd & expected)
+{
+  const Eigen::VectorXd scales = coordinateScales(expected);
+  return scaledError(value, expected, scales * scales.transpose());
 }
 
 FrameStatus compressWithNoise(const Eigen::MatrixXd & h,
@@ -459,10 +489,11 @@ FrameStatus compressWithNoise(const Eigen::MatrixXd & h,
   const double tolerance = arithmeticTolerance(condition);
   if (!candidate.h.allFinite() || !candidate.gain.allFinite() || !candidate.observation.allFinite() ||
       !std::isfinite(candidate.chi2Perpendicular) || candidate.chi2Perpendicular < 0.0 ||
-      relativeError(candidate.gain * candidate.h, gain * h) > tolerance ||
-      relativeError(candidate.gain * candidate.observation, gain * y) > tolerance ||
-      relativeError(candidate.gain * candidate.gain.transpose(), gain * noise.multiply(gain.transpose())) > tolerance ||
-      relativeError(candidate.h.transpose() * candidate.h, h.transpose() * inverseH) > tolerance)
+      scaledError(candidate.gain * candidate.h, gain * h, gain.cwiseAbs() * h.cwiseAbs()) > tolerance ||
+      scaledError(candidate.gain * candidate.observation, gain * y, gain.cwiseAbs() * y.cwiseAbs()) > tolerance ||
+      scaledCovarianceError(candidate.gain * candidate.gain.transpose(), gain * noise.multiply(gain.transpose())) >
+        tolerance ||
+      scaledCovarianceError(candidate.h.transpose() * candidate.h, h.transpose() * inverseH) > tolerance)
     return FrameStatus::kNumericalFailure;
   result = std::move(candidate);
   return FrameStatus::kOkFrameConditional;
@@ -627,9 +658,10 @@ FrameStatus closeProduction(const FrameSnapshot & snapshot,
   posterior = (result.reset * posterior * result.reset.transpose()).eval();
   if (!posterior.allFinite() || !finiteState(result.predictedState))
     return FrameStatus::kNumericalFailure;
-  const double dxError = relativeError(increment, snapshot.diagnostics.lastDx);
-  const double covarianceError = relativeError(posterior, capturedPosterior);
-  const double stateError = difference(result.predictedState, posteriorState).cwiseAbs().maxCoeff();
+  const double dxError = scaledError(increment, snapshot.diagnostics.lastDx, coordinateScales(result.prior));
+  const double covarianceError = scaledCovarianceError(capturedPosterior, posterior);
+  const double stateError =
+    scaledError(difference(result.predictedState, posteriorState), Vector23::Zero(), coordinateScales(posterior));
   diagnostics.dxError = dxError;
   diagnostics.covarianceError = covarianceError;
   diagnostics.stateError = stateError;

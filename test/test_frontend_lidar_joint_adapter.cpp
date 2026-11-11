@@ -758,6 +758,43 @@ TEST(FrontendLidarJointAdapter, ManufacturerRangeAmplitudeUsesBeamProjectionAndP
   expectMatrix(website.readings->amplitude->optimalCovariance, expected);
 }
 
+TEST(FrontendLidarJointAdapter, ReviewClosureRejectsSmallScaleRelativeMismatch)
+{
+  constexpr double kPoseVariance = 1.0e-6, kPositionIncrement = 1.0e-3, kRelativePerturbation = 1.0e-3;
+  constexpr Eigen::Index kPositionDof = 3;
+  auto snapshot = frame();
+  snapshot.priorCovariance->topLeftCorner<kPoseDof, kPoseDof>() =
+    Eigen::Matrix<double, kPoseDof, kPoseDof>::Identity() * kPoseVariance;
+  snapshot.considerKeep = Eigen::Matrix3d::Zero();
+  closeFixture(snapshot);
+  Eigen::MatrixXd h = Eigen::MatrixXd::Zero(snapshot.productionH.rows(), kStateDof);
+  h.leftCols(kProductionColumns) = snapshot.productionH;
+  const Matrix23 prior = *snapshot.priorCovariance;
+  const Matrix23 information = h.transpose() * h + kProductionVariance * prior.inverse();
+  const Eigen::MatrixXd gain = information.ldlt().solve(h.transpose());
+  const Eigen::MatrixXd positionGain = gain.topRows(kPositionDof);
+  const Eigen::Vector3d target(kPositionIncrement, 0.0, 0.0);
+  snapshot.productionObservation =
+    positionGain.transpose() * (positionGain * positionGain.transpose()).ldlt().solve(target);
+  snapshot.preFloorObservation = snapshot.productionObservation;
+  const Eigen::Vector3d increment = positionGain * snapshot.productionObservation;
+  snapshot.posterior->position = increment;
+  snapshot.diagnostics.lastDx.head<kPositionDof>() = increment;
+  const auto baseline = observeFrame(snapshot);
+  ASSERT_EQ(baseline.status, FrameStatus::kOkFrameConditional) << baseline.rejectReason;
+  EXPECT_NEAR(increment[0], kPositionIncrement, kOracleTolerance * kPositionIncrement);
+  auto covarianceMismatch = snapshot;
+  (*covarianceMismatch.posteriorCovariance)(0, 0) *= 1.0 + kRelativePerturbation;
+  const auto covarianceResult = observeFrame(covarianceMismatch);
+  EXPECT_EQ(covarianceResult.status, FrameStatus::kIdentityMismatch) << covarianceResult.rejectReason;
+  EXPECT_FALSE(covarianceResult.readings);
+  auto incrementMismatch = snapshot;
+  incrementMismatch.diagnostics.lastDx[0] *= 1.0 + kRelativePerturbation;
+  const auto incrementResult = observeFrame(incrementMismatch);
+  EXPECT_EQ(incrementResult.status, FrameStatus::kIdentityMismatch) << incrementResult.rejectReason;
+  EXPECT_FALSE(incrementResult.readings);
+}
+
 TEST(FrontendLidarJointAdapter, O10RejectionsAreAtomicAndNumericalReadingsAreAbsent)
 {
   constexpr double kDifferentPointTime = 0.01, kIdentityPerturbation = 0.1;

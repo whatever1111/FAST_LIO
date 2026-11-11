@@ -509,8 +509,10 @@ TEST(FrontendLidarJointAdapter, O7CompressionPreservesRankSixAndTwelveArbitraryG
   const Eigen::MatrixXd information = h.transpose() * r.ldlt().solve(h);
   const Matrix23 p = mirror((Matrix23::Identity() + information).ldlt().solve(Matrix23::Identity()));
   for (const Eigen::Index rank : {6, 12}) {
-    const Eigen::MatrixXd gain =
-      dense(generator, kStateDof, rank) * dense(generator, rank, kRows) / static_cast<double>(kRows);
+    // Sequence shared-generator consumption identically on both architectures.
+    const Eigen::MatrixXd gainLeft = dense(generator, kStateDof, rank);
+    const Eigen::MatrixXd gainRight = dense(generator, rank, kRows);
+    const Eigen::MatrixXd gain = gainLeft * gainRight / static_cast<double>(kRows);
     CompressedFrame compressed;
     Counts counts;
     ASSERT_EQ(compressRows(h, observation, gain, b.sparseView(), diagonal, kQuarter, {}, compressed, counts),

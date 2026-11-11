@@ -32,6 +32,7 @@
 #include "population_moments.hpp"
 #include "scan_history_policy.hpp"
 #include "scan_time_policy.hpp"
+#include "time_admission_accounting.hpp"
 #include "use-ikfom.hpp"
 
 /// *************Preconfiguration
@@ -70,7 +71,8 @@ class ImuProcess
   Eigen::Matrix<double, 12, 12> Q;
   bool Process(const MeasureGroup & meas,
                esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state,
-               PointCloudXYZI::Ptr pcl_un_);
+               PointCloudXYZI::Ptr pcl_un_,
+               fast_lio::ProcessAudit * audit = nullptr);
 
   enum class ProcessStatus
   {
@@ -143,19 +145,21 @@ class ImuProcess
 #endif
 
  private:
-  // Discard only the invalid initialization window. In particular, keep the
-  // consumed-scan guard and the initialization attempt clock.
-  void discardInitializationWindow()
-  {
-    if (sustainedInitActive())
-      init_static_gate_.reset();
-    b_first_frame_ = true;
-    init_iter_num = 0;
-    mean_acc.setZero();
-    mean_gyr.setZero();
-    cov_acc.setZero();
-    cov_gyr.setZero();
-  }
+   fast_lio::ScanHistoryAction
+   prepareHistoryCloud(const MeasureGroup & meas, PointCloudXYZI::Ptr & history_cloud, fast_lio::ProcessAudit * audit);
+   // Discard only the invalid initialization window. In particular, keep the
+   // consumed-scan guard and the initialization attempt clock.
+   void discardInitializationWindow()
+   {
+     if (sustainedInitActive())
+       init_static_gate_.reset();
+     b_first_frame_ = true;
+     init_iter_num = 0;
+     mean_acc.setZero();
+     mean_gyr.setZero();
+     cov_acc.setZero();
+     cov_gyr.setZero();
+   }
   fast_lio::ImuProcessOutcome
   IMU_init(const MeasureGroup & meas, esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state, std::size_t & N);
   void UndistortPcl(const MeasureGroup & meas,
@@ -677,16 +681,50 @@ void ImuProcess::UndistortPcl(const MeasureGroup & meas,
   }
 }
 
+fast_lio::ScanHistoryAction ImuProcess::prepareHistoryCloud(const MeasureGroup & meas,
+                                                            PointCloudXYZI::Ptr & history_cloud,
+                                                            fast_lio::ProcessAudit * audit)
+{
+  const double history_offset = last_lidar_end_time_ - meas.lidar_beg_time;
+  const auto point_offset = [](const auto & point) {
+    return point.curvature;
+  };
+  const auto history = fast_lio::scanHistoryAction(meas.lidar->points, history_offset, point_offset);
+  if (audit) {
+    audit->history_evaluated = true;
+    audit->history_action = history;
+    if (history != fast_lio::ScanHistoryAction::kDiscardEarly) {
+      audit->history_erase_completed = true;
+      audit->history_retained_points = history == fast_lio::ScanHistoryAction::kKeepAll ? meas.lidar->size() : 0;
+    }
+  }
+  if (history == fast_lio::ScanHistoryAction::kDiscardEarly) {
+    history_cloud.reset(new PointCloudXYZI(*meas.lidar));
+    const auto erased = fast_lio::discardPointsBeforeHistory(history_cloud->points, history_offset, point_offset);
+    if (audit) {
+      audit->history_erase_completed = true;
+      audit->history_erased_points = erased;
+      audit->history_retained_points = history_cloud->size();
+    }
+    history_cloud->width = static_cast<std::uint32_t>(history_cloud->size());
+    history_cloud->height = 1;
+  }
+  return history;
+}
+
 bool ImuProcess::Process(const MeasureGroup & meas,
                          esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state,
-                         PointCloudXYZI::Ptr cur_pcl_un_)
+                         PointCloudXYZI::Ptr cur_pcl_un_,
+                         fast_lio::ProcessAudit * audit)
 {
+  if (audit)
+    fast_lio::beginProcessAudit(*audit, meas.lidar ? meas.lidar->size() : 0, lastProcessedEnd());
   double t1,t2,t3;
   t1 = omp_get_wtime();
 
   last_status_ = ProcessStatus::kRejected;
   last_outcome_ = {};
-  const auto finish = [this, &meas, &cur_pcl_un_](
+  const auto finish = [this, &meas, &cur_pcl_un_, audit](
                         fast_lio::ImuDisposition disposition, fast_lio::ImuProcessReason reason, bool output = false) {
     if (disposition == fast_lio::ImuDisposition::kUncommitted &&
         !fast_lio::canRetainImuBatch(
@@ -699,6 +737,8 @@ bool ImuProcess::Process(const MeasureGroup & meas,
     if (!output && cur_pcl_un_ && !cur_pcl_un_->empty())
       ++stale_output_reuse_count_;
     last_outcome_ = {disposition, reason, output};
+    if (audit)
+      fast_lio::finishProcessAudit(*audit, last_outcome_, lastProcessedEnd());
     return output;
   };
   gap_summary = fast_lio::ImuGapSummary{};
@@ -811,20 +851,9 @@ bool ImuProcess::Process(const MeasureGroup & meas,
   // Original scanTime validation above must precede any removal. Only the
   // overlapping branch copies points; all timestamps and the IMU window stay
   // unchanged. Points without history never enter deskew or the caller's map.
-  const double history_offset = last_lidar_end_time_ - meas.lidar_beg_time;
-  const auto point_offset = [](const auto & point) {
-    return point.curvature;
-  };
-  const auto history = fast_lio::scanHistoryAction(meas.lidar->points, history_offset, point_offset);
-  if (history == fast_lio::ScanHistoryAction::kReject)
-    return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kHistory);
   PointCloudXYZI::Ptr history_cloud;
-  if (history == fast_lio::ScanHistoryAction::kDiscardEarly) {
-    history_cloud.reset(new PointCloudXYZI(*meas.lidar));
-    fast_lio::discardPointsBeforeHistory(history_cloud->points, history_offset, point_offset);
-    history_cloud->width = static_cast<std::uint32_t>(history_cloud->size());
-    history_cloud->height = 1;
-  }
+  if (prepareHistoryCloud(meas, history_cloud, audit) == fast_lio::ScanHistoryAction::kReject)
+    return finish(fast_lio::ImuDisposition::kUncommitted, fast_lio::ImuProcessReason::kHistory);
 
   std::vector<double> imu_stamps;
   imu_stamps.reserve(meas.imu.size() + 1);
@@ -859,6 +888,10 @@ bool ImuProcess::Process(const MeasureGroup & meas,
 
   last_outcome_ = {fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation};
   UndistortPcl(meas, kf_state, *cur_pcl_un_, history_cloud ? *history_cloud : *meas.lidar);
+  if (audit) {
+    audit->deskew_completed = true;
+    audit->deskew_points = cur_pcl_un_->size();
+  }
   scan_consumption_.commit(meas.lidar_end_time);
   integration_ledger_.anchor(meas.lidar_end_time);
 

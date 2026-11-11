@@ -705,7 +705,7 @@ void frontendDrop(std::uint64_t count = 1)
     frontend_progress.increment(frontend_progress.dropped, count);
 }
 
-static void trim_lidar_buffer()
+static void trim_lidar_buffer(fast_lio::TimeAdmissionAccounting * observer = nullptr)
 {
   const bool count_bounded = max_buffered_scans > 0;
   const bool age_bounded = max_scan_backlog_sec > 0.0;
@@ -726,6 +726,15 @@ static void trim_lidar_buffer()
     return false;
   };
   while (over_cap()) {
+    if (observer) {
+      const bool count = count_bounded && lidar_buffer.size() > cap;
+      const bool age = age_bounded && time_buffer.size() > keep_front &&
+                       time_buffer.back() - time_buffer[keep_front] > max_scan_backlog_sec;
+      observer->record(count ? fast_lio::AdmissionBucket::kTrimCount : fast_lio::AdmissionBucket::kTrimAge,
+                       lidar_buffer[keep_front]->size());
+      if (count && age)
+        observer->add(observer->trim_also_age);
+    }
     lidar_buffer.erase(lidar_buffer.begin() + keep_front);
     time_buffer.erase(time_buffer.begin() + keep_front);
     if (lidar_receive_time_buffer.size() > keep_front)
@@ -833,8 +842,11 @@ void logImuBacklogLoss(const ImuBacklogLoss & loss)
 
 // Caller holds mtx_buffer. Clearing references and invalidating the epoch is
 // one operation with admission latching; partial integration is never retried.
-void clearBufferedInputsLocked()
+void clearBufferedInputsLocked(fast_lio::TimeAdmissionAccounting * observer, fast_lio::AdmissionBucket reason)
 {
+  if (observer)
+    for (const auto & cloud : lidar_buffer)
+      observer->record(reason, cloud->size());
   imu_fifo_transaction.invalidate();
   pending_imu_token = {};
   lidar_buffer.clear();
@@ -853,22 +865,29 @@ void clearBufferedInputsLocked()
 // exclusive group. A full estimator/map reset requires explicit restart, not
 // an automatic gravity reinitialization on a possibly moving platform. `lead`
 // is the calling stream's own filter for stamps far ahead (scan_time_policy.hpp).
-bool acceptInputEpoch(double previous, double current, const char * source, fast_lio::InputLeadFilter & lead)
+fast_lio::AdmissionInputResult acceptInputEpoch(double previous,
+                                                double current,
+                                                const char * source,
+                                                fast_lio::InputLeadFilter & lead,
+                                                fast_lio::TimeAdmissionAccounting * observer = nullptr)
 {
-  if (!imu_fifo_transaction.acceptsInput(input_epoch_guard.faulted())) {
+  const bool already_faulted = input_epoch_guard.faulted();
+  const bool input_allowed = imu_fifo_transaction.acceptsInput(already_faulted);
+  constexpr double kInputEpochRollbackSec = 1.0;
+  // Longer than any hole the front end bridges on its own (the IMU backlog bound is 10 s as well), so a normal
+  // stream never meets it; a stamp far in the future only costs its own sample.
+  constexpr double kInputEpochLeadSec = 10.0;
+  const auto result = fast_lio::classifyAdmissionInput(
+    input_epoch_guard, lead, previous, current, input_allowed, kInputEpochRollbackSec, kInputEpochLeadSec);
+  if (!input_allowed) {
     if (std::strcmp(source, "imu") == 0)
       ++imu_consumption_counters.rejectedImu;
     else
       ++imu_consumption_counters.rejectedLidar;
     frontendDrop();
-    return false;
+    return result;
   }
-  const bool already_faulted = input_epoch_guard.faulted();
-  constexpr double kInputEpochRollbackSec = 1.0;
-  // Longer than any hole the front end bridges on its own (the IMU backlog bound is 10 s as well), so a normal
-  // stream never meets it; a stamp far in the future only costs its own sample.
-  constexpr double kInputEpochLeadSec = 10.0;
-  if (!lead.admit(previous, current, kInputEpochLeadSec)) {
+  if (result == fast_lio::AdmissionInputResult::kLeadRejected) {
     RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"),
                          input_time_log_clock,
                          5000,
@@ -879,15 +898,15 @@ bool acceptInputEpoch(double previous, double current, const char * source, fast
                          current - previous,
                          previous);
     frontendDrop();
-    return false;
+    return result;
   }
-  if (input_epoch_guard.observe(previous, current, kInputEpochRollbackSec))
-    return true;
+  if (result == fast_lio::AdmissionInputResult::kAccepted)
+    return result;
   frontendDrop(lidar_buffer.size() + imu_buffer.size() + 1);
   for (const auto & sample : imu_buffer)
     if (validImuForConsumption(sample.message))
       ++imu_consumption_counters.epochValidLost;
-  clearBufferedInputsLocked();
+  clearBufferedInputsLocked(observer, fast_lio::AdmissionBucket::kClearEpoch);
   if (!already_faulted) {
     input_epoch_fault_stamp = current;
     RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
@@ -897,11 +916,16 @@ bool acceptInputEpoch(double previous, double current, const char * source, fast
                  previous,
                  current);
   }
-  return false;
+  return result;
 }
 
-void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg, fast_lio::InputLeadFilter & lead)
+void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg,
+                      fast_lio::InputLeadFilter & lead,
+                      fast_lio::TimeAdmissionAccounting * observer)
 {
+  fast_lio::AdmissionCallbackScope accounting{observer};
+  if (observer)
+    observer->record(fast_lio::AdmissionBucket::kReceived, std::uint64_t(msg->width) * msg->height);
   const auto receive_time = SteadyClock::now();
   if (!diag_first_lidar_cb_logged) {
     RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
@@ -912,7 +936,15 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg, fast_l
   mtx_buffer.lock();
   scan_count++;
   double cur_time = get_time_sec(msg->header.stamp);
-  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar", lead)) {
+  if (observer) {
+    observer->canonical_header_known = true;
+    observer->canonical_header_bits = fast_lio::admissionDoubleBits(cur_time);
+  }
+  const auto input = acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar", lead, observer);
+  if (input != fast_lio::AdmissionInputResult::kAccepted) {
+    if (observer)
+      observer->recordInputRejection(input, std::uint64_t(msg->width) * msg->height);
+    accounting.resolve();
     mtx_buffer.unlock();
     if (frontend_observation_en)
       publishFrontendObservation(false);
@@ -935,6 +967,9 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg, fast_l
                          "[INPUT-TIME] late lidar by %.6f seconds, dropped",
                          last_timestamp_lidar - cur_time);
     frontendDrop();
+    if (observer)
+      observer->record(fast_lio::AdmissionBucket::kLateRejected, std::uint64_t(msg->width) * msg->height);
+    accounting.resolve();
     mtx_buffer.unlock();
     return;
   }
@@ -945,10 +980,15 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg, fast_l
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
   lidar_buffer.push_back(ptr);
+  if (observer) {
+    observer->record(fast_lio::AdmissionBucket::kEnqueued, ptr->size());
+    observer->record(fast_lio::AdmissionBucket::kEnqueuedDeclared, std::uint64_t(msg->width) * msg->height);
+  }
+  accounting.resolve();
   frontendAdmit(msg->header.stamp);
   time_buffer.push_back(cur_time);
   lidar_receive_time_buffer.push_back(receive_time);
-  trim_lidar_buffer();
+  trim_lidar_buffer(observer);
   last_timestamp_lidar = cur_time;
   if (fast_lio::timingLogAccepts(scan_count)) {
     s_plot11[fast_lio::timingLogSlot(scan_count)] = omp_get_wtime() - preprocess_start_time;
@@ -972,7 +1012,8 @@ void shm_allpoint_cbk(const shm_msgs::msg::PointCloud8mAndPose::UniquePtr msg, f
   mtx_buffer.lock();
   scan_count++;
   double cur_time = get_time_sec(msg->header.stamp);
-  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar", lead)) {
+  if (acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar", lead) !=
+      fast_lio::AdmissionInputResult::kAccepted) {
     mtx_buffer.unlock();
     if (frontend_observation_en)
       publishFrontendObservation(false);
@@ -1022,7 +1063,8 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg, fast_
   }
   mtx_buffer.lock();
   double cur_time = get_time_sec(msg->header.stamp);
-  if (!acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar", lead)) {
+  if (acceptInputEpoch(is_first_lidar ? -1.0 : last_timestamp_lidar, cur_time, "lidar", lead) !=
+      fast_lio::AdmissionInputResult::kAccepted) {
     mtx_buffer.unlock();
     if (frontend_observation_en)
       publishFrontendObservation(false);
@@ -1075,7 +1117,10 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg, fast_
 
 void checkAnchorEvidenceOnImu(double imu_stamp, bool scan_waiting);
 
-void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stamp, fast_lio::InputLeadFilter & lead)
+void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg,
+                     double debug_raw_stamp,
+                     fast_lio::InputLeadFilter & lead,
+                     fast_lio::TimeAdmissionAccounting * observer = nullptr)
 {
   publish_count++;
   if (!diag_first_imu_cb_logged) {
@@ -1089,7 +1134,8 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
   double timestamp = get_time_sec(msg->header.stamp);
 
   mtx_buffer.lock();
-  if (!acceptInputEpoch(last_timestamp_imu, timestamp, "imu", lead)) {
+  if (acceptInputEpoch(last_timestamp_imu, timestamp, "imu", lead, observer) !=
+      fast_lio::AdmissionInputResult::kAccepted) {
     mtx_buffer.unlock();
     if (frontend_observation_en)
       publishFrontendObservation(false);
@@ -1122,14 +1168,16 @@ void enqueue_imu_msg(sensor_msgs::msg::Imu::SharedPtr msg, double debug_raw_stam
     publishFrontendObservation(false);
 }
 
-void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in, fast_lio::InputLeadFilter & lead)
+void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in,
+             fast_lio::InputLeadFilter & lead,
+             fast_lio::TimeAdmissionAccounting * observer)
 {
   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
   msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
   if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en) {
     msg->header.stamp = rclcpp::Time(timediff_lidar_wrt_imu + get_time_sec(msg_in->header.stamp));
   }
-  enqueue_imu_msg(msg, get_time_sec(msg_in->header.stamp), lead);
+  enqueue_imu_msg(msg, get_time_sec(msg_in->header.stamp), lead, observer);
 }
 
 void imu_bias_cbk(const fixposition_driver_msgs::msg::FpaImubias::UniquePtr msg_in)
@@ -1153,7 +1201,9 @@ void imu_bias_cbk(const fixposition_driver_msgs::msg::FpaImubias::UniquePtr msg_
   }
 }
 
-void imu_fpa_cbk(const fixposition_driver_msgs::msg::FpaImu::UniquePtr msg_in, fast_lio::InputLeadFilter & lead)
+void imu_fpa_cbk(const fixposition_driver_msgs::msg::FpaImu::UniquePtr msg_in,
+                 fast_lio::InputLeadFilter & lead,
+                 fast_lio::TimeAdmissionAccounting * observer)
 {
   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(msg_in->data));
   msg->header.stamp = get_ros_time(get_time_sec(msg_in->data.header.stamp) + imu_time_offset);
@@ -1178,7 +1228,7 @@ void imu_fpa_cbk(const fixposition_driver_msgs::msg::FpaImu::UniquePtr msg_in, f
                 get_time_sec(msg->header.stamp));
     diag_first_fixposition_bias_applied_logged = true;
   }
-  enqueue_imu_msg(msg, get_time_sec(msg_in->data.header.stamp), lead);
+  enqueue_imu_msg(msg, get_time_sec(msg_in->data.header.stamp), lead, observer);
 }
 
 void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
@@ -1291,8 +1341,10 @@ std::uint64_t empty_scan_imu_count = 0;
 std::uint64_t imu_coverage_drop_count = 0;
 
 // Callbacks and sync use the same mutually exclusive callback group.
-void popLidarScan()
+void popLidarScan(fast_lio::TimeAdmissionAccounting * observer, fast_lio::AdmissionBucket reason)
 {
+  if (observer)
+    observer->record(reason, lidar_buffer.front()->size());
   lidar_buffer.pop_front();
   time_buffer.pop_front();
   if (!lidar_receive_time_buffer.empty())
@@ -2281,7 +2333,7 @@ void markImuGapBridged(double end)
   fast_lio::updateReanchorGate(&reanchor_gate, true, 0, 0.0, end, reanchor_params);
 }
 
-bool finishImuBatch(const fast_lio::ImuProcessOutcome & outcome)
+bool finishImuBatch(const fast_lio::ImuProcessOutcome & outcome, fast_lio::TimeAdmissionAccounting * observer = nullptr)
 {
   std::unique_lock<std::mutex> lock(mtx_buffer);
   const auto sequence = pending_imu_token.sequence;
@@ -2295,6 +2347,16 @@ bool finishImuBatch(const fast_lio::ImuProcessOutcome & outcome)
   last_imu_token_for_test = pending_imu_token;
 #endif
   const auto confirmation = imu_fifo_transaction.settle(imu_buffer, pending_imu_token, outcome.disposition);
+  if (observer) {
+    observer->add(observer->confirmations[static_cast<std::size_t>(confirmation)]);
+    observer->add(observer->settle_reasons[static_cast<std::size_t>(outcome.reason)]);
+    observer->add(observer->settle_dispositions[static_cast<std::size_t>(outcome.disposition)]);
+    observer->add(observer->settle_samples, samples);
+    observer->last_token = sequence;
+    observer->last_epoch = epoch;
+    observer->last_settle_known = true;
+    observer->settle_fc_bits = fast_lio::admissionDoubleBits(p_imu->lastProcessedEnd());
+  }
   const auto reason = static_cast<std::size_t>(outcome.reason);
   ++imu_consumption_counters.events.at(reason);
   if (confirmation == fast_lio::ImuConfirmation::kRetained) {
@@ -2338,7 +2400,7 @@ bool finishImuBatch(const fast_lio::ImuProcessOutcome & outcome)
           ++imu_consumption_counters.exceptionValidLost;
       }
     }
-    clearBufferedInputsLocked();
+    clearBufferedInputsLocked(observer, fast_lio::AdmissionBucket::kClearFatal);
   }
   const auto pending = imu_buffer.size();
   const auto events = imu_consumption_counters.events.at(reason);
@@ -2381,7 +2443,7 @@ bool finishImuBatch(const fast_lio::ImuProcessOutcome & outcome)
   return settled;
 }
 
-bool sync_packages(MeasureGroup & meas)
+bool sync_packages(MeasureGroup & meas, fast_lio::TimeAdmissionAccounting * observer)
 {
   std::unique_lock<std::mutex> lock(mtx_buffer);
   if (input_epoch_guard.faulted() && !input_epoch_handled) {
@@ -2399,6 +2461,8 @@ bool sync_packages(MeasureGroup & meas)
   if (!imu_fifo_transaction.acceptsInput(input_epoch_guard.faulted()))
     return false;
   if (lidar_buffer.empty() || imu_buffer.empty()) {
+    if (observer && !lidar_buffer.empty() && imu_buffer.empty())
+      observer->add(observer->wait_no_imu);
     return false;
   }
 
@@ -2419,6 +2483,8 @@ bool sync_packages(MeasureGroup & meas)
     }
     const auto timing = fast_lio::scanTime(
       meas.lidar_beg_time, meas.lidar->points, [](const auto & point) { return point.curvature; }, max_scan_duration_s);
+    if (observer)
+      observer->add(observer->scan_time_status[static_cast<std::size_t>(timing.status)]);
     if (!timing.valid()) {
       ++invalid_scan_time_count;
       RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping.imu_transactions"),
@@ -2440,7 +2506,7 @@ bool sync_packages(MeasureGroup & meas)
       // A rejected scan is no match: a recovery has to show its stable time again without it.
       fast_lio::breakRecoveryRun(&recovery_state);
       meas.imu.clear();
-      popLidarScan();
+      popLidarScan(observer, fast_lio::AdmissionBucket::kSyncInvalid);
       return false;
     }
     lidar_end_time = timing.end;
@@ -2461,7 +2527,7 @@ bool sync_packages(MeasureGroup & meas)
         fast_lio::AnchorScanOutcome::kDroppedNonadvancing, meas.lidar_beg_time, lidar_end_time, false);
       fast_lio::breakRecoveryRun(&recovery_state);
       meas.imu.clear();
-      popLidarScan();
+      popLidarScan(observer, fast_lio::AdmissionBucket::kSyncNonadvancing);
       return false;
     }
 
@@ -2471,6 +2537,8 @@ bool sync_packages(MeasureGroup & meas)
   }
 
   if (last_timestamp_imu < lidar_end_time) {
+    if (observer)
+      observer->add(observer->wait_tail);
     return false;
   }
 
@@ -2481,14 +2549,25 @@ bool sync_packages(MeasureGroup & meas)
   pending_imu_token = imu_fifo_transaction.borrow(imu_buffer, count);
   for (const auto & sample : pending_imu_token.prefix)
     meas.imu.push_back(sample.message);
-  popLidarScan();
+  popLidarScan(observer, fast_lio::AdmissionBucket::kBorrowed);
   if (meas.imu.empty() && p_imu->bridgesEmptyScan(meas.lidar_end_time)) {
     // No IMU sample in this scan, but the lidar kept recording through the IMU dropout: the IMU-gap prior carries
     // the state across it (imu_gap_empty_scans) and the scan is registered instead of dropped.
     return true;
   }
   if (meas.imu.empty()) {
-    imu_fifo_transaction.settle(imu_buffer, pending_imu_token, fast_lio::ImuDisposition::kUncommitted);
+    const auto confirmation =
+      imu_fifo_transaction.settle(imu_buffer, pending_imu_token, fast_lio::ImuDisposition::kUncommitted);
+    if (observer) {
+      observer->record(fast_lio::AdmissionBucket::kEmptyImu, meas.lidar->size());
+      observer->add(observer->confirmations[static_cast<std::size_t>(confirmation)]);
+      observer->add(observer->settle_dispositions[static_cast<std::size_t>(fast_lio::ImuDisposition::kUncommitted)]);
+      observer->add(observer->settle_reason_not_recorded);
+      observer->last_settle_known = true;
+      observer->settle_fc_bits = fast_lio::admissionDoubleBits(p_imu->lastProcessedEnd());
+      observer->last_token = pending_imu_token.sequence;
+      observer->last_epoch = pending_imu_token.epoch;
+    }
 #ifdef FASTLIO_TEST_HOOKS
     const std::uint64_t emptyWindowSequence = pending_imu_token.sequence;
     const std::size_t emptyWindowSamples = pending_imu_token.prefix.size();
@@ -2572,6 +2651,8 @@ double g_map_join_wait_ms = 0;            // last joinMapAdd() block time (main-
 namespace fast_lio_test
 {
 std::function<void()> beforeMapAdd;
+std::function<void(const fast_lio::TimeAdmissionSnapshot &)> afterAdmissionSnapshot;
+std::function<void(const char *, std::size_t)> afterAdmissionSummary;
 std::function<void()> beforeResetJoin;
 std::function<void()> afterPendingReset;
 std::function<void(std::size_t, double)> afterScanPrepared;
@@ -2642,7 +2723,8 @@ ImuInputSnapshot inspectImuInput()
           imu_fifo_transaction.faulted(),
           flio_map_frozen,
           flio_degraded_odom,
-          p_imu->lastProcessedEnd()};
+          p_imu->lastProcessedEnd(),
+          scan_count};
 }
 
 int reconfirmLastImuBatch()
@@ -2752,7 +2834,7 @@ void startMapWorker()
     map_worker_thread = std::thread(mapWorkerLoop);
 }
 
-void stopMapWorker()  // drain any in-flight Add + join; idempotent
+void stopMapWorker(fast_lio::TimeAdmissionAccounting * observer)  // drain + join; idempotent
 {
   {
     std::lock_guard<std::mutex> lk(map_add_mtx);
@@ -2761,12 +2843,21 @@ void stopMapWorker()  // drain any in-flight Add + join; idempotent
   map_add_cv.notify_all();
   if (map_worker_thread.joinable())
     map_worker_thread.join();
+  if (observer)
+    observer->joined();
 }
 
 // Hand the two add-lists to the worker. Precondition: worker idle (caller joined this
 // scan's predecessor). Moves the vectors so the hot path does no point copy.
-void dispatchMapAdd(PointVector & toAdd, PointVector & noDS)
+void dispatchMapAdd(PointVector & toAdd, PointVector & noDS, fast_lio::TimeAdmissionAccounting * observer)
 {
+  std::uint64_t downsampled = 0, direct = 0;
+  if (observer) {
+    if (observer->async_inflight)
+      observer->accounting_complete = false;
+    downsampled = toAdd.size();
+    direct = noDS.size();
+  }
   {
     std::lock_guard<std::mutex> lk(map_add_mtx);
     map_add_ds_.swap(toAdd);
@@ -2774,30 +2865,79 @@ void dispatchMapAdd(PointVector & toAdd, PointVector & noDS)
     map_add_ready_ = true;
   }
   map_add_cv.notify_one();
+  if (observer) {
+    observer->submit(fast_lio::AdmissionMapKind::kIncrementalDownsampled, downsampled);
+    observer->submit(fast_lio::AdmissionMapKind::kIncrementalDirect, direct);
+    observer->add(observer->async_dispatches);
+    observer->async_inflight = true;
+  }
 }
 
 // Block until the worker has finished the in-flight Add. Called before the next scan's
 // first tree op (lasermap_fov_segment) to restore the single-operator invariant.
-void joinMapAdd()
+void joinMapAdd(fast_lio::TimeAdmissionAccounting * observer = nullptr)
 {
   const double t0 = omp_get_wtime();
   std::unique_lock<std::mutex> lk(map_add_mtx);
   map_add_cv.wait(lk, [] { return !map_add_ready_ && !map_add_running_; });
   g_map_join_wait_ms = (omp_get_wtime() - t0) * 1000.0;
+  if (observer)
+    observer->joined();
+}
+
+// Point counts are read only on the opt-in path. Completion means this exact backend call returned, not that
+// every presented point survived voxel selection. The original return and exception propagate unchanged.
+template<class Points, class Call>
+auto observeMapOperation(fast_lio::TimeAdmissionAccounting * observer,
+                         fast_lio::AdmissionMapKind kind,
+                         Points points,
+                         Call call) -> decltype(call())
+{
+  if (!observer)
+    return call();
+  const auto sizes = points();  // current scan, prior, reused local map (map_presented units)
+  observer->submit(kind, sizes[0], sizes[1], sizes[2]);
+  try {
+    if constexpr (std::is_void<decltype(call())>::value) {
+      call();
+      observer->complete(kind);
+    } else {
+      auto result = call();
+      observer->complete(kind);
+      return result;
+    }
+  } catch (...) {
+    observer->accounting_complete = false;
+    throw;
+  }
+}
+
+fast_lio::AdmissionCount admissionDelayedPending(fast_lio::TimeAdmissionAccounting & observer)
+{
+  fast_lio::AdmissionCount pending{};
+  for (const auto & batch : map_insert_pending.pending()) {
+    observer.count(pending, batch.first.size());
+    observer.add(pending.points, batch.second.size());
+  }
+  return pending;
 }
 
 // The recovery callback and the worker-ordering fixture use this exact boundary.
 // Join precedes every map read/write and discarding delayed world-frame batches.
-bool rebuildLocalMapStorage(int & map_before)
+bool rebuildLocalMapStorage(int & map_before, fast_lio::TimeAdmissionAccounting * observer)
 {
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::beforeResetJoin)
     fast_lio_test::beforeResetJoin();
 #endif
   if (async_map_en)
-    joinMapAdd();
+    joinMapAdd(observer);
   // The worker no longer owns an old batch. Pending world-frame points
   // belong to the discarded live history and must not reappear later.
+  if (observer) {
+    const auto pending = admissionDelayedPending(*observer);
+    observer->count(observer->reset_discarded, pending.points, pending.messages);
+  }
   map_insert_pending.reset();
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterPendingReset)
@@ -2815,19 +2955,43 @@ bool rebuildLocalMapStorage(int & map_before)
     // stopped fitting, the delivered map did not. Recovery drops what this run learned
     // and re-registers against what it was given.
     ikdtree.clearLive();
-    ikdtree.Add_Points(feats_down_world->points, true);
+    observeMapOperation(
+      observer,
+      fast_lio::AdmissionMapKind::kRecoveryAdd,
+      [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
+      [] { return ikdtree.Add_Points(feats_down_world->points, true); });
     kept_prior = true;
   } else
 #endif
   {
-    ikdtree.Build(feats_down_world->points);
+    observeMapOperation(
+      observer,
+      fast_lio::AdmissionMapKind::kRecoveryBuild,
+      [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
+      [] { return ikdtree.Build(feats_down_world->points); });
   }
   Localmap_Initialized = false;
   return kept_prior;
 }
 
+#ifdef FASTLIO_TEST_HOOKS
+// Preserve the existing worker fixture's ABI; those calls have no node-owned observer.
+void stopMapWorker()
+{
+  stopMapWorker(nullptr);
+}
+void dispatchMapAdd(PointVector & downsampled, PointVector & direct)
+{
+  dispatchMapAdd(downsampled, direct, nullptr);
+}
+bool rebuildLocalMapStorage(int & before)
+{
+  return rebuildLocalMapStorage(before, nullptr);
+}
+#endif
+
 // nearest: each scan point's map neighbours from the measurement model's last search.
-void map_incremental(const std::vector<PointVector> & nearest)
+void map_incremental(const std::vector<PointVector> & nearest, fast_lio::TimeAdmissionAccounting * observer)
 {
   PointVector PointToAdd;
   PointVector PointNoNeedDownsample;
@@ -2872,6 +3036,10 @@ void map_incremental(const std::vector<PointVector> & nearest)
 
   // Preserve each scan's paired add decisions and release exactly the batch
   // that is now delay scans old; the reset path discards its old-world history.
+  if (observer) {
+    observer->count(observer->staged, PointToAdd.size());
+    observer->add(observer->staged.points, PointNoNeedDownsample.size());
+  }
   auto ready =
     map_insert_pending.stage(std::move(PointToAdd), std::move(PointNoNeedDownsample), map_insert_delay_scans);
   if (!ready) {
@@ -2880,6 +3048,10 @@ void map_incremental(const std::vector<PointVector> & nearest)
   }
   PointToAdd = std::move(ready->first);
   PointNoNeedDownsample = std::move(ready->second);
+  if (observer) {
+    observer->count(observer->released, PointToAdd.size());
+    observer->add(observer->released.points, PointNoNeedDownsample.size());
+  }
 #ifdef USE_IVOX
   ikdtree.countEntryViewFrame();
 #ifdef FASTLIO_TEST_HOOKS
@@ -2895,11 +3067,19 @@ void map_incremental(const std::vector<PointVector> & nearest)
     // untouched in this path — it is a main-thread debug stat and the worker must not
     // write plain globals the main thread reads.
     add_point_size = (int)(PointToAdd.size() + PointNoNeedDownsample.size());
-    dispatchMapAdd(PointToAdd, PointNoNeedDownsample);
+    dispatchMapAdd(PointToAdd, PointNoNeedDownsample, observer);
   } else {
     double st_time = omp_get_wtime();
-    add_point_size = ikdtree.Add_Points(PointToAdd, true);
-    ikdtree.Add_Points(PointNoNeedDownsample, false);
+    add_point_size = observeMapOperation(
+      observer,
+      fast_lio::AdmissionMapKind::kIncrementalDownsampled,
+      [&] { return std::array<std::uint64_t, 3>{PointToAdd.size(), 0, 0}; },
+      [&] { return ikdtree.Add_Points(PointToAdd, true); });
+    observeMapOperation(
+      observer,
+      fast_lio::AdmissionMapKind::kIncrementalDirect,
+      [&] { return std::array<std::uint64_t, 3>{PointNoNeedDownsample.size(), 0, 0}; },
+      [&] { return ikdtree.Add_Points(PointNoNeedDownsample, false); });
     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     kdtree_incremental_time = omp_get_wtime() - st_time;
   }
@@ -3530,13 +3710,7 @@ public:
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("map_backend");
 #endif
-    params_.readDiagnosticsAndMapSave(*this,
-                                      startup,
-                                      latency_diag_en,
-                                      latency_log_period_sec,
-                                      map_insert_delay_scans,
-                                      pcd_save_en,
-                                      pcd_save_interval);
+    configureDiagnostics(startup);
     params_.readPriorMapPath(*this, prior_map_pcd_);
     // Recovery episodes wait for the first local reference only in a fresh process that builds its local map from
     // its own scans. Decided here, once, from the configured parameter and before any input: the prior-map paths
@@ -3691,6 +3865,9 @@ public:
           std::sort(names.begin(), names.end());
           std::string config;
           for (const auto & name : names) {
+            // Local observation does not change the estimator/reference contract or its existing identity.
+            if (name == "diagnostics.time_admission_counts_enable")
+              continue;
             const auto text = this->get_parameter(name).value_to_string();
             config += std::to_string(name.size()) + ":" + name + std::to_string(text.size()) + ":" + text;
           }
@@ -3777,7 +3954,8 @@ public:
     // Both workers are global std::threads: component destruction must join them before
     // library unload to avoid std::terminate. Match standalone shutdown order: finish map
     // updates first, then drain PCD writes. Both stops are idempotent with main's calls.
-    stopMapWorker();
+    stopMapWorker(admissionObserver());
+    finishAdmissionAccounting();
     stopPcdWriter();
     frontend_publisher.reset();
     reference_publisher.reset();
@@ -4090,14 +4268,14 @@ private:
                                       : rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
       sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
         startup.lid_topic, pc_qos, [this](sensor_msgs::msg::PointCloud2::UniquePtr msg) {
-          standard_pcl_cbk(std::move(msg), lidar_input_lead_);
+          standard_pcl_cbk(std::move(msg), lidar_input_lead_, admissionObserver());
         });
     }
     if (startup.imu_input_type == "fixposition_fpa") {
       auto imu_qos = rclcpp::SensorDataQoS();
       sub_imu_fpa_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImu>(
         startup.imu_topic, imu_qos, [this](fixposition_driver_msgs::msg::FpaImu::UniquePtr msg) {
-          imu_fpa_cbk(std::move(msg), imu_input_lead_);
+          imu_fpa_cbk(std::move(msg), imu_input_lead_, admissionObserver());
         });
       sub_imu_bias_ = this->create_subscription<fixposition_driver_msgs::msg::FpaImubias>(
         startup.imu_bias_topic, imu_qos, imu_bias_cbk);
@@ -4109,7 +4287,7 @@ private:
     } else {
       sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
         startup.imu_topic, 1000, [this](sensor_msgs::msg::Imu::UniquePtr msg) {
-          imu_cbk(std::move(msg), imu_input_lead_);
+          imu_cbk(std::move(msg), imu_input_lead_, admissionObserver());
         });
       RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", startup.imu_topic.c_str());
     }
@@ -4352,6 +4530,7 @@ private:
     record.value("diagnostics.latency_enable", latency_diag_en);
     record.value("diagnostics.latency_log_period_sec", latency_log_period_sec);
     record.value("diagnostics.kalman_channel_enable", params_.values().kalman_channel_diag_en);
+    record.value("diagnostics.time_admission_counts_enable", params_.values().time_admission_counts_enable);
   }
   void effectiveRecoveryForTest(fast_lio_test::EffectiveRecorder & record)
   {
@@ -4699,7 +4878,7 @@ private:
       fast_lio::resetRecoveryReference(&recovery_state, fast_lio::traceNs(lidar_end_time), recovery_params),
       fast_lio::traceNs(lidar_end_time));
     int map_before = 0;
-    const bool kept_prior = rebuildLocalMapStorage(map_before);
+    const bool kept_prior = rebuildLocalMapStorage(map_before, admissionObserver());
     const auto prior =
       fast_lio::priorMapAfterReset(prior_map_installed_, kept_prior, params_.values().prior_map_freeze);
 #ifdef FASTLIO_TEST_HOOKS
@@ -4791,10 +4970,398 @@ private:
                           input_epoch_fault_stamp);
   }
 
+  void configureDiagnostics(fast_lio::FrontendStartup & startup)
+  {
+    params_.readDiagnosticsAndMapSave(
+      *this, startup, latency_diag_en, latency_log_period_sec, map_insert_delay_scans, pcd_save_en, pcd_save_interval);
+    admission_.enabled = params_.values().time_admission_counts_enable;
+    if (admission_.enabled && (p_pre->lidar_type == AVIA || p_pre->lidar_type == ALLPOINT)) {
+      admission_.supported = false;
+      admission_.accounting_complete = false;
+    }
+  }
+
+  fast_lio::TimeAdmissionAccounting * admissionObserver() noexcept
+  {
+    return admission_.enabled && admission_.supported ? &admission_ : nullptr;
+  }
+
+  void accountProcessException(fast_lio::TimeAdmissionAccounting * observer) noexcept
+  {
+    if (!observer)
+      return;
+    auto & audit = observer->last_process;
+    audit.fc_after_known = true;
+    audit.fc_after_bits = fast_lio::admissionDoubleBits(p_imu->lastProcessedEnd());
+    audit.reason = fast_lio::ImuProcessReason::kPartialPropagation;
+    audit.disposition = fast_lio::ImuDisposition::kFatal;
+    observer->process(audit);
+  }
+
+  // Called only after stopMapWorker returned. No buffer mutex is held while joining or formatting.
+  fast_lio::TimeAdmissionSnapshot admissionShutdownSnapshot()
+  {
+    fast_lio::TimeAdmissionSnapshot snapshot{};
+    snapshot.accounting = admission_;
+    snapshot.shutdown = true;
+    snapshot.map_joined = !map_worker_thread.joinable() && !admission_.async_inflight;
+    if (!admission_.enabled)
+      return snapshot;
+    // stopMapWorker has joined: these are the real worker's flags, read without mtx_buffer or a live worker.
+    snapshot.map_pending_known = true;
+    snapshot.map_pending_operations = (map_add_ready_ || map_add_running_) ? 2 : 0;
+    {
+      std::lock_guard<std::mutex> lock(mtx_buffer);
+      for (const auto & cloud : lidar_buffer)
+        snapshot.accounting.count(snapshot.queue_pending, cloud->size());
+    }
+    snapshot.delayed_pending = admissionDelayedPending(snapshot.accounting);
+    snapshot.pending_known = true;
+    snapshot.fc_known = true;
+    snapshot.fc_bits = fast_lio::admissionDoubleBits(p_imu->lastProcessedEnd());
+    snapshot.imu_duplicate_confirmations = imu_fifo_transaction.duplicateConfirmations();
+    snapshot.imu_duplicate_integrations = p_imu->integrationLedger().duplicateIntegrations();
+    snapshot.imu_watermark_regressions = p_imu->integrationLedger().watermarkRegressions();
+    fast_lio::checkAdmissionSnapshot(snapshot);
+    if (!snapshot.map_joined || snapshot.map_pending_operations != 0)
+      snapshot.accounting.accounting_complete = false;
+    return snapshot;
+  }
+
+  void finishAdmissionAccounting() noexcept
+  {
+    if (!admission_.enabled) {
+#ifdef FASTLIO_TEST_HOOKS
+      if (fast_lio_test::afterAdmissionSnapshot)
+        fast_lio_test::afterAdmissionSnapshot(admissionShutdownSnapshot());
+#endif
+      return;
+    }
+    try {
+      const auto snapshot = admissionShutdownSnapshot();
+#ifdef FASTLIO_TEST_HOOKS
+      if (fast_lio_test::afterAdmissionSnapshot)
+        fast_lio_test::afterAdmissionSnapshot(snapshot);
+#endif
+      logAdmissionSummary(snapshot);
+    } catch (...) {
+      admission_.accounting_complete = false;  // diagnostic trouble never stops the estimator or throws at shutdown
+    }
+  }
+
+  template<class Append>
+  void appendAdmissionDetails(Append append, const fast_lio::TimeAdmissionSnapshot & s)
+  {
+    const auto & a = s.accounting;
+    const auto integers = [&](const char * name, const auto & values) {
+      append("\"%s\":[", name);
+      for (std::size_t i = 0; i < values.size(); ++i)
+        append("%s%llu", i ? "," : "", static_cast<unsigned long long>(values[i]));
+      append("],");
+    };
+    integers("scan_time_status", a.scan_time_status);
+    integers("settle_confirmations", a.confirmations);
+    integers("settle_reasons", a.settle_reasons);
+    integers("settle_dispositions", a.settle_dispositions);
+    integers("process_dispositions", a.process_dispositions);
+    integers("caller_exits", a.exits);
+    integers("map_gate_labels", a.map_gates);
+    append("\"map_pending_known\":%s,\"map_pending_operations\":%llu,",
+           s.map_pending_known ? "true" : "false",
+           static_cast<unsigned long long>(s.map_pending_operations));
+    append(
+      "\"history_keep_erased_points\":%llu,\"history_keep_retained_points\":%llu,"
+      "\"history_reject_erased_points\":%llu,\"history_reject_retained_points\":%llu,\"settle_fc_bits\":%llu,",
+      static_cast<unsigned long long>(a.history_keep_erased),
+      static_cast<unsigned long long>(a.history_keep_retained),
+      static_cast<unsigned long long>(a.history_reject_erased),
+      static_cast<unsigned long long>(a.history_reject_retained),
+      static_cast<unsigned long long>(a.settle_fc_bits));
+    append("\"last_settle_known\":%s,\"settle_reason_not_recorded\":%llu,",
+           a.last_settle_known ? "true" : "false",
+           static_cast<unsigned long long>(a.settle_reason_not_recorded));
+    append(
+      "\"async_inflight\":%s,\"async_dispatches\":%llu,\"async_joins\":%llu,"
+      "\"last_settle_token\":%llu,\"last_settle_epoch\":%llu,\"settle_samples\":%llu,"
+      "\"trim_also_age_label\":%llu,\"callback_exceptions\":%llu,"
+      "\"imu_duplicate_confirmations\":%llu,\"imu_duplicate_integrations\":%llu,\"imu_watermark_regressions\":%llu,",
+      a.async_inflight ? "true" : "false",
+      static_cast<unsigned long long>(a.async_dispatches),
+      static_cast<unsigned long long>(a.async_joins),
+      static_cast<unsigned long long>(a.last_token),
+      static_cast<unsigned long long>(a.last_epoch),
+      static_cast<unsigned long long>(a.settle_samples),
+      static_cast<unsigned long long>(a.trim_also_age),
+      static_cast<unsigned long long>(a.callback_exceptions),
+      static_cast<unsigned long long>(s.imu_duplicate_confirmations),
+      static_cast<unsigned long long>(s.imu_duplicate_integrations),
+      static_cast<unsigned long long>(s.imu_watermark_regressions));
+    append(
+      "\"canonical_header_known\":%s,\"canonical_header_bits\":%llu,\"bootstrap_fc_known\":%s,"
+      "\"bootstrap_fc_before_bits\":%llu,\"bootstrap_fc_after_bits\":%llu,"
+      "\"partitions\":{\"callback\":%s,\"fifo\":%s,\"borrowed\":%s,\"process\":%s,\"history\":%s,\"map\":%s},",
+      a.canonical_header_known ? "true" : "false",
+      static_cast<unsigned long long>(a.canonical_header_bits),
+      a.bootstrap_fc_known ? "true" : "false",
+      static_cast<unsigned long long>(a.bootstrap_fc_before_bits),
+      static_cast<unsigned long long>(a.bootstrap_fc_after_bits),
+      s.callback_partition ? "true" : "false",
+      s.queue_partition ? "true" : "false",
+      s.borrowed_partition ? "true" : "false",
+      s.process_partition ? "true" : "false",
+      s.history_partition ? "true" : "false",
+      s.map_partition ? "true" : "false");
+    const auto & p = a.last_process;
+    append(
+      "\"last_process\":{\"entered\":%s,\"completed\":%s,\"input_effective_points\":%llu,"
+      "\"history_evaluated\":%s,\"history_action\":%d,\"history_erase_completed\":%s,"
+      "\"history_erased_points\":%llu,\"history_retained_points\":%llu,\"deskew_completed\":%s,\"deskew_points\":%llu,"
+      "\"fc_before_known\":%s,\"fc_before_bits\":%llu,\"fc_after_known\":%s,\"fc_after_bits\":%llu,"
+      "\"reason\":%d,\"disposition\":%d,\"produced_output\":%s},\"delayed_count_unit\":\"batches\",",
+      p.entered ? "true" : "false",
+      p.completed ? "true" : "false",
+      static_cast<unsigned long long>(p.input_points),
+      p.history_evaluated ? "true" : "false",
+      static_cast<int>(p.history_action),
+      p.history_erase_completed ? "true" : "false",
+      static_cast<unsigned long long>(p.history_erased_points),
+      static_cast<unsigned long long>(p.history_retained_points),
+      p.deskew_completed ? "true" : "false",
+      static_cast<unsigned long long>(p.deskew_points),
+      p.fc_before_known ? "true" : "false",
+      static_cast<unsigned long long>(p.fc_before_bits),
+      p.fc_after_known ? "true" : "false",
+      static_cast<unsigned long long>(p.fc_after_bits),
+      static_cast<int>(p.reason),
+      static_cast<int>(p.disposition),
+      p.produced_output ? "true" : "false");
+  }
+
+  void logAdmissionSummary(const fast_lio::TimeAdmissionSnapshot & s)
+  {
+    char text[32768];
+    std::size_t used = 0;
+    bool complete = true;
+    const auto append = [&](const char * format, auto... values) {
+      if (!complete)
+        return;
+      const int n = std::snprintf(text + used, sizeof text - used, format, values...);
+      if (n < 0 || static_cast<std::size_t>(n) >= sizeof text - used) {
+        complete = false;
+        return;
+      }
+      used += static_cast<std::size_t>(n);
+    };
+    const auto count = [&](const char * name, const fast_lio::AdmissionCount & c) {
+      append("\"%s\":{\"messages\":%llu,\"points\":%llu},",
+             name,
+             static_cast<unsigned long long>(c.messages),
+             static_cast<unsigned long long>(c.points));
+    };
+    const auto & a = s.accounting;
+    append(
+      "{\"schema\":\"fe_local_accounting_v1\",\"scope\":\"fe_local_standard_pcl_v1\","
+      "\"enabled\":true,\"supported\":%s,\"end_reason\":\"shutdown\",\"reader_eof_verified\":false,"
+      "\"map_joined\":%s,\"source_identity\":\"NOT_RECORDED\",\"config_identity\":\"NOT_RECORDED\","
+      "\"source_message_uid\":\"NOT_RECORDED\",\"point_uid\":\"NOT_RECORDED\",\"raw_header\":\"NOT_RECORDED\","
+      "\"raw_index\":\"NOT_RECORDED\",\"bag_ordinal\":\"NOT_RECORDED\",\"physical_identity\":\"NOT_RECORDED\","
+      "\"lineage_scope\":\"LOCAL_COUNTS_ONLY\",\"local_event_seq\":%llu,\"buckets\":[",
+      a.supported ? "true" : "false",
+      s.map_joined ? "true" : "false",
+      static_cast<unsigned long long>(a.local_event_seq));
+    constexpr const char * names[] = {"received",
+                                      "epoch_rejected",
+                                      "late_rejected",
+                                      "enqueued_declared",
+                                      "enqueued",
+                                      "trim_count",
+                                      "trim_age",
+                                      "clear_epoch",
+                                      "clear_fatal",
+                                      "sync_invalid",
+                                      "sync_nonadvancing",
+                                      "borrowed",
+                                      "empty_imu",
+                                      "bootstrap",
+                                      "process_entered",
+                                      "deskew",
+                                      "downsampled",
+                                      "lead_rejected",
+                                      "transaction_rejected"};
+    constexpr const char * units[] = {
+      "declared_input", "preprocessed_effective", "deskew", "downsampled", "map_presented"};
+    for (std::size_t i = 0; i < a.counts.size(); ++i) {
+      const auto & c = a.counts[i];
+      append("%s{\"name\":\"%s\",\"point_unit\":\"%s\",\"messages\":%llu,\"points\":%llu}",
+             i ? "," : "",
+             names[i],
+             units[static_cast<std::size_t>(fast_lio::admissionPointUnit(static_cast<fast_lio::AdmissionBucket>(i)))],
+             static_cast<unsigned long long>(c.messages),
+             static_cast<unsigned long long>(c.points));
+    }
+    append("],\"process_outcomes\":[");
+    for (std::size_t i = 0; i < a.process_outcomes.size(); ++i)
+      append("%s{\"reason\":\"%s\",\"messages\":%llu,\"effective_points\":%llu}",
+             i ? "," : "",
+             fast_lio::imuProcessReasonName(static_cast<fast_lio::ImuProcessReason>(i)),
+             static_cast<unsigned long long>(a.process_outcomes[i].messages),
+             static_cast<unsigned long long>(a.process_outcomes[i].points));
+    append("],\"map_operations\":[");
+    for (std::size_t i = 0; i < a.map.size(); ++i) {
+      const auto & op = a.map[i];
+      append(
+        "%s{\"kind\":%zu,\"submitted\":%llu,\"completed\":%llu,\"map_presented\":%llu,"
+        "\"current\":%llu,\"prior\":%llu,\"reused\":%llu}",
+        i ? "," : "",
+        i,
+        static_cast<unsigned long long>(op.submitted),
+        static_cast<unsigned long long>(op.completed),
+        static_cast<unsigned long long>(op.presented),
+        static_cast<unsigned long long>(op.current),
+        static_cast<unsigned long long>(op.prior),
+        static_cast<unsigned long long>(op.reused));
+    }
+    append("],");
+    appendAdmissionDetails(append, s);
+    count("queue_pending_effective", s.queue_pending);
+    count("callback_unresolved_declared", s.callback_unresolved_declared);
+    count("borrowed_unresolved_effective", s.borrowed_unresolved);
+    count("history_keep_effective", a.history_keep);
+    count("history_reject_effective", a.history_reject);
+    count("history_mixed_effective", a.history_mixed);
+    count("history_unknown_effective", a.history_unknown);
+    count("history_not_reached_effective", a.history_not_reached);
+    count("process_exceptions_effective", a.process_exceptions);
+    count("staged_map_presented_batches", a.staged);
+    count("released_map_presented_batches", a.released);
+    count("reset_discarded_map_presented_batches", a.reset_discarded);
+    count("pending_map_presented_batches", s.delayed_pending);
+    append(
+      "\"history_mixed_erased\":%llu,\"history_mixed_retained\":%llu,\"wait_no_imu_calls\":%llu,"
+      "\"wait_tail_calls\":%llu,\"overflow\":%s,\"exact\":%s,\"accounting_complete\":%s,"
+      "\"fc_known\":%s,\"fc_bits\":%llu,\"sink_delivery_verified\":false,\"summary_complete\":true}",
+      static_cast<unsigned long long>(a.history_erased),
+      static_cast<unsigned long long>(a.history_retained),
+      static_cast<unsigned long long>(a.wait_no_imu),
+      static_cast<unsigned long long>(a.wait_tail),
+      a.overflow ? "true" : "false",
+      a.exact ? "true" : "false",
+      a.accounting_complete ? "true" : "false",
+      s.fc_known ? "true" : "false",
+      static_cast<unsigned long long>(s.fc_bits));
+    if (!complete) {
+      admission_.accounting_complete = false;
+      return;  // no complete marker is emitted when the fixed serialization buffer is insufficient
+    }
+#ifdef FASTLIO_TEST_HOOKS
+    if (fast_lio_test::afterAdmissionSummary)
+      fast_lio_test::afterAdmissionSummary(text, used);
+#endif
+    RCLCPP_INFO(this->get_logger(), "[TIME-ADMISSION-SUMMARY] %s", text);
+  }
+
+  void bootstrapScan(fast_lio::TimeAdmissionAccounting * observer, fast_lio::AdmissionCallerScope & accounting)
+  {
+    accounting.finish(fast_lio::AdmissionExit::kBootstrap);
+    if (observer) {
+      observer->record(fast_lio::AdmissionBucket::kBootstrap, Measures.lidar->size());
+      observer->bootstrap_fc_known = true;
+      observer->bootstrap_fc_before_bits = fast_lio::admissionDoubleBits(p_imu->lastProcessedEnd());
+    }
+    first_lidar_time = Measures.lidar_beg_time;
+    p_imu->first_lidar_time = first_lidar_time;
+    flg_first_scan = false;
+    finishImuBatch({fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kBootstrap}, observer);
+    if (observer)
+      observer->bootstrap_fc_after_bits = fast_lio::admissionDoubleBits(p_imu->lastProcessedEnd());
+    anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kBootstrap;
+  }
+
+  bool processImuScan(fast_lio::TimeAdmissionAccounting * observer,
+                      fast_lio::AdmissionCallerScope & accounting,
+                      AnchorScanScope & anchor_scan_scope)
+  {
+    bool processed = false;
+    auto * audit = observer ? &observer->last_process : nullptr;
+    if (audit)
+      *audit = {};
+    try {
+#ifdef FASTLIO_TEST_HOOKS
+      if (fast_lio_test::beforeImuProcess)
+        fast_lio_test::beforeImuProcess();
+#endif
+      processed = p_imu->Process(Measures, kf, feats_undistort, audit);
+      if (observer)
+        observer->process(*audit);
+    } catch (const std::exception & error) {
+      accountProcessException(observer);
+      accounting.finish(fast_lio::AdmissionExit::kProcessException);
+      feats_undistort->clear();
+      finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation}, observer);
+      RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: %s", error.what());
+      anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
+      dropAnchorForLostImu(Measures.lidar_end_time);
+      return false;
+    } catch (...) {
+      accountProcessException(observer);
+      accounting.finish(fast_lio::AdmissionExit::kProcessException);
+      feats_undistort->clear();
+      finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation}, observer);
+      RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: unknown exception");
+      anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
+      dropAnchorForLostImu(Measures.lidar_end_time);
+      return false;
+    }
+    if (p_imu->initializationDegraded() && !imu_init_degraded_warned_) {
+      imu_init_degraded_warned_ = true;
+      RCLCPP_WARN(this->get_logger(),
+                  "[IMU-INIT] sustained still-gate timeout: initialized from a MOVING IMU window; "
+                  "map roll/pitch may be biased (initialization degraded)");
+    }
+    if (!finishImuBatch(p_imu->lastOutcome(), observer)) {
+      accounting.finish(fast_lio::AdmissionExit::kSettleFailed);
+      anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
+      dropAnchorForLostImu(Measures.lidar_end_time);
+      return false;
+    }
+    anchor_scan_scope.noteImuSettlement(p_imu->lastOutcome());
+    if (required_prior_lost) {
+      accounting.finish(fast_lio::AdmissionExit::kRequiredPriorLost);
+      fast_lio::tripReanchorLost(&reanchor_gate);
+      flio_degraded_odom = flio_map_frozen = true;
+      return false;
+    }
+    if (!processed) {
+      accounting.finish(fast_lio::AdmissionExit::kNotProcessed);
+      anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuNotProcessed;
+      if (p_imu->lastOutcome().disposition == fast_lio::ImuDisposition::kInvalid)
+        dropAnchorForLostImu(Measures.lidar_end_time);
+      if (p_imu->lastStatus() == ImuProcess::ProcessStatus::kCoverageGap) {
+        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuCoverageGap;
+        markImuCoverageGap(Measures.lidar_end_time);
+        frontendDrop();
+        if (frontend_observation_en)
+          publishFrontendObservation(false, true, Measures.lidar_end_time);
+        RCLCPP_WARN_THROTTLE(this->get_logger(),
+                             *this->get_clock(),
+                             5000,
+                             "[IMU-COVERAGE] skip without propagation reason=%d gap=%.6f end_extrap=%.6f count=%lu; "
+                             "map frozen until re-anchored",
+                             static_cast<int>(p_imu->coverage_result.status),
+                             p_imu->coverage_result.max_gap_s,
+                             p_imu->coverage_result.end_extrapolation_s,
+                             static_cast<unsigned long>(imu_coverage_drop_count));
+      }
+      return false;
+    }
+    return true;
+  }
+
   void timer_callback()
   {
     const fast_lio::FrontendParams & p = params_.values();
-    const bool ready = sync_packages(Measures);
+    auto * observer = admissionObserver();
+    const bool ready = sync_packages(Measures, observer);
     publishPendingReference();  // sync's drop path has released mtx_buffer
     if (!ready) {
       if (input_epoch_guard.faulted())
@@ -4803,6 +5370,7 @@ private:
         publishReferenceRepeat();
     }
     if (ready) {
+      fast_lio::AdmissionCallerScope accounting{observer};
       AnchorScanScope anchor_scan_scope(Measures);
       frontend_runaway = false;
 #ifdef FASTLIO_TEST_HOOKS
@@ -4814,11 +5382,7 @@ private:
         imu_backlog_reanchor_required = false;
       }
       if (flg_first_scan) {
-        first_lidar_time = Measures.lidar_beg_time;
-        p_imu->first_lidar_time = first_lidar_time;
-        flg_first_scan = false;
-        finishImuBatch({fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kBootstrap});
-        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kBootstrap;
+        bootstrapScan(observer, accounting);
         return;
       }
 
@@ -4835,67 +5399,8 @@ private:
       svd_time = 0;
       t0 = omp_get_wtime();
 
-      bool processed = false;
-      try {
-#ifdef FASTLIO_TEST_HOOKS
-        if (fast_lio_test::beforeImuProcess)
-          fast_lio_test::beforeImuProcess();
-#endif
-        processed = p_imu->Process(Measures, kf, feats_undistort);
-      } catch (const std::exception & error) {
-        feats_undistort->clear();
-        finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation});
-        RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: %s", error.what());
-        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
-        dropAnchorForLostImu(Measures.lidar_end_time);
+      if (!processImuScan(observer, accounting, anchor_scan_scope))
         return;
-      } catch (...) {
-        feats_undistort->clear();
-        finishImuBatch({fast_lio::ImuDisposition::kFatal, fast_lio::ImuProcessReason::kPartialPropagation});
-        RCLCPP_ERROR(this->get_logger(), "[IMU-CONSUMPTION-FAULT] filter processing failed closed: unknown exception");
-        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
-        dropAnchorForLostImu(Measures.lidar_end_time);
-        return;
-      }
-      if (p_imu->initializationDegraded() && !imu_init_degraded_warned_) {
-        imu_init_degraded_warned_ = true;
-        RCLCPP_WARN(this->get_logger(),
-                    "[IMU-INIT] sustained still-gate timeout: initialized from a MOVING IMU window; "
-                    "map roll/pitch may be biased (initialization degraded)");
-      }
-      if (!finishImuBatch(p_imu->lastOutcome())) {
-        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuFault;
-        dropAnchorForLostImu(Measures.lidar_end_time);
-        return;
-      }
-      anchor_scan_scope.noteImuSettlement(p_imu->lastOutcome());
-      if (required_prior_lost) {
-        fast_lio::tripReanchorLost(&reanchor_gate);
-        flio_degraded_odom = flio_map_frozen = true;
-        return;
-      }
-      if (!processed) {
-        anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuNotProcessed;
-        if (p_imu->lastOutcome().disposition == fast_lio::ImuDisposition::kInvalid)
-          dropAnchorForLostImu(Measures.lidar_end_time);
-        if (p_imu->lastStatus() == ImuProcess::ProcessStatus::kCoverageGap) {
-          anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kImuCoverageGap;
-          markImuCoverageGap(Measures.lidar_end_time);
-          frontendDrop();
-          if (frontend_observation_en)
-            publishFrontendObservation(false, true, Measures.lidar_end_time);
-          RCLCPP_WARN_THROTTLE(this->get_logger(),
-                               *this->get_clock(),
-                               5000,
-                               "[IMU-COVERAGE] skip without propagation reason=%d gap=%.6f end_extrap=%.6f count=%lu; "
-                               "map frozen until re-anchored",
-                               static_cast<int>(p_imu->coverage_result.status),
-                               p_imu->coverage_result.max_gap_s,
-                               p_imu->coverage_result.end_extrapolation_s,
-                               static_cast<unsigned long>(imu_coverage_drop_count));
-        }
-        return;
-      }
       t_undist = omp_get_wtime();
       state_point = kf.get_x();
       if (p_imu->gap_summary.gaps > 0) {
@@ -4984,6 +5489,7 @@ private:
       pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
       if (!feats_undistort || feats_undistort->empty()) {
+        accounting.finish(fast_lio::AdmissionExit::kNoCloud);
         if (!diag_first_no_point_logged) {
           RCLCPP_WARN(
             this->get_logger(), "[STARTUP][FAST_LIO] first no-point scan lidar_beg=%.3f", Measures.lidar_beg_time);
@@ -5007,7 +5513,7 @@ private:
       /*** Restore the ikd-tree single-operator invariant: wait for the previous
        *   scan's off-thread map Add to finish before this scan touches the tree. ***/
       if (async_map_en)
-        joinMapAdd();
+        joinMapAdd(observer);
       t_join = omp_get_wtime();
       installPriorMap();
 #ifdef USE_IVOX
@@ -5034,7 +5540,10 @@ private:
       /*** downsample the feature points in a scan ***/
       downSizeFilterSurf.filter(feats_undistort->points, feats_down_body->points);
       const std::size_t downsampled_count = feats_down_body->points.size();
+      if (observer)
+        observer->record(fast_lio::AdmissionBucket::kDownsampled, downsampled_count);
       if (!measurement_.prepareScan(downsampled_count, feats_down_size)) {
+        accounting.finish(fast_lio::AdmissionExit::kPrepareFailed);
         RCLCPP_ERROR(
           this->get_logger(), "Downsampled scan exceeds int-indexed estimator capacity: %zu points", downsampled_count);
         frontendDrop();
@@ -5066,6 +5575,8 @@ private:
       if (ikdtree.Root_Node == nullptr)
 #endif
       {
+        if (observer)
+          observer->add(observer->map_gates[3]);
         RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
         if (feats_down_size > 5) {
           // --- Prior map preload (Scheme 1) ---
@@ -5164,7 +5675,11 @@ private:
               size_t map_points = 0;
               if (p.prior_map_align == fast_lio::PriorMapAlign::kRelocalization) {
                 prior_map_ds_ = prior_ds;
-                ikdtree.Build(feats_down_world->points);
+                observeMapOperation(
+                  observer,
+                  fast_lio::AdmissionMapKind::kInitialBuild,
+                  [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
+                  [] { return ikdtree.Build(feats_down_world->points); });
                 anchorTraceMapUpdated();
                 RCLCPP_INFO(this->get_logger(),
                             "map built from the current scan (%d points); the prior map (%zu points) is held "
@@ -5173,10 +5688,12 @@ private:
                             prior_ds->size());
                 Localmap_Initialized = false;
                 prior_map_pcd_.clear();
+                accounting.finish(fast_lio::AdmissionExit::kInitialMap);
                 return;
               }
 #ifdef USE_IVOX
               if (!ikdtree.canAddPinnedPoints(prior_ds->points)) {
+                accounting.finish(fast_lio::AdmissionExit::kPriorCapacity);
                 RCLCPP_FATAL(this->get_logger(),
                              "Prior map cannot fit coarse capacity (%zu) or has unrepresentable voxel coordinates",
                              ikdtree.maxVoxels());
@@ -5184,8 +5701,16 @@ private:
                 return;
               }
               if (p.prior_map_pinned) {
-                ikdtree.AddPinnedPoints(prior_ds->points);
-                ikdtree.Add_Points(feats_down_world->points, true);
+                observeMapOperation(
+                  observer,
+                  fast_lio::AdmissionMapKind::kPriorAdd,
+                  [&] { return std::array<std::uint64_t, 3>{0, prior_ds->size(), 0}; },
+                  [&] { return ikdtree.AddPinnedPoints(prior_ds->points); });
+                observeMapOperation(
+                  observer,
+                  fast_lio::AdmissionMapKind::kPriorAdd,
+                  [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
+                  [] { return ikdtree.Add_Points(feats_down_world->points, true); });
                 map_points = static_cast<size_t>(ikdtree.size());
                 RCLCPP_INFO(this->get_logger(),
                             "map built from prior map (PINNED, %zu voxels) + current scan (%zu + %d = %zu points)",
@@ -5199,7 +5724,11 @@ private:
                 PointCloudXYZI::Ptr combined(new PointCloudXYZI());
                 *combined = *prior_ds;
                 *combined += *feats_down_world;
-                ikdtree.Build(combined->points);
+                observeMapOperation(
+                  observer,
+                  fast_lio::AdmissionMapKind::kPriorBuild,
+                  [&] { return std::array<std::uint64_t, 3>{feats_down_world->size(), prior_ds->size(), 0}; },
+                  [&] { return ikdtree.Build(combined->points); });
                 map_points = combined->size();
                 RCLCPP_INFO(this->get_logger(),
                             "ikd-tree built from prior map + current scan (%zu + %d = %zu points)",
@@ -5216,6 +5745,7 @@ private:
               // truncated in PCD file order — an arbitrary hole in the map the robot is about
               // to localize against, with no other symptom than a degraded match later.
               if (ikdtree.evictedVoxels() > 0) {
+                accounting.finish(fast_lio::AdmissionExit::kPriorCapacity);
                 RCLCPP_FATAL(this->get_logger(),
                              "Prior map does not fit the map backend: %zu voxel(s) were evicted while loading "
                              "(capacity ivox_max_voxels=%zu, held=%zu). The loaded map is truncated in PCD file "
@@ -5243,7 +5773,11 @@ private:
               for (int i = 0; i < feats_down_size; i++) {
                 pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
               }
-              ikdtree.Build(feats_down_world->points);
+              observeMapOperation(
+                observer,
+                fast_lio::AdmissionMapKind::kInitialBuild,
+                [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
+                [] { return ikdtree.Build(feats_down_world->points); });
               anchorTraceMapUpdated();
             }
             prior_map_pcd_.clear();  // Prevent re-execution
@@ -5260,7 +5794,11 @@ private:
                 point.x = std::numeric_limits<float>::quiet_NaN();
             }
 #endif
-            ikdtree.Build(feats_down_world->points);
+            observeMapOperation(
+              observer,
+              fast_lio::AdmissionMapKind::kInitialBuild,
+              [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
+              [] { return ikdtree.Build(feats_down_world->points); });
             // The first local reference: this build returned with the map backend holding points. Not a supported
             // scan, and nothing else of the recovery state moves; a build that took no point records nothing.
             if (fast_lio::mapBackendHoldsPoints(ikdtree))
@@ -5272,6 +5810,7 @@ private:
           fast_lio::tripReanchorLost(&reanchor_gate);
           flio_degraded_odom = flio_map_frozen = true;
         }
+        accounting.finish(fast_lio::AdmissionExit::kInitialMap);
         return;
       }
       int featsFromMapNum = ikdtree.validnum();
@@ -5282,6 +5821,7 @@ private:
 
       /*** ICP and iterated Kalman filter update ***/
       if (feats_down_size < 5) {
+        accounting.finish(fast_lio::AdmissionExit::kDownsampleSmall);
         RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
         frontendDrop();
         return;
@@ -6000,8 +6540,10 @@ private:
                      res_mean_last,
                      p.reanchor_on_fail.c_str());
         if (p.reanchor_on_fail == "reset_map") {
-          if (!rebuildLocalMap("REANCHOR"))
+          if (!rebuildLocalMap("REANCHOR")) {
+            accounting.finish(fast_lio::AdmissionExit::kRecoveryFailed);
             return;
+          }
         }
       }
       // Release the static hold.  The flag leaves this node as "the platform is
@@ -6318,9 +6860,12 @@ private:
             state_point = kf.get_x();
           }
           if (p.runaway_on_trip == "reset_map") {
-            if (!rebuildLocalMap("RUNAWAY"))
+            if (!rebuildLocalMap("RUNAWAY")) {
+              accounting.finish(fast_lio::AdmissionExit::kRecoveryFailed);
               return;
+            }
           } else if (p.runaway_on_trip == "fault_exit") {
+            accounting.finish(fast_lio::AdmissionExit::kFaultExit);
             RCLCPP_FATAL(this->get_logger(),
                          "[RUNAWAY] exiting so the supervisor can restart the pipeline (runaway_on_trip=fault_exit)");
             rclcpp::shutdown();
@@ -6494,6 +7039,7 @@ private:
       const auto & final = anchor_final_snapshot;
       logFloorFinal(lidar_end_time, p.degeneracy_floor_mode, measured.floor, final, floorCoordinateEpoch);
       publish_odometry(pubOdomAftMapped_, tf_broadcaster_, final);
+      accounting.finish(fast_lio::AdmissionExit::kPublished);
       if (anchor_scan_record_open) {
         anchor_scan_record.published = true;
         anchor_scan_record.outcome = fast_lio::AnchorScanOutcome::kPublished;
@@ -6513,8 +7059,17 @@ private:
       // to it. Without it the map is neither: the prior owns the cells it covers and live
       // scans fill the gaps between them.
       const bool frozen_by_prior = p.prior_map_freeze && prior_map_installed_;
-      if (mapping_enabled.load(std::memory_order_relaxed) && !flio_map_frozen && !frozen_by_prior) {
-        map_incremental(measurement_.nearestPoints());
+      const bool map_enabled = mapping_enabled.load(std::memory_order_relaxed);
+      if (observer) {
+        if (!map_enabled)
+          observer->add(observer->map_gates[0]);
+        if (flio_map_frozen)
+          observer->add(observer->map_gates[1]);
+        if (frozen_by_prior)
+          observer->add(observer->map_gates[2]);
+      }
+      if (map_enabled && !flio_map_frozen && !frozen_by_prior) {
+        map_incremental(measurement_.nearestPoints(), observer);
         anchorTraceMapUpdated();
       }
       t5 = omp_get_wtime();
@@ -6753,7 +7308,11 @@ private:
     // first-point-wins, so where this run has already put a point the delivered map does not
     // displace it. Expected, and small early in a run — but a large shortfall means the live
     // map already covers the area and the prior map is adding little.
-    const int added = ikdtree.AddPinnedPoints(in_frame->points);
+    const int added = observeMapOperation(
+      admissionObserver(),
+      fast_lio::AdmissionMapKind::kPriorInstall,
+      [&] { return std::array<std::uint64_t, 3>{0, in_frame->size(), 0}; },
+      [&] { return ikdtree.AddPinnedPoints(in_frame->points); });
     prior_map_installed_T_ = T_map_lidar_odom;
     prior_map_installed_ = true;
     ++prior_map_installs_;
@@ -6798,7 +7357,7 @@ private:
     // the off-thread Add is in flight — join first to keep the single-operator invariant.
     if (params_.values().map_pub_en) {
       if (async_map_en)
-        joinMapAdd();
+        joinMapAdd(admissionObserver());
       publish_map(pubLaserCloudMap_);
     }
   }
@@ -6847,6 +7406,8 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mapping_enabled_sub_;
 
   fast_lio::FrontendParameters params_;  // the configuration the constructor read; read through values()
+  // Only the default mutually-exclusive FE callback group writes this POD. The map worker never receives it.
+  fast_lio::TimeAdmissionAccounting admission_{};
   fast_lio::FrontendMeasurement measurement_{params_.values()};  // the filter's measurement model; kf holds its address
   // The wheel update's samples and counts. The callbacks fill it through wheel_speed_input under mtx_twist; the scan
   // thread reads it under mtx_twist and keeps its slip-window IMU history and counts without a lock.
@@ -6923,7 +7484,7 @@ int main(int argc, char ** argv)
     rclcpp::shutdown();
   // Drain any in-flight off-thread ikd-tree Add and join the worker before the final
   // map read/save, so the tree is quiescent and the worker thread exits cleanly.
-  stopMapWorker();
+  stopMapWorker(nullptr);
   /**************** save map ****************/
   /* 1. make sure you have enough memories
   /* 2. pcd save will largely influence the real-time performences **/

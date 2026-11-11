@@ -1,8 +1,8 @@
 # frontend contract golden: parameter/typed_merged_m20_bodyimu
-# fork_sha: 1be7d727accce1e761cde7bb18cf1b198925d320
+# fork_sha: d84b73c19bf1f0bd87ba3ca440b40de4337ba675
 # arch: x86_64
 # ros_distro: humble
-# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
 case typed_merged_m20_bodyimu
 config test/frontend_contract/m20_bodyimu_laser_mapping.yaml sha256 a1dbe30368193e6ebf2d95a5ef528c2527a7ce98ed5e6083f7ca6b13dcff3f2d
 overrides 3
@@ -12,28 +12,28 @@ override publish.reference_health type=bool value=true
 outcome constructed
 event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
 event.v1 typed_outputs declared=153 names_sha256=2ea6b8f17ef100433f2047577867e9f0985d22eefd59b7b0df0f2ac6604a3aa9
-event.v1 declare_back declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
-event.v1 lost_recovery_loaded declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
-event.v1 read_policies declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
+event.v1 declare_back declared=240 names_sha256=a7a81db7a6971268060bb690d1a064e099c4e8aac0713022db002cbcb5f2c66d
+event.v1 lost_recovery_loaded declared=240 names_sha256=a7a81db7a6971268060bb690d1a064e099c4e8aac0713022db002cbcb5f2c66d
+event.v1 read_policies declared=240 names_sha256=a7a81db7a6971268060bb690d1a064e099c4e8aac0713022db002cbcb5f2c66d
 log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
-event.v1 anchor_gap_resolved declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
+event.v1 anchor_gap_resolved declared=240 names_sha256=a7a81db7a6971268060bb690d1a064e099c4e8aac0713022db002cbcb5f2c66d
 log INFO laser_mapping "[IVOX] map backend = iVox (res=0.20 nearby=26 voxel_cap=50 max_voxels=5000000)"
-event.v1 map_backend declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
+event.v1 map_backend declared=244 names_sha256=e005c5c9098778c3a8adfd3718be6857df6719bea25b44bb73b5b84affc83f2a
 log INFO laser_mapping "p_pre->lidar_type 2"
-event.v1 read_inputs declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
-event.v1 filter_init declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
+event.v1 read_inputs declared=244 names_sha256=e005c5c9098778c3a8adfd3718be6857df6719bea25b44bb73b5b84affc83f2a
+event.v1 filter_init declared=244 names_sha256=e005c5c9098778c3a8adfd3718be6857df6719bea25b44bb73b5b84affc83f2a
 log INFO laser_mapping "Standard IMU mode: topic=/lio/imu"
 log INFO laser_mapping "Wheel twist subscribed: topic=/lio/wheel_twist scale=1.000 (fusion off, static hold on, parked hold off)"
-event.v1 subscriptions declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
-event.v1 cloud_publishers declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
-event.v1 odometry_publishers declared=247 names_sha256=c109c8eda563455474f67357dc1009b6365c72685245e7422459df64f026cb31
-event.v1 scan_timer declared=247 names_sha256=c109c8eda563455474f67357dc1009b6365c72685245e7422459df64f026cb31
-event.v1 map_timer declared=247 names_sha256=c109c8eda563455474f67357dc1009b6365c72685245e7422459df64f026cb31
+event.v1 subscriptions declared=244 names_sha256=e005c5c9098778c3a8adfd3718be6857df6719bea25b44bb73b5b84affc83f2a
+event.v1 cloud_publishers declared=244 names_sha256=e005c5c9098778c3a8adfd3718be6857df6719bea25b44bb73b5b84affc83f2a
+event.v1 odometry_publishers declared=248 names_sha256=89bbca35a0cec576550dd96a4964db6a14d6c549a60dad0dcabd1fbc7843015e
+event.v1 scan_timer declared=248 names_sha256=89bbca35a0cec576550dd96a4964db6a14d6c549a60dad0dcabd1fbc7843015e
+event.v1 map_timer declared=248 names_sha256=89bbca35a0cec576550dd96a4964db6a14d6c549a60dad0dcabd1fbc7843015e
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
-event.v1 config_id declared=247 names_sha256=c109c8eda563455474f67357dc1009b6365c72685245e7422459df64f026cb31
+event.v1 config_id declared=248 names_sha256=89bbca35a0cec576550dd96a4964db6a14d6c549a60dad0dcabd1fbc7843015e
 log INFO laser_mapping "Node init finished."
-event.v1 constructed declared=247 names_sha256=c109c8eda563455474f67357dc1009b6365c72685245e7422459df64f026cb31
-parameters 247
+event.v1 constructed declared=248 names_sha256=89bbca35a0cec576550dd96a4964db6a14d6c549a60dad0dcabd1fbc7843015e
+parameters 248
 param common.imu_input_type type=string value="standard" read_only=0 descriptor_type=4
 param common.imu_topic type=string value="/lio/imu" read_only=0 descriptor_type=4
 param common.lid_topic type=string value="/lio/points" read_only=0 descriptor_type=4
@@ -61,7 +61,7 @@ param publish.reference_health type=bool value=true read_only=1 descriptor_type=
 param wheel_extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1] read_only=0 descriptor_type=8
 param wheel_topic type=string value="/lio/wheel_twist" read_only=0 descriptor_type=4
 param wheel_vel_noise_vz type=double value=0.20000000000000001 read_only=0 descriptor_type=3
-effective.v1.count 313
+effective.v1.count 314
 effective.v1 common.imu_input_type string[8] "standard"
 effective.v1 common.imu_topic string[8] "/lio/imu"
 effective.v1 common.lid_topic string[11] "/lio/points"

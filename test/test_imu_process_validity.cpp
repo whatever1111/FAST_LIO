@@ -350,7 +350,13 @@ TEST(ImuProcessValidity, SuccessfulScanThenDuplicateAndGapCannotReuseOrPropagate
   auto gap = scan(14.1);
   for (int i = 0; i < 20; ++i)
     addImu(gap, 14.1 + i * 0.005);
-  EXPECT_FALSE(process.Process(gap, filter, output));
+  fast_lio::ProcessAudit audit{};
+  EXPECT_FALSE(process.Process(gap, filter, output, &audit));
+  EXPECT_TRUE(audit.completed && audit.history_evaluated && audit.history_erase_completed);
+  EXPECT_FALSE(audit.deskew_completed);
+  EXPECT_EQ(audit.history_retained_points, gap.lidar->size());
+  EXPECT_EQ(audit.reason, fast_lio::ImuProcessReason::kCoverageGap);
+  EXPECT_EQ(audit.fc_after_bits, fast_lio::admissionDoubleBits(gap.lidar_end_time));
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kCoverageGap);
   EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
   EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kCoverageGap);
@@ -681,7 +687,12 @@ TEST(ImuProcessValidity, OppositeFiniteAccelerationsCannotSupplyAGravityDirectio
   addImu(input, 10.0, V3D(0, 0, 9.81), V3D::Zero());
   addImu(input, 10.05, V3D(0, 0, -9.81), V3D::Zero());
   auto output = std::make_shared<PointCloudXYZI>();
-  EXPECT_FALSE(process.Process(input, filter, output));
+  fast_lio::ProcessAudit audit{};
+  EXPECT_FALSE(process.Process(input, filter, output, &audit));
+  EXPECT_TRUE(audit.completed && audit.fc_before_known && audit.fc_after_known);
+  EXPECT_NE(audit.fc_before_bits, audit.fc_after_bits);
+  EXPECT_EQ(audit.fc_after_bits, fast_lio::admissionDoubleBits(process.lastProcessedEnd()));
+  EXPECT_FALSE(audit.history_evaluated || audit.deskew_completed);
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
   expectUnchangedInitialization(filter, before, covariance);
 }
@@ -717,7 +728,11 @@ TEST(ImuProcessValidity, NonFiniteConstructedCandidateDoesNotPartiallyCommit)
   for (int i = 0; i < 20; ++i)
     addImu(input, 10.0 + i * 0.005);
   auto output = std::make_shared<PointCloudXYZI>();
-  EXPECT_FALSE(process.Process(input, filter, output));
+  fast_lio::ProcessAudit audit{};
+  EXPECT_FALSE(process.Process(input, filter, output, &audit));
+  EXPECT_TRUE(audit.completed && audit.fc_before_known && audit.fc_after_known);
+  EXPECT_EQ(audit.reason, fast_lio::ImuProcessReason::kInitializationInvalidState);
+  EXPECT_NE(audit.fc_before_bits, audit.fc_after_bits);
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
   EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
   EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationInvalidState);
@@ -975,7 +990,17 @@ TEST(ImuProcessValidity, DeskewRetainsLegalOverlapPointsAndExcludesPointsWithout
   selected.lidar = std::make_shared<PointCloudXYZI>(original);
   selected.lidar->erase(selected.lidar->begin());
   selected.lidar->erase(selected.lidar->begin() + 1);
-  ASSERT_TRUE(fixture.process.Process(input, fixture.filter, fixture.output));
+  fast_lio::ProcessAudit audit{};
+  ASSERT_TRUE(fixture.process.Process(input, fixture.filter, fixture.output, &audit));
+  EXPECT_TRUE(audit.entered && audit.completed && audit.history_evaluated && audit.history_erase_completed);
+  EXPECT_EQ(audit.input_points, 5u);
+  EXPECT_EQ(audit.history_action, fast_lio::ScanHistoryAction::kDiscardEarly);
+  EXPECT_EQ(audit.history_erased_points, 2u);
+  EXPECT_EQ(audit.history_retained_points, 3u);  // <, = and > the real history boundary
+  EXPECT_TRUE(audit.deskew_completed && audit.produced_output);
+  EXPECT_EQ(audit.deskew_points, 3u);
+  EXPECT_EQ(audit.fc_before_bits, fast_lio::admissionDoubleBits(begin + 0.0625));
+  EXPECT_EQ(audit.fc_after_bits, fast_lio::admissionDoubleBits(input.lidar_end_time));
   ASSERT_TRUE(reference.process.Process(selected, reference.filter, reference.output));
   EXPECT_EQ(fixture.process.lastStatus(), ImuProcess::ProcessStatus::kProcessed);
   EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
@@ -1019,7 +1044,14 @@ TEST(ImuProcessValidity, AllOldHistoryPointsStillRejectWithoutAdvancingOrReusing
   const auto covariance = fixture.filter.get_P();
   const double watermark = fixture.process.lastProcessedEnd();
   fixture.output->push_back(rejected.lidar->front());
-  EXPECT_FALSE(fixture.process.Process(rejected, fixture.filter, fixture.output));
+  fast_lio::ProcessAudit audit{};
+  EXPECT_FALSE(fixture.process.Process(rejected, fixture.filter, fixture.output, &audit));
+  EXPECT_TRUE(audit.completed && audit.history_erase_completed);
+  EXPECT_EQ(audit.history_action, fast_lio::ScanHistoryAction::kReject);
+  EXPECT_EQ(audit.input_points, 2u);
+  EXPECT_EQ(audit.history_retained_points, 0u);
+  EXPECT_FALSE(audit.deskew_completed);
+  EXPECT_EQ(audit.fc_before_bits, audit.fc_after_bits);
   EXPECT_EQ(fixture.process.lastStatus(), ImuProcess::ProcessStatus::kRejected);
   EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kUncommitted);
   EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kHistory);
@@ -1078,7 +1110,12 @@ TEST(ImuProcessValidity, HistoryCompactionCannotHideInvalidOriginalScanTimes)
     const auto covariance = fixture.filter.get_P();
     const double watermark = fixture.process.lastProcessedEnd();
     fixture.output->push_back(input.lidar->back());
-    EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output));
+    fast_lio::ProcessAudit audit{};
+    EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output, &audit));
+    EXPECT_TRUE(audit.completed);
+    EXPECT_FALSE(audit.history_evaluated);
+    EXPECT_FALSE(audit.history_erase_completed);
+    EXPECT_EQ(audit.input_points, 2u);
     EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInvalidScanTime);
     EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kUncommitted);
     EXPECT_TRUE(fixture.output->empty());
@@ -1187,14 +1224,83 @@ TEST(ImuProcessValidity, InitializationCompletesAtExactlyTenSamples)
   auto output = std::make_shared<PointCloudXYZI>();
   auto nine = scan(10.0);
   for (int i = 0; i < 9; ++i) addImu(nine, 10.0 + i * 0.01);
-  EXPECT_FALSE(process.Process(nine, filter, output));
+  fast_lio::ProcessAudit audit{};
+  EXPECT_FALSE(process.Process(nine, filter, output, &audit));
+  fast_lio::TimeAdmissionAccounting accounting{};
+  accounting.process(audit);
+  EXPECT_EQ(accounting.history_unknown.messages, 0u);
+  EXPECT_EQ(accounting.history_not_reached.messages, 1u);
+  EXPECT_EQ(audit.reason, fast_lio::ImuProcessReason::kInitializationAccumulated);
+  EXPECT_TRUE(audit.completed);
+  EXPECT_FALSE(audit.history_evaluated);
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
   auto tenth = scan(10.1);
   addImu(tenth, 10.195);
-  EXPECT_FALSE(process.Process(tenth, filter, output));
+  EXPECT_FALSE(process.Process(tenth, filter, output, &audit));
+  accounting.process(audit);
+  EXPECT_EQ(accounting.history_unknown.messages, 0u);
+  EXPECT_EQ(accounting.history_not_reached.messages, 2u);
+  EXPECT_EQ(audit.reason, fast_lio::ImuProcessReason::kInitializationComplete);
+  EXPECT_EQ(audit.fc_after_bits, fast_lio::admissionDoubleBits(tenth.lidar_end_time));
+  EXPECT_FALSE(audit.deskew_completed);
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
   EXPECT_TRUE(process.Process(initializationWindow(10.2, false), filter, output));
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kProcessed);
+}
+
+TEST(ImuProcessValidity, AccountingObservesStartCoverageWithoutCallingItDeskewOrValidObservation)
+{
+  ImuProcess process;
+  InitFilter filter;
+  configureInitialization(process, filter);
+  auto output = std::make_shared<PointCloudXYZI>();
+  auto init = scan(10.0);
+  // A direct Process caller can supply a future init tail. This exercises its existing start-coverage guard;
+  // it is not a claim that sync_packages borrows samples past the scan end.
+  for (int i = 0; i < 20; ++i)
+    addImu(init, 10.1 + i * 0.005);
+  ASSERT_FALSE(process.Process(init, filter, output));
+  process.coverage_params = {2.0, 0.02};
+  auto input = scan(10.25);
+  input.lidar_end_time = 10.375;
+  deskewPoints(input, {0.0f, 125.0f});
+  addImu(input, 10.25);
+  addImu(input, 10.3125);
+  addImu(input, 10.375);
+  fast_lio::ProcessAudit audit{};
+  EXPECT_FALSE(process.Process(input, filter, output, &audit));
+  EXPECT_EQ(audit.reason, fast_lio::ImuProcessReason::kCoverageStart);
+  EXPECT_TRUE(audit.history_erase_completed && audit.completed);
+  EXPECT_EQ(audit.history_retained_points, input.lidar->size());
+  EXPECT_FALSE(audit.deskew_completed || audit.produced_output);
+  EXPECT_EQ(audit.fc_after_bits, fast_lio::admissionDoubleBits(process.lastProcessedEnd()));
+}
+
+TEST(ImuProcessValidity, AccountingOnAndOffKeepTheOriginalInputAndFilterIdentical)
+{
+  GapFixture observed(false), original(false);
+  auto input = scan(observed.process.lastProcessedEnd() - 0.0625);
+  deskewPoints(input, {0.0f, 62.5f, 51.0f, 100.0f, 75.0f});
+  for (int i = 0; i < 9; ++i)
+    addImu(input, 10.095 + i * 0.005);
+  fast_lio::ProcessAudit audit{};
+  ASSERT_TRUE(observed.process.Process(input, observed.filter, observed.output, &audit));
+  ASSERT_TRUE(original.process.Process(input, original.filter, original.output));
+  expectUnchangedInitialization(observed.filter, original.filter.get_x(), original.filter.get_P());
+  EXPECT_DOUBLE_EQ(observed.process.lastProcessedEnd(), original.process.lastProcessedEnd());
+  ASSERT_EQ(observed.output->size(), original.output->size());
+  for (std::size_t i = 0; i < observed.output->size(); ++i) {
+    const auto & a = observed.output->points[i];
+    const auto & b = original.output->points[i];
+    EXPECT_EQ(a.x, b.x);
+    EXPECT_EQ(a.y, b.y);
+    EXPECT_EQ(a.z, b.z);
+    EXPECT_EQ(a.intensity, b.intensity);
+    EXPECT_EQ(a.curvature, b.curvature);
+  }
+  EXPECT_EQ(input.lidar->size(), 5u);
+  EXPECT_EQ(audit.history_erased_points, 2u);
+  EXPECT_EQ(audit.history_retained_points, 3u);
 }
 
 TEST(ImuProcessValidity, DeskewConstantYawIncludesStartWithNonzeroExtrinsics)
@@ -1386,7 +1492,12 @@ TEST(ImuProcessValidity, InvalidMessageStampsAndNonFiniteComponentsAreExplicitly
         break;
     }
     input.imu.push_back(imu);
-    EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output));
+    fast_lio::ProcessAudit audit{};
+    EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output, &audit));
+    EXPECT_TRUE(audit.completed);
+    EXPECT_FALSE(audit.history_evaluated);
+    EXPECT_FALSE(audit.deskew_completed);
+    EXPECT_EQ(audit.fc_after_bits, fast_lio::admissionDoubleBits(fixture.process.lastProcessedEnd()));
     EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kInvalid);
     EXPECT_EQ(fixture.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInvalidImu);
     EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), 10.1);
@@ -1406,7 +1517,13 @@ TEST(ImuProcessValidity, EndCoverageReanchorsButUnorderedOrInvalidCoverageDoesNo
       addImu(input, 10.105);
     else
       fixture.process.coverage_params.max_gap_s = -1.0;
-    EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output));
+    fast_lio::ProcessAudit audit{};
+    EXPECT_FALSE(fixture.process.Process(input, fixture.filter, fixture.output, &audit));
+    EXPECT_TRUE(audit.completed && audit.history_evaluated && audit.history_erase_completed);
+    EXPECT_EQ(audit.history_action, fast_lio::ScanHistoryAction::kKeepAll);
+    EXPECT_EQ(audit.history_retained_points, input.lidar->size());
+    EXPECT_FALSE(audit.deskew_completed);
+    EXPECT_EQ(audit.fc_after_bits, fast_lio::admissionDoubleBits(fixture.process.lastProcessedEnd()));
     EXPECT_EQ(fixture.process.lastOutcome().disposition,
               path == 0 ? fast_lio::ImuDisposition::kCommitted : fast_lio::ImuDisposition::kInvalid);
     EXPECT_DOUBLE_EQ(fixture.process.lastProcessedEnd(), path == 0 ? input.lidar_end_time : 10.1);
@@ -1436,7 +1553,10 @@ TEST(ImuProcessValidity, PartiallyPropagatedExceptionIsFatalInsteadOfAnUncommitt
   for (int i = 0; i < 20; ++i)
     addImu(input, 10.1 + i * 0.005);
   const auto before = fixture.filter.get_x().pos;
-  EXPECT_THROW(fixture.process.Process(input, fixture.filter, fixture.output), std::runtime_error);
+  fast_lio::ProcessAudit audit{};
+  EXPECT_THROW(fixture.process.Process(input, fixture.filter, fixture.output, &audit), std::runtime_error);
+  EXPECT_TRUE(audit.entered && audit.history_evaluated && audit.history_erase_completed);
+  EXPECT_FALSE(audit.completed || audit.deskew_completed || audit.fc_after_known);
   EXPECT_EQ(calls, 2);
   EXPECT_FALSE(fixture.filter.get_x().pos.isApprox(before, 0.0));
   EXPECT_EQ(fixture.process.lastOutcome().disposition, fast_lio::ImuDisposition::kFatal);

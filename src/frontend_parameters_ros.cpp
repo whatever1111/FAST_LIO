@@ -313,6 +313,7 @@ void FrontendParameters::declareImuGapToWheel(rclcpp::Node & node)
   declareOnly(node, diagnostics.diagnostics_latency_enable);
   declareOnly(node, diagnostics.diagnostics_latency_log_period_sec);
   declareOnly(node, diagnostics.diagnostics_kalman_channel_enable);
+  values_.time_admission_counts_enable = declareValue(node, diagnostics.diagnostics_time_admission_counts_enable);
   declareOnly(node, imu.mapping_extrinsic_est_en);
   declareOnly(node, map.mapping_map_insert_delay_scans);
   declareOnly(node, map.pcd_save_pcd_save_en);
@@ -1016,6 +1017,8 @@ void FrontendParameters::readDiagnosticsAndMapSave(const rclcpp::Node & node,
   readInto(node, diagnostics.diagnostics_latency_enable, latency_diag_en);
   readInto(node, diagnostics.diagnostics_latency_log_period_sec, latency_log_period_sec);
   readInto(node, diagnostics.diagnostics_kalman_channel_enable, values_.kalman_channel_diag_en);
+  values_.time_admission_counts_enable =
+    node.get_parameter(diagnostics.diagnostics_time_admission_counts_enable.name).as_bool();
   readInto(node, imu.mapping_extrinsic_est_en, values_.extrinsic_est_en);
   if (values_.attitude_hold.enabled && values_.extrinsic_est_en) {
     RCLCPP_FATAL(node.get_logger(),

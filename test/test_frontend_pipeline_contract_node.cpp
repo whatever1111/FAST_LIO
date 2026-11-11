@@ -130,6 +130,7 @@
 #include "imu_process_outcome.hpp"
 #include "laser_mapping_test_hooks.hpp"
 #include "preprocess.h"
+#include "scan_time_policy.hpp"
 #include "wheel_speed_input.hpp"
 
 namespace
@@ -728,6 +729,7 @@ enum class Cloud : std::uint8_t
   kRoom,      // three steep, tilted, non-parallel walls 4-6 m away: every position and attitude direction observed
   kGround,    // the ground 0.8 m below, a third of it clutter 0.2-0.5 m high, and the room's walls above it
   kCorridor,  // two parallel walls 3.2 m apart and a small patch across its end: nothing vertical, little along it
+  kLongSpan,  // the dense scene with a declared 300 ms span, beyond the scenario's configured 200 ms sync guard
 };
 
 const char * cloudName(Cloud cloud)
@@ -749,6 +751,8 @@ const char * cloudName(Cloud cloud)
       return "ground";
     case Cloud::kCorridor:
       return "corridor";
+    case Cloud::kLongSpan:
+      return "long_span";
   }
   return "unknown";
 }
@@ -900,6 +904,7 @@ struct Slot
   bool clock_back = false;  // an IMU sample stamped 1.5 s before the newest one precedes the scan: an epoch fault
   int repeat = 0;           // > 0: the cloud of the scan this many slots back is sent once more instead of a new one
   bool refused = false;     // the node refuses this slot's cloud where it arrives: it leaves no record
+  bool lead_refused = false;  // lead drops keep the existing rejection counter unchanged; wait for its callback
   bool outliers = false;    // a room cloud with about one point in 20 moved off its wall
 };
 
@@ -914,6 +919,8 @@ struct Scenario
   // covariance each lidar update left
   bool kalman = false;
   bool floor_log_binding = false;  // assert schema-2 u/stamp against the actual /Odometry, without a new golden
+  bool accounting_capture = false;
+  bool accounting_queue_probe = false;
   std::map<std::string, rclcpp::Parameter> params;
   std::vector<Slot> slots;          // after the warm-up
   std::vector<std::string> claims;  // the branches the scenario exists to reach
@@ -1597,6 +1604,12 @@ public:
     // The repeat throttle keeps the time of its first call: make that call before any input, at the clock's start.
     if (error.empty() && scenario_.typed)
       error = runScanPath("before the first input");
+    if (error.empty() && scenario_.accounting_queue_probe) {
+      error = probeAccountingQueue();
+      teardown();
+      finish();
+      return error;
+    }
     if (error.empty())
       error = warmUp();
     for (std::size_t i = 0; error.empty() && i < scenario_.slots.size(); ++i) {
@@ -1631,6 +1644,10 @@ public:
       const auto it = counts_.find(branch.name);
       out << "branch " << branch.name << ' ' << (it == counts_.end() ? 0u : it->second) << '\n';
     }
+    if (scenario_.accounting_capture)
+      for (const auto & entry : counts_)
+        if (entry.first.rfind("accounting.", 0) == 0)
+          out << "branch " << entry.first << ' ' << entry.second << '\n';
     std::lock_guard<std::mutex> lock(off_thread_mutex_);
     for (const auto & entry : off_thread_)
       out << "off_thread " << entry.first << ' ' << entry.second << '\n';
@@ -1638,6 +1655,33 @@ public:
   }
 
 private:
+  std::string probeAccountingQueue()
+  {
+    sendLidar(scanStart(0), Cloud::kDense, false);
+    executor_->spin_some();
+    for (int i = 0; i < 3; ++i) {
+      const auto error = runScanPath("accounting no-IMU wait");
+      if (!error.empty())
+        return error;
+    }
+    // A real tail wait protects the first queue entry. Later callbacks trim only the other entries.
+    auto error = publishImu(static_cast<std::int64_t>(std::llround(scanStart(0) * 1e9)), 0.0);
+    if (!error.empty())
+      return error;
+    for (int i = 1; i < 6; ++i) {
+      sendLidar(scanStart(i), Cloud::kDense, false);
+      executor_->spin_some();
+      error = runScanPath("accounting tail wait");
+      if (!error.empty())
+        return error;
+    }
+    sendLidar(scanStart(5) - 0.05, Cloud::kDense, false);  // late, before preprocess
+    executor_->spin_some();
+    sendLidar(scanStart(5) - 1.5, Cloud::kDense, false);  // epoch fault clears the actual protected queue
+    executor_->spin_some();
+    return runScanPath("accounting epoch clear");
+  }
+
   std::string validateFloorBindings()
   {
     if (odom_by_ms_.empty())
@@ -1697,6 +1741,56 @@ private:
 
   void installHooks()
   {
+    if (scenario_.accounting_capture) {
+      fast_lio_test::afterAdmissionSnapshot = [this](const fast_lio::TimeAdmissionSnapshot & s) {
+        const auto & a = s.accounting;
+        ++counts_["accounting.snapshots"];
+        counts_["accounting.enabled"] = a.enabled;
+        counts_["accounting.complete"] = a.accounting_complete;
+        counts_["accounting.seq"] = a.local_event_seq;
+        counts_["accounting.joined"] = s.map_joined;
+        counts_["accounting.map_pending_known"] = s.map_pending_known;
+        counts_["accounting.map_pending_operations"] = s.map_pending_operations;
+        counts_["accounting.eof"] = s.reader_eof_verified;
+        counts_["accounting.shutdown"] = s.shutdown;
+        counts_["accounting.partitions"] = s.callback_partition && s.queue_partition && s.borrowed_partition &&
+                                           s.process_partition && s.history_partition && s.map_partition;
+        for (std::size_t i = 0; i < a.counts.size(); ++i) {
+          counts_["accounting.bucket." + std::to_string(i)] = a.counts[i].messages;
+          counts_["accounting.points." + std::to_string(i)] = a.counts[i].points;
+        }
+        for (std::size_t i = 0; i < a.exits.size(); ++i)
+          counts_["accounting.exit." + std::to_string(i)] = a.exits[i];
+        for (std::size_t i = 0; i < a.process_outcomes.size(); ++i)
+          counts_["accounting.process." + std::to_string(i)] = a.process_outcomes[i].messages;
+        counts_["accounting.bootstrap_fc_unchanged"] =
+          a.bootstrap_fc_known && a.bootstrap_fc_before_bits == a.bootstrap_fc_after_bits;
+        counts_["accounting.wait_no_imu"] = a.wait_no_imu;
+        counts_["accounting.wait_tail"] = a.wait_tail;
+        counts_["accounting.delayed_reset"] = a.reset_discarded.messages;
+        counts_["accounting.delayed_pending"] = s.delayed_pending.messages;
+        counts_["accounting.async_dispatch"] = a.async_dispatches;
+        counts_["accounting.async_join"] = a.async_joins;
+        counts_["accounting.map_build"] =
+          a.map[static_cast<std::size_t>(fast_lio::AdmissionMapKind::kInitialBuild)].completed;
+        counts_["accounting.span"] =
+          a.scan_time_status[static_cast<std::size_t>(fast_lio::ScanTimeStatus::kExcessiveSpan)];
+      };
+      fast_lio_test::afterAdmissionSummary = [this](const char * text, std::size_t size) {
+        const std::string message(text, size);
+        const auto complete = [](const std::string & value) {
+          const std::string end = "\"summary_complete\":true}";
+          return value.rfind("{\"schema\":\"fe_local_accounting_v1\",", 0) == 0 &&
+                 value.find("\"source_message_uid\":\"NOT_RECORDED\"") != std::string::npos &&
+                 value.find("\"reader_eof_verified\":false") != std::string::npos && value.size() >= end.size() &&
+                 value.compare(value.size() - end.size(), end.size(), end) == 0;
+        };
+        ++counts_["accounting.summaries"];
+        counts_["accounting.summary_complete"] = complete(message);
+        counts_["accounting.truncation_rejected"] = !complete(message.substr(0, message.size() / 2));
+        counts_["accounting.loss_rejected"] = !complete("");
+      };
+    }
     // The first call of every scan that has its input; its answer schedules no reset.
     fast_lio_test::resetBeforeReference = [this](double end) {
       note("resetBeforeReference", "scan_begin end=" + formatDouble(end));
@@ -1935,6 +2029,8 @@ private:
 
   static void clearHooks()
   {
+    fast_lio_test::afterAdmissionSnapshot = {};
+    fast_lio_test::afterAdmissionSummary = {};
     fast_lio_test::resetBeforeReference = {};
     fast_lio_test::beforeImuProcess = {};
     fast_lio_test::afterImuConsumption = {};
@@ -2151,12 +2247,13 @@ private:
   {
     const bool scene = kind == Cloud::kRoom || kind == Cloud::kGround || kind == Cloud::kCorridor;
     const std::vector<Point3> scene_points = scene ? scenePoints(kind, msKey(start), outliers) : std::vector<Point3>();
-    const std::size_t points = scene                                          ? scene_points.size()
-                               : kind == Cloud::kDense || kind == Cloud::kFar ? kScanPoints
-                               : kind == Cloud::kSparse                       ? 3u
-                                                                              : 0u;
+    const std::size_t points = scene ? scene_points.size()
+                               : kind == Cloud::kDense || kind == Cloud::kFar || kind == Cloud::kLongSpan ? kScanPoints
+                               : kind == Cloud::kSparse                                                   ? 3u
+                                                                                                          : 0u;
     const float offset = kind == Cloud::kFar ? kFarOffset : 0.0f;
-    const auto length_ns = static_cast<std::uint64_t>(std::llround(kScanLength * 1e9));
+    const auto length_ns =
+      static_cast<std::uint64_t>(std::llround((kind == Cloud::kLongSpan ? 0.3 : kScanLength) * 1e9));
     pcl::PointCloud<ouster_ros::Point> cloud;
     cloud.resize(points);
     for (std::size_t i = 0; i < points; ++i) {
@@ -2370,7 +2467,7 @@ private:
     std::string error;
     if (s.clock_back)
       error = publishImu(std::max<std::int64_t>(1, newest_imu_ns_ - 1500000000LL), 0.0);
-    const std::uint64_t refused_before = fast_lio_test::inspectImuInput().rejectedLidar;
+    const auto input_before = fast_lio_test::inspectImuInput();
     if (error.empty())
       error = sendImuThrough(scanEnd(scan) + 0.006);
     if (!error.empty())
@@ -2382,8 +2479,13 @@ private:
       sendLidar(scanStart(cloud_scan), s.cloud, s.outliers);
       if (!s.refused) {
         pending_.push_back({cloud_scan, index, s.cloud != Cloud::kEmpty, after_seq});
-      } else if (!spinUntil([&] { return fast_lio_test::inspectImuInput().rejectedLidar > refused_before; },
-                            kReceiptWaitSeconds)) {
+      } else if (!spinUntil(
+                   [&] {
+                     const auto input = fast_lio_test::inspectImuInput();
+                     return s.lead_refused ? input.scanCount > input_before.scanCount
+                                           : input.rejectedLidar > input_before.rejectedLidar;
+                   },
+                   kReceiptWaitSeconds)) {
         return "slot " + std::to_string(index) + ": the cloud was not refused within 5 s";
       } else {
         ++counts_["refused_input"];
@@ -2949,6 +3051,123 @@ TEST(FrontendPipelineContract, InputEpoch)
   checkScenario(inputEpochScenario());
 }
 
+ChildRun checkAccountingScenario(Scenario scenario, bool complete = true)
+{
+  scenario.accounting_capture = true;
+  const auto off = runScenario(scenario);
+  EXPECT_TRUE(off.ok()) << off.describe();
+  EXPECT_EQ(off.count("accounting.snapshots"), 1u);
+  EXPECT_EQ(off.count("accounting.enabled"), 0u);
+  EXPECT_EQ(off.count("accounting.seq"), 0u);
+  EXPECT_EQ(off.count("accounting.summaries"), 0u);
+  for (std::size_t i = 0; i < static_cast<std::size_t>(fast_lio::AdmissionBucket::kCount); ++i) {
+    EXPECT_EQ(off.count("accounting.bucket." + std::to_string(i)), 0u);
+    EXPECT_EQ(off.count("accounting.points." + std::to_string(i)), 0u);
+  }
+  setParam(scenario, rclcpp::Parameter("diagnostics.time_admission_counts_enable", true));
+  const auto on = runScenario(scenario);
+  EXPECT_TRUE(on.ok()) << on.describe();
+  EXPECT_EQ(on.record, off.record);  // all existing point/filter/odometry/IMU/anchor/recovery records, unchanged
+  EXPECT_EQ(on.count("accounting.enabled"), 1u);
+  EXPECT_EQ(on.count("accounting.snapshots"), 1u);
+  EXPECT_EQ(on.count("accounting.summaries"), 1u);
+  EXPECT_EQ(on.count("accounting.summary_complete"), 1u);
+  EXPECT_EQ(on.count("accounting.truncation_rejected"), 1u);
+  EXPECT_EQ(on.count("accounting.loss_rejected"), 1u);
+  EXPECT_EQ(on.count("accounting.complete"), complete ? 1u : 0u);
+  EXPECT_EQ(on.count("accounting.partitions"), 1u);
+  EXPECT_EQ(on.count("accounting.joined"), 1u);
+  EXPECT_EQ(on.count("accounting.map_pending_known"), 1u);
+  EXPECT_EQ(on.count("accounting.map_pending_operations"), 0u);
+  EXPECT_EQ(on.count("accounting.shutdown"), 1u);
+  EXPECT_EQ(on.count("accounting.eof"), 0u);
+  return on;
+}
+
+std::uint64_t accountingBucket(const ChildRun & run, fast_lio::AdmissionBucket bucket)
+{
+  return run.count("accounting.bucket." + std::to_string(static_cast<std::size_t>(bucket)));
+}
+
+TEST(FrontendPipelineContract, AccountingRealDropsBootstrapAndDownsamplePreserveOriginalRecord)
+{
+  const auto run = checkAccountingScenario(scanDropsScenario());
+  EXPECT_GT(accountingBucket(run, fast_lio::AdmissionBucket::kSyncInvalid), 0u);
+  EXPECT_GT(accountingBucket(run, fast_lio::AdmissionBucket::kSyncNonadvancing), 0u);
+  EXPECT_GT(accountingBucket(run, fast_lio::AdmissionBucket::kEmptyImu), 0u);
+  EXPECT_EQ(accountingBucket(run, fast_lio::AdmissionBucket::kBootstrap), 1u);
+  EXPECT_EQ(run.count("accounting.bootstrap_fc_unchanged"), 1u);
+  EXPECT_GT(run.count("accounting.map_build"), 0u);
+  EXPECT_GT(accountingBucket(run, fast_lio::AdmissionBucket::kDownsampled), 0u);
+}
+
+TEST(FrontendPipelineContract, AccountingCoverageAndFatalPreserveOriginalRecord)
+{
+  const auto coverage = checkAccountingScenario(imuCoverageScenario());
+  EXPECT_GT(
+    coverage.count("accounting.process." + std::to_string(static_cast<int>(fast_lio::ImuProcessReason::kCoverageEnd))),
+    0u);
+  const auto fatal = checkAccountingScenario(imuFatalScenario(), false);
+  EXPECT_GT(
+    fatal.count("accounting.exit." + std::to_string(static_cast<int>(fast_lio::AdmissionExit::kProcessException))), 0u);
+}
+
+TEST(FrontendPipelineContract, AccountingEpochRefusalPreservesOriginalRecord)
+{
+  const auto run = checkAccountingScenario(inputEpochScenario());
+  EXPECT_GT(accountingBucket(run, fast_lio::AdmissionBucket::kEpochRejected), 0u);
+}
+
+TEST(FrontendPipelineContract, AccountingIsolatedLeadDropDoesNotReportEpochRejection)
+{
+  auto scenario = matchScenario();
+  auto ahead = slot("isolated_lead", false, kGuardHealthy);
+  ahead.repeat = -150;  // one cloud fifteen seconds ahead of the otherwise healthy stream
+  ahead.refused = ahead.lead_refused = true;
+  scenario.slots.push_back(ahead);
+  scenario.slots.push_back(slot("after_lead", false, kGuardHealthy));
+  const auto run = checkAccountingScenario(scenario);
+  EXPECT_EQ(accountingBucket(run, fast_lio::AdmissionBucket::kLeadRejected), 1u);
+  EXPECT_EQ(accountingBucket(run, fast_lio::AdmissionBucket::kEpochRejected), 0u);
+}
+
+TEST(FrontendPipelineContract, AccountingPreservesTypedOutputAndReferenceConfigIdentity)
+{
+  checkAccountingScenario(typedMatchScenario());
+}
+
+TEST(FrontendPipelineContract, AccountingActualQueueCountAgeClearAndRepeatedWaits)
+{
+  auto scenario = baseScenario("accounting_queue_count");
+  scenario.accounting_queue_probe = true;
+  setParam(scenario, rclcpp::Parameter("max_buffered_scans", 2));
+  setParam(scenario, rclcpp::Parameter("max_scan_backlog_sec", 0.05));
+  const auto count = checkAccountingScenario(scenario);
+  EXPECT_GT(accountingBucket(count, fast_lio::AdmissionBucket::kTrimCount), 0u);
+  EXPECT_EQ(accountingBucket(count, fast_lio::AdmissionBucket::kTrimAge), 0u);
+  EXPECT_GT(accountingBucket(count, fast_lio::AdmissionBucket::kClearEpoch), 0u);
+  EXPECT_EQ(accountingBucket(count, fast_lio::AdmissionBucket::kLateRejected), 1u);
+  EXPECT_GE(count.count("accounting.wait_no_imu"), 3u);
+  EXPECT_GT(count.count("accounting.wait_tail"), 0u);
+  EXPECT_EQ(accountingBucket(count, fast_lio::AdmissionBucket::kBorrowed), 0u);
+  setParam(scenario, rclcpp::Parameter("max_buffered_scans", 0));
+  const auto age = checkAccountingScenario(scenario);
+  EXPECT_EQ(accountingBucket(age, fast_lio::AdmissionBucket::kTrimCount), 0u);
+  EXPECT_GT(accountingBucket(age, fast_lio::AdmissionBucket::kTrimAge), 0u);
+}
+
+TEST(FrontendPipelineContract, AccountingOriginalSpanAndSparseExitsPreserveOriginalRecord)
+{
+  auto scenario = matchScenario();
+  setParam(scenario, rclcpp::Parameter("preprocess.max_scan_duration_s", 0.2));
+  scenario.slots.push_back(slot("original_span", false, kGuardHealthy, Cloud::kLongSpan));
+  scenario.slots.push_back(slot("sparse", false, kGuardHealthy, Cloud::kSparse));
+  const auto run = checkAccountingScenario(scenario);
+  EXPECT_GT(run.count("accounting.span"), 0u);
+  EXPECT_GT(run.count("accounting.exit." + std::to_string(static_cast<int>(fast_lio::AdmissionExit::kDownsampleSmall))),
+            0u);
+}
+
 TEST(FrontendPipelineContract, EntryViewMovingRecovery)
 {
   checkScenario(entryViewScenario());
@@ -3248,6 +3467,15 @@ TEST(WheelInput, NodeUsesTimestampedAngularEndpoint)
 TEST(FrontendPipelineWorker, AsyncMapDelayAndReset)
 {
   checkScenario(workerScenario());
+}
+
+TEST(FrontendPipelineWorker, AccountingDelayedResetAndShutdownJoinPreserveOriginalRecord)
+{
+  const auto run = checkAccountingScenario(workerScenario());
+  EXPECT_GT(run.count("accounting.delayed_reset"), 0u);
+  EXPECT_GT(run.count("accounting.delayed_pending"), 0u);
+  EXPECT_GT(run.count("accounting.async_dispatch"), 0u);
+  EXPECT_EQ(run.count("accounting.async_dispatch"), run.count("accounting.async_join"));
 }
 
 // A record without what only a run with the map worker writes: the count of the batches it added.

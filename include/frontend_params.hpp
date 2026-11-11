@@ -233,6 +233,7 @@ struct FrontendParams
   fast_lio::AdaptiveDownsampleParams adaptive_ds;
   double filter_size_surf_min = 0;
   bool kalman_channel_diag_en = false;
+  bool time_admission_counts_enable = false;  // startup-only FE local accounting
 
   bool wheel_odom_en = false;
   double wheel_speed_scale = 1.0;

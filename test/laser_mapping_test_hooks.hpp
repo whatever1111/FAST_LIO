@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "anchor_trace.hpp"
+#include "time_admission_accounting.hpp"
 
 // Only the non-installed test component defines or references these callbacks.
 // Install before starting the worker/reset threads, clear only after joining both.
@@ -33,6 +34,9 @@ struct AnchorFixtureState
 };
 
 extern std::function<void()> beforeMapAdd;
+/// Owner snapshot after the existing shutdown join, outside mtx_buffer. No worker accesses this hook.
+extern std::function<void(const fast_lio::TimeAdmissionSnapshot &)> afterAdmissionSnapshot;
+extern std::function<void(const char *, std::size_t)> afterAdmissionSummary;
 extern std::function<void()> beforeResetJoin;
 extern std::function<void()> afterPendingReset;
 extern std::function<void(std::size_t, double)> afterScanPrepared;
@@ -323,6 +327,7 @@ struct ImuInputSnapshot
   bool mapFrozen;
   bool degradedOdom;
   double filterEnd;
+  int scanCount;
 };
 ImuInputSnapshot inspectImuInput();
 int reconfirmLastImuBatch();

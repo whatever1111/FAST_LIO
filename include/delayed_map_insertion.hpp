@@ -32,6 +32,8 @@ public:
 
   void reset() { pending_.clear(); }
   std::size_t pendingSize() const { return pending_.size(); }
+  // Owner-only diagnostic view; never associates an old payload with the current scan's timestamp.
+  const std::deque<Batch> & pending() const { return pending_; }
 
 private:
   std::deque<Batch> pending_;

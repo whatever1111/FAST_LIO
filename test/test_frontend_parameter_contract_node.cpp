@@ -1478,6 +1478,28 @@ TEST(FrontendParameterContract, ReadOnlyWithObservation)
   checkCase(c);
 }
 
+TEST(FrontendParameterContract, TimeAdmissionAccountingIsDefaultOffAndStartupReadOnly)
+{
+  auto c = overridesCase("time_admission_counts", Expect::kConstructed);
+  c.sets = {rclcpp::Parameter("diagnostics.time_admission_counts_enable", true)};
+  const auto off = runInChild([&c] { return recordCase(c); });
+  ASSERT_TRUE(off.ok()) << off.describe();
+  EXPECT_NE(off.record.find("param diagnostics.time_admission_counts_enable type=bool value=false read_only=1"),
+            std::string::npos);
+  EXPECT_NE(off.record.find("set diagnostics.time_admission_counts_enable type=bool value=true -> rejected"),
+            std::string::npos);
+  EXPECT_NE(off.record.find("effective.v1 diagnostics.time_admission_counts_enable bool 0"), std::string::npos);
+  setOverride(c, rclcpp::Parameter("diagnostics.time_admission_counts_enable", true));
+  c.sets = {rclcpp::Parameter("diagnostics.time_admission_counts_enable", false)};
+  const auto on = runInChild([&c] { return recordCase(c); });
+  ASSERT_TRUE(on.ok()) << on.describe();
+  EXPECT_NE(on.record.find("param diagnostics.time_admission_counts_enable type=bool value=true read_only=1"),
+            std::string::npos);
+  EXPECT_NE(on.record.find("set diagnostics.time_admission_counts_enable type=bool value=false -> rejected"),
+            std::string::npos);
+  EXPECT_NE(on.record.find("effective.v1 diagnostics.time_admission_counts_enable bool 1"), std::string::npos);
+}
+
 // The attitude hold projects only the attitude columns of H, so the node refuses it together with online extrinsic
 // estimation, and says which two parameters and why. On its own the hold starts: estimation is off unless asked for.
 TEST(FrontendParameterContract, AttitudeHoldWithOnlineExtrinsic)

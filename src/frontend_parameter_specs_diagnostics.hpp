@@ -18,5 +18,7 @@ struct DiagnosticsParameterSpecs
   const ParameterSpec<bool> diagnostics_latency_enable{"diagnostics.latency_enable", true, true};
   const ParameterSpec<double> diagnostics_latency_log_period_sec{"diagnostics.latency_log_period_sec", 1.0, 1.0};
   const ParameterSpec<bool> diagnostics_kalman_channel_enable{"diagnostics.kalman_channel_enable", false, false};
+  const DeclaredValueSpec<bool> diagnostics_time_admission_counts_enable{
+    "diagnostics.time_admission_counts_enable", false, true};
 };
 }  // namespace fast_lio

@@ -816,9 +816,12 @@ Status compactRecent(Metadata & data, const Budget & budget)
   while (data.recent.size() > budget.recentLedger) {
     const auto old = std::find_if(
       data.recent.begin(), data.recent.end(), [](const FactorIdentity & item) { return item.sequence.has_value(); });
-    if (old == data.recent.end() || old == std::prev(data.recent.end()) || !old->sequence)
+    if (old == data.recent.end() || old == std::prev(data.recent.end()))
       return Status::kModelCapacityExceeded;
-    raise(data.compacted, *old->sequence);
+    const auto & sequence = old->sequence;
+    if (!sequence.has_value())
+      return Status::kModelCapacityExceeded;
+    raise(data.compacted, *sequence);
     data.recent.erase(old);
   }
   return Status::kOk;

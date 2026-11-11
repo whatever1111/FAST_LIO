@@ -237,11 +237,16 @@ Eigen::Matrix<typename Base::scalar, 3, 3> A_matrix(const Base & v){
     Eigen::Matrix<typename Base::scalar, 3, 3> res;
     double squaredNorm = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
 	double norm = std::sqrt(squaredNorm);
-	if(norm < MTK::tolerance<typename Base::scalar>()){
+        if (squaredNorm == 0) {
 		res = Eigen::Matrix<typename Base::scalar, 3, 3>::Identity();
 	}
 	else{
-		res = Eigen::Matrix<typename Base::scalar, 3, 3>::Identity() + (1 - std::cos(norm)) / squaredNorm * hat(v) + (1 - std::sin(norm) / norm) / squaredNorm * hat(v) * hat(v);
+          // (1 - cos t) / t^2 as sinc(t/2)^2 / 2: the difference 1 - cos t cancels for small t
+          // and drops the first-order term of the Jacobian.
+          const double half = 0.5 * norm;
+          const double sinc_half = std::sin(half) / half;
+          res = Eigen::Matrix<typename Base::scalar, 3, 3>::Identity() + 0.5 * sinc_half * sinc_half * hat(v) +
+                (1 - std::sin(norm) / norm) / squaredNorm * hat(v) * hat(v);
 	}
     return res;
 }

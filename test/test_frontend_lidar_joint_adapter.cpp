@@ -1089,6 +1089,12 @@ TEST(FrontendLidarJointAdapter, DISABLED_ConnectedSupportGraphResourceDistributi
     }
 }
 
+TEST(FrontendLidarJointAdapter, ReviewStatusFallbackHasItsOwnName)
+{
+  EXPECT_STREQ(statusName(static_cast<FrameStatus>(-1)), "UNRECOGNIZED_FRAME_STATUS");
+  EXPECT_STRNE(statusName(static_cast<FrameStatus>(-1)), statusName(FrameStatus::kNumericalFailure));
+}
+
 TEST(FrontendLidarJointAdapter, DISABLED_SyntheticFrameResourceDistribution)
 {
   constexpr int kSamples = 5;

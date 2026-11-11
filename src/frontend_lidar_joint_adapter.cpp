@@ -1194,8 +1194,12 @@ const char * k2StatusName(joint_source::Status status)
       return "kStaleProposal";
     case Status::kNumericalFailure:
       return "kNumericalFailure";
+    case Status::kLedgerCompacted:
+      return "kLedgerCompacted";
+    case Status::kReuseBudgetExceeded:
+      return "kReuseBudgetExceeded";
   }
-  return "kUnknownMoment";
+  return "UNRECOGNIZED_K2_STATUS";
 }
 
 FrameStatus calculateFrame(const FrameSnapshot & snapshot, const Budgets & budgets, FrameReadout & readout)
@@ -1453,7 +1457,7 @@ const char * statusName(FrameStatus status)
     case FrameStatus::kNumericalFailure:
       return "NUMERICAL_FAILURE";
   }
-  return "NUMERICAL_FAILURE";
+  return "UNRECOGNIZED_FRAME_STATUS";
 }
 
 }  // namespace fastlio::lidar_joint

@@ -2,7 +2,9 @@
 
 #include <cmath>
 #include <gtest/gtest.h>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 
 #include "frontend_correlated_update.hpp"
 
@@ -15,6 +17,42 @@ namespace
 // QR/products have <=110 terms. 8192 eps bounds accumulated arithmetic error for
 // these fixtures. Matrix assertions scale this by the expected norm.
 constexpr double kTolerance = 8192.0 * std::numeric_limits<double>::epsilon();
+
+std::string numericValues(const Eigen::MatrixXd & value)
+{
+  std::ostringstream text;
+  text << std::setprecision(std::numeric_limits<double>::max_digits10);
+  for (Eigen::Index i = 0; i < value.size(); ++i)
+    text << (i == 0 ? "" : ",") << value.data()[i];
+  return text.str();
+}
+
+void recordNumeric(const Eigen::MatrixXd & actual,
+                   const Eigen::MatrixXd & expected,
+                   double tolerance,
+                   const std::string & metric)
+{
+  const auto * result = ::testing::UnitTest::GetInstance()->current_test_info()->result();
+  const std::string key = "sample_" + std::to_string(result->test_property_count());
+  ::testing::Test::RecordProperty(key + "_actual", numericValues(actual));
+  ::testing::Test::RecordProperty(key + "_expected", numericValues(expected));
+  ::testing::Test::RecordProperty(key + "_tolerance", numericValues(Eigen::MatrixXd::Constant(1, 1, tolerance)));
+  ::testing::Test::RecordProperty(key + "_metric", metric);
+}
+
+// The original GTest predicate and its three operands are unchanged; recording
+// only exposes successful comparisons for the required cross-architecture table.
+::testing::AssertionResult recordedNear(const char * actualText,
+                                        const char * expectedText,
+                                        const char * toleranceText,
+                                        double actual,
+                                        double expected,
+                                        double tolerance)
+{
+  recordNumeric(Eigen::MatrixXd::Constant(1, 1, actual), Eigen::MatrixXd::Constant(1, 1, expected), tolerance, "abs");
+  return ::testing::internal::DoubleNearPredFormat(
+    actualText, expectedText, toleranceText, actual, expected, tolerance);
+}
 
 Coordinates coordinates(Eigen::Index count, const std::string & prefix)
 {
@@ -81,6 +119,7 @@ void expectMatrix(const Eigen::MatrixXd & actual, const Eigen::MatrixXd & expect
 {
   ASSERT_EQ(actual.rows(), expected.rows());
   ASSERT_EQ(actual.cols(), expected.cols());
+  recordNumeric(actual, expected, kTolerance * std::max(1.0, expected.norm()), "norm");
   EXPECT_LE((actual - expected).norm(), kTolerance * std::max(1.0, expected.norm()));
 }
 
@@ -113,7 +152,7 @@ TEST(FrontendCorrelatedUpdate, I01SharedSaturationAndIdentifiableDifferentLoadin
     ASSERT_EQ(filter.initialize(initial), Status::kOk);
     update(filter, {measurement(initial, "batch", count)});
     const double expected = static_cast<double>(count + 1) / static_cast<double>(2 * count + 1);
-    EXPECT_NEAR(filter.moments()->covariance(0, 0), expected, kTolerance);
+    EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 0), expected, kTolerance);
     EXPECT_GT(expected, 0.5);
     if (count > 1)
       EXPECT_GT(std::abs(expected - 2.0 / (2.0 + count)), 0.09);
@@ -125,7 +164,7 @@ TEST(FrontendCorrelatedUpdate, I01SharedSaturationAndIdentifiableDifferentLoadin
   auto negative = measurement(initial, "minus");
   negative.a(0, 0) = -1.0;
   update(filter, {positive, negative});
-  EXPECT_NEAR(filter.moments()->covariance(0, 0), 1.0 / 3.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 0), 1.0 / 3.0, kTolerance);
   EXPECT_LT(filter.moments()->covariance(0, 0), 0.5);  // no universal ceiling
 }
 
@@ -136,7 +175,7 @@ TEST(FrontendCorrelatedUpdate, I02ExactDuplicateAliasesAndChangedNumericPayload)
   ASSERT_EQ(filter.initialize(initial), Status::kOk);
   auto factor = measurement(initial);
   update(filter, {factor, factor});
-  EXPECT_NEAR(filter.moments()->covariance(0, 0), 2.0 / 3.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 0), 2.0 / 3.0, kTolerance);
   const auto snapshot = *filter.moments();
   const auto entries = filter.ledger()->entries();
   factor.sourceKeys[0] = "z/alias";
@@ -167,7 +206,7 @@ TEST(FrontendCorrelatedUpdate, I03RawGeometryReuseSharesCanonicalSource)
   second.identity.shared = {{"shared-raw", "z"}};
   second.a(0, 0) = -1.0;
   update(filter, {second});
-  EXPECT_NEAR(filter.moments()->covariance(0, 0), 1.0 / 3.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 0), 1.0 / 3.0, kTolerance);
   second.identity.key = "geometry3";
   second.identity.remainderKey = "eps3";
   second.a.setZero();
@@ -185,10 +224,10 @@ TEST(FrontendCorrelatedUpdate, I04ConditionalEquivalenceHasIndependentRationalOr
   JointSourceFilter filter;
   ASSERT_EQ(filter.initialize(initial), Status::kOk);
   update(filter, {factor});
-  EXPECT_NEAR(filter.moments()->mean(0), 12.0 / 19.0, kTolerance);
-  EXPECT_NEAR(filter.moments()->covariance(0, 0), 22.0 / 19.0, kTolerance);
-  EXPECT_NEAR(filter.moments()->covariance(0, 1), -9.0 / 19.0, kTolerance);
-  EXPECT_NEAR(filter.moments()->covariance(1, 1), 8.0 / 19.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->mean(0), 12.0 / 19.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 0), 22.0 / 19.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 1), -9.0 / 19.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(1, 1), 8.0 / 19.0, kTolerance);
   EXPECT_GT(std::abs(22.0 / 19.0 - (2.0 - 4.0 / 15.0)), 0.5);    // deleting K
   EXPECT_GT(std::abs(22.0 / 19.0 - (2.0 - 16.0 / 21.0)), 0.07);  // HP H' in Rc
 }
@@ -204,9 +243,9 @@ TEST(FrontendCorrelatedUpdate, I05PerfectCorrelationCancellationAndDoubling)
     factor.a(0, 0) = sign;
     update(filter, {factor});
     const double expected = sign < 0.0 ? 1.0 : 1.0 / 5.0;
-    EXPECT_NEAR(filter.moments()->covariance(0, 0), expected, kTolerance);
-    EXPECT_NEAR(filter.moments()->covariance(0, 1), expected, kTolerance);
-    EXPECT_NEAR(filter.moments()->covariance(1, 1), expected, kTolerance);
+    EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 0), expected, kTolerance);
+    EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 1), expected, kTolerance);
+    EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(1, 1), expected, kTolerance);
     EXPECT_GT(std::abs(expected - 2.0 / 3.0), 0.3);
   }
 }
@@ -226,7 +265,7 @@ TEST(FrontendCorrelatedUpdate, I06SequentialBatchAndBothOrdersPreservePosterior)
       update(filter, {first, second});
     else {
       update(filter, {order == 1 ? first : second});
-      EXPECT_NEAR(filter.moments()->covariance(0, 1), -1.0 / 3.0, kTolerance);
+      EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 1), -1.0 / 3.0, kTolerance);
       update(filter, {order == 1 ? second : first});
     }
     expectMatrix(filter.moments()->covariance, expected);
@@ -269,9 +308,9 @@ TEST(FrontendCorrelatedUpdate, I10GeneratedMomentsHaveSignedCrossAndDeterministi
   generator << 0.0, -2.0, 0.0, 1.0;
   ASSERT_EQ(filter.augment(source("h-and-n", 2), generator, Eigen::Vector2d::Zero(), zeroNoise(2, 2)), Status::kOk);
   const auto & covariance = filter.moments()->covariance;
-  EXPECT_NEAR(covariance(2, 2), 4.0, kTolerance);
-  EXPECT_NEAR(covariance(2, 3), -2.0, kTolerance);
-  EXPECT_NEAR(covariance(3, 3), 1.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, covariance(2, 2), 4.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, covariance(2, 3), -2.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, covariance(3, 3), 1.0, kTolerance);
   const Eigen::Vector4d null(0.0, 0.0, 1.0, 2.0);
   EXPECT_LE((covariance * null).norm(), kTolerance);
   EXPECT_GT(std::abs(covariance(2, 3) - 2.0), 3.9);
@@ -348,7 +387,7 @@ TEST(FrontendCorrelatedUpdate, I16PriorCrossLegitimatelyReducesNullCoordinateVar
     ASSERT_EQ(filter.initialize(initial), Status::kOk);
     const auto factor = measurement(initial);
     update(filter, {factor});
-    EXPECT_NEAR(filter.moments()->covariance(1, 1), 1.0 - rho * rho / 2.0, kTolerance);
+    EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(1, 1), 1.0 - rho * rho / 2.0, kTolerance);
     EXPECT_EQ((factor.h.transpose() * factor.h).col(1).norm(), 0.0);
     if (rho != 0.0)
       EXPECT_LT(filter.moments()->covariance(1, 1), 0.9);
@@ -361,9 +400,9 @@ TEST(FrontendCorrelatedUpdate, I17IndependentEqualCoordinatesReduceP)
   JointSourceFilter filter;
   ASSERT_EQ(filter.initialize(initial), Status::kOk);
   update(filter, {measurement(initial, "first")});
-  EXPECT_NEAR(filter.moments()->covariance(0, 0), 0.5, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 0), 0.5, kTolerance);
   update(filter, {measurement(initial, "second")});
-  EXPECT_NEAR(filter.moments()->covariance(0, 0), 1.0 / 3.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 0), 1.0 / 3.0, kTolerance);
   EXPECT_LT(filter.moments()->covariance(0, 0), 0.5);
 }
 
@@ -377,12 +416,12 @@ TEST(FrontendCorrelatedUpdate, I18ActualGainReportsFiveEighthsAndCanIncreaseP)
     const auto result = filter.appliedGain({factor}, Eigen::MatrixXd::Constant(1, 1, gain));
     ASSERT_EQ(result.status, Status::kOk);
     const double expected = 1.0 - 2.0 * gain + 2.0 * gain * gain;
-    EXPECT_NEAR(result.covariance(0, 0), expected, kTolerance);
-    EXPECT_NEAR(result.mean(0), gain, kTolerance);
+    EXPECT_PRED_FORMAT3(recordedNear, result.covariance(0, 0), expected, kTolerance);
+    EXPECT_PRED_FORMAT3(recordedNear, result.mean(0), gain, kTolerance);
     EXPECT_GE(expected, 0.5);
   }
   const auto quarter = filter.appliedGain({factor}, Eigen::MatrixXd::Constant(1, 1, 0.25));
-  EXPECT_NEAR(quarter.covariance(0, 0), 5.0 / 8.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, quarter.covariance(0, 0), 5.0 / 8.0, kTolerance);
   EXPECT_GT(quarter.covariance(0, 0) - 0.5, 0.12);
   const auto amplified = filter.appliedGain({factor}, Eigen::MatrixXd::Constant(1, 1, 2.0));
   EXPECT_GT(amplified.covariance(0, 0), 1.0);
@@ -446,10 +485,10 @@ TEST(FrontendCorrelatedUpdate, I22CorrelatedProcessAndGeneratedSourceKeepFullCro
   sourceNoise.covariance(0, 0) = 0.25;
   sourceNoise.mean(0) = 0.25;
   ASSERT_EQ(filter.augment(source("map"), generator, Eigen::VectorXd::Ones(1), sourceNoise), Status::kOk);
-  EXPECT_NEAR(filter.moments()->covariance(0, 2), 12.0, kTolerance);
-  EXPECT_NEAR(filter.moments()->covariance(1, 2), 0.25, kTolerance);
-  EXPECT_NEAR(filter.moments()->covariance(2, 2), 35.75, kTolerance * 36.0);
-  EXPECT_NEAR(filter.moments()->mean(2), 4.75, kTolerance * 5.0);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 2), 12.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(1, 2), 0.25, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(2, 2), 35.75, kTolerance * 36.0);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->mean(2), 4.75, kTolerance * 5.0);
 }
 
 TEST(FrontendCorrelatedUpdate, I23Full23ColumnsAndMaximumDimensionsAreUsable)
@@ -464,7 +503,7 @@ TEST(FrontendCorrelatedUpdate, I23Full23ColumnsAndMaximumDimensionsAreUsable)
     factor.h(column, column) = 1.0;
   update(filter, {factor});
   for (const Eigen::Index column : {12, 15, 18, 21, 22})
-    EXPECT_NEAR(filter.moments()->covariance(column, column), 0.5, kTolerance);
+    EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(column, column), 0.5, kTolerance);
   EXPECT_EQ(filter.moments()->mean.size(), 55);
   const auto snapshot = *filter.moments();
   const auto entries = filter.ledger()->entries();
@@ -530,8 +569,8 @@ TEST(FrontendCorrelatedUpdate, I26ExactMarginalAndRenamedAncestryReentry)
   EXPECT_EQ(filter.marginalize({"z"}, false, "may reuse"), Status::kSourceHistoryUnavailable);
   expectExact(*filter.moments(), snapshot);
   ASSERT_EQ(filter.marginalize({"z/alias"}, true, "finished source"), Status::kOk);
-  EXPECT_NEAR(filter.moments()->covariance(0, 0), 2.0 / 3.0, kTolerance);
-  EXPECT_NEAR(filter.moments()->mean(0), 1.0 / 3.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 0), 2.0 / 3.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->mean(0), 1.0 / 3.0, kTolerance);
   EXPECT_TRUE(filter.moments()->sources.empty());
   EXPECT_EQ(filter.retiredSources(), 1U);
   EXPECT_EQ(filter.ledger()->entries(), entries);
@@ -659,16 +698,16 @@ TEST(FrontendCorrelatedUpdate, I22IndependentProcessAndCorrelatedAugmentationNoi
   ASSERT_EQ(filter.propagate(
               transition, Eigen::Vector2d::Zero(), independent, initial.active, {initial.sources[0].coordinates}),
             Status::kOk);
-  EXPECT_NEAR(filter.moments()->covariance(0, 1), 0.5, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 1), 0.5, kTolerance);
   auto correlated = zeroNoise(2, 1);
   correlated.covariance(0, 0) = 1.0;
   correlated.priorCross(1, 0) = 0.5;
   ASSERT_EQ(filter.augment(source("generated"), Eigen::RowVector2d(1.0, 0.0), Eigen::VectorXd::Zero(1), correlated),
             Status::kOk);
   // q=x+w, Var(x)=5, Cov(w,z)=1/2. Cross with z is 1/2+1/2.
-  EXPECT_NEAR(filter.moments()->covariance(0, 2), 5.0, kTolerance * 5.0);
-  EXPECT_NEAR(filter.moments()->covariance(1, 2), 1.0, kTolerance);
-  EXPECT_NEAR(filter.moments()->covariance(2, 2), 6.0, kTolerance * 6.0);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(0, 2), 5.0, kTolerance * 5.0);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(1, 2), 1.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, filter.moments()->covariance(2, 2), 6.0, kTolerance * 6.0);
   EXPECT_GT(std::abs(filter.moments()->covariance(1, 2) - 0.5), 0.49);
 }
 
@@ -793,7 +832,8 @@ TEST(FrontendCorrelatedUpdate, ReviewF1DensePosteriorSurvivesEveryLifecycleStep)
                                initial.active,
                                blocks),
               Status::kOk);
-    EXPECT_NEAR(filter.moments()->covariance(0, 0), expected(0, 0) + 1.0, kTolerance * expected.norm());
+    EXPECT_PRED_FORMAT3(
+      recordedNear, filter.moments()->covariance(0, 0), expected(0, 0) + 1.0, kTolerance * expected.norm());
   }
 }
 
@@ -906,8 +946,8 @@ TEST(FrontendCorrelatedUpdate, ReviewF6DistinctLoadingsAcrossSeveralSourceBlocks
   Eigen::RowVector2d gain(0.25, -0.125);
   const auto applied = filter.appliedGain({factor}, gain);
   ASSERT_EQ(applied.status, Status::kOk);
-  EXPECT_NEAR(applied.covariance(0, 0), 107.0 / 64.0, kTolerance);
-  EXPECT_NEAR(applied.mean(0), 0.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, applied.covariance(0, 0), 107.0 / 64.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, applied.mean(0), 0.0, kTolerance);
   auto wrongBlock = factor;
   wrongBlock.a.rightCols(2).setZero();
   EXPECT_EQ(filter.propose({wrongBlock}).status(), Status::kUnsupportedNoiseStructure);
@@ -1033,10 +1073,10 @@ TEST(FrontendCorrelatedUpdate, B1bX8LegacyDefaultRetainsAnyCarrier)
   const auto proposal = filter.propose({factor});
   ASSERT_EQ(proposal.status(), Status::kOk);
   // y=2e+d, Cov(e)=Cov(d)=1: optimal P=1-4/5=1/5.
-  EXPECT_NEAR(proposal.posterior()->covariance(0, 0), 1.0 / 5.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, proposal.posterior()->covariance(0, 0), 1.0 / 5.0, kTolerance);
   const auto applied = filter.appliedGain({factor}, Eigen::MatrixXd::Constant(1, 1, 0.25));
   ASSERT_EQ(applied.status, Status::kOk);
-  EXPECT_NEAR(applied.covariance(0, 0), 5.0 / 16.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, applied.covariance(0, 0), 5.0 / 16.0, kTolerance);
 }
 
 TEST(FrontendCorrelatedUpdate, B1bX8ExplicitDerivedRetirementDoesNotRouteRaw)
@@ -1056,7 +1096,7 @@ TEST(FrontendCorrelatedUpdate, B1bX8ExplicitDerivedRetirementDoesNotRouteRaw)
   factor.identity.shared = {{"shared-raw", "z"}};
   const auto proposal = filter.propose({factor});
   ASSERT_EQ(proposal.status(), Status::kOk);
-  EXPECT_NEAR(proposal.posterior()->covariance(0, 0), 2.0 / 3.0, kTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, proposal.posterior()->covariance(0, 0), 2.0 / 3.0, kTolerance);
 }
 
 TEST(FrontendCorrelatedUpdate, B1bX10UpperBoundIsIsolatedAtAllThreeEntries)

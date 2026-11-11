@@ -9,10 +9,12 @@
 #include <cmath>
 #include <cstdlib>
 #include <gtest/gtest.h>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <random>
+#include <sstream>
 #include <sys/resource.h>
 
 #include "IMU_Processing.hpp"
@@ -32,11 +34,46 @@ constexpr double kOracleTolerance = 4194304.0 * std::numeric_limits<double>::eps
 constexpr double kHalf = 0.5, kQuarter = 0.25;
 constexpr Eigen::Index kVelocityIndex = 12, kGyroIndex = 15, kAccelIndex = 18, kGravityIndex = 21;
 
+std::string numericValues(const Eigen::MatrixXd & value)
+{
+  std::ostringstream text;
+  text << std::setprecision(std::numeric_limits<double>::max_digits10);
+  for (Eigen::Index i = 0; i < value.size(); ++i)
+    text << (i == 0 ? "" : ",") << value.data()[i];
+  return text.str();
+}
+
+void recordNumeric(const Eigen::MatrixXd & actual,
+                   const Eigen::MatrixXd & expected,
+                   double tolerance,
+                   const std::string & metric)
+{
+  const auto * result = ::testing::UnitTest::GetInstance()->current_test_info()->result();
+  const std::string key = "sample_" + std::to_string(result->test_property_count());
+  ::testing::Test::RecordProperty(key + "_actual", numericValues(actual));
+  ::testing::Test::RecordProperty(key + "_expected", numericValues(expected));
+  ::testing::Test::RecordProperty(key + "_tolerance", numericValues(Eigen::MatrixXd::Constant(1, 1, tolerance)));
+  ::testing::Test::RecordProperty(key + "_metric", metric);
+}
+
+::testing::AssertionResult recordedNear(const char * actualText,
+                                        const char * expectedText,
+                                        const char * toleranceText,
+                                        double actual,
+                                        double expected,
+                                        double tolerance)
+{
+  recordNumeric(Eigen::MatrixXd::Constant(1, 1, actual), Eigen::MatrixXd::Constant(1, 1, expected), tolerance, "abs");
+  return ::testing::internal::DoubleNearPredFormat(
+    actualText, expectedText, toleranceText, actual, expected, tolerance);
+}
+
 void expectMatrix(const Eigen::MatrixXd & actual, const Eigen::MatrixXd & expected)
 {
   ASSERT_EQ(actual.rows(), expected.rows());
   ASSERT_EQ(actual.cols(), expected.cols());
   ASSERT_TRUE(actual.allFinite());
+  recordNumeric(actual, expected, kOracleTolerance * std::max(1.0, expected.norm()), "norm");
   EXPECT_LE((actual - expected).norm(), kOracleTolerance * std::max(1.0, expected.norm()));
 }
 
@@ -320,7 +357,7 @@ TEST(FrontendLidarJointAdapter, O1HatWeightsMatchAffineAnalyticPlane)
   constexpr std::array<double, kSupportCount> kExpected{-0.05, 0.45, 0.075, 0.325, 0.2};
   Eigen::Vector3d affine = Eigen::Vector3d::Zero();
   for (std::size_t a = 0; a < kSupportCount; ++a) {
-    EXPECT_NEAR(weights[a], kExpected[a], kOracleTolerance);
+    EXPECT_PRED_FORMAT3(recordedNear, weights[a], kExpected[a], kOracleTolerance);
     affine += weights[a] * Eigen::Vector3d(row.support[a].x, row.support[a].y, row.support[a].z);
   }
   expectMatrix(affine, Eigen::Vector3d(kHalf, kQuarter, 1.0));
@@ -349,7 +386,7 @@ TEST(FrontendLidarJointAdapter, O2TlsDerivativeMatchesProductionPlaneFitFiniteDi
     EXPECT_LE((derivative - expected).norm(), kDifferenceBound);
     const double residualDerivative =
       ((high.head<3>().dot(query) + high[3]) - (low.head<3>().dot(query) + low[3])) / (2.0 * kStep);
-    EXPECT_NEAR(residualDerivative, weights[a], kDifferenceBound);
+    EXPECT_PRED_FORMAT3(recordedNear, residualDerivative, weights[a], kDifferenceBound);
   }
 }
 
@@ -364,8 +401,8 @@ TEST(FrontendLidarJointAdapter, O3SharedTwoRowsMatchRationalOracle)
   ASSERT_EQ(compressRows(
               h, Eigen::VectorXd::Ones(2), gain, b.sparseView(), Eigen::VectorXd::Ones(2), 1.0, {}, compressed, counts),
             FrameStatus::kOkFrameConditional);
-  EXPECT_NEAR(compressed.h.squaredNorm(), kHalf, kOracleTolerance);
-  EXPECT_NEAR(compressed.gain.squaredNorm(), kHalf, kOracleTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, compressed.h.squaredNorm(), kHalf, kOracleTolerance);
+  EXPECT_PRED_FORMAT3(recordedNear, compressed.gain.squaredNorm(), kHalf, kOracleTolerance);
   checkK2(moments(1),
           compressed,
           Eigen::MatrixXd::Constant(1, 1, 2.0 / kThree),
@@ -393,7 +430,7 @@ TEST(FrontendLidarJointAdapter, O4RepeatedRowsSaturateWithoutInformationCeiling)
                            counts),
               FrameStatus::kOkFrameConditional);
     const double information = static_cast<double>(count) / (kHalf + static_cast<double>(count) * kQuarter);
-    EXPECT_NEAR(compressed.h.squaredNorm(), information, kOracleTolerance);
+    EXPECT_PRED_FORMAT3(recordedNear, compressed.h.squaredNorm(), information, kOracleTolerance);
     EXPECT_LT(information, 4.0);
     const double sumGain = static_cast<double>(count) / static_cast<double>(count + 1);
     const double pg =
@@ -491,7 +528,8 @@ TEST(FrontendLidarJointAdapter, O7CompressionPreservesRankSixAndTwelveArbitraryG
             p * h.transpose() * r.ldlt().solve(observation),
             gain * observation);
     const double expectedChi = observation.dot(r.ldlt().solve(observation)) - compressed.observation.squaredNorm();
-    EXPECT_NEAR(compressed.chi2Perpendicular, expectedChi, kOracleTolerance * std::max(1.0, expectedChi));
+    EXPECT_PRED_FORMAT3(
+      recordedNear, compressed.chi2Perpendicular, expectedChi, kOracleTolerance * std::max(1.0, expectedChi));
   }
 }
 
@@ -677,7 +715,8 @@ TEST(FrontendLidarJointAdapter, O6aRigidDeskewColumnsMatchIndependentMotionFinit
     return row.plane->normal.dot(state.rotation * point + displacement);
   };
   for (Eigen::Index index = kVelocityIndex; index < kStateDof; ++index)
-    EXPECT_NEAR(analytic[index], (motion(index, kStep) - motion(index, -kStep)) / (2.0 * kStep), kCentralBound);
+    EXPECT_PRED_FORMAT3(
+      recordedNear, analytic[index], (motion(index, kStep) - motion(index, -kStep)) / (2.0 * kStep), kCentralBound);
   const auto expected = productionRow(row, state, true);
   expectMatrix(analytic.head<kProductionColumns>(), expected);
 }
@@ -711,7 +750,8 @@ TEST(FrontendLidarJointAdapter, O6bColumnsPredictActualImuProcessDeskewDifferent
       StateRowJacobian h;
       ASSERT_EQ(geometricRow(row, adapterState(nominal.state), false, Eigen::Vector3d::Zero(), h),
                 FrameStatus::kOkFrameConditional);
-      EXPECT_NEAR(h.dot(endDerivative), pointDerivative[axis], tolerance) << "state " << index << " normal " << axis;
+      EXPECT_PRED_FORMAT3(recordedNear, h.dot(endDerivative), pointDerivative[axis], tolerance)
+        << "state " << index << " normal " << axis;
     }
   }
 }
@@ -859,7 +899,7 @@ TEST(FrontendLidarJointAdapter, ReviewClosureRejectsSmallScaleRelativeMismatch)
   snapshot.diagnostics.lastDx.head<kPositionDof>() = increment;
   const auto baseline = observeFrame(snapshot);
   ASSERT_EQ(baseline.status, FrameStatus::kOkFrameConditional) << baseline.rejectReason;
-  EXPECT_NEAR(increment[0], kPositionIncrement, kOracleTolerance * kPositionIncrement);
+  EXPECT_PRED_FORMAT3(recordedNear, increment[0], kPositionIncrement, kOracleTolerance * kPositionIncrement);
   auto covarianceMismatch = snapshot;
   (*covarianceMismatch.posteriorCovariance)(0, 0) *= 1.0 + kRelativePerturbation;
   const auto covarianceResult = observeFrame(covarianceMismatch);

@@ -332,8 +332,13 @@ public:
     inner.makeCompressed();
     if (!finiteSparse(inner))
       return FrameStatus::kNumericalFailure;
+    // Eigen ordering methods return the inverse permutation: entry k names the
+    // k-th pivot. The elimination order is its inverse, as SimplicialCholesky
+    // applies it; twisting by the returned matrix itself is not fill-reducing.
+    Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> pivots;
     Eigen::AMDOrdering<int> ordering;
-    ordering(inner, permutation_);
+    ordering(inner, pivots);
+    permutation_ = pivots.inverse();
     SparseMatrix ordered = permutation_ * inner * permutation_.transpose();
     ordered.makeCompressed();
     std::size_t fill = 0;

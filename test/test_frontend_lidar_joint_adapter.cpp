@@ -1,5 +1,7 @@
 #include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
+#include <Eigen/OrderingMethods>
+#include <Eigen/SparseCholesky>
 
 #include <algorithm>
 #include <array>
@@ -860,6 +862,58 @@ TEST(FrontendLidarJointAdapter, CompressionFailureLeavesCallerOutputUnchanged)
                          counts),
             FrameStatus::kNumericalFailure);
   EXPECT_DOUBLE_EQ(output.h(0, 0), kSentinel);
+}
+
+TEST(FrontendLidarJointAdapter, ReviewInnerFactorUsesFillReducingEliminationOrder)
+{
+  // One scalar map source per node of a 24x24 grid and one row per grid edge,
+  // so the Woodbury inner matrix has the connected grid pattern. Source columns
+  // are scrambled: neither the natural order nor the inverse of a fill-reducing
+  // order is then fill-reducing. The reference is Eigen's own AMD factorization
+  // of the same inner matrix. Equality is expected; the factor 2 only absorbs
+  // ordering tie-breaks, while an inverted permutation fills several times more.
+  constexpr Eigen::Index kGrid = 24, kSources = kGrid * kGrid, kScramble = 77;
+  const auto source = [&](Eigen::Index row, Eigen::Index column) {
+    return ((row * kGrid + column) * kScramble) % kSources;
+  };
+  std::vector<Eigen::Triplet<double>> loads;
+  Eigen::Index rows = 0;
+  const auto edge = [&](Eigen::Index first, Eigen::Index second) {
+    loads.emplace_back(rows, first, 1.0);
+    loads.emplace_back(rows, second, 1.0);
+    ++rows;
+  };
+  for (Eigen::Index row = 0; row < kGrid; ++row)
+    for (Eigen::Index column = 0; column < kGrid; ++column) {
+      if (column + 1 < kGrid)
+        edge(source(row, column), source(row, column + 1));
+      if (row + 1 < kGrid)
+        edge(source(row, column), source(row + 1, column));
+    }
+  SparseMatrix b(rows, kSources);
+  b.setFromTriplets(loads.begin(), loads.end());
+  SparseMatrix inner = b.transpose() * b;
+  for (Eigen::Index i = 0; i < kSources; ++i)
+    inner.coeffRef(i, i) += 1.0;
+  inner.makeCompressed();
+  const Eigen::SimplicialLDLT<SparseMatrix, Eigen::Lower, Eigen::AMDOrdering<int>> reference(inner);
+  ASSERT_EQ(reference.info(), Eigen::Success);
+  const auto referenceFill = static_cast<std::size_t>(reference.matrixL().nestedExpression().nonZeros());
+  ASSERT_GT(referenceFill, static_cast<std::size_t>(kSources));
+  CompressedFrame compressed;
+  Counts counts;
+  ASSERT_EQ(compressRows(Eigen::MatrixXd::Ones(rows, 1),
+                         Eigen::VectorXd::Zero(rows),
+                         Eigen::MatrixXd::Constant(1, rows, 1.0 / static_cast<double>(rows)),
+                         b,
+                         Eigen::VectorXd::Ones(rows),
+                         1.0,
+                         {},
+                         compressed,
+                         counts),
+            FrameStatus::kOkFrameConditional);
+  ASSERT_TRUE(counts.nnzFactor);
+  EXPECT_LE(*counts.nnzFactor, 2 * referenceFill);
 }
 
 TEST(FrontendLidarJointAdapter, DuplicateSupportIdentityUsesAllFloatBits)

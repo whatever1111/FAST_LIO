@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <limits>
+#include <vector>
 
 namespace fastlio::joint_source
 {
@@ -361,55 +362,46 @@ Status auditCovariance(const Eigen::MatrixXd & covariance)
     return Status::kNonFinite;
   if (!(covariance.array() == covariance.transpose().array()).all())
     return Status::kInvalidCovariance;
-  // A rootless consider recursion creates exact deterministic clone relations.
-  // Pivot on the UPDATED Schur diagonal. Eigen's LDLT can report NumericalIssue
-  // for a zero interior pivot followed by a nonzero pivot even when all its D
-  // entries are nonnegative and the input reconstructs exactly. The v1 root
-  // entry and its acceptance domain remain unchanged above.
-  Eigen::MatrixXd schur = covariance;
-  Eigen::MatrixXd lower = Eigen::MatrixXd::Identity(n, n);
-  Eigen::VectorXd diagonal = Eigen::VectorXd::Zero(n);
-  Eigen::PermutationMatrix<Eigen::Dynamic> permutation(n);
-  permutation.setIdentity();
-  for (Eigen::Index k = 0; k < n; ++k) {
-    Eigen::Index relative = 0;
-    schur.diagonal().tail(n - k).cwiseAbs().maxCoeff(&relative);
-    const auto pivot = k + relative;
-    if (pivot != k) {
-      schur.row(k).swap(schur.row(pivot));
-      schur.col(k).swap(schur.col(pivot));
-      lower.row(k).head(k).swap(lower.row(pivot).head(k));
-      std::swap(permutation.indices()(k), permutation.indices()(pivot));
-    }
-    const double value = schur(k, k);
-    if (!std::isfinite(value) || value < 0.0)
+  // Coordinate rules carry no tolerance: a variance is never negative, and an
+  // exactly zero variance has an exactly zero row, which is then left out.
+  std::vector<Eigen::Index> support;
+  for (Eigen::Index i = 0; i < n; ++i) {
+    const double variance = covariance(i, i);
+    if (variance < 0.0 || (variance == 0.0 && !covariance.row(i).isZero(0.0)))
       return Status::kInvalidCovariance;
-    if (value == 0.0) {
-      // A zero diagonal in a PSD Schur block has a zero row/column. No epsilon
-      // zeroing is allowed, including tiny nonzero off-diagonal residuals.
-      if (!schur.bottomRightCorner(n - k, n - k).isZero(0.0))
-        return Status::kInvalidCovariance;
-      break;
-    }
-    diagonal(k) = value;
-    for (Eigen::Index row = k + 1; row < n; ++row)
-      lower(row, k) = schur(row, k) / value;
-    for (Eigen::Index col = k + 1; col < n; ++col) {
-      for (Eigen::Index row = col; row < n; ++row) {
-        schur(row, col) -= lower(row, k) * schur(col, k);
-        schur(col, row) = schur(row, col);
-      }
+    if (variance > 0.0)
+      support.push_back(i);
+  }
+  // A rootless consider recursion keeps exact deterministic relations, so the
+  // smallest eigenvalue of a valid joint is zero and its computed pivot is
+  // rounding noise of either sign. The audit therefore decides whether
+  // covariance + budget * I has a Cholesky factor, with the v1 arithmetic
+  // budget. This judges only: nothing is clipped, shifted or kept. With
+  // u = eps / 2 and c = n (n + 1) u, Demmel (LAPACK Working Note 14, Lemma 2.1
+  // and Theorem 3.2) gives, to first order in u and relative to maxAbs,
+  //   smallest eigenvalue >= -(budget - c): always accepted,
+  //   smallest eigenvalue <= -(budget + c): always rejected.
+  // budget = 64 n eps exceeds c for n <= 126. Impl::audit windows have n <= 55;
+  // process-copy samples can be larger and have no such dimension guarantee.
+  // The v1 root entry and its acceptance domain remain unchanged above.
+  const double shift = arithmeticTolerance(n) * covariance.cwiseAbs().maxCoeff();
+  const auto size = static_cast<Eigen::Index>(support.size());
+  Eigen::MatrixXd lower(size, size);
+  for (Eigen::Index i = 0; i < size; ++i) {
+    double pivot = covariance(support[i], support[i]) + shift;
+    for (Eigen::Index k = 0; k < i; ++k)
+      pivot -= lower(i, k) * lower(i, k);
+    if (!(pivot > 0.0) || !std::isfinite(pivot))
+      return Status::kInvalidCovariance;
+    lower(i, i) = std::sqrt(pivot);
+    for (Eigen::Index j = i + 1; j < size; ++j) {
+      double value = covariance(support[j], support[i]);
+      for (Eigen::Index k = 0; k < i; ++k)
+        value -= lower(j, k) * lower(i, k);
+      lower(j, i) = value / lower(i, i);
     }
   }
-  const Eigen::MatrixXd reconstructed = lower * diagonal.asDiagonal() * lower.transpose();
-  if (!lower.allFinite() || !reconstructed.allFinite())
-    return Status::kInvalidCovariance;
-  double error = 0.0;
-  for (Eigen::Index row = 0; row < n; ++row)
-    for (Eigen::Index col = 0; col < n; ++col)
-      error = std::max(
-        error, std::abs(reconstructed(row, col) - covariance(permutation.indices()(row), permutation.indices()(col))));
-  return error <= arithmeticTolerance(n) * covariance.cwiseAbs().maxCoeff() ? Status::kOk : Status::kInvalidCovariance;
+  return Status::kOk;
 }
 
 bool coordinatesEqual(const Coordinates & first, const Coordinates & second)

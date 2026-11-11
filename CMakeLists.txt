@@ -499,7 +499,10 @@ ${sanitizer_tests}
   ament_add_gtest(test_frontend_correlated_update test/test_frontend_correlated_update.cpp)
   target_link_libraries(test_frontend_correlated_update frontend_correlated_update)
   ament_add_gtest(test_frontend_consider_source_filter test/test_frontend_consider_source_filter.cpp)
-  target_link_libraries(test_frontend_consider_source_filter frontend_consider_source_filter)
+  target_link_libraries(test_frontend_consider_source_filter frontend_consider_source_filter ${CMAKE_DL_LIBS})
+  # Observe the actual audit inputs in tests without changing processCopyAudit.
+  target_link_options(test_frontend_consider_source_filter PRIVATE
+    "LINKER:--wrap=_ZN7fastlio12joint_source6detail15auditCovarianceERKN5Eigen6MatrixIdLin1ELin1ELi0ELin1ELin1EEE")
   ament_add_gtest(test_frontend_lidar_joint_adapter test/test_frontend_lidar_joint_adapter.cpp TIMEOUT 300)
   target_link_libraries(test_frontend_lidar_joint_adapter frontend_lidar_joint_adapter ${PCL_LIBRARIES})
   target_include_directories(test_frontend_lidar_joint_adapter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${PCL_INCLUDE_DIRS})

@@ -3,6 +3,9 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <dlfcn.h>
 #include <gtest/gtest.h>
 #include <iomanip>
 #include <iostream>
@@ -14,6 +17,39 @@
 
 namespace fastlio::joint_source
 {
+namespace detail
+{
+
+// GNU ld wrapping observes the real matrix at each call site. The return address
+// is relative to the ELF image; addr2line identifies processCopyAudit offline.
+// Only this GTest target links the wrapper, and the original audit always runs.
+Status realAudit(const Eigen::MatrixXd & covariance) asm(
+  "__real__ZN7fastlio12joint_source6detail15auditCovarianceERKN5Eigen6MatrixIdLin1ELin1ELi0ELin1ELin1EEE");
+Status observedAudit(const Eigen::MatrixXd & covariance) asm(
+  "__wrap__ZN7fastlio12joint_source6detail15auditCovarianceERKN5Eigen6MatrixIdLin1ELin1ELi0ELin1ELin1EEE");
+
+Status observedAudit(const Eigen::MatrixXd & covariance)
+{
+  const auto * test = ::testing::UnitTest::GetInstance()->current_test_info();
+  Dl_info image{};
+  const auto * caller = __builtin_return_address(0);
+  // The timing fixture measures entries without XML observation overhead.
+  if (test != nullptr && std::strcmp(test->name(), "DISABLED_FullBudgetSingleEntryTimings") != 0 &&
+      dladdr(caller, &image) != 0) {
+    const auto offset = reinterpret_cast<std::uintptr_t>(caller) - reinterpret_cast<std::uintptr_t>(image.dli_fbase);
+    const std::string key = "audit_rows_at_" + std::to_string(offset);
+    auto maximum = covariance.rows();
+    for (int i = 0; i < test->result()->test_property_count(); ++i) {
+      const auto & property = test->result()->GetTestProperty(i);
+      if (key == property.key())
+        maximum = std::max(maximum, static_cast<Eigen::Index>(std::stoll(property.value())));
+    }
+    ::testing::Test::RecordProperty(key, std::to_string(maximum));
+  }
+  return realAudit(covariance);
+}
+
+}  // namespace detail
 namespace
 {
 
@@ -327,6 +363,33 @@ TEST(ConsiderSourceFilter, X4SameFrameAcrossCallsRetainsBothCrossBlocks)
   EXPECT_EQ(filter.reuseCount({7, 1, 0}), 1U);
 }
 
+TEST(ConsiderSourceFilter, X4ProcessCopyCrossUsesTheSameAuditRule)
+{
+  const auto initial = prior();
+  ConsiderSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial, budget()), Status::kOk);
+  auto query = factor(initial.active, {}, "query");
+  auto copy = reuse(query, "echo", {8, 1, 0}, 1);
+  apply(filter, query, -1, {copy});
+  // Independent unit primitives e0, eta: e = 2 e0 + eta. Choose
+  // w = eta - e0/2, so Cov(e,w)=0, Var(w)=5/4 and Cov(w,eta)=1.
+  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 5));
+  const auto process = noise(1, 1, 5.0 / 4.0);
+  CopyNoiseCross cross{{7, 1, 0}, {8, 1, 0}, Eigen::MatrixXd::Constant(1, 1, 2)};
+  const auto ledger = filter.ledgerIdentity();
+  EXPECT_EQ(filter.propagate(Eigen::MatrixXd::Ones(1, 1), process, {cross}), Status::kInvalidCovariance);
+  EXPECT_EQ(filter.ledgerIdentity(), ledger);
+  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 5));
+  cross.covariance.setOnes();
+  ASSERT_EQ(filter.propagate(Eigen::MatrixXd::Ones(1, 1), process, {cross}), Status::kOk);
+  // e' = 3 e0/2 + 2 eta; the next same-frame update is e'' = 3 e0/4 + eta/2.
+  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 25.0 / 4.0));
+  auto support = factor(initial.active, {}, "support");
+  copy = reuse(support, "echo", {8, 1, 0}, 1);
+  apply(filter, support, 0.5, {copy});
+  expectMatrix(*filter.activeCovariance(), Eigen::MatrixXd::Constant(1, 1, 13.0 / 16.0));
+}
+
 TEST(ConsiderSourceFilter, X5YoungOracleDoesNotAuthorizeReentry)
 {
   Eigen::Matrix2d exact;
@@ -500,9 +563,20 @@ TEST(ConsiderSourceFilter, X11NearSingularAndAsymmetry)
     auto candidate = filter.proposeAppliedGain({input}, gain);
     ASSERT_EQ(candidate.status(), Status::kOk);
     ASSERT_EQ(filter.commit(std::move(candidate)), Status::kOk);
-    const Eigen::LDLT<Eigen::MatrixXd> audit(joint(filter, {z}));
-    EXPECT_GE(audit.vectorD().minCoeff(), 0);
+    // h*G = 0 keeps e0-e1 = z0-z1 exactly: every joint has rank 3, and its
+    // entries are dyadic, so the reference is exact.
+    const Eigen::Matrix2d p = initial.covariance;
+    Eigen::Matrix4d expected;
+    expected << p + Eigen::Matrix2d::Constant((i + 1) / 64.0), p, p, p;
+    expectMatrix(joint(filter, {z}), expected);
+    EXPECT_EQ(detail::auditCovariance(joint(filter, {z})), Status::kOk);
   }
+  // Symmetric and indefinite beyond the arithmetic budget: smallest eigenvalue -2^-36.
+  initial.covariance << 1, 1 + std::ldexp(1.0, -36), 1 + std::ldexp(1.0, -36), 1;
+  ConsiderSourceFilter indefinite;
+  EXPECT_EQ(indefinite.initialize(initial, budget()), Status::kInvalidCovariance);
+  EXPECT_EQ(indefinite.activeCovariance(), nullptr);
+  initial.covariance << 1, 1, 1, 1 + std::ldexp(1.0, -36);
   initial.covariance(0, 1) = std::nextafter(1.0, 2.0);
   ConsiderSourceFilter invalid;
   EXPECT_EQ(invalid.initialize(initial, budget()), Status::kInvalidCovariance);
@@ -848,6 +922,165 @@ TEST(ConsiderSourceFilter, ConstructiveAuditHandlesInteriorZeroPivotsWithoutClip
   invalid.setIdentity();
   invalid(2, 2) = -std::numeric_limits<double>::epsilon();
   EXPECT_EQ(detail::auditCovariance(invalid), Status::kInvalidCovariance);
+}
+
+// The stored joint of a valid recursion with a deterministic relation is the
+// rounding of a singular matrix: its smallest eigenvalue is zero up to a few
+// ulp of either sign. X1 with non-dyadic numbers makes every product inexact.
+TEST(ConsiderSourceFilter, X1NonDyadicSequenceKeepsDeterministicSupport)
+{
+  auto initial = prior(2);
+  ConsiderSourceFilter filter;
+  JointSourceFilter reference;
+  ASSERT_EQ(filter.initialize(initial, budget()), Status::kOk);
+  ASSERT_EQ(reference.initialize(initial), Status::kOk);
+  const Eigen::Matrix2d phi = (Eigen::Matrix2d() << 1, 0.3, 0, 1).finished();
+  ASSERT_EQ(filter.propagate(phi, noise(2, 2, 0.1)), Status::kOk);
+  ASSERT_EQ(reference.propagate(phi, Eigen::Vector2d::Zero(), noise(2, 2, 0.1), initial.active, {}), Status::kOk);
+  auto z = source("z", "z/raw", 2);
+  ASSERT_EQ(filter.augment(z, Eigen::Matrix2d::Identity()), Status::kOk);
+  ASSERT_EQ(reference.augment(z, Eigen::Matrix2d::Identity(), Eigen::Vector2d::Zero(), noise(2, 2)), Status::kOk);
+  auto input = factor(initial.active, {z}, "first");
+  input.h << 1, 0.7;
+  input.a << -0.3, 0.45;
+  const Eigen::Vector2d gain(0.3, -0.1);
+  auto candidate = filter.proposeAppliedGain({input}, gain);
+  ASSERT_EQ(candidate.status(), Status::kOk);
+  ASSERT_EQ(filter.commit(std::move(candidate)), Status::kOk);
+  Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
+  transform.topLeftCorner<2, 2>() -= gain * input.h;
+  transform.topRightCorner<2, 2>() = -gain * input.a;
+  auto process = noise(4, 4);
+  process.covariance.topLeftCorner<2, 2>() = gain * gain.transpose();
+  ASSERT_EQ(reference.propagate(transform, Eigen::Vector4d::Zero(), process, initial.active, {z.coordinates}),
+            Status::kOk);
+  expectMatrix(joint(filter, {z}), reference.moments()->covariance);
+}
+
+// h*G = 0 keeps e0-e1 = 0.99^k (z0-z1) through every update and propagation,
+// with no process noise to remove it: rounding in that null direction only
+// accumulates. 256 consecutive steps stay far inside the arithmetic budget.
+TEST(ConsiderSourceFilter, PersistentDeterministicRelationStaysWithinArithmeticBudget)
+{
+  auto initial = prior(2);
+  initial.covariance << 1.3, 0.4, 0.4, 0.9;
+  ConsiderSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial, budget()), Status::kOk);
+  const auto z = source("z", "z/raw", 2);
+  ASSERT_EQ(filter.augment(z, Eigen::Matrix2d::Identity()), Status::kOk);
+  for (std::uint64_t i = 0; i < 256; ++i) {
+    ASSERT_EQ(filter.propagate(0.99 * Eigen::Matrix2d::Identity(), noise(4, 2)), Status::kOk);
+    auto input = factor(initial.active, {z}, "step" + std::to_string(i));
+    input.identity.sequence = RawId{1, i + 1, 0};
+    input.identity.typedRaw = {{input.identity.rawAncestry.front(), {2, i + 1, 0}}};
+    input.h << 1, -1;
+    input.a << -1, 1;
+    auto candidate = filter.proposeAppliedGain({input}, Eigen::Vector2d(0.1, 0.1));
+    ASSERT_EQ(candidate.status(), Status::kOk) << "step " << i;
+    ASSERT_EQ(filter.commit(std::move(candidate)), Status::kOk);
+  }
+  const Eigen::MatrixXd value = joint(filter, {z});
+  // e0-e1 - 0.99^256 (z0-z1) has zero variance.
+  const double decay = std::pow(0.99, 256);
+  const Eigen::Vector4d null(1, -1, -decay, decay);
+  const double error = std::abs(null.dot(value * null));
+  const double tolerance = kTolerance * value.cwiseAbs().maxCoeff();
+  ::testing::Test::RecordProperty("null_direction_actual", numbers(Eigen::MatrixXd::Constant(1, 1, error)));
+  ::testing::Test::RecordProperty("null_direction_expected", "0");
+  ::testing::Test::RecordProperty("null_direction_tolerance", numbers(Eigen::MatrixXd::Constant(1, 1, tolerance)));
+  ::testing::Test::RecordProperty("null_direction_metric", "max_abs");
+  EXPECT_LE(error, tolerance);
+}
+
+TEST(ConsiderSourceFilter, AuditAcceptsSingularSupportWithinArithmeticBudget)
+{
+  // Exact rational X1 joint after the update: rank 3, null vector [1, 2, -1, -2].
+  Eigen::Matrix4d support;
+  support << 475.0 / 512, 181.0 / 1024, 35.0 / 32, 3.0 / 32, 181.0 / 1024, 3515.0 / 2048, 45.0 / 64, 93.0 / 64,
+    35.0 / 32, 45.0 / 64, 1.5, 0.5, 3.0 / 32, 93.0 / 64, 0.5, 1.25;
+  EXPECT_LE((support * Eigen::Vector4d(1, 2, -1, -2)).cwiseAbs().maxCoeff(), 0.0);
+  // The budget is relative to maxAbs: a change of units changes no verdict.
+  for (const double unit : {1.0, 1e-12, 1e12})
+    EXPECT_EQ(detail::auditCovariance(unit * support), Status::kOk) << unit;
+  // Rounded rank one: 0.1, 0.3 and 0.7 have no exact products.
+  const Eigen::Vector3d direction(0.1, 0.3, 0.7);
+  EXPECT_EQ(detail::auditCovariance(direction * direction.transpose()), Status::kOk);
+  // Largest sampled window, 23 + 32: one variable repeated 55 times, and 27 exact clone pairs.
+  EXPECT_EQ(detail::auditCovariance(Eigen::MatrixXd::Constant(55, 55, 0.3)), Status::kOk);
+  Eigen::MatrixXd pairs = Eigen::MatrixXd::Identity(55, 55);
+  for (Eigen::Index i = 0; i + 1 < 55; i += 2)
+    pairs(i, i + 1) = pairs(i + 1, i) = 1;
+  EXPECT_EQ(detail::auditCovariance(pairs), Status::kOk);
+  // Known zero covariance is deterministic support.
+  EXPECT_EQ(detail::auditCovariance(Eigen::Matrix3d::Zero()), Status::kOk);
+  Eigen::Matrix3d partial = Eigen::Matrix3d::Zero();
+  partial(1, 1) = 2;
+  EXPECT_EQ(detail::auditCovariance(partial), Status::kOk);
+}
+
+TEST(ConsiderSourceFilter, AuditRejectsIndefiniteBeyondArithmeticBudget)
+{
+  const double eps = std::numeric_limits<double>::epsilon();
+  Eigen::Matrix2d invalid;
+  invalid << 1, 2, 2, 1;
+  EXPECT_EQ(detail::auditCovariance(invalid), Status::kInvalidCovariance);
+  // Smallest eigenvalue -2^-36 * maxAbs at every scale.
+  invalid << 1, 1 + std::ldexp(1.0, -36), 1 + std::ldexp(1.0, -36), 1;
+  for (const double unit : {1.0, 1e-12, 1e12})
+    EXPECT_EQ(detail::auditCovariance(unit * invalid), Status::kInvalidCovariance) << unit;
+  // Smallest eigenvalue -1024 eps, eight times the n = 2 budget of 128 eps.
+  invalid << 1, 1 + 1024 * eps, 1 + 1024 * eps, 1;
+  EXPECT_EQ(detail::auditCovariance(invalid), Status::kInvalidCovariance);
+  // The X1 joint with one variance lowered by 1e-9.
+  Eigen::Matrix4d lowered;
+  lowered << 475.0 / 512, 181.0 / 1024, 35.0 / 32, 3.0 / 32, 181.0 / 1024, 3515.0 / 2048, 45.0 / 64, 93.0 / 64,
+    35.0 / 32, 45.0 / 64, 1.5, 0.5, 3.0 / 32, 93.0 / 64, 0.5, 1.25;
+  lowered(0, 0) -= 1e-9;
+  EXPECT_EQ(detail::auditCovariance(lowered), Status::kInvalidCovariance);
+  // Largest sampled window: 26 exact clone pairs and one pair with correlation
+  // 1 + 2^-36. The budget is 3520 eps and the error bound 1541 eps.
+  Eigen::MatrixXd pairs = Eigen::MatrixXd::Identity(55, 55);
+  for (Eigen::Index i = 0; i + 1 < 55; i += 2)
+    pairs(i, i + 1) = pairs(i + 1, i) = 1;
+  pairs(52, 53) = pairs(53, 52) = 1 + std::ldexp(1.0, -36);
+  EXPECT_EQ(detail::auditCovariance(pairs), Status::kInvalidCovariance);
+  Eigen::Matrix2d nonFinite = Eigen::Matrix2d::Identity();
+  nonFinite(1, 1) = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(detail::auditCovariance(nonFinite), Status::kNonFinite);
+  nonFinite(1, 1) = std::numeric_limits<double>::infinity();
+  EXPECT_EQ(detail::auditCovariance(nonFinite), Status::kNonFinite);
+  Eigen::Matrix2d asymmetric = Eigen::Matrix2d::Identity();
+  asymmetric(0, 1) = std::numeric_limits<double>::denorm_min();
+  EXPECT_EQ(detail::auditCovariance(asymmetric), Status::kInvalidCovariance);
+}
+
+// The budget is where the verdict changes, not an endorsement of indefinite
+// input: a symmetric matrix that is indefinite within it is the same kind of
+// double matrix a valid singular joint rounds to, and no judgement of the stored
+// numbers can reject one and keep the other. [[1, 1 + d], [1 + d, 1]] has the
+// smallest eigenvalue -d exactly. Acceptance is certain above -(budget - c) and
+// rejection below -(budget + c), with c the factorization error bound.
+TEST(ConsiderSourceFilter, AuditVerdictChangesAtTheArithmeticBudget)
+{
+  const double eps = std::numeric_limits<double>::epsilon();
+  const auto pair = [](double excess) {
+    Eigen::Matrix2d value;
+    value << 1, 1 + excess, 1 + excess, 1;
+    return value;
+  };
+  EXPECT_LT(pair(eps).determinant(), 0);
+  EXPECT_EQ(detail::auditCovariance(pair(eps)), Status::kOk);
+  // n = 2: budget 128 eps, c = 4 eps.
+  EXPECT_EQ(detail::auditCovariance(pair(112 * eps)), Status::kOk);
+  EXPECT_EQ(detail::auditCovariance(pair(144 * eps)), Status::kInvalidCovariance);
+  // n = 55, the largest sampled window: budget 3520 eps, c = 1541 eps.
+  const auto window = [&pair](double excess) {
+    Eigen::MatrixXd value = Eigen::MatrixXd::Identity(55, 55);
+    value.topLeftCorner(2, 2) = pair(excess);
+    return value;
+  };
+  EXPECT_EQ(detail::auditCovariance(window(1900 * eps)), Status::kOk);
+  EXPECT_EQ(detail::auditCovariance(window(5200 * eps)), Status::kInvalidCovariance);
 }
 
 TEST(ConsiderSourceFilter, AllSourcesReferencedKeepsUpdateWorkspaceLinear)

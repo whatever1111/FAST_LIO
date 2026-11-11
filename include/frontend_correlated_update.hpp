@@ -50,8 +50,11 @@ struct GainResult
   Eigen::MatrixXd covariance;
 };
 
-// Shared process-local identity encoding and strict LDLT audit. These helpers do
-// not select an estimator, change capacities, or relax the v1 covariance domain.
+// Shared process-local identity encoding and the consider-class covariance
+// audit: exact symmetry, no negative variance, an exactly zero row for an
+// exactly zero variance, and positive semidefiniteness within the v1 arithmetic
+// budget 64 * dimension * eps * maxAbs. These helpers do not select an
+// estimator, change capacities, or relax the v1 covariance domain.
 namespace detail
 {
 Status auditCovariance(const Eigen::MatrixXd & covariance);

@@ -187,6 +187,11 @@ target_include_directories(frontend_correlated_update PUBLIC
 target_link_libraries(frontend_correlated_update PUBLIC Eigen3::Eigen)
 target_compile_features(frontend_correlated_update PUBLIC cxx_std_17)
 
+# Given-gain covariance companion, kept outside all production link paths.
+add_library(frontend_consider_source_filter STATIC src/frontend_consider_source_filter.cpp)
+target_link_libraries(frontend_consider_source_filter PUBLIC frontend_correlated_update Eigen3::Eigen)
+target_compile_features(frontend_consider_source_filter PUBLIC cxx_std_17)
+
 # Independent frame-conditional observer; production mapping does not link it.
 add_library(frontend_lidar_joint_adapter STATIC src/frontend_lidar_joint_adapter.cpp)
 target_link_libraries(frontend_lidar_joint_adapter PUBLIC frontend_correlated_update Eigen3::Eigen)
@@ -493,6 +498,8 @@ ${sanitizer_tests}
   target_include_directories(test_frontend_source_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   ament_add_gtest(test_frontend_correlated_update test/test_frontend_correlated_update.cpp)
   target_link_libraries(test_frontend_correlated_update frontend_correlated_update)
+  ament_add_gtest(test_frontend_consider_source_filter test/test_frontend_consider_source_filter.cpp)
+  target_link_libraries(test_frontend_consider_source_filter frontend_consider_source_filter)
   ament_add_gtest(test_frontend_lidar_joint_adapter test/test_frontend_lidar_joint_adapter.cpp TIMEOUT 300)
   target_link_libraries(test_frontend_lidar_joint_adapter frontend_lidar_joint_adapter ${PCL_LIBRARIES})
   target_include_directories(test_frontend_lidar_joint_adapter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${PCL_INCLUDE_DIRS})

@@ -350,6 +350,89 @@ Status validateAncestry(const std::vector<Source> & live,
 
 }  // namespace
 
+namespace detail
+{
+Status auditCovariance(const Eigen::MatrixXd & covariance)
+{
+  const auto n = covariance.rows();
+  if (n == 0 || covariance.cols() != n)
+    return Status::kDimensionMismatch;
+  if (!covariance.allFinite())
+    return Status::kNonFinite;
+  if (!(covariance.array() == covariance.transpose().array()).all())
+    return Status::kInvalidCovariance;
+  // A rootless consider recursion creates exact deterministic clone relations.
+  // Pivot on the UPDATED Schur diagonal. Eigen's LDLT can report NumericalIssue
+  // for a zero interior pivot followed by a nonzero pivot even when all its D
+  // entries are nonnegative and the input reconstructs exactly. The v1 root
+  // entry and its acceptance domain remain unchanged above.
+  Eigen::MatrixXd schur = covariance;
+  Eigen::MatrixXd lower = Eigen::MatrixXd::Identity(n, n);
+  Eigen::VectorXd diagonal = Eigen::VectorXd::Zero(n);
+  Eigen::PermutationMatrix<Eigen::Dynamic> permutation(n);
+  permutation.setIdentity();
+  for (Eigen::Index k = 0; k < n; ++k) {
+    Eigen::Index relative = 0;
+    schur.diagonal().tail(n - k).cwiseAbs().maxCoeff(&relative);
+    const auto pivot = k + relative;
+    if (pivot != k) {
+      schur.row(k).swap(schur.row(pivot));
+      schur.col(k).swap(schur.col(pivot));
+      lower.row(k).head(k).swap(lower.row(pivot).head(k));
+      std::swap(permutation.indices()(k), permutation.indices()(pivot));
+    }
+    const double value = schur(k, k);
+    if (!std::isfinite(value) || value < 0.0)
+      return Status::kInvalidCovariance;
+    if (value == 0.0) {
+      // A zero diagonal in a PSD Schur block has a zero row/column. No epsilon
+      // zeroing is allowed, including tiny nonzero off-diagonal residuals.
+      if (!schur.bottomRightCorner(n - k, n - k).isZero(0.0))
+        return Status::kInvalidCovariance;
+      break;
+    }
+    diagonal(k) = value;
+    for (Eigen::Index row = k + 1; row < n; ++row)
+      lower(row, k) = schur(row, k) / value;
+    for (Eigen::Index col = k + 1; col < n; ++col) {
+      for (Eigen::Index row = col; row < n; ++row) {
+        schur(row, col) -= lower(row, k) * schur(col, k);
+        schur(col, row) = schur(row, col);
+      }
+    }
+  }
+  const Eigen::MatrixXd reconstructed = lower * diagonal.asDiagonal() * lower.transpose();
+  if (!lower.allFinite() || !reconstructed.allFinite())
+    return Status::kInvalidCovariance;
+  double error = 0.0;
+  for (Eigen::Index row = 0; row < n; ++row)
+    for (Eigen::Index col = 0; col < n; ++col)
+      error = std::max(
+        error, std::abs(reconstructed(row, col) - covariance(permutation.indices()(row), permutation.indices()(col))));
+  return error <= arithmeticTolerance(n) * covariance.cwiseAbs().maxCoeff() ? Status::kOk : Status::kInvalidCovariance;
+}
+
+bool coordinatesEqual(const Coordinates & first, const Coordinates & second)
+{
+  return sameCoordinates(first, second);
+}
+
+void appendCanonicalText(std::string & payload, const std::string & value)
+{
+  appendText(payload, value);
+}
+
+void appendCanonicalCoordinates(std::string & payload, const Coordinates & coordinates)
+{
+  appendCoordinates(payload, coordinates);
+}
+
+void appendCanonicalMatrix(std::string & payload, const Eigen::MatrixXd & matrix)
+{
+  appendMatrix(payload, matrix);
+}
+}  // namespace detail
+
 struct JointSourceFilter::Snapshot
 {
   JointMoments moments;

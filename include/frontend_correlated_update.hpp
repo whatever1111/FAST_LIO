@@ -50,6 +50,17 @@ struct GainResult
   Eigen::MatrixXd covariance;
 };
 
+// Shared process-local identity encoding and strict LDLT audit. These helpers do
+// not select an estimator, change capacities, or relax the v1 covariance domain.
+namespace detail
+{
+Status auditCovariance(const Eigen::MatrixXd & covariance);
+bool coordinatesEqual(const Coordinates & first, const Coordinates & second);
+void appendCanonicalText(std::string & payload, const std::string & value);
+void appendCanonicalCoordinates(std::string & payload, const Coordinates & coordinates);
+void appendCanonicalMatrix(std::string & payload, const Eigen::MatrixXd & matrix);
+}  // namespace detail
+
 // Thread-confined owner. Callers serialize access. moments()/ledger() are borrowed
 // views valid until the next mutation. Proposals own their immutable snapshots.
 class JointSourceFilter

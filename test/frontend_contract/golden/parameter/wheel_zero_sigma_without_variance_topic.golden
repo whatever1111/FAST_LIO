@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/wheel_zero_sigma_without_variance_topic
-# fork_sha: 7603d5f6aaaa005a8624b8b8cd13da50591905bf
+# fork_sha: 1be7d727accce1e761cde7bb18cf1b198925d320
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -13,11 +13,11 @@ override wheel_vel_noise_vy type=double value=0
 outcome threw std::invalid_argument: "wheel_vel_noise_vy"
 event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
 event.v1 typed_outputs declared=153 names_sha256=2ea6b8f17ef100433f2047577867e9f0985d22eefd59b7b0df0f2ac6604a3aa9
-event.v1 declare_back declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
-event.v1 lost_recovery_loaded declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
-event.v1 read_policies declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
+event.v1 declare_back declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
+event.v1 lost_recovery_loaded declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
+event.v1 read_policies declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
 log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
-event.v1 anchor_gap_resolved declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
+event.v1 anchor_gap_resolved declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
 log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
-event.v1 map_backend declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
+event.v1 map_backend declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
 log FATAL laser_mapping "wheel_vel_noise_vy must be > 0 without wheel_cov_topic, got 0"

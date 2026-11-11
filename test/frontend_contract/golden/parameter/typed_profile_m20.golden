@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/typed_profile_m20
-# fork_sha: 7603d5f6aaaa005a8624b8b8cd13da50591905bf
+# fork_sha: 1be7d727accce1e761cde7bb18cf1b198925d320
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -12,30 +12,30 @@ override publish.reference_health type=bool value=true
 outcome constructed
 event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
 event.v1 typed_outputs declared=153 names_sha256=2ea6b8f17ef100433f2047577867e9f0985d22eefd59b7b0df0f2ac6604a3aa9
-event.v1 declare_back declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
+event.v1 declare_back declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
 log INFO laser_mapping "[RP-CONSIDER] lidar update considers roll/pitch while engulfed=1, 2.5s after a release, when the previous scan's roll/pitch information < 1500 or z_weak >= 1.10 (cap 0.0s)"
-event.v1 lost_recovery_loaded declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
-event.v1 read_policies declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
+event.v1 lost_recovery_loaded declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
+event.v1 read_policies declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
 log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=10000000000 stable_ns=1000000000 (platform policy on)"
-event.v1 anchor_gap_resolved declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
+event.v1 anchor_gap_resolved declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
 log INFO laser_mapping "[IMU-GAP] prior on: IMU intervals > 0.100s up to imu_coverage.max_gap_s 2.00s are bridged (gyro average, velocity held; 1-sigma accel 1.00 / 0.20 m/s^2 horizontal / vertical, rate roll/pitch 0.0 yaw 10.0 deg/s), scans without IMU samples carried; gaps > 0.30s are re-verified against the frozen map"
 log INFO laser_mapping "[IVOX] map backend = iVox (res=0.30 nearby=26 voxel_cap=50 max_voxels=5000000)"
-event.v1 map_backend declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
+event.v1 map_backend declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
 log INFO laser_mapping "p_pre->lidar_type 2"
-event.v1 read_inputs declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
-event.v1 filter_init declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
+event.v1 read_inputs declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
+event.v1 filter_init declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
 log INFO laser_mapping "Standard IMU mode: topic=/lio/imu"
 log INFO laser_mapping "Wheel twist subscribed: topic=/wheel_odom/twist scale=1.000 (fusion off, static hold on, parked hold on)"
-event.v1 subscriptions declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
-event.v1 cloud_publishers declared=242 names_sha256=b91cfd5382372bc5d3c7d920ae6cb3e22bce7d758738bc7fdc24bd4cd079d440
-event.v1 odometry_publishers declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
-event.v1 scan_timer declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
-event.v1 map_timer declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
+event.v1 subscriptions declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
+event.v1 cloud_publishers declared=243 names_sha256=32d268b1d692fee9e279a24b294ff3bf5f5429a4dbea5893c22800bc9d8dda02
+event.v1 odometry_publishers declared=247 names_sha256=c109c8eda563455474f67357dc1009b6365c72685245e7422459df64f026cb31
+event.v1 scan_timer declared=247 names_sha256=c109c8eda563455474f67357dc1009b6365c72685245e7422459df64f026cb31
+event.v1 map_timer declared=247 names_sha256=c109c8eda563455474f67357dc1009b6365c72685245e7422459df64f026cb31
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
-event.v1 config_id declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
+event.v1 config_id declared=247 names_sha256=c109c8eda563455474f67357dc1009b6365c72685245e7422459df64f026cb31
 log INFO laser_mapping "Node init finished."
-event.v1 constructed declared=246 names_sha256=431955759c983be1a5df12130414df900a6276588d863b672e336fe430592848
-parameters 246
+event.v1 constructed declared=247 names_sha256=c109c8eda563455474f67357dc1009b6365c72685245e7422459df64f026cb31
+parameters 247
 param adaptive_downsample_max_voxel type=double value=0.34999999999999998 read_only=0 descriptor_type=3
 param common.imu_input_type type=string value="standard" read_only=0 descriptor_type=4
 param common.imu_topic type=string value="/lio/imu" read_only=0 descriptor_type=4
@@ -108,7 +108,7 @@ param wheel_vel_noise_vz type=double value=0.20000000000000001 read_only=0 descr
 param zupt_anchor_max_scan_gap_s type=double value=0.29999999999999999 read_only=0 descriptor_type=3
 param zupt_parked_hold_en type=bool value=true read_only=0 descriptor_type=1
 param zupt_require_wheel type=bool value=true read_only=0 descriptor_type=1
-effective.v1.count 312
+effective.v1.count 313
 effective.v1 adaptive_downsample_max_voxel float64 0x3fd6666666666666
 effective.v1 common.imu_input_type string[8] "standard"
 effective.v1 common.imu_topic string[8] "/lio/imu"
@@ -117,7 +117,7 @@ effective.v1 corr_gate_mad_scale float64 0x3ff0000000000000
 effective.v1 corr_gate_rot_sigma_floor_deg float64 0x3fd3333333333333
 effective.v1 corr_innov_gate_k float64 0x4004000000000000
 effective.v1 cube_side_length float64 0x4072c00000000000
-effective.v1 derived:config_id:reference_config_id bytes[32] e3b756394307dc91704f57df2c6d8475705d563693555b4105ca1034324dcf68
+effective.v1 derived:config_id:reference_config_id bytes[32] 8af6fcd21fc160edb7078c21e022fb16da6381b26e893c86e9859c67e53c299e
 effective.v1 derived:config_id:reference_contract_id bytes[32] 7f76d47e6a3b97253e1d11c9fe21871a0fe9f723b749c0bd0ad894d84054de06
 effective.v1 derived:extrinsic_and_noise:Lidar_T_wrt_IMU float64[3x1] [0xbfd03e425aee6320,0x0000000000000000,0xbfd1e00d1b71758e]
 effective.v1 derived:extrinsic_and_noise:p_imu->Lidar_T_wrt_IMU float64[3x1] [0xbfd03e425aee6320,0x0000000000000000,0xbfd1e00d1b71758e]

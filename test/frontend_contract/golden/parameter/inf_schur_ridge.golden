@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/inf_schur_ridge
-# fork_sha: 7603d5f6aaaa005a8624b8b8cd13da50591905bf
+# fork_sha: 1be7d727accce1e761cde7bb18cf1b198925d320
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -12,5 +12,5 @@ override mapping.extrinsic_T type=double_array value=[0,0,0]
 outcome threw std::invalid_argument: "degeneracy_schur_ridge"
 event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
 event.v1 typed_outputs declared=153 names_sha256=2ea6b8f17ef100433f2047577867e9f0985d22eefd59b7b0df0f2ac6604a3aa9
-event.v1 declare_back declared=238 names_sha256=954cf54d9df9998b6a1a13076a2c8433f909fcbece0a6b6bfc2c1dc20aebdf72
+event.v1 declare_back declared=239 names_sha256=3ea17e7e300b40f571372b3eee46aa5cbf8ffb0d92173df14744c95272d25ac1
 log FATAL laser_mapping "degeneracy_schur_ridge must be finite, got inf"

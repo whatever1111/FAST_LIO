@@ -423,6 +423,16 @@ double scaledCovarianceError(const Eigen::MatrixXd & value, const Eigen::MatrixX
   return scaledError(value, expected, scales * scales.transpose());
 }
 
+bool svdSucceeded(const Eigen::JacobiSVD<Eigen::MatrixXd> & svd)
+{
+#if EIGEN_VERSION_AT_LEAST(3, 4, 0)
+  return svd.info() == Eigen::Success;
+#else
+  // Eigen 3.3 (Foxy) exposes no computation-status API on JacobiSVD.
+  return svd.singularValues().allFinite();
+#endif
+}
+
 FrameStatus compressWithNoise(const Eigen::MatrixXd & h,
                               const Eigen::VectorXd & y,
                               const Eigen::MatrixXd & gain,
@@ -433,7 +443,7 @@ FrameStatus compressWithNoise(const Eigen::MatrixXd & h,
 {
   const auto rows = h.rows(), active = h.cols();
   Eigen::JacobiSVD<Eigen::MatrixXd> svd(gain, Eigen::ComputeThinU | Eigen::ComputeThinV);
-  if (svd.info() != Eigen::Success)
+  if (!svdSucceeded(svd))
     return FrameStatus::kNumericalFailure;
   const double gainScale = svd.singularValues().size() == 0 ? 0.0 : svd.singularValues()[0];
   const Eigen::Index rankGain =
@@ -580,7 +590,7 @@ struct Closure
 double conditionNumber(const Eigen::MatrixXd & matrix)
 {
   Eigen::JacobiSVD<Eigen::MatrixXd> svd(matrix);
-  if (svd.info() != Eigen::Success || !svd.singularValues().allFinite() || svd.singularValues().tail(1)[0] <= 0.0)
+  if (!svdSucceeded(svd) || !svd.singularValues().allFinite() || svd.singularValues().tail(1)[0] <= 0.0)
     return std::numeric_limits<double>::infinity();
   return svd.singularValues()[0] / svd.singularValues().tail(1)[0];
 }

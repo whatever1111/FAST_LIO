@@ -219,6 +219,22 @@ std::string identityBytes(const FactorIdentity & value)
   return result;
 }
 
+std::size_t identityStorageBytes(const FactorIdentity & value)
+{
+  auto result = sizeof(value);
+  for (const auto * text : {&value.key, &value.payload, &value.remainderKey, &value.independenceEvidence})
+    result = sumBytes(result, textBytes(*text));
+  for (const auto & raw : value.rawAncestry)
+    result = sumBytes(result, textBytes(raw));
+  for (const auto & shared : value.shared)
+    result = sumBytes(result, sizeof(shared) + textBytes(shared.raw) + textBytes(shared.source));
+  for (const auto & raw : value.typedRaw)
+    result = sumBytes(result, sizeof(raw) + textBytes(raw.raw));
+  for (const auto & use : value.reuse)
+    result = sumBytes(result, sizeof(use) + textBytes(use.owner.key));
+  return result;
+}
+
 std::size_t metadataBytes(const Metadata & value)
 {
   auto result = sumBytes(sizeof(value), coordinatesBytes(value.active));
@@ -236,11 +252,11 @@ std::size_t metadataBytes(const Metadata & value)
   result = sumBytes(
     result,
     productBytes(value.rawHigh.size() + value.sourceHigh.size() + value.compacted.size() + value.factorHigh.size(),
-                 sizeof(Watermarks::value_type)));
+                 sizeof(Watermarks::value_type) + 4 * sizeof(void *)));
   for (const auto & binding : value.factorBindings)
     result = sumBytes(result, sizeof(binding) + textBytes(binding.first));
   for (const auto & identity : value.recent)
-    result = sumBytes(result, sizeof(identity) + identityBytes(identity).size());
+    result = sumBytes(result, identityStorageBytes(identity));
   for (const auto & noise : value.noises) {
     result = sumBytes(result, sizeof(noise) + textBytes(noise.use.owner.key) + textBytes(noise.evidence));
     result = sumBytes(result, coordinatesBytes(noise.coordinates) + matrixBytes(noise.covariance));
@@ -272,7 +288,8 @@ public:
 
   bool acquire(const std::shared_ptr<Account> & account, std::size_t bytes)
   {
-    if (sumBytes(sumBytes(account->resident, account->pending), bytes) > account->limit)
+    if (bytes > account->limit || account->pending > account->limit - bytes ||
+        account->resident > account->limit - bytes - account->pending)
       return false;
     account_ = account;
     bytes_ = bytes;
@@ -1141,19 +1158,30 @@ std::size_t proposalBytes(const std::vector<LinearFactor> & factors,
 {
   std::size_t result = 0;
   for (const auto & factor : factors) {
-    result = sumBytes(result, identityBytes(factor.identity).size());
+    result = sumBytes(result, identityStorageBytes(factor.identity));
+    result =
+      sumBytes(result, coordinatesBytes(factor.active) + textBytes(factor.model) + textBytes(factor.linearization));
+    for (const auto & coordinates : factor.sourceCoordinates)
+      result = sumBytes(result, coordinatesBytes(coordinates));
+    for (const auto & key : factor.sourceKeys)
+      result = sumBytes(result, textBytes(key));
+    for (const auto & unit : factor.rowUnits)
+      result = sumBytes(result, textBytes(unit));
     result = sumBytes(result, sumBytes(matrixBytes(factor.h), matrixBytes(factor.a)));
     result = sumBytes(result,
                       sumBytes(matrixBytes(factor.observation),
                                sumBytes(matrixBytes(factor.remainderMean), matrixBytes(factor.remainderVariance))));
   }
   for (const auto & noise : noises) {
-    result = sumBytes(result, matrixBytes(noise.covariance));
+    result = sumBytes(result,
+                      matrixBytes(noise.covariance) + coordinatesBytes(noise.coordinates) + textBytes(noise.evidence) +
+                        textBytes(noise.use.owner.key));
     for (const auto & loading : noise.factors)
-      result = sumBytes(result, matrixBytes(loading.loading));
+      result = sumBytes(result, matrixBytes(loading.loading) + textBytes(loading.factor));
   }
   for (const auto & sensitivity : sensitivities)
-    result = sumBytes(result, matrixBytes(sensitivity.loading));
+    result = sumBytes(
+      result, matrixBytes(sensitivity.loading) + textBytes(sensitivity.factor) + textBytes(sensitivity.sensitivity));
   return productBytes(8, result);
 }
 
@@ -1228,7 +1256,8 @@ ConsiderSourceFilter::proposeAppliedGain(const std::vector<LinearFactor> & facto
         sizeof(Impl),
         sumBytes(metadataBytes(prepared->metadata),
                  sumBytes(matrixBytes(prepared->p), sumBytes(matrixBytes(prepared->k), matrixBytes(impl_->c)))));
-      if (sumBytes(prepared->resident, impl_->account->pending) > impl_->budget.memoryBytes)
+      if (prepared->resident > impl_->budget.memoryBytes ||
+          impl_->account->pending > impl_->budget.memoryBytes - prepared->resident)
         return Status::kModelCapacityExceeded;
       prepared->next = std::make_shared<const std::uint64_t>(*impl_->version + 1);
       return Status::kOk;
@@ -1237,6 +1266,8 @@ ConsiderSourceFilter::proposeAppliedGain(const std::vector<LinearFactor> & facto
     if (result.status_ == Status::kNoOp) {
       prepared->metadata = {};
       prepared->reservation.release();
+      if (!prepared->reservation.acquire(impl_->account, productBytes(2, sizeof(Prepared))))
+        result.status_ = Status::kModelCapacityExceeded;
     }
     if (result.status_ == Status::kOk || result.status_ == Status::kNoOp)
       result.data_ = std::move(prepared);
@@ -1569,8 +1600,10 @@ ConsiderSourceFilter::retire(const std::vector<std::string> & keys, bool willNev
     data.sources = std::move(sources);
     Eigen::MatrixXd p = impl_->p;
     Eigen::MatrixXd k = selectRows(impl_->k.transpose(), kept).transpose();
-    const Eigen::MatrixXd rows = selectRows(impl_->c, kept);
-    Eigen::MatrixXd c = selectRows(rows.transpose(), kept).transpose();
+    Eigen::MatrixXd c(static_cast<Eigen::Index>(kept.size()), static_cast<Eigen::Index>(kept.size()));
+    for (std::size_t row = 0; row < kept.size(); ++row)
+      for (std::size_t col = 0; col < kept.size(); ++col)
+        c(static_cast<Eigen::Index>(row), static_cast<Eigen::Index>(col)) = impl_->c(kept[row], kept[col]);
     return impl_->publish(p, k, c, data);
   } catch (const std::bad_alloc &) {
     return Status::kModelCapacityExceeded;

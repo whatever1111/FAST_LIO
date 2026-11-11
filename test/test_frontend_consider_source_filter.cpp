@@ -625,6 +625,26 @@ TEST(ConsiderSourceFilter, RejectedBatchDoesNotConsumeAnyPrefix)
   apply(filter, one, 0.5);
 }
 
+TEST(ConsiderSourceFilter, NoOpCandidatesRetainAndReleaseTheirMemoryCharge)
+{
+  ConsiderSourceFilter filter;
+  const auto initial = prior();
+  ASSERT_EQ(filter.initialize(initial, budget()), Status::kOk);
+  const auto input = factor(initial.active, {}, "one");
+  apply(filter, input, 0.5);
+  const auto before = filter.memoryBytes();
+  const auto ledger = filter.ledgerIdentity();
+  {
+    auto noOp = filter.proposeAppliedGain({input}, Eigen::MatrixXd::Constant(1, 1, 0.5));
+    ASSERT_EQ(noOp.status(), Status::kNoOp);
+    EXPECT_GT(filter.memoryBytes(), before);
+    EXPECT_EQ(filter.commit(std::move(noOp)), Status::kNoOp);
+    EXPECT_GT(filter.memoryBytes(), before);
+    EXPECT_EQ(filter.ledgerIdentity(), ledger);
+  }
+  EXPECT_EQ(filter.memoryBytes(), before);
+}
+
 TEST(ConsiderSourceFilter, X4SameFrameBatchUsesOneSharedCopy)
 {
   auto initial = prior();

@@ -1,8 +1,8 @@
 # frontend contract golden: parameter/profile_xsw_hesai
-# fork_sha: d84b73c19bf1f0bd87ba3ca440b40de4337ba675
+# fork_sha: 6336ad3102166184ba9bc7e4376bb8e4ba6e316d
 # arch: x86_64
 # ros_distro: humble
-# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
 case profile_xsw_hesai
 config config/xsw_hesai.yaml sha256 8c372f9b78bd92e3bced041a0d0a1d61da780604452bedcf1ca4c0952ea008cd
 overrides 0

@@ -1,8 +1,8 @@
 # frontend contract golden: parameter/merged_giant
-# fork_sha: d84b73c19bf1f0bd87ba3ca440b40de4337ba675
+# fork_sha: 6336ad3102166184ba9bc7e4376bb8e4ba6e316d
 # arch: x86_64
 # ros_distro: humble
-# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
 case merged_giant
 config test/frontend_contract/giant_laser_mapping.yaml sha256 3d988bbbf0b91116ccab783c14ea49fe1a0110c5ba8da88f0ecafc8dedd43311
 overrides 0

@@ -1,8 +1,8 @@
 # frontend contract golden: parameter/merged_m20_bodyimu
-# fork_sha: d84b73c19bf1f0bd87ba3ca440b40de4337ba675
+# fork_sha: 6336ad3102166184ba9bc7e4376bb8e4ba6e316d
 # arch: x86_64
 # ros_distro: humble
-# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O0, sanitizer=
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
 case merged_m20_bodyimu
 config test/frontend_contract/m20_bodyimu_laser_mapping.yaml sha256 a1dbe30368193e6ebf2d95a5ef528c2527a7ce98ed5e6083f7ca6b13dcff3f2d
 overrides 0

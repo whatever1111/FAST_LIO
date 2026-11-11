@@ -15,7 +15,7 @@
 
 extern lio_ivox::IVox<PointType> ikdtree;
 extern PointCloudXYZI::Ptr feats_down_body;
-extern fast_lio::DelayedMapInsertion<PointVector> map_insert_pending;
+extern fast_lio::DelayedMapInsertion<PointVector, fast_lio::MapInsertProvenance> map_insert_pending;
 extern bool async_map_en;
 extern int feats_down_size;
 extern void startMapWorker();

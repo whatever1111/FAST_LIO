@@ -2632,7 +2632,7 @@ bool async_map_en = true;  // gated by env FLIO_ASYNC_MAP ("0" disables)
 // its length depends on scheduling (non-reproducible). This makes the lag
 // explicit: same benefit, bit-reproducible.
 int map_insert_delay_scans = 0;
-fast_lio::DelayedMapInsertion<PointVector> map_insert_pending;
+fast_lio::DelayedMapInsertion<PointVector, fast_lio::MapInsertProvenance> map_insert_pending;
 std::mutex map_add_mtx;
 std::condition_variable map_add_cv;
 PointVector map_add_ds_;        // handoff: points to add WITH downsample
@@ -2817,8 +2817,7 @@ void mapWorkerLoop()
       fast_lio_test::beforeMapAdd();
 #endif
     const double st = omp_get_wtime();
-    ikdtree.Add_Points(toAdd, true);
-    ikdtree.Add_Points(noDS, false);
+    fast_lio::addStagedPoints(ikdtree, toAdd, noDS);
     g_async_add_us.store((uint64_t)((omp_get_wtime() - st) * 1e6), std::memory_order_relaxed);
 
     lk.lock();
@@ -2922,6 +2921,25 @@ fast_lio::AdmissionCount admissionDelayedPending(fast_lio::TimeAdmissionAccounti
   return pending;
 }
 
+// The map's process-level switches, read once before the backend is initialised.
+// Identity timing preserves output only with adaptive_ds.enabled == false: its lookup
+// time enters the scan cost used by adaptive downsampling.
+void readMapEnvironment(const rclcpp::Logger & logger)
+{
+  const char * am = getenv("FLIO_ASYNC_MAP");
+  if (am && std::string(am) == "0")
+    async_map_en = false;
+  const char * identity = getenv("FLIO_MAP_POINT_IDENTITY");
+  const bool requested = identity != nullptr && std::string(identity) == "1";
+  if (identity != nullptr && !requested && identity[0] != '\0' && std::string(identity) != "0")
+    RCLCPP_WARN(logger, "[MAP-ID] FLIO_MAP_POINT_IDENTITY=%s ignored: only 1 turns map point identity on", identity);
+  const fast_lio::MapIdentityStatus status = fast_lio::enableMapPointIdentity(ikdtree, requested);
+  if (requested && status == fast_lio::MapIdentityStatus::kOk)
+    RCLCPP_INFO(logger, "[MAP-ID] map point identity on (FLIO_MAP_POINT_IDENTITY=1)");
+  else if (requested)
+    RCLCPP_ERROR(logger, "[MAP-ID] FLIO_MAP_POINT_IDENTITY=1 but this map backend cannot provide point identity");
+}
+
 // The recovery callback and the worker-ordering fixture use this exact boundary.
 // Join precedes every map read/write and discarding delayed world-frame batches.
 bool rebuildLocalMapStorage(int & map_before, fast_lio::TimeAdmissionAccounting * observer)
@@ -2959,7 +2977,7 @@ bool rebuildLocalMapStorage(int & map_before, fast_lio::TimeAdmissionAccounting 
       observer,
       fast_lio::AdmissionMapKind::kRecoveryAdd,
       [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
-      [] { return ikdtree.Add_Points(feats_down_world->points, true); });
+      [] { return fast_lio::addScanSeed(ikdtree, feats_down_world->points, lifecycle_scan_seq); });
     kept_prior = true;
   } else
 #endif
@@ -2968,7 +2986,7 @@ bool rebuildLocalMapStorage(int & map_before, fast_lio::TimeAdmissionAccounting 
       observer,
       fast_lio::AdmissionMapKind::kRecoveryBuild,
       [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
-      [] { return ikdtree.Build(feats_down_world->points); });
+      [] { return fast_lio::buildScanMap(ikdtree, feats_down_world->points, lifecycle_scan_seq); });
   }
   Localmap_Initialized = false;
   return kept_prior;
@@ -2997,6 +3015,8 @@ void map_incremental(const std::vector<PointVector> & nearest, fast_lio::TimeAdm
   PointVector PointNoNeedDownsample;
   PointToAdd.reserve(feats_down_size);
   PointNoNeedDownsample.reserve(feats_down_size);
+  fast_lio::MapInsertProvenance provenance = fast_lio::beginScanProvenance(
+    fast_lio::mapPointIdentityStatus(ikdtree) == fast_lio::MapIdentityStatus::kOk, lifecycle_scan_seq, feats_down_size);
   for (int i = 0; i < feats_down_size; i++) {
     /* transform to world frame */
     pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
@@ -3017,6 +3037,7 @@ void map_incremental(const std::vector<PointVector> & nearest, fast_lio::TimeAdm
           fabs(points_near[0].y - mid_point.y) > 0.5 * filter_size_map_min &&
           fabs(points_near[0].z - mid_point.z) > 0.5 * filter_size_map_min) {
         PointNoNeedDownsample.push_back(feats_down_world->points[i]);
+        provenance.noteDirect(i);
         continue;
       }
       for (int readd_i = 0; readd_i < NUM_MATCH_POINTS; readd_i++) {
@@ -3027,10 +3048,13 @@ void map_incremental(const std::vector<PointVector> & nearest, fast_lio::TimeAdm
           break;
         }
       }
-      if (need_add)
+      if (need_add) {
         PointToAdd.push_back(feats_down_world->points[i]);
+        provenance.noteDownsampled(i);
+      }
     } else {
       PointToAdd.push_back(feats_down_world->points[i]);
+      provenance.noteDownsampled(i);
     }
   }
 
@@ -3040,8 +3064,8 @@ void map_incremental(const std::vector<PointVector> & nearest, fast_lio::TimeAdm
     observer->count(observer->staged, PointToAdd.size());
     observer->add(observer->staged.points, PointNoNeedDownsample.size());
   }
-  auto ready =
-    map_insert_pending.stage(std::move(PointToAdd), std::move(PointNoNeedDownsample), map_insert_delay_scans);
+  auto ready = map_insert_pending.stage(
+    std::move(PointToAdd), std::move(PointNoNeedDownsample), map_insert_delay_scans, std::move(provenance));
   if (!ready) {
     add_point_size = 0;
     return;
@@ -3060,6 +3084,7 @@ void map_incremental(const std::vector<PointVector> & nearest, fast_lio::TimeAdm
 #endif
 #endif
 
+  fast_lio::stageMapProvenance(ikdtree, std::move(ready->provenance));
   if (async_map_en) {
     // Off-thread: the worker calls Add_Points during the inter-scan gap; joined before
     // the next scan's first tree op. add_point_size is known here (sizes); the Add wall
@@ -3070,16 +3095,18 @@ void map_incremental(const std::vector<PointVector> & nearest, fast_lio::TimeAdm
     dispatchMapAdd(PointToAdd, PointNoNeedDownsample, observer);
   } else {
     double st_time = omp_get_wtime();
+    // One staged call adds both lists, as on the worker; both kinds are submitted before it, as on dispatch.
     add_point_size = observeMapOperation(
       observer,
       fast_lio::AdmissionMapKind::kIncrementalDownsampled,
       [&] { return std::array<std::uint64_t, 3>{PointToAdd.size(), 0, 0}; },
-      [&] { return ikdtree.Add_Points(PointToAdd, true); });
-    observeMapOperation(
-      observer,
-      fast_lio::AdmissionMapKind::kIncrementalDirect,
-      [&] { return std::array<std::uint64_t, 3>{PointNoNeedDownsample.size(), 0, 0}; },
-      [&] { return ikdtree.Add_Points(PointNoNeedDownsample, false); });
+      [&] {
+        return observeMapOperation(
+          observer,
+          fast_lio::AdmissionMapKind::kIncrementalDirect,
+          [&] { return std::array<std::uint64_t, 3>{PointNoNeedDownsample.size(), 0, 0}; },
+          [&] { return fast_lio::addStagedPoints(ikdtree, PointToAdd, PointNoNeedDownsample); });
+      });
     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     kdtree_incremental_time = omp_get_wtime() - st_time;
   }
@@ -3687,11 +3714,7 @@ public:
     params_.readFeatureInputs(*this, p_pre->point_filter_num, p_pre->feature_enabled, runtime_pos_log);
     p_imu->runtime_log_en = runtime_pos_log;                // mirror to ImuProcess so Log/imu.txt is written
     ikd_profile = (getenv("FLIO_IKD_PROFILE") != nullptr);  // [ikd-profile] opt-in via env
-    {
-      const char * am = getenv("FLIO_ASYNC_MAP");
-      if (am && std::string(am) == "0")
-        async_map_en = false;
-    }
+    readMapEnvironment(this->get_logger());
 #ifdef USE_IVOX
     {  // option B: iVox map backend (its parameters and their notes: frontend_parameter_specs_map.hpp)
       const fast_lio::IvoxDeclaredValues ivox = params_.declareIvox(*this);
@@ -5679,7 +5702,7 @@ private:
                   observer,
                   fast_lio::AdmissionMapKind::kInitialBuild,
                   [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
-                  [] { return ikdtree.Build(feats_down_world->points); });
+                  [] { return fast_lio::buildScanMap(ikdtree, feats_down_world->points, lifecycle_scan_seq); });
                 anchorTraceMapUpdated();
                 RCLCPP_INFO(this->get_logger(),
                             "map built from the current scan (%d points); the prior map (%zu points) is held "
@@ -5710,7 +5733,7 @@ private:
                   observer,
                   fast_lio::AdmissionMapKind::kPriorAdd,
                   [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
-                  [] { return ikdtree.Add_Points(feats_down_world->points, true); });
+                  [] { return fast_lio::addScanSeed(ikdtree, feats_down_world->points, lifecycle_scan_seq); });
                 map_points = static_cast<size_t>(ikdtree.size());
                 RCLCPP_INFO(this->get_logger(),
                             "map built from prior map (PINNED, %zu voxels) + current scan (%zu + %d = %zu points)",
@@ -5728,7 +5751,7 @@ private:
                   observer,
                   fast_lio::AdmissionMapKind::kPriorBuild,
                   [&] { return std::array<std::uint64_t, 3>{feats_down_world->size(), prior_ds->size(), 0}; },
-                  [&] { return ikdtree.Build(combined->points); });
+                  [&] { fast_lio::buildScanMap(ikdtree, combined->points, lifecycle_scan_seq, prior_ds->size()); });
                 map_points = combined->size();
                 RCLCPP_INFO(this->get_logger(),
                             "ikd-tree built from prior map + current scan (%zu + %d = %zu points)",
@@ -5777,7 +5800,7 @@ private:
                 observer,
                 fast_lio::AdmissionMapKind::kInitialBuild,
                 [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
-                [] { return ikdtree.Build(feats_down_world->points); });
+                [] { return fast_lio::buildScanMap(ikdtree, feats_down_world->points, lifecycle_scan_seq); });
               anchorTraceMapUpdated();
             }
             prior_map_pcd_.clear();  // Prevent re-execution
@@ -5798,7 +5821,7 @@ private:
               observer,
               fast_lio::AdmissionMapKind::kInitialBuild,
               [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
-              [] { return ikdtree.Build(feats_down_world->points); });
+              [] { return fast_lio::buildScanMap(ikdtree, feats_down_world->points, lifecycle_scan_seq); });
             // The first local reference: this build returned with the map backend holding points. Not a supported
             // scan, and nothing else of the recovery state moves; a build that took no point records nothing.
             if (fast_lio::mapBackendHoldsPoints(ikdtree))

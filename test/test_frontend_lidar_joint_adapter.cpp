@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <random>
 #include <sys/resource.h>
 
@@ -230,6 +231,82 @@ FrameSnapshot frame(std::size_t count = 36, std::size_t reuse = 1)
   }
   closeFixture(result);
   return result;
+}
+
+FrameSnapshot connectedFrame(std::size_t count, double reuse)
+{
+  constexpr double kSpacing = 0.3, kSurfaceX = 0.0005, kSurfaceY = 0.0015;
+  constexpr double kOrigin = 5.0, kNormalOffset = 0.02, kRepeatOffset = 0.01;
+  constexpr double kHalfGridArea = 2.0;
+  auto result = frame(1);
+  result.rows.clear();
+  result.rows.reserve(count);
+  const auto centers = static_cast<std::size_t>(std::ceil(static_cast<double>(count) / reuse));
+  const auto halfWidth = static_cast<std::size_t>(std::ceil(std::sqrt(static_cast<double>(centers) / kHalfGridArea)));
+  const Eigen::Vector3d normal = Eigen::Vector3d(1.0, 2.0, 3.0).normalized();
+  const Eigen::Vector3d u = normal.unitOrthogonal(), v = normal.cross(u);
+  const auto point = [&](int x, int y) {
+    const double height = kSurfaceX * static_cast<double>(x * x) + kSurfaceY * static_cast<double>(y * y);
+    return (u * (kSpacing * static_cast<double>(x)) + v * (kSpacing * static_cast<double>(y)) +
+            normal * (kOrigin + height))
+      .eval();
+  };
+  const std::array<std::array<int, 2>, kSupportCount> offsets{{{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {0, 0}}};
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto center = static_cast<std::size_t>(static_cast<double>(i) / reuse);
+    const std::size_t line = center / halfWidth, column = center % halfWidth;
+    // Checkerboard centers, visited in a serpentine order. Adjacent rows have
+    // at least one identical support point; vertical neighbors also share,
+    // creating a connected two-dimensional graph rather than disjoint cliques.
+    const int x = 1 + static_cast<int>(line % 2 == 0 ? 2 * column : 2 * (halfWidth - 1 - column) + 1);
+    const int y = 1 + static_cast<int>(line);
+    Row row;
+    row.queryOrdinal = i;
+    row.relativeTime = 0.0;
+    row.point = point(x, y) + normal * kNormalOffset + u * (kRepeatOffset * std::fmod(static_cast<double>(i), reuse));
+    row.beamDirection = row.point.normalized();
+    for (std::size_t a = 0; a < kSupportCount; ++a) {
+      const Eigen::Vector3d value = point(x + offsets[a][0], y + offsets[a][1]);
+      row.support[a] = {
+        static_cast<float>(value.x()), static_cast<float>(value.y()), static_cast<float>(value.z()), 0.0F};
+    }
+    fast_lio::PlaneFitEigen spectrum;
+    const Eigen::Vector4d fit = fitted(row.support, &spectrum);
+    row.plane = Plane{fit.head<3>(),
+                      fit[3],
+                      Eigen::Vector3d(spectrum.lambda0, spectrum.lambda1, spectrum.lambda2),
+                      spectrum.e1,
+                      spectrum.e2,
+                      kSupportCount};
+    result.rows.push_back(row);
+  }
+  closeFixture(result);
+  return result;
+}
+
+TEST(FrontendLidarJointAdapter, ReviewResourceFixtureHasConnectedSupportGraph)
+{
+  constexpr std::size_t kFixtureRows = 80;
+  const auto snapshot = connectedFrame(kFixtureRows, 1);
+  std::vector<std::size_t> parent(kFixtureRows);
+  for (std::size_t i = 0; i < parent.size(); ++i)
+    parent[i] = i;
+  const auto root = [&](std::size_t node) {
+    while (parent[node] != node)
+      node = parent[node];
+    return node;
+  };
+  std::map<std::array<float, 4>, std::size_t> firstOwner;
+  for (std::size_t i = 0; i < snapshot.rows.size(); ++i)
+    for (const auto & support : snapshot.rows[i].support) {
+      const std::array<float, 4> key{support.x, support.y, support.z, support.intensity};
+      const auto inserted = firstOwner.emplace(key, i);
+      if (!inserted.second)
+        parent[root(i)] = root(inserted.first->second);
+    }
+  for (std::size_t i = 0; i < parent.size(); ++i)
+    EXPECT_EQ(root(i), root(0));
+  EXPECT_LT(firstOwner.size(), kSupportCount * kFixtureRows);
 }
 
 TEST(FrontendLidarJointAdapter, O1HatWeightsMatchAffineAnalyticPlane)
@@ -979,6 +1056,37 @@ TEST(FrontendLidarJointAdapter, RowIdentityDigestIsOrderedCanonicalSha256)
   EXPECT_EQ(rowSetDigest(rows), "d04da9bd6e532de288ee63d5d8adc4358fdf2a1e7d3d3fbc614a83465048c2f0");
   std::swap(rows[0], rows[1]);
   EXPECT_NE(rowSetDigest(rows), rowSetDigest(std::vector<Row>(3)));
+}
+
+TEST(FrontendLidarJointAdapter, DISABLED_ConnectedSupportGraphResourceDistribution)
+{
+  constexpr int kSamples = 3;
+  constexpr double kRealisticMinimumSharing = 4.0, kRealisticMaximumSharing = 20.0;
+  for (const std::size_t rows : {1118U, 1599U, 2374U})
+    for (const double reuse : {1.0, 2.0, 4.0, 6.0, 6.5}) {
+      const auto snapshot = connectedFrame(rows, reuse);
+      for (int sample = 0; sample < kSamples; ++sample) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto result = observeFrame(snapshot);
+        const auto elapsed =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
+        ASSERT_TRUE(result.counts.supportPoints);
+        const double sharing =
+          static_cast<double>(kSupportCount * rows) / static_cast<double>(*result.counts.supportPoints);
+        std::cout << "K3_CONNECTED rows=" << rows << " reuse=" << reuse << " sample=" << sample
+                  << " status=" << statusName(result.status) << " sharing=" << sharing
+                  << " total_ns=" << result.timings.totalNs.value_or(0) << " wall_ns=" << elapsed.count()
+                  << " accounted_bytes=" << result.counts.accountedPeakBytes.value_or(0)
+                  << " support=" << *result.counts.supportPoints
+                  << " factor_nnz_available=" << result.counts.nnzFactor.has_value()
+                  << " factor_nnz=" << result.counts.nnzFactor.value_or(0) << '\n';
+        if (sharing >= kRealisticMinimumSharing && sharing <= kRealisticMaximumSharing)
+          EXPECT_EQ(result.status, FrameStatus::kOkFrameConditional) << result.rejectReason;
+        else
+          EXPECT_TRUE(result.status == FrameStatus::kOkFrameConditional || result.status == FrameStatus::kMemoryBudget)
+            << result.rejectReason;
+      }
+    }
 }
 
 TEST(FrontendLidarJointAdapter, DISABLED_SyntheticFrameResourceDistribution)

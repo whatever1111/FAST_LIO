@@ -4766,16 +4766,22 @@ private:
   }
 
   // The latched input-epoch guard stops input and odometry until a restart (acceptInputEpoch), and the scan path
-  // calls here every cycle while it is latched. fault_exit asks for that restart: the node shuts its context down and
-  // the supervisor restarts the pipeline. hold keeps saying it is stopped. True when the node is shutting down.
-  bool exitOnInputEpochFault()
+  // calls here instead of the plain reference repeat every cycle while it is latched. With reference health on, the
+  // final reference and the repeat go out first, while the context still delivers them. fault_exit then asks for that
+  // restart: the node shuts its context down and the supervisor restarts the pipeline. hold keeps saying it is stopped.
+  void onInputEpochFault()
   {
+    if (reference_health_en) {
+      const auto final = captureFinalFrontend(false, false, 0.0);
+      reference_publication_guard.run([&] { buildAndPublishReference(final.reference); }, disableReferencePublication);
+    }
+    publishReferenceRepeat();
     if (params_.values().input_epoch_on_fault == "fault_exit") {
       RCLCPP_FATAL(
         this->get_logger(),
         "[INPUT-EPOCH] exiting so the supervisor can restart the pipeline (input_epoch_on_fault=fault_exit)");
       rclcpp::shutdown();
-      return true;
+      return;
     }
     RCLCPP_ERROR_THROTTLE(this->get_logger(),
                           input_time_log_clock,
@@ -4783,7 +4789,6 @@ private:
                           "[INPUT-EPOCH] still latched since the sample stamped %.9f: input and odometry stay stopped "
                           "until the node restarts (input_epoch_on_fault=hold)",
                           input_epoch_fault_stamp);
-    return false;
   }
 
   void timer_callback()
@@ -4792,14 +4797,10 @@ private:
     const bool ready = sync_packages(Measures);
     publishPendingReference();  // sync's drop path has released mtx_buffer
     if (!ready) {
-      if (reference_health_en && input_epoch_guard.faulted()) {
-        const auto final = captureFinalFrontend(false, false, 0.0);
-        reference_publication_guard.run([&] { buildAndPublishReference(final.reference); },
-                                        disableReferencePublication);
-      }
-      publishReferenceRepeat();
-      if (input_epoch_guard.faulted() && exitOnInputEpochFault())
-        return;
+      if (input_epoch_guard.faulted())
+        onInputEpochFault();
+      else
+        publishReferenceRepeat();
     }
     if (ready) {
       AnchorScanScope anchor_scan_scope(Measures);

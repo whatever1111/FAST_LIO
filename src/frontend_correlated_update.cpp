@@ -178,6 +178,8 @@ Status validateFactor(const std::vector<Source> & dictionary,
     return Status::kUnsupportedModel;
   if (factor.remainderKnowledge != MomentKnowledge::kKnown)
     return Status::kUnknownMoment;
+  if (!factor.identity.reuse.empty())
+    return Status::kUnsupportedNoiseStructure;
   if (!factor.independentRemainder)
     return Status::kUnsupportedNoiseStructure;
   if (!validCoordinates(factor.active) || factor.sourceCoordinates.size() != factor.sourceKeys.size())
@@ -329,7 +331,7 @@ Status validateAncestry(const std::vector<Source> & live,
 {
   for (const auto & raw : canonical.rawAncestry) {
     const auto carries = [&raw](const Source & source) {
-      return contains(source.rawAncestry, raw);
+      return designatesRaw(source, raw);
     };
     if (std::any_of(retired.begin(), retired.end(), carries))
       return Status::kSourceHistoryUnavailable;

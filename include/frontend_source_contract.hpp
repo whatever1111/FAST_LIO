@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,14 +35,17 @@ enum class Status
   kModelCapacityExceeded,
   kSourceHistoryUnavailable,
   kStaleProposal,
-  kNumericalFailure
+  kNumericalFailure,
+  kLedgerCompacted,
+  kReuseBudgetExceeded
 };
 
 // Known includes deterministic zero covariance. Unknown never denotes zero.
 enum class MomentKnowledge
 {
   kUnknown,
-  kKnown
+  kKnown,
+  kUpperBound
 };
 enum class ModelDomain
 {
@@ -58,6 +62,62 @@ struct Coordinates
   std::string epoch;
 };
 
+struct RawId
+{
+  std::uint32_t stream = 0;
+  std::uint64_t ordinal = 0;
+  std::uint32_t sub = 0;
+
+  bool operator==(const RawId & other) const
+  {
+    return stream == other.stream && ordinal == other.ordinal && sub == other.sub;
+  }
+  bool operator!=(const RawId & other) const { return !(*this == other); }
+};
+
+struct TypedRaw
+{
+  std::string raw;  // Exact binding to the existing canonical raw name.
+  RawId identity;
+
+  bool operator==(const TypedRaw & other) const { return raw == other.raw && identity == other.identity; }
+};
+
+enum class RawRole
+{
+  kDesignated,
+  kDerived
+};
+
+struct RawRoleBinding
+{
+  // Unspecified remains designated. Derived names inherited statistical
+  // dependence without asserting a factor route through this source.
+  std::string raw;
+  RawRole role = RawRole::kDesignated;
+};
+
+struct SourceOwner
+{
+  std::string key;
+  std::optional<RawId> sequence = std::nullopt;
+
+  bool operator==(const SourceOwner & other) const { return key == other.key && sequence == other.sequence; }
+};
+
+struct ReuseUse
+{
+  RawId raw;
+  RawId frame;
+  std::uint64_t totalUses = 0;
+  SourceOwner owner;
+
+  bool operator==(const ReuseUse & other) const
+  {
+    return raw == other.raw && frame == other.frame && totalUses == other.totalUses && owner == other.owner;
+  }
+};
+
 // These keys denote physical observations, never XYZ proximity or delivery order.
 // An alias names this same variable. Derived variables need an explicit generator.
 struct Source
@@ -69,6 +129,9 @@ struct Source
   Coordinates coordinates;
   std::string model;
   std::string lifetime;
+  std::optional<RawId> sequence = std::nullopt;
+  std::vector<TypedRaw> typedRaw = {};
+  std::vector<RawRoleBinding> rawRoles = {};
 };
 
 struct JointMoments
@@ -96,20 +159,24 @@ struct FactorIdentity
   // Fresh raw ancestry carried by a live source requires a shared entry naming
   // that source with nonzero loading. Retired ancestry is unavailable. Exact
   // retransmissions are checked by the ledger before fresh ancestry validation.
-  // If live and retired sources both carry the same raw item, a fresh factor
-  // conservatively returns kSourceHistoryUnavailable, even when it loads the
-  // live carrier: the retired dependency cannot be reconstructed.
+  // Without role declarations, live and retired carriers of the same raw keep
+  // the conservative kSourceHistoryUnavailable behavior. Only an explicitly
+  // derived retired dependence is excluded from that routing requirement.
   std::string key;      // complete canonical likelihood identity, excluding delivery aliases
   std::string payload;  // exact canonical bytes, including all numeric inputs
   std::vector<std::string> rawAncestry;
   std::vector<SharedRawSource> shared;
   std::string remainderKey;  // independent realization, unique across new factors
   std::string independenceEvidence;
+  std::optional<RawId> sequence = std::nullopt;
+  std::vector<TypedRaw> typedRaw = {};
+  std::vector<ReuseUse> reuse = {};
 
   bool operator==(const FactorIdentity & other) const
   {
     return key == other.key && payload == other.payload && rawAncestry == other.rawAncestry && shared == other.shared &&
-           remainderKey == other.remainderKey && independenceEvidence == other.independenceEvidence;
+           remainderKey == other.remainderKey && independenceEvidence == other.independenceEvidence &&
+           sequence == other.sequence && typedRaw == other.typedRaw && reuse == other.reuse;
   }
 };
 
@@ -130,6 +197,42 @@ inline bool uniqueKeys(const std::vector<std::string> & keys)
       return false;
   }
   return true;
+}
+
+inline bool validTypedRaw(const std::vector<std::string> & ancestry, const std::vector<TypedRaw> & typed)
+{
+  if (typed.size() > ancestry.size())
+    return false;
+  for (std::size_t i = 0; i < typed.size(); ++i) {
+    if (!contains(ancestry, typed[i].raw))
+      return false;
+    for (std::size_t j = 0; j < i; ++j)
+      if (typed[i].raw == typed[j].raw || typed[i].identity == typed[j].identity)
+        return false;
+  }
+  return true;
+}
+
+inline bool validSourceExtensions(const Source & source)
+{
+  if (source.rawRoles.size() > source.rawAncestry.size() || !validTypedRaw(source.rawAncestry, source.typedRaw))
+    return false;
+  std::vector<std::string> declared;
+  for (const auto & binding : source.rawRoles) {
+    if (!contains(source.rawAncestry, binding.raw) ||
+        (binding.role != RawRole::kDesignated && binding.role != RawRole::kDerived))
+      return false;
+    declared.push_back(binding.raw);
+  }
+  return uniqueKeys(declared);
+}
+
+inline bool designatesRaw(const Source & source, const std::string & raw)
+{
+  return contains(source.rawAncestry, raw) &&
+         std::none_of(source.rawRoles.begin(), source.rawRoles.end(), [&](const RawRoleBinding & binding) {
+           return binding.raw == raw && binding.role == RawRole::kDerived;
+         });
 }
 
 inline bool validCoordinates(const Coordinates & coordinates)
@@ -157,7 +260,8 @@ inline Status validateSources(const std::vector<Source> & sources)
   for (const auto & source : sources) {
     if (!validKey(source.key) || !validKey(source.kind) || !validKey(source.model) || !validKey(source.lifetime) ||
         !validCoordinates(source.coordinates) || source.rawAncestry.empty() || source.rawAncestry.size() > kMaxLedger ||
-        source.aliases.size() > kMaxLedger || !uniqueKeys(source.rawAncestry) || !uniqueKeys(source.aliases))
+        source.aliases.size() > kMaxLedger || !uniqueKeys(source.rawAncestry) || !uniqueKeys(source.aliases) ||
+        !validSourceExtensions(source))
       return Status::kInvalidIdentity;
     names.push_back(source.key);
     names.insert(names.end(), source.aliases.begin(), source.aliases.end());
@@ -174,8 +278,22 @@ inline Status validateIdentity(const FactorIdentity & factor)
   if (!validKey(factor.key) || factor.payload.empty() || !validKey(factor.remainderKey) ||
       !validKey(factor.independenceEvidence) || factor.rawAncestry.empty() || !uniqueKeys(factor.rawAncestry))
     return Status::kInvalidIdentity;
-  if (factor.rawAncestry.size() > kMaxLedger || factor.shared.size() > kMaxLedger)
+  if (factor.rawAncestry.size() > kMaxLedger || factor.shared.size() > kMaxLedger ||
+      factor.typedRaw.size() > kMaxLedger || factor.reuse.size() > kMaxLedger)
     return Status::kModelCapacityExceeded;
+  if (!validTypedRaw(factor.rawAncestry, factor.typedRaw))
+    return Status::kInvalidIdentity;
+  for (std::size_t i = 0; i < factor.reuse.size(); ++i) {
+    const auto & use = factor.reuse[i];
+    if (use.totalUses == 0 || !validKey(use.owner.key) ||
+        std::none_of(factor.typedRaw.begin(), factor.typedRaw.end(), [&](const TypedRaw & raw) {
+          return raw.identity == use.raw;
+        }))
+      return Status::kInvalidIdentity;
+    for (std::size_t j = 0; j < i; ++j)
+      if (use.raw == factor.reuse[j].raw && use.frame == factor.reuse[j].frame)
+        return Status::kInvalidIdentity;
+  }
   for (std::size_t i = 0; i < factor.shared.size(); ++i) {
     const auto & shared = factor.shared[i];
     if (!contains(factor.rawAncestry, shared.raw) || !validKey(shared.source) ||

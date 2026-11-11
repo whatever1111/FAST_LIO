@@ -105,5 +105,43 @@ TEST(FrontendSourceContract, SourceDictionaryDimensionsUnitsEpochAndAliases)
   EXPECT_EQ(JointMoments{}.knowledge, MomentKnowledge::kUnknown);
 }
 
+TEST(FrontendSourceContract, B1bExtensionsKeepLegacyEnumValuesAndTypedIdentity)
+{
+  constexpr int kLegacyLastStatus = 13, kCompactedStatus = 14, kReuseExceededStatus = 15;
+  EXPECT_EQ(static_cast<int>(Status::kNumericalFailure), kLegacyLastStatus);
+  EXPECT_EQ(static_cast<int>(Status::kLedgerCompacted), kCompactedStatus);
+  EXPECT_EQ(static_cast<int>(Status::kReuseBudgetExceeded), kReuseExceededStatus);
+  EXPECT_EQ(static_cast<int>(MomentKnowledge::kKnown), 1);
+  EXPECT_EQ(static_cast<int>(MomentKnowledge::kUpperBound), 2);
+  auto typed = factor("typed-factor", "raw");
+  typed.sequence = RawId{1, 7, 0};
+  typed.typedRaw = {{"raw", {2, 6, 3}}};
+  typed.reuse = {{{2, 6, 3}, {1, 7, 0}, 2, {"frame-source", RawId{3, 7, 0}}}};
+  EXPECT_EQ(validateIdentity(typed), Status::kOk);
+  FactorLedger ledger;
+  ASSERT_EQ(ledger.consume({typed}).status, Status::kOk);
+  const auto before = ledger.entries();
+  auto changed = typed;
+  ++changed.reuse[0].totalUses;
+  EXPECT_EQ(ledger.consume({changed}).status, Status::kIdentityConflict);
+  EXPECT_EQ(ledger.entries(), before);
+  changed = typed;
+  changed.typedRaw[0].raw = "not-an-ancestor";
+  EXPECT_EQ(validateIdentity(changed), Status::kInvalidIdentity);
+}
+
+TEST(FrontendSourceContract, B1bRoleDeclarationsAreExplicitAndValidated)
+{
+  Source block{"z", "synthetic", {"raw"}, {}, {{"z"}, {"m"}, "F", "T", "epoch"}, "known-model", "retained"};
+  EXPECT_TRUE(designatesRaw(block, "raw"));
+  block.rawRoles = {{"raw", RawRole::kDerived}};
+  EXPECT_EQ(validateSources({block}), Status::kOk);
+  EXPECT_FALSE(designatesRaw(block, "raw"));
+  block.rawRoles.push_back({"raw", RawRole::kDesignated});
+  EXPECT_EQ(validateSources({block}), Status::kInvalidIdentity);
+  block.rawRoles = {{"not-an-ancestor", RawRole::kDerived}};
+  EXPECT_EQ(validateSources({block}), Status::kInvalidIdentity);
+}
+
 }  // namespace
 }  // namespace fastlio::joint_source

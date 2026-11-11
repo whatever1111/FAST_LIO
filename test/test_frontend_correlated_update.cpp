@@ -1016,5 +1016,65 @@ TEST(FrontendCorrelatedUpdate, RecheckR2AppliedGainIsBitwiseSymmetric)
   }
 }
 
+TEST(FrontendCorrelatedUpdate, B1bX8LegacyDefaultRetainsAnyCarrier)
+{
+  auto initial = prior(1, 0);
+  initial.sources = {source("first"), source("second")};
+  for (auto & block : initial.sources)
+    block.rawAncestry = {"shared-raw"};
+  initial.mean = Eigen::VectorXd::Zero(3);
+  initial.covariance = Eigen::MatrixXd::Ones(3, 3);
+  JointSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial), Status::kOk);
+  auto factor = measurement(initial, "one-of-two-carriers");
+  factor.identity.rawAncestry = {"shared-raw"};
+  factor.identity.shared = {{"shared-raw", "first"}};
+  factor.a(0, 1) = 0.0;
+  const auto proposal = filter.propose({factor});
+  ASSERT_EQ(proposal.status(), Status::kOk);
+  // y=2e+d, Cov(e)=Cov(d)=1: optimal P=1-4/5=1/5.
+  EXPECT_NEAR(proposal.posterior()->covariance(0, 0), 1.0 / 5.0, kTolerance);
+  const auto applied = filter.appliedGain({factor}, Eigen::MatrixXd::Constant(1, 1, 0.25));
+  ASSERT_EQ(applied.status, Status::kOk);
+  EXPECT_NEAR(applied.covariance(0, 0), 5.0 / 16.0, kTolerance);
+}
+
+TEST(FrontendCorrelatedUpdate, B1bX8ExplicitDerivedRetirementDoesNotRouteRaw)
+{
+  auto initial = prior();
+  initial.sources[0].rawAncestry = {"shared-raw"};
+  JointSourceFilter filter;
+  ASSERT_EQ(filter.initialize(initial), Status::kOk);
+  auto derived = source("derived");
+  derived.rawAncestry = {"shared-raw"};
+  derived.rawRoles = {{"shared-raw", RawRole::kDerived}};
+  const Eigen::RowVector2d selector(0.0, 1.0);
+  ASSERT_EQ(filter.augment(derived, selector, Eigen::VectorXd::Zero(1), zeroNoise(2, 1)), Status::kOk);
+  ASSERT_EQ(filter.marginalize({"derived"}, true, "derived-only lifetime ended"), Status::kOk);
+  auto factor = measurement(*filter.moments(), "retired-derived");
+  factor.identity.rawAncestry = {"shared-raw"};
+  factor.identity.shared = {{"shared-raw", "z"}};
+  const auto proposal = filter.propose({factor});
+  ASSERT_EQ(proposal.status(), Status::kOk);
+  EXPECT_NEAR(proposal.posterior()->covariance(0, 0), 2.0 / 3.0, kTolerance);
+}
+
+TEST(FrontendCorrelatedUpdate, B1bX10UpperBoundIsIsolatedAtAllThreeEntries)
+{
+  auto initial = prior();
+  auto upper = initial;
+  upper.knowledge = MomentKnowledge::kUpperBound;
+  JointSourceFilter filter;
+  EXPECT_EQ(filter.initialize(upper), Status::kUnknownMoment);
+  EXPECT_EQ(filter.moments(), nullptr);
+  ASSERT_EQ(filter.initialize(initial), Status::kOk);
+  auto factor = measurement(initial, "upper-remainder");
+  factor.remainderKnowledge = MomentKnowledge::kUpperBound;
+  EXPECT_EQ(filter.propose({factor}).status(), Status::kUnknownMoment);
+  EXPECT_EQ(filter.appliedGain({factor}, Eigen::MatrixXd::Zero(1, 1)).status, Status::kUnknownMoment);
+  expectExact(*filter.moments(), initial);
+  EXPECT_TRUE(filter.ledger()->entries().empty());
+}
+
 }  // namespace
 }  // namespace fastlio::joint_source

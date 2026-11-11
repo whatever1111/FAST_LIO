@@ -59,7 +59,7 @@ std::size_t matrixBytes(const Eigen::MatrixXd & value)
 
 std::size_t textBytes(const std::string & value)
 {
-  return sumBytes(sizeof(value), value.capacity() + 1);
+  return sumBytes(sizeof(std::string), value.capacity() + 1);
 }
 
 std::size_t coordinatesBytes(const Coordinates & value)
@@ -816,7 +816,7 @@ Status compactRecent(Metadata & data, const Budget & budget)
   while (data.recent.size() > budget.recentLedger) {
     const auto old = std::find_if(
       data.recent.begin(), data.recent.end(), [](const FactorIdentity & item) { return item.sequence.has_value(); });
-    if (old == data.recent.end() || old == std::prev(data.recent.end()))
+    if (old == data.recent.end() || old == std::prev(data.recent.end()) || !old->sequence)
       return Status::kModelCapacityExceeded;
     raise(data.compacted, *old->sequence);
     data.recent.erase(old);

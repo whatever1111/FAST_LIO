@@ -678,11 +678,13 @@ TEST(ConsiderSourceFilter, IndependentInformationReducesPAndCommitIsSingleUse)
   ASSERT_EQ(other.initialize(initial, budget()), Status::kOk);
   auto first = filter.proposeAppliedGain({input}, Eigen::MatrixXd::Constant(1, 1, 0.5));
   auto stale = filter.proposeAppliedGain({input}, Eigen::MatrixXd::Constant(1, 1, 0.5));
-  EXPECT_EQ(other.commit(std::move(first)), Status::kStaleProposal);
+  // commit takes an rvalue reference and retains the object for stale rejection.
+  const auto commitFirst = [&first](ConsiderSourceFilter & target) { return target.commit(std::move(first)); };
+  EXPECT_EQ(commitFirst(other), Status::kStaleProposal);
   EXPECT_DOUBLE_EQ((*filter.activeCovariance())(0, 0), 1);
-  ASSERT_EQ(filter.commit(std::move(first)), Status::kOk);
+  ASSERT_EQ(commitFirst(filter), Status::kOk);
   EXPECT_DOUBLE_EQ((*filter.activeCovariance())(0, 0), 0.5);
-  EXPECT_EQ(filter.commit(std::move(first)), Status::kStaleProposal);
+  EXPECT_EQ(commitFirst(filter), Status::kStaleProposal);
   EXPECT_EQ(filter.commit(std::move(stale)), Status::kStaleProposal);
 }
 

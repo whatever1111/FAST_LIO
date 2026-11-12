@@ -288,9 +288,25 @@ TEST(ConsiderSourceFilter, X3CapturedGainsPreserveCommonPartAndAddRemainder)
     expected << 1 + gain * gain, 1, 1, 1;
     expectMatrix(joint(filter, {z}), expected);
   }
-  // H=-A alone does not imply E=0: independent P=2, C=3 gives E=2.
-  const Eigen::Matrix2d noncommon = (Eigen::Matrix2d() << 2, 0, 0, 3).finished();
-  EXPECT_DOUBLE_EQ((noncommon.row(0) * Eigen::Vector2d(1, -1))(0), 2);
+  // H=-A alone does not imply E=0. Phi=0 with Q=2 after the clone leaves the
+  // active error independent of the frame source: P=2, K=0, C=3, E=HP+AK'=2.
+  // Primitives e0~(0,3), w~(0,2), eps~(0,1): z=e0, e=w, e+=w/2+e0/2-eps/2.
+  // The common-mode shortcut P+G*D*G'=9/4, K unchanged=0 fails this fixture.
+  auto wide = prior();
+  wide.covariance.setConstant(3);
+  ConsiderSourceFilter filter;
+  ASSERT_EQ(filter.initialize(wide, budget()), Status::kOk);
+  ASSERT_EQ(filter.augment(z, Eigen::MatrixXd::Ones(1, 1)), Status::kOk);
+  ASSERT_EQ(filter.propagate(Eigen::MatrixXd::Zero(1, 1), noise(2, 1, 2.0)), Status::kOk);
+  Eigen::Matrix2d noncommon;
+  noncommon << 2, 0, 0, 3;
+  expectMatrix(joint(filter, {z}), noncommon);
+  auto input = factor(wide.active, {z}, "noncommon");
+  input.a(0, 0) = -1;
+  apply(filter, input, 0.5);
+  Eigen::Matrix2d expected;
+  expected << 1.5, 1.5, 1.5, 3;
+  expectMatrix(joint(filter, {z}), expected);
 }
 
 ReuseNoise reuse(LinearFactor & input, const std::string & raw, RawId frame, std::uint64_t total)

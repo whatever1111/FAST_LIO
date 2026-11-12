@@ -457,6 +457,11 @@ TEST(IvoxIdentity, ClearLiveKeepsThePinnedTierWithItsIdentities)
   ASSERT_EQ(ids.size(), 1u);
   expectIdentity(ids[0], Origin::kScanIncremental, 6, 0, g);
   EXPECT_TRUE(identitiesAt(map, live.front()).empty());
+  // A voxel the reset removed starts its identities afresh when a later scan refills it.
+  map.Add_Points(live, true, {Origin::kScanIncremental, 7});
+  const auto refilled = identitiesAt(map, live.front());
+  ASSERT_EQ(refilled.size(), 1u);
+  expectIdentity(refilled[0], Origin::kScanIncremental, 7, 0, g + 1);
 }
 
 TEST(IvoxIdentity, EveryResetAdvancesTheGeneration)

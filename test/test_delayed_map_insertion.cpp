@@ -191,6 +191,9 @@ TEST(DelayedMapInsertion, ResetDropsProvenanceWithItsPoints)
   provenance.noteDownsampled(0);
   EXPECT_FALSE(queue.stage(point(80), {}, 2, std::move(provenance)));
   queue.reset();
+  // The rebuild replaces what the map held at the seed's own position, identity included.
+  auto replaced = point(90);
+  map.Add_Points(replaced, true, fast_lio::seedLabel(7));
   auto seed = point(90);
   map.Build(seed, fast_lio::seedLabel(9));
   for (int frame = 10; frame <= 12; ++frame) {
@@ -246,6 +249,16 @@ TEST(DelayedMapInsertion, TheWorkerThreadAddsTheSameIdentities)
     EXPECT_EQ(da, db);
     ASSERT_EQ(ia.size(), ib.size());
     EXPECT_EQ(std::memcmp(ia.data(), ib.data(), ia.size() * sizeof(ia[0])), 0);
+    // Each list is labelled from its own index array: the direct point is not given the downsampled one's.
+    ASSERT_EQ(ib.size(), 1u);
+    EXPECT_EQ(ib[0].point_index, static_cast<std::uint32_t>(frame + 10));
+    for (const Map * map : {&sync, &worker}) {
+      map->Nearest_Search_Identified(point(frame * 10 + 1).front(), 1, a, da, ia);
+      ASSERT_EQ(ia.size(), 1u);
+      EXPECT_EQ(ia[0].origin, fast_lio::MapPointOrigin::kScanIncremental);
+      EXPECT_EQ(ia[0].frame_seq, static_cast<std::uint32_t>(frame));
+      EXPECT_EQ(ia[0].point_index, static_cast<std::uint32_t>(frame + 20));
+    }
   }
 }
 

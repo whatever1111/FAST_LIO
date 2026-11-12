@@ -98,6 +98,8 @@ public:
   // Advances after each accepted pinned preflight, and for a merged Build with a prior prefix,
   // including unpinned priors. Only the scan thread installs priors and may read this counter.
   std::uint32_t priorBatchSeq() const { return prior_batch_seq_; }
+  // Points admitted without a usable label while identity is on. Additions write it, on the
+  // worker too: read it as the map itself is read, after joining the worker.
   std::size_t unlabelledPoints() const { return unlabelled_points_; }
 
   void Build(PointVector & points, const fast_lio::MapInsertLabel & label)

@@ -567,10 +567,11 @@ ${sanitizer_tests}
     target_include_directories(test_static_evidence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
   # Pure header, no ROS: which anchor a parked platform may be held to, and when
-  # the front end may call its reference trusted again.
+  # the front end may call its reference trusted again. Also the rebuild relevel
+  # (rebuild_relevel.hpp), which needs Eigen.
   ament_add_gtest(test_lost_recovery_policy test/test_lost_recovery_policy.cpp)
   if(TARGET test_lost_recovery_policy)
-    target_include_directories(test_lost_recovery_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(test_lost_recovery_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
   ament_add_gtest(test_stationary_anchor_policy test/test_stationary_anchor_policy.cpp)
   if(TARGET test_stationary_anchor_policy)

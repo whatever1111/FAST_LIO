@@ -13,6 +13,9 @@ using fast_lio::legEdgeVariance;
 using fast_lio::legEdgeVelocity;
 using fast_lio::levellingSigma;
 using fast_lio::LevellingSigmaPolicy;
+using fast_lio::LevellingWindowGates;
+using fast_lio::LevellingWindowReference;
+using fast_lio::levellingWindowReference;
 using fast_lio::LevellingWindowScan;
 using fast_lio::LinearAccelerationTerm;
 using fast_lio::linearAccelerationTerm;
@@ -197,5 +200,188 @@ TEST(GravityAlignKinematics, MeasurementPolicyIgnoresTheSceneAndFollowsTheBody)
   for (const bool scene : {false, true}) {
     EXPECT_DOUBLE_EQ(levellingSigma(P, scene, true, 0.03, 0.008, 0.01, 0.045), 0.01);
     EXPECT_DOUBLE_EQ(levellingSigma(P, scene, false, 0.03, 0.008, 0.01, 0.045), 0.045);
+  }
+}
+
+// ── The window read as a vertical reference ──────────────────────────────────
+// The rebuild relevel (rebuild_relevel.hpp) reads the levelling window with the block's own gates. Here the window
+// is one second of 200 Hz samples on the m20 settings: its oldest entry ends at 0.1 s, the scan in question at 1.0 s.
+namespace
+{
+constexpr double kNoiseStatic = 0.008;
+constexpr double kLegSigma = 0.15;
+
+LevellingWindowGates m20Gates()
+{
+  LevellingWindowGates gates;
+  gates.window_s = 1.0;
+  gates.accel_tol = 0.05;
+  gates.magnitude_ref = kG;
+  gates.raw_per_mps2 = 1.0;
+  gates.gravity = kG;
+  gates.lin_accel_comp = true;
+  gates.leg_edges = true;
+  gates.leg_stream_alive = true;
+  gates.vel_sigma_scale = 1.0;
+  gates.leg_vel_sigma = kLegSigma;
+  gates.noise_static = kNoiseStatic;
+  return gates;
+}
+
+// A window of a constant mean specific force whose leg edges read v_start and v_end; a zero edge is a parked one
+// (the IMU agrees), any other a moving one.
+struct Window
+{
+  LevellingWindowScan oldest = scan(0.0, 0.1, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+  LevellingWindowScan newest = scan(0.9, 1.0, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+  Eigen::Vector3d sum = Eigen::Vector3d::Zero();
+  int samples = 200;
+  double span = 1.0;
+  bool overwritten_inside = false;
+
+  Window(const Eigen::Vector3d & mean_force, const Eigen::Vector3d & v_start, const Eigen::Vector3d & v_end)
+  {
+    oldest.v_start = v_start;
+    oldest.var_start = legEdgeVariance(v_start.x(), v_start.isZero(), kLegSigma);
+    newest.v_end = v_end;
+    newest.var_end = legEdgeVariance(v_end.x(), v_end.isZero(), kLegSigma);
+    sum = mean_force * double(samples);
+  }
+
+  LevellingWindowReference read(const LevellingWindowGates & gates = m20Gates()) const
+  {
+    return levellingWindowReference(sum, samples, span, oldest, newest, overwritten_inside, gates);
+  }
+};
+
+// The specific force of a body at rest, tilted by `deg` about +y.
+Eigen::Vector3d restingForce(double deg)
+{
+  const double a = deg * M_PI / 180.0;
+  return kG * Eigen::Vector3d(std::sin(a), 0.0, std::cos(a));
+}
+}  // namespace
+
+// Parked at both edges: the window's mean linear acceleration is zero, so its mean is the body's up.
+TEST(GravityAlignKinematics, WindowParkedAtBothEdgesIsTheNormalisedMean)
+{
+  const LevellingWindowReference ref =
+    Window(restingForce(5.0), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()).read();
+  ASSERT_TRUE(ref.valid);
+  EXPECT_TRUE(ref.parked);
+  EXPECT_NEAR((ref.up_body - restingForce(5.0).normalized()).norm(), 0.0, 1e-12);
+  // the levelling block's variance for this measurement: the static noise; the compensation adds exactly 0
+  EXPECT_DOUBLE_EQ(ref.variance, kNoiseStatic * kNoiseStatic);
+}
+
+TEST(GravityAlignKinematics, WindowWalkingAtConstantSpeedIsValidButNotParked)
+{
+  const Eigen::Vector3d v(0.8, 0.0, 0.0);
+  const LevellingWindowReference ref = Window(restingForce(0.0), v, v).read();
+  EXPECT_TRUE(ref.valid);
+  EXPECT_FALSE(ref.parked);
+  EXPECT_DOUBLE_EQ(ref.variance, 0.0);
+}
+
+// Setting off inside the window, 0 → 0.5 m/s in its second: the specific-force mean leans 2.9° forward, and the
+// reference takes off the mean linear acceleration the two edges give. One parked edge does not make it parked,
+// and neither does a stop.
+TEST(GravityAlignKinematics, WindowAtAStartTakesOffTheMeanLinearAcceleration)
+{
+  const Eigen::Vector3d accel(0.5, 0.0, 0.0);
+  const Window start(restingForce(0.0) + accel, Eigen::Vector3d::Zero(), accel);
+  const LevellingWindowReference ref = start.read();
+  ASSERT_TRUE(ref.valid);
+  EXPECT_FALSE(ref.parked);
+  EXPECT_NEAR((ref.up_body - Eigen::Vector3d::UnitZ()).norm(), 0.0, 1e-12);
+  LevellingWindowGates uncompensated = m20Gates();
+  uncompensated.lin_accel_comp = false;
+  const LevellingWindowReference raw = start.read(uncompensated);
+  ASSERT_TRUE(raw.valid);
+  EXPECT_NEAR(std::acos(raw.up_body.z()), leanOfAcceleration(accel, kG), 1e-12);
+  const Window stop(restingForce(0.0) - accel, accel, Eigen::Vector3d::Zero());
+  ASSERT_TRUE(stop.read().valid);
+  EXPECT_FALSE(stop.read().parked);
+}
+
+TEST(GravityAlignKinematics, WindowNeedsTheBlockCoverage)
+{
+  Window w(restingForce(0.0), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+  w.span = 0.7;
+  w.samples = 20;
+  w.sum = restingForce(0.0) * 20.0;
+  EXPECT_TRUE(w.read().valid);  // the block's limits themselves pass
+  Window short_span = w;
+  short_span.span = 0.69;
+  EXPECT_FALSE(short_span.read().valid);
+  Window few = w;
+  few.samples = 19;
+  few.sum = restingForce(0.0) * 19.0;
+  EXPECT_FALSE(few.read().valid);
+  Window empty = w;
+  empty.samples = 0;
+  empty.sum.setZero();
+  EXPECT_FALSE(empty.read().valid);
+  // a window length of zero keeps no window at all
+  LevellingWindowGates no_window = m20Gates();
+  no_window.window_s = 0.0;
+  EXPECT_FALSE(w.read(no_window).valid);
+}
+
+// A lift accelerating vertically changes only the magnitude of the specific force: outside the tolerance the window
+// is no reference.
+TEST(GravityAlignKinematics, WindowMagnitudeMustMatchTheReference)
+{
+  const Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
+  const Eigen::Vector3d parked = Eigen::Vector3d::Zero();
+  EXPECT_TRUE(Window(up * kG * 1.04, parked, parked).read().valid);
+  EXPECT_FALSE(Window(up * kG * 1.06, parked, parked).read().valid);
+  EXPECT_FALSE(Window(up * kG * 0.94, parked, parked).read().valid);
+  LevellingWindowGates no_reference = m20Gates();
+  no_reference.magnitude_ref = 0.0;
+  EXPECT_FALSE(Window(up * kG, parked, parked).read(no_reference).valid);
+}
+
+// A leg edge the bridge could not measure leaves no linear-acceleration term. With the leg stream alive the block
+// withholds such a window, and so does the reference; with no leg stream at all the block keeps the window
+// uncompensated, which is then valid but never parked.
+TEST(GravityAlignKinematics, WindowWithoutALegEdgeIsInvalid)
+{
+  Window w(restingForce(0.0), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+  w.newest.velocity_overwritten = true;
+  EXPECT_FALSE(w.read().valid);
+  LevellingWindowGates no_stream = m20Gates();
+  no_stream.leg_stream_alive = false;
+  const LevellingWindowReference legacy = w.read(no_stream);
+  EXPECT_TRUE(legacy.valid);
+  EXPECT_FALSE(legacy.parked);
+  // leg edges do not come from the filter's velocity: an overwrite inside the window leaves them usable, while the
+  // filter's own velocity edges have no derivative across it
+  Window inside(restingForce(0.0), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+  inside.overwritten_inside = true;
+  EXPECT_TRUE(inside.read().parked);
+  LevellingWindowGates filter_edges = m20Gates();
+  filter_edges.leg_edges = false;
+  EXPECT_FALSE(inside.read(filter_edges).valid);
+}
+
+// Parked needs edges that can tell moving from parked: the filter's velocity edges carry a variance of 0 whenever
+// the compensation sigma is off, a leg sigma of 0 gives every leg edge 0, and without the compensation there are
+// no edges.
+TEST(GravityAlignKinematics, WindowIsParkedOnlyOnLegEdgesThatCanTellMoving)
+{
+  const Window w(restingForce(0.0), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+  ASSERT_TRUE(w.read().parked);
+  LevellingWindowGates filter_edges = m20Gates();
+  filter_edges.leg_edges = false;
+  LevellingWindowGates zero_sigma = m20Gates();
+  zero_sigma.leg_vel_sigma = 0.0;
+  LevellingWindowGates uncompensated = m20Gates();
+  uncompensated.lin_accel_comp = false;
+  for (const LevellingWindowGates & gates : {filter_edges, zero_sigma, uncompensated}) {
+    const LevellingWindowReference ref = w.read(gates);
+    EXPECT_TRUE(ref.valid);
+    EXPECT_FALSE(ref.parked);
+    EXPECT_DOUBLE_EQ(ref.variance, 0.0);
   }
 }

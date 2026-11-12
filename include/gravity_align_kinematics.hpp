@@ -159,4 +159,80 @@ inline double leanOfAcceleration(const Eigen::Vector3d & accel, double gravity)
   return std::atan2(std::hypot(accel.x(), accel.y()), gravity);
 }
 
+// ── The window read as a vertical reference ──────────────────────────────────
+// A second reader of the levelling window (rebuild_relevel.hpp) applies the levelling block's own window rules.
+
+/// The levelling block's window settings, in the units the block uses them.
+struct LevellingWindowGates
+{
+  double window_s = 0.0;          ///< s; gravity_align_window_s (≤ 0: no window is kept)
+  double accel_tol = 0.0;         ///< relative tolerance of the mean's magnitude (gravity_align_accel_tol)
+  double magnitude_ref = 0.0;     ///< raw units; the magnitude the mean must have (gravity_align_mag_ref, else init)
+  double raw_per_mps2 = 1.0;      ///< raw accelerometer units per m/s²
+  double gravity = 0.0;           ///< m/s²; the nominal gravity the compensation sigma is divided by
+  bool lin_accel_comp = false;    ///< gravity_align_lin_accel_comp
+  bool leg_edges = false;         ///< the edges are the legs' (gravity_align_lin_accel_source == "leg")
+  bool leg_stream_alive = false;  ///< no leg stream is expected, or a leg sample arrived within the last second
+  double vel_sigma_scale = 0.0;   ///< gravity_align_vel_sigma_scale
+  double leg_vel_sigma = 0.0;     ///< m/s; gravity_align_leg_vel_sigma, a moving leg edge's sigma
+  double noise_static = 0.0;      ///< rad; gravity_align_noise_static
+};
+
+struct LevellingWindowReference
+{
+  bool valid = false;   ///< the window passes the levelling block's window gates
+  bool parked = false;  ///< valid, and the legs and the IMU call the body parked at both window edges
+  Eigen::Vector3d up_body = Eigen::Vector3d::UnitZ();  ///< the measured up in the body frame (unit), when valid
+  double variance = 0.0;                               ///< rad²; the measurement's variance, when parked
+};
+
+/// The levelling window read the way the levelling block reads it. force_sum and samples sum the window's samples of
+/// specific force less the centripetal term (raw units); span is its coverage (the newest scan's end less the oldest
+/// contributing scan's, plus one scan); oldest and newest are its end entries; overwritten_inside ORs every entry's
+/// overwrite flag.
+///  - valid: the coverage, the linear-acceleration term and the magnitude pass the block's gates. Two of its gates
+///    are not repeated, the blind stretch with the body moving and the ~30° outlier gate against the attitude: only a
+///    parked window is ever used as a reference, one that ends at the scan in question says the body is static
+///    there, and at rest the window is the reference the attitude is checked against.
+///  - parked: the mean linear acceleration is exactly zero. Only leg edges can say so: a leg edge's variance is
+///    exactly zero only when the legs read standstill and the IMU agrees (legEdgeVariance); the filter's velocity
+///    never does.
+inline LevellingWindowReference levellingWindowReference(const Eigen::Vector3d & force_sum,
+                                                         int samples,
+                                                         double span,
+                                                         const LevellingWindowScan & oldest,
+                                                         const LevellingWindowScan & newest,
+                                                         bool overwritten_inside,
+                                                         const LevellingWindowGates & gates)
+{
+  LevellingWindowReference ref;
+  if (!(gates.window_s > 0.0) || samples <= 0) {
+    return ref;
+  }
+  Eigen::Vector3d mean = force_sum / double(samples);
+  LinearAccelerationTerm lin;
+  if (gates.lin_accel_comp) {
+    lin = linearAccelerationTerm(
+      oldest, newest, gates.leg_edges ? false : overwritten_inside, gates.gravity, gates.vel_sigma_scale);
+    if (lin.valid) {
+      mean -= lin.accel * gates.raw_per_mps2;
+    }
+  }
+  const double norm = mean.norm();
+  const bool span_ok = span >= 0.7 * gates.window_s && samples >= 20;
+  const bool lin_ok = !gates.lin_accel_comp || lin.valid || !gates.leg_stream_alive;
+  if (!(gates.magnitude_ref > 1e-3) || !(norm > 1e-6) || !span_ok || !lin_ok ||
+      !(std::abs(norm - gates.magnitude_ref) <= gates.accel_tol * gates.magnitude_ref)) {
+    return ref;
+  }
+  ref.valid = true;
+  ref.up_body = mean / norm;
+  ref.parked = gates.lin_accel_comp && gates.leg_edges && gates.leg_vel_sigma > 0.0 && lin.valid &&
+               oldest.var_start == 0.0 && newest.var_end == 0.0;
+  if (ref.parked) {
+    ref.variance = gates.noise_static * gates.noise_static + lin.sigma * lin.sigma;
+  }
+  return ref;
+}
+
 }  // namespace fast_lio

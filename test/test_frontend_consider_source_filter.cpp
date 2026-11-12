@@ -350,8 +350,6 @@ TEST(ConsiderSourceFilter, X4ReuseFromFirstQueryBoundsCompleteJoint)
   EXPECT_GE(Eigen::LDLT<Eigen::Matrix2d>(bound - exact).vectorD().minCoeff(), 0);
   const Eigen::RowVector2d delta(1, -1);
   EXPECT_GE((delta * (bound - exact) * delta.transpose())(0), 0);
-  EXPECT_DOUBLE_EQ(2 + 2, 4);  // Equal, co-directed echo sensitivities attain the bound.
-  EXPECT_LT(1 + 2, 4);         // Late registration cannot repair the query prefix.
   EXPECT_EQ(filter.knowledge(), MomentKnowledge::kUpperBound);
 }
 

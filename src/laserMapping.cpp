@@ -2665,6 +2665,7 @@ std::function<void()> beforeImuProcess;
 std::function<int(double)> overrideGuardDegraded;
 std::function<void(double, AnchorFixtureState &)> beforeAnchorStep;
 std::function<bool(double)> forceRunawayTrip;
+std::function<bool(double)> overrideScanWheelFit;
 std::function<bool(double)> initialBuildTakesNoPoint;
 std::function<bool(double)> resetBeforeReference;
 std::function<void(bool, bool, bool, std::size_t)> afterPriorMapReset;
@@ -3354,7 +3355,7 @@ void exportLostRecoveryEpoch(const FinalFrontendSnapshot & final)
 
 void logFloorFinal(double scan_end,
                    fast_lio::FloorMode mode,
-                   const fast_lio::FloorScanRecord & record,
+                   const fast_lio::MeasurementTelemetry & measured,
                    const FinalFrontendSnapshot & final,
                    std::uint64_t measurement_epoch)
 {
@@ -3370,9 +3371,11 @@ void logFloorFinal(double scan_end,
                                       : Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
   const bool same_frame = final.coordinateEpoch == measurement_epoch && !odom_frame_id.empty();
   const auto stamp_ns = rclcpp::Time(get_ros_time(scan_end)).nanoseconds();
-  RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-              "%s",
-              fast_lio::floorLine(scan_end, stamp_ns, mode, record, direction, same_frame).c_str());
+  RCLCPP_INFO(
+    rclcpp::get_logger("laser_mapping"),
+    "%s",
+    fast_lio::floorLine(scan_end, stamp_ns, mode, measured.floor, measured.floor_no_wheel_scans, direction, same_frame)
+      .c_str());
 }
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped,
@@ -4090,6 +4093,21 @@ private:
     const auto & P = kf.get_P();
     fout_kalman << ',' << P(12, 12) << ',' << P(12, 13) << ',' << P(12, 14) << ',' << P(13, 13) << ',' << P(13, 14)
                 << ',' << P(14, 14);
+  }
+
+  // Whether this scan's wheel update (updateWheelSpeed) will find a speed, asked before the lidar update for an
+  // applying floor (fast_lio::scanFloorMode): the same read of the ring over the same span. Every callback waits for
+  // the scan timer in its mutually exclusive group, so no sample reaches the ring between the two reads.
+  bool scanWheelFit(const fast_lio::FrontendParams & p)
+  {
+#ifdef FASTLIO_TEST_HOOKS
+    if (fast_lio_test::overrideScanWheelFit)
+      return fast_lio_test::overrideScanWheelFit(lidar_end_time);
+#endif
+    if (p.degeneracy_floor_mode != fast_lio::FloorMode::kApply || !p.wheel_odom_en)
+      return false;
+    std::lock_guard<std::mutex> lk(mtx_twist);
+    return wheel_speed_.hasFit(Measures.lidar_beg_time, lidar_end_time);
   }
 
   // The wheel update after the lidar update (design B.2): the paired samples of the scan's own span fitted at its
@@ -5426,7 +5444,7 @@ private:
       // undistort / FOV-segment / downsample costs were invisible in the per-frame budget.
       double t_undist = 0.0, t_join = 0.0, t_fov = 0.0;
 
-      measurement_.beginScan();
+      measurement_.beginScan(scanWheelFit(p));
       const fast_lio::MeasurementTelemetry & measured = measurement_.telemetry();
       ekf_iters = 0;
       kdtree_search_time = 0.0;
@@ -7072,7 +7090,7 @@ private:
       anchor_final_frozen = true;
       reference_pending = reference_health_en;
       const auto & final = anchor_final_snapshot;
-      logFloorFinal(lidar_end_time, p.degeneracy_floor_mode, measured.floor, final, floorCoordinateEpoch);
+      logFloorFinal(lidar_end_time, p.degeneracy_floor_mode, measured, final, floorCoordinateEpoch);
       publish_odometry(pubOdomAftMapped_, tf_broadcaster_, final);
       accounting.finish(fast_lio::AdmissionExit::kPublished);
       if (anchor_scan_record_open) {

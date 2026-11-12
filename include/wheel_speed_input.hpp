@@ -4,11 +4,12 @@
 // read) and, when the node has a variance topic, the variances of the same samples. Without a variance topic every
 // gated sample carries the parameter sigmas, the wheel update's noise model before the bridge published variances.
 // After the lidar update the scan thread reads the ring once: the paired samples of the scan's own span, fitted at
-// its end (wheel_measurement.hpp). The scan thread alone keeps the slip regressor's IMU history and the per-scan
-// counts.
+// its end (wheel_measurement.hpp). Before the lidar update an applying normal-noise floor asks whether that read will
+// find a speed (hasFit): the callbacks wait for the scan timer, so the ring cannot change in between. The scan thread
+// alone keeps the slip regressor's IMU history and the per-scan counts.
 //
-// Locking is the owner's. The node guards addTwist, addVariances and read with its mtx_twist; recordImu, step and
-// counts belong to the scan thread and take no lock.
+// Locking is the owner's. The node guards addTwist, addVariances, read and hasFit with its mtx_twist; recordImu, step
+// and counts belong to the scan thread and take no lock.
 //
 // Pure C++ + Eigen. No ROS.
 
@@ -176,6 +177,10 @@ public:
     out.rejected = ring_.rejected() + malformed_stamps_;
     return out;
   }
+
+  /// Whether read(t_begin, t_end) fits a speed: the scan's wheel update has a measurement to make only then. A span
+  /// without a paired valid sample, an endpoint one sample time cannot identify and an invalid fit leave it without.
+  bool hasFit(double t_begin, double t_end) const { return read(t_begin, t_end).fit.has_value(); }
 
   // The scan thread's part: no lock.
 

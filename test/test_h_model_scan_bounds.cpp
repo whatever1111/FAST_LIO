@@ -34,10 +34,10 @@ protected:
   }
 
   // The node's order for a new scan: the scan reset, then the storage sized from the downsampled count. The scan's
-  // points lie on the patch, or (rows = false) far from every map point.
+  // points lie on the patch, or (rows = false) far from every map point. The floor is off: no wheel fit is asked.
   void prepare(std::size_t count, bool rows)
   {
-    measurement_.beginScan();
+    measurement_.beginScan(false);
     ASSERT_TRUE(measurement_.prepareScan(count, point_count_));
     ASSERT_EQ(point_count_, static_cast<int>(count));
     body_.resize(count);

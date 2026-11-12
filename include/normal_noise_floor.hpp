@@ -67,6 +67,37 @@ inline const char * floorModeName(FloorMode mode)
   return "off";
 }
 
+/// Why a scan runs the floor in the mode it does (scanFloorMode).
+enum class FloorModeReason
+{
+  kConfigured,  ///< "configured": the scan runs degeneracy_floor_mode as configured
+  kNoWheel,     ///< "no_wheel": apply, but the scan's wheel update finds no speed, so the scan observes
+};
+
+inline const char * floorModeReasonName(FloorModeReason reason)
+{
+  return reason == FloorModeReason::kNoWheel ? "no_wheel" : "configured";
+}
+
+/// The mode one scan's lidar update runs the floor in, and why.
+struct ScanFloorMode
+{
+  FloorMode mode = FloorMode::kOff;
+  FloorModeReason reason = FloorModeReason::kConfigured;
+};
+
+/// A direction the floor releases rides on IMU propagation until another measurement fills it, and within the scan
+/// only the wheel update after the lidar update can. So the floor applies only on a scan whose wheel update finds a
+/// speed (wheel_fit: wheel_odom_en and WheelSpeedInput::hasFit, the read that update makes); without one the scan
+/// observes, the decision computed and reported and the rows left as built. Observe and off never read the wheel.
+inline ScanFloorMode scanFloorMode(FloorMode configured, bool wheel_fit)
+{
+  if (configured == FloorMode::kApply && !wheel_fit) {
+    return {FloorMode::kObserve, FloorModeReason::kNoWheel};
+  }
+  return {configured, FloorModeReason::kConfigured};
+}
+
 /// Parameters of the floor decision.
 struct FloorParams
 {
@@ -555,6 +586,7 @@ struct FloorScanRecord
   int invalid_evaluations = 0;
   int evaluation_iter = 0;
   bool projected = false;
+  ScanFloorMode scan;  ///< the mode the scan runs the floor in, set where the scan begins (scanFloorMode)
 };
 
 inline void floorStep(FloorMode mode,
@@ -661,10 +693,14 @@ inline std::string floorMatrix(const Eigen::Matrix3d & matrix, bool symmetric = 
 
 /// Schema 2, one final evaluation per frame, raw normal-equivalent row units.
 /// u/stamp come from the same final snapshot and conversion used by /Odometry.
+/// mode is the configured degeneracy_floor_mode and decides which fields the line has; effective_mode and mode_reason
+/// are the scan's own (record.scan), and no_wheel_scans counts the scans since construction whose floor observed
+/// because apply found no wheel speed. Such a scan in apply mode shifts nothing: shift_coords_valid=0, dh_norm=0.
 inline std::string floorLine(double lidar_end_time,
                              std::int64_t stamp_ns,
                              FloorMode mode,
                              const FloorScanRecord & record,
+                             long no_wheel_scans,
                              const Eigen::Vector3d & direction,
                              bool frame_matches)
 {
@@ -678,7 +714,7 @@ inline std::string floorLine(double lidar_end_time,
                 sizeof text,
                 "[FLOOR] schema=2 rule=%s mode=%s t=%.17g stamp_ns=%lld evaluation_iter=%d valid=%d reason=%s "
                 "points=%d points_without_covariance=%d iterations=%d invalid_iterations=%d projected=%d "
-                "rank_m=%d rank_r=%d",
+                "effective_mode=%s mode_reason=%s no_wheel_scans=%ld rank_m=%d rank_r=%d",
                 r.rule,
                 floorModeName(mode),
                 lidar_end_time,
@@ -691,6 +727,9 @@ inline std::string floorLine(double lidar_end_time,
                 record.evaluations,
                 record.invalid_evaluations,
                 record.projected ? 1 : 0,
+                floorModeName(record.scan.mode),
+                floorModeReasonName(record.scan.reason),
+                no_wheel_scans,
                 r.rank_m,
                 r.rank_r);
   std::string line(text);

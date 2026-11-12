@@ -5,7 +5,9 @@
 // takes the production scan path, off the node's own 100 Hz timer, to the /Odometry publisher. The existing
 // FASTLIO_TEST_HOOKS fix only what a synthetic stream cannot produce on demand (the divergence guard's verdict, the
 // registration state test_anchor_lifecycle_node injects before the anchor step, a runaway trip, a failing IMU
-// processing step) and report what the scan path did. The child writes one record, in the order things happened:
+// processing step, and the wheel speed an applying floor needs, which the driver does not publish: a wheel stream
+// would also feed the static hold and the wheel update) and report what the scan path did. The child writes one
+// record, in the order things happened:
 //   slot      what the fixture sent for one scan period: the scan, its IMU window and what was done to them;
 //   scan_begin, imu_process, imu_batch, scan_prepared, initial_build, h_rows, guard, anchor_step_fixture,
 //   runaway_check, map_reset_join, map_reset_pending_cleared, map_reset, pose_publish
@@ -921,6 +923,7 @@ struct Scenario
   // covariance each lidar update left
   bool kalman = false;
   bool floor_log_binding = false;  // assert schema-2 u/stamp against the actual /Odometry, without a new golden
+  bool wheel_fit = false;  // overrideScanWheelFit: every scan's wheel update finds a speed, as an applying floor needs
   bool accounting_capture = false;
   bool accounting_queue_probe = false;
   std::map<std::string, rclcpp::Parameter> params;
@@ -1299,13 +1302,15 @@ Scenario groundScenario()
 
 // The normal-noise floor applied (degeneracy_floor_mode apply) on the corridor, with the residual histogram and the
 // spectrum trace on: nothing faces up, so the vertical information of the walls' rows is what their noisy normals
-// fake, and the floor projects it out of the position columns with the matching residual shift.
+// fake, and the floor projects it out of the position columns with the matching residual shift. Apply projects only
+// on a scan whose wheel update finds a speed: the scan path is told every scan has one.
 Scenario degeneracyScenario()
 {
   Scenario s = measurementScenario("h_degeneracy", Cloud::kCorridor);
   setParam(s, rclcpp::Parameter("degeneracy_floor_mode", std::string("apply")));
   setParam(s, rclcpp::Parameter("degeneracy_debug", true));
   setParam(s, rclcpp::Parameter("degeneracy_spectrum_trace", true));
+  s.wheel_fit = true;
   append(s, 8, sceneSlot(Cloud::kCorridor));
   s.claims = {"h_floor_projected"};
   return s;
@@ -1490,6 +1495,10 @@ constexpr Branch kBranches[] = {
    "(degeneracy_floor_mode)",
    "test_normal_noise_floor; test_degeneracy_policy SchurComplement.*; "
    "test_rp_consider_filter FloorProjection*"},
+  {"h_floor_no_wheel",
+   "H-model calls with rows on scans an applying floor observed because the wheel update found no speed "
+   "(fast_lio::scanFloorMode)",
+   "test_normal_noise_floor ScanFloorMode.*; test_wheel_measurement WheelSpeedInput.HasFit*"},
   {"h_hold_rows",
    "H-model calls with rows whose rotation rows the attitude hold's scene rule restricted to yaw",
    "test_attitude_hold AttitudeHold.*"},
@@ -1926,6 +1935,8 @@ private:
       // The floor's decision of the call itself: every call with rows runs the floor while it is on.
       if (e.valid && e.degeneracy_engaged)
         ++counts_["h_floor_projected"];
+      if (e.valid && e.degeneracy_no_wheel)
+        ++counts_["h_floor_no_wheel"];
       if (e.valid && e.hold_rows && e.hold_scene)
         ++counts_["h_hold_rows"];
       if (e.valid && e.hold_rows && e.hold_info && !e.hold_scene)
@@ -1997,6 +2008,12 @@ private:
         ++counts_["runaway_trip"];
       return trip;
     };
+    // Installed only where the scenario says: it records nothing, so the record is the one the scan path leaves.
+    if (scenario_.wheel_fit) {
+      fast_lio_test::overrideScanWheelFit = [](double) {
+        return true;
+      };
+    }
     // Installed only where a slot injects: an installed hook makes the scan path re-read its state after it.
     if (std::any_of(scenario_.slots.begin(), scenario_.slots.end(), [](const Slot & s) { return s.inject; })) {
       fast_lio_test::beforeAnchorStep = [this](double end, fast_lio_test::AnchorFixtureState & fixture) {
@@ -2081,6 +2098,7 @@ private:
     fast_lio_test::afterConstruction = {};
     fast_lio_test::overrideGuardDegraded = {};
     fast_lio_test::forceRunawayTrip = {};
+    fast_lio_test::overrideScanWheelFit = {};
     fast_lio_test::beforeAnchorStep = {};
     fast_lio_test::initialBuildTakesNoPoint = {};
     fast_lio_test::beforeResetJoin = {};
@@ -3259,6 +3277,7 @@ TEST(FrontendPipelineContract, JointRowFloorMeasurementFixture)
   const std::vector<double> weights(6, 1.0);
   std::vector<std::optional<Eigen::Matrix3d>> covariances(6, Eigen::Matrix3d::Zero());
   covariances.front() = S0;
+  measurement.beginScan(true);  // the scan's wheel update finds a speed
   measurement.applyFloorRows(data, weights, covariances, 7);
   EXPECT_LT((data.h_x - expected).norm(), 1e-12);
   EXPECT_LT((data.h - expected_h).norm(), 1e-12);
@@ -3267,6 +3286,109 @@ TEST(FrontendPipelineContract, JointRowFloorMeasurementFixture)
   EXPECT_EQ(telemetry.floor.evaluation_iter, 7);
   EXPECT_EQ(telemetry.floor_rows_projected, 6);
   EXPECT_NEAR(telemetry.floor_kept_sum, 2.0 + std::sqrt(2.0), 1e-12);
+}
+
+// The scan's wheel fit decides only whether apply projects (fast_lio::scanFloorMode). With it the rows are what
+// floorStep's apply makes of them; without it they stay as built, bit for bit, the decision is the one observe
+// computes, and the scan is counted once however many evaluations run the floor. Observe and off never read it.
+// This assertion fixture does not record or generate a golden.
+TEST(FrontendPipelineContract, FloorAppliesOnlyOnAScanWhoseWheelUpdateFindsASpeed)
+{
+  // JointRowFloorMeasurementFixture's rows: the floor projects one direction out of them.
+  esekfom::dyn_share_datastruct<double> built;
+  built.h_x = Eigen::MatrixXd::Zero(6, 12);
+  built.h_x.leftCols(6).setIdentity();
+  built.h_x(3, 0) = built.h_x(3, 1) = 1.0;
+  built.h_x.rightCols(6) = built.h_x.leftCols(6);
+  built.h = built.h_x.col(0);
+  const std::vector<double> weights(6, 1.0);
+  std::vector<std::optional<Eigen::Matrix3d>> covariances(6, Eigen::Matrix3d::Zero());
+  covariances.front() = Eigen::Matrix3d(Eigen::Vector3d(1, 0, 0).asDiagonal());
+  const auto decision = [](const fast_lio::FloorProjectionResult & r) {
+    std::ostringstream out;
+    out << r.valid << ' ' << r.reason << ' ' << r.spectral_count << ' ' << r.rank_m << ' ' << r.rank_r << ' '
+        << r.points << ' ' << r.points_without_covariance << ' ' << bitsList(r.lambda.data(), 3) << ' '
+        << bitsList(r.gains.data(), 3) << ' ' << bitsList(r.tau.data(), 3) << ' ' << matrixDigest(r.M0) << ' '
+        << matrixDigest(r.S0) << ' ' << matrixDigest(r.K) << ' ' << matrixDigest(r.A_keep) << ' '
+        << matrixDigest(r.B_keep) << ' ' << matrixDigest(r.C_keep) << ' ' << r.shift_coords_valid << ' '
+        << bitsList(r.d_t.data(), 3) << ' ' << bitsList(r.d_r.data(), 3) << ' ' << bits(r.dh_norm);
+    return out.str();
+  };
+  using fast_lio::FloorMode;
+  for (const FloorMode configured : {FloorMode::kApply, FloorMode::kObserve, FloorMode::kOff}) {
+    for (const bool wheel_fit : {true, false}) {
+      SCOPED_TRACE(std::string(fast_lio::floorModeName(configured)) + (wheel_fit ? ", wheel fit" : ", none"));
+      fast_lio::FrontendParams params;
+      params.degeneracy_floor_mode = configured;
+      params.degeneracy_floor.rel_uncertainty = 0.0;
+      const bool applies = configured == FloorMode::kApply && wheel_fit;
+      const bool no_wheel = configured == FloorMode::kApply && !wheel_fit;
+      const FloorMode runs = no_wheel ? FloorMode::kObserve : configured;
+      // The reference: floorStep in the mode the scan runs, on the same rows.
+      Eigen::MatrixXd reference_h_x = built.h_x;
+      Eigen::VectorXd reference_h = built.h;
+      fast_lio::FloorScanRecord reference;
+      fast_lio::floorStep(runs,
+                          reference_h_x,
+                          reference_h,
+                          weights,
+                          covariances,
+                          params.degeneracy_floor,
+                          params.degeneracy_params.schur_ridge,
+                          reference);
+      EXPECT_EQ(reference.projected, applies);
+      EXPECT_EQ(matrixDigest(reference_h_x) == matrixDigest(built.h_x), !applies);
+      EXPECT_EQ(matrixDigest(reference_h) == matrixDigest(built.h), !applies);
+      fast_lio::FrontendMeasurement measurement(params);
+      for (int scan = 0; scan < 2; ++scan) {
+        measurement.beginScan(wheel_fit);
+        for (int evaluation = 1; evaluation <= 2; ++evaluation) {
+          esekfom::dyn_share_datastruct<double> data;
+          data.h_x = built.h_x;
+          data.h = built.h;
+          measurement.applyFloorRows(data, weights, covariances, evaluation);
+          EXPECT_EQ(matrixDigest(data.h_x), matrixDigest(reference_h_x));
+          EXPECT_EQ(matrixDigest(data.h), matrixDigest(reference_h));
+          const fast_lio::FloorScanRecord & floor = measurement.telemetry().floor;
+          EXPECT_EQ(decision(floor.last), decision(reference.last));
+          EXPECT_EQ(floor.projected, applies);
+          EXPECT_EQ(floor.scan.mode, runs);
+          EXPECT_EQ(floor.scan.reason,
+                    no_wheel ? fast_lio::FloorModeReason::kNoWheel : fast_lio::FloorModeReason::kConfigured);
+        }
+      }
+      const fast_lio::MeasurementTelemetry & telemetry = measurement.telemetry();
+      EXPECT_EQ(telemetry.floor_no_wheel_scans, no_wheel ? 2 : 0);
+      EXPECT_EQ(telemetry.floor_rows_projected, applies ? 2 * 2 * 6 : 0);
+    }
+  }
+}
+
+// The node's own answer to the floor's wheel question, without the forced fit: with wheel_odom_en off, and on with no
+// wheel sample in the ring, an applying floor observes every scan. The record is the one observe records, bit for
+// bit: no row is projected and nothing downstream of the rows changes.
+TEST(FrontendPipelineContract, MeasurementNoiseFloorApplyWithoutAWheelSpeedObserves)
+{
+  Scenario observe = degeneracyScenario();
+  observe.wheel_fit = false;
+  setParam(observe, rclcpp::Parameter("degeneracy_floor_mode", std::string("observe")));
+  const ChildRun observed = runScenario(observe);
+  ASSERT_TRUE(observed.ok()) << observed.describe();
+  EXPECT_EQ(observed.count("h_floor_projected"), 0u);
+  EXPECT_EQ(observed.count("h_floor_no_wheel"), 0u);
+  for (const bool wheel_odom : {false, true}) {
+    SCOPED_TRACE(wheel_odom ? "wheel_odom_en true, no wheel sample" : "wheel_odom_en false");
+    Scenario apply = degeneracyScenario();
+    apply.wheel_fit = false;
+    setParam(apply, rclcpp::Parameter("wheel_odom_en", wheel_odom));
+    const ChildRun run = runScenario(apply);
+    ASSERT_TRUE(run.ok()) << run.describe();
+    EXPECT_GT(run.count("h_floor_no_wheel"), 0u);
+    EXPECT_EQ(run.count("h_floor_projected"), 0u);
+    const Comparison comparison = compareLines(observed.record, run.record);
+    EXPECT_EQ(comparison.result, "equal")
+      << "line " << comparison.line << "\n  observe: " << comparison.expected << "\n  apply:   " << comparison.actual;
+  }
 }
 
 TEST(FrontendPipelineContract, FloorExitRecordVersionsEnabledMode)

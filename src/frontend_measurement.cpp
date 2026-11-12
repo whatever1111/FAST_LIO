@@ -104,6 +104,7 @@ static HModelExit hModelExit(const fast_lio::MeasurementTelemetry & telemetry,
   // decided, which is the inert record of the former subspace weighting field for field.
   const fast_lio::FloorProjectionResult & decision = telemetry.floor.last;
   out.degeneracy_engaged = telemetry.floor.projected;
+  out.degeneracy_no_wheel = telemetry.floor.scan.reason == fast_lio::FloorModeReason::kNoWheel;
   for (int i = 0; i < 3; ++i) {
     out.degeneracy_shares[i] = decision.valid && outputs.effective_rows > 0
                                  ? decision.lambda(i) / static_cast<double>(outputs.effective_rows)
@@ -880,7 +881,7 @@ void fast_lio::FrontendMeasurement::applyFloorRows(esekfom::dyn_share_datastruct
                                                    const std::vector<std::optional<Eigen::Matrix3d>> & covariances,
                                                    int evaluation_iteration)
 {
-  fast_lio::floorStep(params_.degeneracy_floor_mode,
+  fast_lio::floorStep(telemetry_.floor.scan.mode,
                       data.h_x,
                       data.h,
                       weights,
@@ -891,13 +892,16 @@ void fast_lio::FrontendMeasurement::applyFloorRows(esekfom::dyn_share_datastruct
   if (params_.degeneracy_floor_mode != fast_lio::FloorMode::kOff) {
     telemetry_.floor.evaluation_iter = evaluation_iteration;
   }
+  if (telemetry_.floor.evaluations == 1 && telemetry_.floor.scan.reason == fast_lio::FloorModeReason::kNoWheel) {
+    ++telemetry_.floor_no_wheel_scans;
+  }
   if (telemetry_.floor.projected) {
     telemetry_.floor_kept_sum += data.h_x.leftCols(3).rowwise().norm().sum();
     telemetry_.floor_rows_projected += static_cast<long>(data.h_x.rows());
   }
 }
 
-void fast_lio::FrontendMeasurement::beginScan()
+void fast_lio::FrontendMeasurement::beginScan(bool wheel_fit)
 {
   telemetry_.match_time = 0;
   telemetry_.match_search_time = 0;
@@ -910,6 +914,7 @@ void fast_lio::FrontendMeasurement::beginScan()
   telemetry_.nn_skips = 0;
   telemetry_.solve_time = 0;
   telemetry_.floor = fast_lio::FloorScanRecord{};
+  telemetry_.floor.scan = fast_lio::scanFloorMode(params_.degeneracy_floor_mode, wheel_fit);
 }
 
 // Called once at the real downsampled-scan boundary, before any int-indexed

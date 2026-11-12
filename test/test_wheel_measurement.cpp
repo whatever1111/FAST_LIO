@@ -1072,6 +1072,72 @@ TEST(WheelSpeedInput, AScanWithoutAPairedSampleInItsSpanMakesNoUpdate)
   EXPECT_EQ(input.counts().updates, 0u);
 }
 
+// What an applying normal-noise floor asks before the lidar update: hasFit is the scan's own read, so it is true
+// exactly when the wheel update after the lidar update has a fitted speed, and false for every way of having none.
+TEST(WheelSpeedInput, HasFitIsWhetherTheScansWheelUpdateFindsASpeed)
+{
+  struct Half
+  {
+    std::int64_t offset_ns;  // from the scan's begin
+    double value;            // the speed, or the forward variance
+  };
+  struct Case
+  {
+    const char * name;
+    std::vector<Half> twists;
+    std::vector<Half> variances;
+    bool fit;
+    WheelOutcome outcome;
+  };
+  const std::vector<Case> cases = {
+    {"paired samples in the span",
+     {{40000000, 0.70}, {100000000, 0.72}},
+     {{40000000, 0.003}, {100000000, 0.003}},
+     true,
+     WheelOutcome::kUpdate},
+    {"the newest sample is older than the scan",
+     {{-20000000, 0.70}},
+     {{-20000000, 0.003}},
+     false,
+     WheelOutcome::kNoSample},
+    {"the only sample is after the scan's end",
+     {{120000000, 0.70}},
+     {{120000000, 0.003}},
+     false,
+     WheelOutcome::kNoSample},
+    {"a non-finite speed", {{100000000, kNaN}}, {{100000000, 0.003}}, false, WheelOutcome::kNoSample},
+    {"a sample still without its variances", {{100000000, 0.70}}, {}, false, WheelOutcome::kNoSample},
+    {"a refused variance", {{100000000, 0.70}}, {{100000000, 0.0}}, false, WheelOutcome::kNoSample},
+    {"one sample time before the end",
+     {{40000000, 0.70}},
+     {{40000000, 0.003}},
+     false,
+     WheelOutcome::kUnidentifiableEndpoint},
+  };
+  for (const Case & c : cases) {
+    SCOPED_TRACE(c.name);
+    WheelSpeedInput input;
+    input.configure(true, 0.075, 0.05);
+    for (const Half & twist : c.twists)
+      addTwistAt(input, kEpochNs + twist.offset_ns, twist.value);
+    for (const Half & variance : c.variances)
+      addVariancesAt(input, kEpochNs + variance.offset_ns, variance.value, kUnobserved);
+    EXPECT_EQ(input.hasFit(kScanBegin, kScanEnd), c.fit);
+    const fast_lio::WheelStep step = stepOf(input, WheelModelParams{});
+    EXPECT_EQ(step.ring.fit.has_value(), c.fit);
+    EXPECT_EQ(step.outcome, c.outcome);
+  }
+
+  // The variances arrive before the next scan reads: the same span now fits.
+  WheelSpeedInput input;
+  input.configure(true, 0.075, 0.05);
+  addTwistAt(input, kEpochNs + 100000000, 0.70);
+  EXPECT_FALSE(input.hasFit(kScanBegin, kScanEnd));
+  addVariancesAt(input, kEpochNs + 100000000, 0.003, kUnobserved);
+  EXPECT_TRUE(input.hasFit(kScanBegin, kScanEnd));
+  EXPECT_EQ(stepOf(input, WheelModelParams{}).outcome, WheelOutcome::kUpdate);
+}
+
 TEST(WheelSpeedInput, AScanWithoutImuSamplesMakesNoUpdate)
 {
   WheelSpeedInput input;

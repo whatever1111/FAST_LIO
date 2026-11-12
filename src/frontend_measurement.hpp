@@ -75,13 +75,15 @@ struct MeasurementTelemetry
   double pos_obs_eig_max = 0.0;
   double pos_obs_z_weak = 0.0;
   Eigen::Matrix3d pos_obs_M = Eigen::Matrix3d::Zero();  // M itself (world frame), for the [SCAN] trace
-  // The normal-noise floor (FrontendParams::degeneracy_floor_mode is the policy): on the current scan, the last
-  // evaluation's decision and how many evaluations ran it and were refused, for the [FLOOR] line; over the node's
-  // life, the rows of the evaluations whose projection changed them and the sum of the position information each of
-  // those rows kept (the actual transformed position-row norm), so the dose stays measurable.
+  // The normal-noise floor (FrontendParams::degeneracy_floor_mode is the policy): on the current scan, the mode it
+  // runs in, the last evaluation's decision and how many evaluations ran it and were refused, for the [FLOOR] line;
+  // over the node's life, the rows of the evaluations whose projection changed them and the sum of the position
+  // information each of those rows kept (the actual transformed position-row norm), so the dose stays measurable, and
+  // the scans whose floor observed because apply found no wheel speed (fast_lio::scanFloorMode).
   fast_lio::FloorScanRecord floor;
   long floor_rows_projected = 0;
   double floor_kept_sum = 0.0;
+  long floor_no_wheel_scans = 0;
   // The correspondence gate and robust kernel (FrontendParams::corr_gate and corr_kernel are the policy) on the last
   // evaluation: the matches the gate refused, and the scan's robust residual scale (1.4826 MAD).
   std::atomic<int> corr_gate_rejected{0};
@@ -167,9 +169,10 @@ public:
   FrontendMeasurement(FrontendMeasurement &&) = delete;
   FrontendMeasurement & operator=(FrontendMeasurement &&) = delete;
 
-  /// A new scan: clears the scan's timings, search count, neighbour-refresh telemetry and floor record, and drops
-  /// every cached neighbour plane and the pose of the last search.
-  void beginScan();
+  /// A new scan: clears the scan's timings, search count, neighbour-refresh telemetry and floor record, drops every
+  /// cached neighbour plane and the pose of the last search, and sets the mode the scan runs the floor in. wheel_fit:
+  /// the scan's wheel update finds a speed, which an applying floor needs (fast_lio::scanFloorMode).
+  void beginScan(bool wheel_fit);
   /// Sizes the per-point storage for a downsampled scan of count points and sets point_count to count. A count the
   /// evaluation's int-indexed loops cannot hold returns false and changes neither.
   bool prepareScan(std::size_t count, int & point_count);

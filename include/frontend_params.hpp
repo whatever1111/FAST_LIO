@@ -274,7 +274,9 @@ struct FrontendParams
   // plane normals' own noise can fake, and keeps of each direction only what is left above that floor. off computes
   // nothing; observe computes the decision and logs it ([FLOOR]) without touching the rows; apply also projects the
   // rows' position columns and shifts their residuals to match. The released directions fall to IMU propagation
-  // until another measurement (wheel speed, ZUPT, planar-Z) fills them.
+  // until another measurement (wheel speed, ZUPT, planar-Z) fills them, so apply projects only on a scan whose wheel
+  // update finds a speed (wheel_odom_en and a fit over the scan's span) and observes on every other scan
+  // (fast_lio::scanFloorMode).
   fast_lio::FloorMode degeneracy_floor_mode = fast_lio::FloorMode::kOff;
   fast_lio::FloorParams degeneracy_floor;
   fast_lio::DegeneracyParams degeneracy_params;

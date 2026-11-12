@@ -1436,11 +1436,12 @@ TEST(FloorLine, CarriesTheDecisionAndTheScansCountsInItsFormat)
   // r2 txt:L37,L43 and E4.2. Historical schema-1 field meanings are not reused.
   Rows rows = fixtureRows(handRows(), Eigen::Vector3d(1.0, 0.0, 0.0).asDiagonal());
   fast_lio::FloorScanRecord record;
+  record.scan = fast_lio::scanFloorMode(FloorMode::kApply, true);
   fast_lio::floorStep(
     FloorMode::kApply, rows.h_x, rows.h, rows.weights, rows.covariances, unitMargin(), kRidge, record);
   const auto stamp = INT64_C(1234567890123456789);
   const std::string line =
-    fast_lio::floorLine(1234.5, stamp, FloorMode::kApply, record, Eigen::Vector3d::UnitX(), true);
+    fast_lio::floorLine(1234.5, stamp, FloorMode::kApply, record, 0, Eigen::Vector3d::UnitX(), true);
   for (const char * field : {"schema=2",
                              "rule=joint_row_v1",
                              "mode=apply",
@@ -1453,6 +1454,9 @@ TEST(FloorLine, CarriesTheDecisionAndTheScansCountsInItsFormat)
                              "points_without_covariance=0",
                              "invalid_iterations=0",
                              "projected=1",
+                             "effective_mode=apply",
+                             "mode_reason=configured",
+                             "no_wheel_scans=0",
                              "rank_m=3",
                              "rank_r=3",
                              "kappa=",
@@ -1490,9 +1494,72 @@ TEST(FloorLine, CarriesTheDecisionAndTheScansCountsInItsFormat)
     EXPECT_NE(line.find(field), std::string::npos) << field << " in " << line;
   }
   const std::string observed =
-    fast_lio::floorLine(1234.5, stamp, FloorMode::kObserve, record, Eigen::Vector3d::UnitX(), true);
+    fast_lio::floorLine(1234.5, stamp, FloorMode::kObserve, record, 0, Eigen::Vector3d::UnitX(), true);
   EXPECT_EQ(observed.find(" d_t="), std::string::npos);
   EXPECT_EQ(observed.find(" d_r="), std::string::npos);
   EXPECT_EQ(observed.find(" shift_kind="), std::string::npos);
-  EXPECT_TRUE(fast_lio::floorLine(1234.5, stamp, FloorMode::kOff, record, Eigen::Vector3d::UnitX(), true).empty());
+  EXPECT_TRUE(fast_lio::floorLine(1234.5, stamp, FloorMode::kOff, record, 0, Eigen::Vector3d::UnitX(), true).empty());
+}
+
+TEST(ScanFloorMode, ApplyObservesOnAScanWithoutAWheelSpeedAndNothingElseReadsIt)
+{
+  using fast_lio::FloorModeReason;
+  const struct
+  {
+    FloorMode configured;
+    bool wheel_fit;
+    FloorMode mode;
+    FloorModeReason reason;
+  } table[] = {
+    {FloorMode::kApply, true, FloorMode::kApply, FloorModeReason::kConfigured},
+    {FloorMode::kApply, false, FloorMode::kObserve, FloorModeReason::kNoWheel},
+    {FloorMode::kObserve, true, FloorMode::kObserve, FloorModeReason::kConfigured},
+    {FloorMode::kObserve, false, FloorMode::kObserve, FloorModeReason::kConfigured},
+    {FloorMode::kOff, true, FloorMode::kOff, FloorModeReason::kConfigured},
+    {FloorMode::kOff, false, FloorMode::kOff, FloorModeReason::kConfigured},
+  };
+  for (const auto & row : table) {
+    SCOPED_TRACE(std::string(fast_lio::floorModeName(row.configured)) + (row.wheel_fit ? ", wheel fit" : ", none"));
+    const fast_lio::ScanFloorMode scan = fast_lio::scanFloorMode(row.configured, row.wheel_fit);
+    EXPECT_EQ(scan.mode, row.mode);
+    EXPECT_EQ(scan.reason, row.reason);
+  }
+}
+
+TEST(FloorLine, AnApplyScanWithoutAWheelSpeedReportsTheObserveDecisionAndShiftsNothing)
+{
+  // The scan observes: its line is the observe line of the same rows, apart from the configured mode, the reason,
+  // the count and the apply-only shift fields, which say no shift was made.
+  const auto stamp = INT64_C(1234567890123456789);
+  const auto lineOf = [stamp](FloorMode configured, bool wheel_fit, long no_wheel_scans) {
+    Rows rows = fixtureRows(handRows(), Eigen::Vector3d(1.0, 0.0, 0.0).asDiagonal());
+    fast_lio::FloorScanRecord record;
+    record.scan = fast_lio::scanFloorMode(configured, wheel_fit);
+    fast_lio::floorStep(
+      record.scan.mode, rows.h_x, rows.h, rows.weights, rows.covariances, unitMargin(), kRidge, record);
+    return fast_lio::floorLine(1234.5, stamp, configured, record, no_wheel_scans, Eigen::Vector3d::UnitX(), true);
+  };
+  const std::string applied = lineOf(FloorMode::kApply, true, 0);
+  ASSERT_NE(applied.find(" projected=1 "), std::string::npos) << applied;  // the rows do lose a direction
+  std::string downgraded = lineOf(FloorMode::kApply, false, 3);
+  for (const char * field : {" mode=apply ",
+                             " projected=0 ",
+                             " effective_mode=observe ",
+                             " mode_reason=no_wheel ",
+                             " no_wheel_scans=3 ",
+                             " shift_kind=joint_schur shift_coords_valid=0 d_t=[nan nan nan] d_r=[nan nan nan] "
+                             "dh_norm=0"}) {
+    EXPECT_NE(downgraded.find(field), std::string::npos) << field << " in " << downgraded;
+  }
+  const auto replace = [](std::string & text, const std::string & from, const std::string & to) {
+    const auto at = text.find(from);
+    ASSERT_NE(at, std::string::npos) << from;
+    text.replace(at, from.size(), to);
+  };
+  replace(downgraded, " mode=apply ", " mode=observe ");
+  replace(downgraded, " mode_reason=no_wheel no_wheel_scans=3 ", " mode_reason=configured no_wheel_scans=0 ");
+  const auto shift = downgraded.find(" shift_kind=");
+  ASSERT_NE(shift, std::string::npos);
+  downgraded.erase(shift);
+  EXPECT_EQ(downgraded, lineOf(FloorMode::kObserve, false, 0));
 }

@@ -84,6 +84,7 @@ with position rows and rotation columns. The row units are `normal_equivalent`. 
 | --- | --- |
 | `schema rule mode t stamp_ns evaluation_iter` | Identity, scan end and last H-model iteration that evaluated the floor |
 | `valid reason projected` | Decision validity, failure reason and actual application |
+| `effective_mode mode_reason no_wheel_scans` | The scan's own mode and why, and the scans since start that observed for want of a wheel speed |
 | `points points_without_covariance iterations invalid_iterations` | Row and per-scan evaluation counts |
 | `rank_m rank_r kappa sigma_rel z a m_definition units` | Supports, model constants and exact Schur identity |
 | `M M_ridge S0 lambda tau g_gen K F_sym transform_kind` | Full decision, with F_sym in the symmetric M0-root basis |
@@ -93,8 +94,12 @@ with position rows and rotation columns. The row units are `normal_equivalent`. 
 | `shift_kind shift_coords_valid d_t d_r dh_norm` | Apply-only joint-shift diagnostics and actual removed residual norm |
 
 Observe computes the same candidate decision and keep blocks while preserving H and h byte for byte. It omits
-all shift fields. Off emits no FLOOR line. Invalid numerical fields are nan and invalid tau/g_gen arrays are
-empty. Successfully computed M0 and S0 remain available when apply is invalid, so rD_valid is independent of valid.
+all shift fields. Apply projects only on a scan whose wheel update finds a speed (`fast_lio::scanFloorMode`); any
+other scan observes, `effective_mode=observe mode_reason=no_wheel`, and keeps the shift fields of `mode=apply` with
+`shift_coords_valid=0`, nan d arrays and `dh_norm=0`. The pipeline fixture has no wheel stream: its apply scenario
+tells the scan path every scan has a speed (`overrideScanWheelFit`). Off emits no FLOOR line. Invalid numerical
+fields are nan and invalid tau/g_gen arrays are empty. Successfully computed M0 and S0 remain available when apply
+is invalid, so rD_valid is independent of valid.
 The zero-floor fast path has K=M0, zero tau and unit gains, with spectrum length rank_m. Coordinate overflow marks
 both d arrays nan without rejecting a finite row update. Other invalid applies keep dh_norm zero and commit no rows.
 

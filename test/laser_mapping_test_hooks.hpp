@@ -50,6 +50,9 @@ extern std::function<int(double)> overrideGuardDegraded;
 extern std::function<void(double, AnchorFixtureState &)> beforeAnchorStep;
 /// Scan end time -> true to trip the runaway watchdog this scan (reason: wheel).
 extern std::function<bool(double)> forceRunawayTrip;
+/// Scan end time -> whether the scan's wheel update finds a speed, in place of the ring's answer: what an applying
+/// normal-noise floor asks before the lidar update (fast_lio::scanFloorMode).
+extern std::function<bool(double)> overrideScanWheelFit;
 /// Scan end time -> true to hand the normal initial map build of that scan only points the map backend skips
 /// (non-finite coordinates): the build runs and leaves the backend empty.
 extern std::function<bool(double)> initialBuildTakesNoPoint;
@@ -125,6 +128,7 @@ struct HModelExit
   // The normal-noise floor's decision of the scan's last evaluation that ran it; neutral (1, 0, 1, 0, 0) while the
   // floor is off.
   bool degeneracy_engaged = false;                 ///< the floor's projection changed this call's rows
+  bool degeneracy_no_wheel = false;                ///< apply, observing on this scan: its wheel update finds no speed
   double degeneracy_shares[3] = {0.0, 0.0, 0.0};   ///< M_eff's eigenvalues over the rows, ascending (1 undecided)
   double degeneracy_lambdas[3] = {0.0, 0.0, 0.0};  ///< M_eff's eigenvalues
   double degeneracy_weights[3] = {0.0, 0.0, 0.0};  ///< the keep gain per direction

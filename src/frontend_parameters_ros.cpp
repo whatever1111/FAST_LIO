@@ -202,6 +202,7 @@ void FrontendParameters::declareHoleToLostRecovery(rclcpp::Node & node)
   declareOnly(node, recovery.reanchor_recovery_entry_view);
   declareValue(node, recovery.lost_recovery_en);
   declareValue(node, recovery.lost_recovery_stable_sec);
+  declareValue(node, recovery.lost_recovery_relevel_en);
 }
 
 void FrontendParameters::declareActivation(rclcpp::Node & node,
@@ -737,9 +738,16 @@ void FrontendParameters::loadLostRecovery(const rclcpp::Node & node,
       "lost_recovery_stable_sec must be finite and positive (representable in ns); "
       "lost_recovery_en=true requires reanchor_total_timeout_sec > 0");
   }
+  values_.lost_recovery_relevel_en = node.get_parameter(recovery.lost_recovery_relevel_en.name).as_bool();
+  if (values_.lost_recovery_relevel_en && !enabled) {
+    throw std::invalid_argument(
+      "lost_recovery_relevel_en=true requires lost_recovery_en=true "
+      "(only then is a rebuilt map the one a new coordinate epoch is committed on)");
+  }
 #ifdef FASTLIO_TEST_HOOKS
   locals_for_test_.value("lost_recovery_en", enabled);
   locals_for_test_.value("lost_recovery_stable_sec", stable_s);
+  locals_for_test_.value("lost_recovery_relevel_en", values_.lost_recovery_relevel_en);
 #endif
 }
 

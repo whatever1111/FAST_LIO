@@ -75,5 +75,6 @@ struct RecoveryParameterSpecs
   const ParameterSpec<std::string> input_epoch_on_fault{"input_epoch_on_fault", "hold", std::string("hold")};
   const DeclaredValueSpec<bool> lost_recovery_en{"lost_recovery_en", false, true};
   const DeclaredValueSpec<double> lost_recovery_stable_sec{"lost_recovery_stable_sec", 2.0, true};
+  const DeclaredValueSpec<bool> lost_recovery_relevel_en{"lost_recovery_relevel_en", false, true};
 };
 }  // namespace fast_lio

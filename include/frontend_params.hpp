@@ -205,6 +205,9 @@ struct FrontendParams
   // A pending recovery is qualified against the map it began with, iVox's entry view, and its scans keep going into
   // the map; off, the map stays frozen until the recovery ends.
   bool reanchor_recovery_entry_view = false;
+  // A local-map rebuild that founds a new coordinate epoch (lost_recovery_en) first levels the pose it seeds the map
+  // from (rebuild_relevel.hpp); off, the map is seeded from the pose as it stands, tilt included.
+  bool lost_recovery_relevel_en = false;
   // Runaway watchdog: the guard and the re-anchor gate both key off the scan, and
   // the worst drift keeps the scan looking healthy — the map is rebuilt around
   // the wrong pose every frame, so correspondences and residuals stay good while

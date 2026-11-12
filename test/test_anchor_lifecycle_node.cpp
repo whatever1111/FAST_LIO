@@ -33,6 +33,7 @@
 #include <rclcpp/serialization.hpp>
 #include <rclcpp_components/node_factory.hpp>
 
+#include <Eigen/Geometry>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 
@@ -41,6 +42,7 @@
 #include <chrono>
 #include <class_loader/class_loader.hpp>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -58,12 +60,14 @@
 #include <rcl/error_handling.h>
 #include <rcl/timer.h>
 #include <rcl/wait.h>
+#include <rcutils/logging.h>
 #include <set>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <thread>
 #include <type_traits>
 #include <unistd.h>
 #include <utility>
@@ -203,6 +207,9 @@ struct Step
   int repeat = 0;
   bool no_build_point = false;  // a normal initial map build on this scan is handed only points the backend skips
   bool reset_before_reference = false;  // schedule the same production map-reset owner before normal Build
+  // The body-frame direction of the specific force the IMU reports during this scan (unit; its size stays kGravity):
+  // a lean the front end's attitude does not share, as a tilt held in the map shows against the accelerometer.
+  std::array<double, 3> force_up = {0.0, 0.0, 1.0};
 };
 
 struct Relocalization
@@ -574,6 +581,13 @@ Scenario natural(bool trace)
 // The child: one component activation, one scenario
 // ---------------------------------------------------------------------------
 
+// The tag of the line a rebuild's relevel logs (rebuild_relevel.hpp); the child keeps such lines with the trace.
+constexpr char kRelevelTag[] = "[RELEVEL]";
+
+class ScenarioRunner;
+ScenarioRunner * g_logging_runner = nullptr;                        // the runner that keeps the tagged lines
+rcutils_logging_output_handler_t g_previous_log_handler = nullptr;  // the handler every line is handed on to
+
 class ScenarioRunner
 {
 public:
@@ -764,8 +778,36 @@ private:
     writeAll(fd, text.data(), text.size());
   }
 
+  // A line the node logs under kRelevelTag from the thread that runs its scan path joins the trace lines, in order;
+  // every line still reaches the handler rclcpp installed.
+  static void captureLoggedLine(const rcutils_log_location_t * location,
+                                int severity,
+                                const char * name,
+                                rcutils_time_point_value_t timestamp,
+                                const char * format,
+                                va_list * args)
+  {
+    ScenarioRunner * runner = g_logging_runner;
+    if (runner != nullptr && format != nullptr && std::strncmp(format, kRelevelTag, sizeof(kRelevelTag) - 1) == 0 &&
+        std::this_thread::get_id() == runner->logging_thread_) {
+      va_list copy;
+      va_copy(copy, *args);
+      char text[512];
+      const int length = std::vsnprintf(text, sizeof(text), format, copy);
+      va_end(copy);
+      runner->lines_.push_back(length < 0 ? std::string("<unformattable>") : std::string(text));
+      runner->line_input_ns_.push_back(runner->newest_imu_ns_);
+    }
+    if (g_previous_log_handler != nullptr)
+      g_previous_log_handler(location, severity, name, timestamp, format, args);
+  }
+
   void installHooks()
   {
+    logging_thread_ = std::this_thread::get_id();
+    g_logging_runner = this;
+    g_previous_log_handler = rcutils_logging_get_output_handler();
+    rcutils_logging_set_output_handler(captureLoggedLine);
     fast_lio_test::overrideGuardDegraded = [this](double end) {
       const Step * s = stepAt(end);
       return s == nullptr ? static_cast<int>(Guard::kHealthy) : static_cast<int>(s->guard);
@@ -924,6 +966,11 @@ private:
     fast_lio_test::afterPriorMapReset = {};
     fast_lio_test::afterRecoveryViewMatch = {};
     fast_lio_test::afterMapInsertion = {};
+    if (g_logging_runner != nullptr) {
+      rcutils_logging_set_output_handler(g_previous_log_handler);
+      g_logging_runner = nullptr;
+      g_previous_log_handler = nullptr;
+    }
   }
 
   const Step * stepAt(double end) const
@@ -940,6 +987,14 @@ private:
     if (it == step_by_scan_.end() || it->second < 0)
       return Imu::kStatic;
     return scenario_.steps[static_cast<std::size_t>(it->second)].imu;
+  }
+
+  std::array<double, 3> forceUpForScan(int scan) const
+  {
+    const auto it = step_by_scan_.find(scan);
+    if (it == step_by_scan_.end() || it->second < 0)
+      return {0.0, 0.0, 1.0};
+    return scenario_.steps[static_cast<std::size_t>(it->second)].force_up;
   }
 
   double scanStart(int scan) const { return kFirstScan + kScanPeriod * scan; }
@@ -960,11 +1015,13 @@ private:
     return false;
   }
 
-  void publishImu(std::int64_t stamp_ns, double yaw_rate)
+  void publishImu(std::int64_t stamp_ns, double yaw_rate, const std::array<double, 3> & up = {0.0, 0.0, 1.0})
   {
     sensor_msgs::msg::Imu message;
     message.header.stamp = rclcpp::Time(stamp_ns);
-    message.linear_acceleration.z = kGravity;
+    message.linear_acceleration.x = kGravity * up[0];
+    message.linear_acceleration.y = kGravity * up[1];
+    message.linear_acceleration.z = kGravity * up[2];
     message.angular_velocity.z = yaw_rate;
     newest_imu_ns_ = std::max(newest_imu_ns_, stamp_ns);
     imu_->publish(message);
@@ -1005,7 +1062,7 @@ private:
     double yaw_rate = pattern == Imu::kMoving ? kMovingYawRate : 0.0;
     if (bad_imu_scan_ == scan && t > scanEnd(scan) - 0.004 && t <= scanEnd(scan))
       yaw_rate = std::numeric_limits<double>::quiet_NaN();
-    publishImu(stamp_ns, yaw_rate);
+    publishImu(stamp_ns, yaw_rate, forceUpForScan(scan));
   }
 
   void sendLidar(double start, Cloud kind = Cloud::kDense)
@@ -1524,6 +1581,7 @@ private:
   std::map<std::uint64_t, ImuBatch> batch_by_seq_;  // by scan_seq of the record that settled it
   std::vector<Observation> observations_;
   std::vector<std::string> lines_;
+  std::thread::id logging_thread_;  // the thread that runs the node's scan path
   std::int64_t next_imu_ns_ = kImuFirstNs;
   int scan_ = 0;
   int relocalizations_sent_ = 0;
@@ -6658,6 +6716,35 @@ TEST(AnchorLifecycleReference, LostRequiredPriorStopsLocalizationButRetainedAndO
         EXPECT_TRUE(result.observations.back().record.map_updated);
     }
   }
+  // With LOST recovery and its relevel on, the pinned prior still defines the frame: the rebuild re-seeds onto it as
+  // the frame stands, every scan the same as with the relevel off (the rebuilt scan's gravity cells and attitude
+  // included), and nothing is relevelled.
+  const auto pinned_prior = [](bool relevel) {
+    Scenario scenario = withReference(resetRebuildsNoMap(false, true));
+    scenario.name += relevel ? "_relevel_on" : "_relevel_off";
+    setParam(scenario, rclcpp::Parameter("prior_map_pcd", priorMapPath()));
+    setParam(scenario, rclcpp::Parameter("prior_map_align", "as_delivered"));
+    setParam(scenario, rclcpp::Parameter("prior_map_pinned", true));
+    setParam(scenario, rclcpp::Parameter("prior_map_freeze", true));
+    setParam(scenario, rclcpp::Parameter("lost_recovery_en", true));
+    setParam(scenario, rclcpp::Parameter("lost_recovery_relevel_en", relevel));
+    for (auto & step : scenario.steps)
+      if (step.phase == Phase::kEvent)
+        step.pos = {0.0, 0.0, 0.0};
+    return runScenario(scenario);
+  };
+  const auto on = pinned_prior(true);
+  const auto off = pinned_prior(false);
+  ASSERT_TRUE(on.ok()) << on.describe();
+  ASSERT_TRUE(off.ok()) << off.describe();
+  const auto reset = std::find_if(on.observations.begin(), on.observations.end(), [](const Observation & o) {
+    return hasEvent(o, fast_lio::kAnchorEventMapReset);
+  });
+  ASSERT_NE(reset, on.observations.end());
+  EXPECT_GT(reset->retained_prior_voxels, 0u);
+  EXPECT_TRUE(reset->odom_seen);
+  expectSameRun(on, off, "pinned prior, relevel on");
+  EXPECT_TRUE(linesTagged(on, kRelevelTag).empty());
 }
 
 TEST(AnchorLifecycleReference, BuildPublishesEstablishedWithoutPoseAndKeepsEmptyBuildsCold)
@@ -7311,4 +7398,240 @@ TEST(AnchorLifecycleLostRecovery, LostRecoveryDroppedScanMustEarnANewStableRun)
     EXPECT_EQ(after[1]->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
     expectEpochCommit(result, 2);
   }
+}
+
+// ---- The relevel of a rebuild that founds a new coordinate epoch (rebuild_relevel.hpp) --------------------------
+
+namespace
+{
+constexpr double kRelevelLean = 3.0 * M_PI / 180.0;  // rad, a lean the IMU reports and the map does not have
+constexpr double kRelevelLegSpeed = 0.5;             // m/s, legs walking: the window is no reference
+constexpr int kRelevelParkedScans = 15;  // the 1 s window, the scan before it and the 0.35 s edge window of that one
+
+// The up the IMU reports, leaned by `angle` about a horizontal body axis.
+std::array<double, 3> leanedUp(double angle, const Eigen::Vector3d & axis)
+{
+  const Eigen::Vector3d up = Eigen::AngleAxisd(angle, axis.normalized()) * Eigen::Vector3d::UnitZ();
+  return {up.x(), up.y(), up.z()};
+}
+
+Eigen::Vector3d vectorOf(const std::array<double, 3> & value)
+{
+  return Eigen::Vector3d(value[0], value[1], value[2]);
+}
+
+Eigen::Matrix3d attitudeOf(const Observation & o)
+{
+  return Eigen::Quaterniond(o.odom_q[0], o.odom_q[1], o.odom_q[2], o.odom_q[3]).toRotationMatrix();
+}
+
+// The gravity state the scan published (world frame, m/s²).
+Eigen::Vector3d gravityOf(const Observation & o)
+{
+  return Eigen::Vector3d(o.odom_twist_cov[2], o.odom_twist_cov[3], o.odom_twist_cov[4]);
+}
+
+double angleBetween(const Eigen::Vector3d & a, const Eigen::Vector3d & b)
+{
+  return std::atan2(a.cross(b).norm(), a.dot(b));
+}
+
+// A slot the levelling window reads: a wheel sample 10 ms before the scan end, the legs parked or walking at
+// `leg_speed`, the IMU still and reporting `up`.
+Step windowSlot(Phase phase, Guard guard, double leg_speed, const std::array<double, 3> & up)
+{
+  Step s = wheelSlot(phase, leg_speed, 0.01);
+  s.guard = guard;
+  s.force_up = up;
+  return s;
+}
+
+// The M20's levelling window: 1 s, leg edges, the window-mean linear acceleration taken off. With one wheel sample a
+// slot, a 0.35 s edge window holds the three samples an edge needs.
+void withLevellingWindow(Scenario & scenario, bool relevel)
+{
+  setParam(scenario, rclcpp::Parameter("lost_recovery_relevel_en", relevel));
+  setParam(scenario, rclcpp::Parameter("wheel_topic", kWheelTopic));
+  setParam(scenario, rclcpp::Parameter("gravity_align_en", true));
+  setParam(scenario, rclcpp::Parameter("gravity_align_window_s", 1.0));
+  setParam(scenario, rclcpp::Parameter("gravity_align_lin_accel_comp", true));
+  setParam(scenario, rclcpp::Parameter("gravity_align_leg_edge_window_s", 0.35));
+}
+
+// The deadline LOST of lostEpochScenario(false), read by the levelling window: from the degraded stretch on, the legs
+// are parked (or walk at `leg_speed`) and the IMU reports `up`. The rebuild is LOST_RECOVERY's, on the first healthy
+// scan after the latch.
+Scenario relevelAfterDeadline(bool relevel, double leg_speed, const std::array<double, 3> & up)
+{
+  auto scenario = lostEpochScenario(false);
+  scenario.name =
+    std::string("relevel_deadline_") + (leg_speed > 0.0 ? "walking" : "parked") + (relevel ? "_on" : "_off");
+  withLevellingWindow(scenario, relevel);
+  for (auto & step : scenario.steps)
+    if (step.phase != Phase::kBefore)
+      step = windowSlot(step.phase, step.guard, leg_speed, up);
+  return scenario;
+}
+
+// The map-reset LOST of lostEpochScenario(true) after a parked stretch the levelling window covers: the moving scans
+// turn the body about the vertical, then the legs are parked and the IMU reports `up`. The rebuild is RUNAWAY's, on
+// the tripped scan.
+Scenario relevelOnTrip(bool relevel, const std::array<double, 3> & up)
+{
+  auto scenario = lostEpochScenario(true);
+  scenario.name = std::string("relevel_trip") + (relevel ? "_on" : "_off");
+  withLevellingWindow(scenario, relevel);
+  scenario.steps.clear();
+  append(scenario, 5, slot(Phase::kBefore, Imu::kMoving));
+  append(scenario, kRelevelParkedScans, windowSlot(Phase::kBefore, Guard::kHealthy, 0.0, up));
+  Step trip = windowSlot(Phase::kEvent, Guard::kHealthy, 0.0, up);
+  trip.trip = true;
+  scenario.steps.push_back(trip);
+  append(scenario, 20, windowSlot(Phase::kAfter, Guard::kHealthy, 0.0, up));
+  return scenario;
+}
+
+// The one scan of a run that rebuilt the map; nullptr for none or more than one.
+const Observation * rebuiltOn(const ChildResult & r)
+{
+  const Observation * rebuilt = nullptr;
+  for (const auto & o : r.observations) {
+    if (!hasEvent(o, fast_lio::kAnchorEventMapReset))
+      continue;
+    if (rebuilt != nullptr)
+      return nullptr;
+    rebuilt = &o;
+  }
+  return rebuilt;
+}
+
+// The relevel acts on the rebuild alone: up to the rebuilt scan the run with it on is the run with it off, bit for
+// bit, and the rebuilt scan is published at the same position.
+void expectSameUpToTheRebuild(const ChildResult & on,
+                              const ChildResult & off,
+                              const Observation & rebuilt_on,
+                              const Observation & rebuilt_off)
+{
+  ASSERT_EQ(rebuilt_on.record.scan_seq, rebuilt_off.record.scan_seq);
+  for (std::size_t i = 0; i < on.observations.size() && i < off.observations.size(); ++i) {
+    if (on.observations[i].record.scan_seq >= rebuilt_on.record.scan_seq)
+      break;
+    std::string why;
+    EXPECT_TRUE(sameObservation(on.observations[i], off.observations[i], &why)) << "scan " << i << ": " << why;
+  }
+  ASSERT_TRUE(rebuilt_on.odom_seen && rebuilt_off.odom_seen);
+  for (int axis = 0; axis < 3; ++axis)
+    EXPECT_TRUE(sameBits(rebuilt_on.odom_p[axis], rebuilt_off.odom_p[axis])) << "axis " << axis;
+}
+
+// The gravity state of a relevelled scan is vertical, at the length it had.
+void expectVerticalGravity(const Observation & rebuilt_on, const Observation & rebuilt_off)
+{
+  const Eigen::Vector3d g = gravityOf(rebuilt_on);
+  EXPECT_EQ(g.x(), 0.0);
+  EXPECT_EQ(g.y(), 0.0);
+  EXPECT_NEAR(g.z(), -gravityOf(rebuilt_off).norm(), 1e-12);
+}
+
+// The relevel's one log line: its source and its tag, and the angle it reports (deg).
+double relevelLogAngle(const ChildResult & on, const std::string & source, const std::string & tag)
+{
+  const auto lines = linesTagged(on, kRelevelTag);
+  EXPECT_EQ(lines.size(), 1u);
+  if (lines.empty())
+    return std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(valueOf(lines.front(), "source"), source) << lines.front();
+  EXPECT_EQ(valueOf(lines.front(), "tag"), tag) << lines.front();
+  const std::string angle = valueOf(lines.front(), "angle_deg");
+  return angle == "<missing>" ? std::numeric_limits<double>::quiet_NaN() : std::stod(angle);
+}
+}  // namespace
+
+// Parked at both edges of the window, the rebuild levels the attitude onto the window's vertical: the frame turns
+// about the current position, the gravity state is set vertical, and the new epoch commits on the levelled map.
+TEST(AnchorLifecycleLostRecovery, LostRecoveryRebuildLevelsTheNewMapFromAParkedWindow)
+{
+  const auto up = leanedUp(kRelevelLean, Eigen::Vector3d::UnitX());
+  const auto on = runScenario(relevelAfterDeadline(true, 0.0, up));
+  const auto off = runScenario(relevelAfterDeadline(false, 0.0, up));
+  SCOPED_TRACE(describeRun(on));
+  ASSERT_TRUE(on.ok());
+  ASSERT_TRUE(off.ok()) << off.describe();
+  const Observation * rebuilt = rebuiltOn(on);
+  const Observation * as_found = rebuiltOn(off);
+  ASSERT_NE(rebuilt, nullptr);
+  ASSERT_NE(as_found, nullptr);
+  expectSameUpToTheRebuild(on, off, *rebuilt, *as_found);
+  const double logged = relevelLogAngle(on, "window", "LOST_RECOVERY");
+  EXPECT_TRUE(linesTagged(off, kRelevelTag).empty());
+  // As the rebuild found the frame, the IMU's vertical is off +Z by about the lean; the rebuilt scan has it on +Z.
+  const Eigen::Vector3d u = vectorOf(up);
+  const double tilt = angleBetween(attitudeOf(*as_found) * u, Eigen::Vector3d::UnitZ());
+  EXPECT_GT(tilt, 0.5 * kRelevelLean);
+  EXPECT_LT(angleBetween(attitudeOf(*rebuilt) * u, Eigen::Vector3d::UnitZ()), 1e-4);
+  EXPECT_NEAR(logged, tilt * 180.0 / M_PI, 2e-3);
+  expectVerticalGravity(*rebuilt, *as_found);
+  expectEpochCommit(on, 2);
+}
+
+// Walking, the window is no reference: the rebuild levels onto the gravity state alone. The attitude the gravity state
+// levels, FromTwoVectors(ĝ, −Z)·R, is what the rebuilt scan publishes, and the window's vertical, which differs from
+// the gravity state's, does not enter it.
+TEST(AnchorLifecycleLostRecovery, LostRecoveryRebuildWhileMovingOnlyUsesTheGravityState)
+{
+  const auto up = leanedUp(kRelevelLean, Eigen::Vector3d::UnitX());
+  const auto on = runScenario(relevelAfterDeadline(true, kRelevelLegSpeed, up));
+  const auto off = runScenario(relevelAfterDeadline(false, kRelevelLegSpeed, up));
+  SCOPED_TRACE(describeRun(on));
+  ASSERT_TRUE(on.ok());
+  ASSERT_TRUE(off.ok()) << off.describe();
+  const Observation * rebuilt = rebuiltOn(on);
+  const Observation * as_found = rebuiltOn(off);
+  ASSERT_NE(rebuilt, nullptr);
+  ASSERT_NE(as_found, nullptr);
+  expectSameUpToTheRebuild(on, off, *rebuilt, *as_found);
+  const double logged = relevelLogAngle(on, "gravity", "LOST_RECOVERY");
+  EXPECT_TRUE(linesTagged(off, kRelevelTag).empty());
+  const Eigen::Vector3d g = gravityOf(*as_found);
+  const double lean = angleBetween(-g, Eigen::Vector3d::UnitZ());
+  EXPECT_GT(lean, 1e-4) << "the gravity state never leaned: the turn would be the identity";
+  const Eigen::Matrix3d levelled =
+    Eigen::Quaterniond::FromTwoVectors(g, -Eigen::Vector3d::UnitZ()).toRotationMatrix() * attitudeOf(*as_found);
+  EXPECT_LT((attitudeOf(*rebuilt) - levelled).norm(), 1e-9);
+  EXPECT_NEAR(logged, lean * 180.0 / M_PI, 1e-3);
+  // The window's vertical is the up the IMU reports: the legs walk at a constant speed, so the window takes no linear
+  // acceleration off. Levelled onto it, the attitude would be off the published one by the angle between the two.
+  const Eigen::Vector3d window_up = attitudeOf(*as_found) * vectorOf(up);
+  const Eigen::Matrix3d by_window =
+    Eigen::Quaterniond::FromTwoVectors(window_up, Eigen::Vector3d::UnitZ()).toRotationMatrix() * attitudeOf(*as_found);
+  EXPECT_GT((attitudeOf(*rebuilt) - by_window).norm(), 1e-4) << "the window agrees with the gravity state";
+  expectVerticalGravity(*rebuilt, *as_found);
+  expectEpochCommit(on, 2);
+}
+
+// The turn is about a horizontal axis: across the rebuild the attitude does not turn about the vertical, whatever
+// heading the moving scans gave it. On the RUNAWAY rebuild, with the lean about another body axis.
+TEST(AnchorLifecycleLostRecovery, LostRecoveryRebuildKeepsTheTurnAboutVertical)
+{
+  const auto up = leanedUp(kRelevelLean, Eigen::Vector3d(1.0, 1.0, 0.0));
+  const auto on = runScenario(relevelOnTrip(true, up));
+  const auto off = runScenario(relevelOnTrip(false, up));
+  SCOPED_TRACE(describeRun(on));
+  ASSERT_TRUE(on.ok());
+  ASSERT_TRUE(off.ok()) << off.describe();
+  const Observation * rebuilt = rebuiltOn(on);
+  const Observation * as_found = rebuiltOn(off);
+  ASSERT_NE(rebuilt, nullptr);
+  ASSERT_NE(as_found, nullptr);
+  expectSameUpToTheRebuild(on, off, *rebuilt, *as_found);
+  const double logged = relevelLogAngle(on, "window", "RUNAWAY");
+  EXPECT_TRUE(linesTagged(off, kRelevelTag).empty());
+  const Eigen::Matrix3d before = attitudeOf(*as_found);
+  const Eigen::Vector3d nose = before * Eigen::Vector3d::UnitX();
+  EXPECT_GT(std::abs(std::atan2(nose.y(), nose.x())), 0.05) << "the moving scans left no heading";
+  const Eigen::AngleAxisd turn(attitudeOf(*rebuilt) * before.transpose());
+  EXPECT_GT(turn.angle(), 0.5 * kRelevelLean);
+  EXPECT_LT(std::abs(turn.axis().z()), 1e-9);
+  EXPECT_NEAR(logged, turn.angle() * 180.0 / M_PI, 2e-3);
+  expectEpochCommit(on, 2);
 }

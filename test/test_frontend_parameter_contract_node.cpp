@@ -1388,6 +1388,20 @@ TEST(FrontendParameterContract, LostRecoveryRequiresHealthPublication)
   checkCase(c);
 }
 
+// The relevel levels the rebuilt map a new coordinate epoch is committed on, and only LOST recovery commits one: on
+// its own the node refuses it, and says which two parameters.
+TEST(FrontendParameterContract, LostRecoveryRelevelNeedsLostRecovery)
+{
+  ParameterCase c = overridesCase("lost_recovery_relevel_needs_lost_recovery", Expect::kRejected);
+  setOverride(c, rclcpp::Parameter("lost_recovery_relevel_en", true));
+  std::string record;
+  checkCase(c, &record);
+  EXPECT_NE(record.find("\noutcome threw std::invalid_argument: \"lost_recovery_relevel_en=true requires "
+                        "lost_recovery_en=true"),
+            std::string::npos)
+    << record;
+}
+
 TEST(FrontendParameterContract, NanImuBacklog)
 {
   ParameterCase c = overridesCase("nan_imu_backlog", Expect::kRejected);

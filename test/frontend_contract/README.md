@@ -129,9 +129,9 @@ with their counts.
   with `config/profiles/m20/fast_lio.yaml` (sha256
   `acc340c2346b0c979b47e31656310e05288a1e3c0a33b9e233d08f4334f6f10b`) by
   `python3 tools/offline_params.py --config-root config --profile m20 --out <dir>` (its `laser_mapping.yaml`, sha256
-  `28c12ac8cd52373eb9fba8f1d9a8925c4d9469313e3f23b035586884d539a6f7`). One line is added to that file:
-  `lost_recovery_en: true` after `reanchor_recovery_entry_view`, the value the M20 profile takes for LOST recovery;
-  sha256 `00445c3f27e3c69179e0199c616cd0b9902bfc4bc51590641169dd0b5663e5bf`.
+  `28c12ac8cd52373eb9fba8f1d9a8925c4d9469313e3f23b035586884d539a6f7`). Two lines are added to that file:
+  `lost_recovery_en: true` and `lost_recovery_relevel_en: true` after `reanchor_recovery_entry_view`, the values the
+  M20 profile takes for LOST recovery; sha256 `cd3079c5bff0a487245d9dd255ddb64622796872938b7a009630e23c696b1ff2`.
 - `giant_allpoint_laser_mapping.yaml`, `giant_laser_mapping.yaml`, `giant_hesai_fp_laser_mapping.yaml`,
   `m20_bodyimu_laser_mapping.yaml`: the parent repository's other merged profiles, made by the same command with
   `--profile <name>` at LIO-SLAM commit `849299d59cddebb94048e1d01bb308557d38d0f5` from `config/fast_lio.base.yaml`

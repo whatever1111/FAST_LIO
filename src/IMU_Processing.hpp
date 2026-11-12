@@ -87,6 +87,9 @@ class ImuProcess
   std::uint64_t staleOutputReuseCount() const { return stale_output_reuse_count_; }
   const V3D & lastDeskewAcceleration() const { return acc_s_last; }
   const V3D & lastDeskewAngularVelocity() const { return angvel_last; }
+  /// The estimate's world frame was turned by L (rebuild_relevel.hpp). The world-frame acceleration the next scan's
+  /// integration starts from turns with it, so the body-frame specific force it stands for stays.
+  void rotateWorld(const M3D & L) { acc_s_last = L * acc_s_last; }
   fast_lio::ImuCoverageParams coverage_params;
   fast_lio::ImuCoverageResult coverage_result;
   // IMU-gap prior (imu_gap_prior.hpp): intervals longer than gap_params.min_gap_s inside the coverage limit are

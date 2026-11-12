@@ -124,6 +124,7 @@
 #include "preprocess.h"
 #include "prior_map_load.hpp"
 #include "reanchor_gate.hpp"
+#include "rebuild_relevel.hpp"
 #include "recovery_view_match.hpp"
 #include "reference_health_contract.hpp"
 #include "rp_consider.hpp"
@@ -4907,6 +4908,84 @@ private:
     return true;
   }
 
+  /// A rebuild seeds its map from the current pose, so the pose is levelled first (rebuild_relevel.hpp): onto the
+  /// levelling window when it is parked at both edges, else onto the gravity state. The window is the levelling
+  /// block's, read the way it reads it; it holds this scan only when the block ran on it.
+  void relevelRebuildFrame(const char * tag)
+  {
+    const fast_lio::FrontendParams & p = params_.values();
+    if (!fast_lio::relevelAllowed(p.lost_recovery_relevel_en,
+                                  lost_recovery_params.enabled,
+                                  ikdtree.pinnedVoxels() > 0,
+                                  recovery_state.reference_initialized_once))
+      return;
+    state_ikfom st = kf.get_x();
+    const M3D R = st.rot.toRotationMatrix();
+    fast_lio::LevellingWindowReference window;
+    if (p.gravity_align_en && p.gravity_align_window_s > 0.0 && !grav_win.empty() &&
+        grav_win.back().t == lidar_end_time) {
+      V3D force_sum = V3D::Zero();
+      int samples = 0;
+      double t_old = lidar_end_time;
+      bool overwritten = false;
+      for (const auto & a : grav_win) {
+        overwritten = overwritten || a.edge.velocity_overwritten;
+        if (a.n == 0)
+          continue;
+        force_sum += a.sum;
+        samples += a.n;
+        t_old = std::min(t_old, a.t);
+      }
+      const double g_raw = p_imu->gravity_norm();
+      fast_lio::LevellingWindowGates gates;
+      gates.window_s = p.gravity_align_window_s;
+      gates.accel_tol = p.gravity_align_accel_tol;
+      gates.magnitude_ref = p.gravity_align_mag_ref > 1e-3 ? p.gravity_align_mag_ref : g_raw;
+      gates.raw_per_mps2 = g_raw / G_m_s2;
+      gates.gravity = G_m_s2;
+      gates.lin_accel_comp = p.gravity_align_lin_accel_comp;
+      gates.leg_edges = p.gravity_align_lin_accel_source == "leg";
+      {
+        std::lock_guard<std::mutex> lk(mtx_twist);
+        gates.leg_stream_alive =
+          !gates.leg_edges || (last_twist_stamp > 0.0 && lidar_end_time - last_twist_stamp < 1.0);
+      }
+      gates.vel_sigma_scale = p.gravity_align_vel_sigma_scale;
+      gates.leg_vel_sigma = p.gravity_align_leg_vel_sigma;
+      gates.noise_static = p.gravity_align_noise_static;
+      window = fast_lio::levellingWindowReference(force_sum,
+                                                  samples,
+                                                  lidar_end_time - t_old + 0.1,
+                                                  grav_win.front().edge,
+                                                  grav_win.back().edge,
+                                                  overwritten,
+                                                  gates);
+    }
+    const fast_lio::RelevelPlan plan = fast_lio::planRelevel(R, V3D(st.grav[0], st.grav[1], st.grav[2]), window);
+    if (!plan.valid)
+      return;
+    Eigen::Matrix<double, 3, 2> B_old;
+    Eigen::Matrix<double, 3, 2> B_new;
+    st.grav.S2_Bx(B_old);
+    st.rot = SO3(M3D(plan.L * R));
+    st.vel = plan.L * st.vel;
+    st.grav = S2(0.0, 0.0, -1.0);  // vertical, at the state's own gravity length
+    st.grav.S2_Bx(B_new);
+    kf.change_x(st);
+    fast_lio::StateCovariance P = kf.get_P();
+    fast_lio::rotateWorldCovariance(P, plan.L, B_old, B_new);
+    if (plan.source == fast_lio::RelevelSource::kWindow)
+      fast_lio::assignGravityBlock(P, window.variance);
+    kf.change_P(P);
+    state_point = kf.get_x();
+    p_imu->rotateWorld(plan.L);
+    RCLCPP_WARN(this->get_logger(),
+                "[RELEVEL] source=%s angle_deg=%.3f tag=%s",
+                fast_lio::relevelSourceName(plan.source),
+                plan.angle * 180.0 / M_PI,
+                tag);
+  }
+
   // The production reset owner, shared verbatim by the late guards and the test-only scheduler.
   bool rebuildLocalMap(const char * tag)
   {
@@ -4931,6 +5010,7 @@ private:
     if (std::strcmp(tag, "TEST_PRE_REFERENCE") == 0)
       seed_scan_seq = 0;
 #endif
+    relevelRebuildFrame(tag);
     const bool kept_prior = rebuildLocalMapStorage(map_before, seed_scan_seq, admissionObserver());
     const auto prior =
       fast_lio::priorMapAfterReset(prior_map_installed_, kept_prior, params_.values().prior_map_freeze);

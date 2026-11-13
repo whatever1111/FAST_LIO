@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/attitude_hold_alone
-# fork_sha: 6336ad3102166184ba9bc7e4376bb8e4ba6e316d
+# fork_sha: f3a7e45e165bb50e8bc3bc2647f59f4f5fa56ef8
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -10,30 +10,30 @@ override lidar_attitude_hold_en type=bool value=true
 override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
 override mapping.extrinsic_T type=double_array value=[0,0,0]
 outcome constructed
-event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
-event.v1 typed_outputs declared=153 names_sha256=2ea6b8f17ef100433f2047577867e9f0985d22eefd59b7b0df0f2ac6604a3aa9
-event.v1 declare_back declared=240 names_sha256=a7a81db7a6971268060bb690d1a064e099c4e8aac0713022db002cbcb5f2c66d
-event.v1 lost_recovery_loaded declared=240 names_sha256=a7a81db7a6971268060bb690d1a064e099c4e8aac0713022db002cbcb5f2c66d
-event.v1 read_policies declared=240 names_sha256=a7a81db7a6971268060bb690d1a064e099c4e8aac0713022db002cbcb5f2c66d
+event.v1 declare_front declared=150 names_sha256=df2197af8d2c2d53e0ce280616476cfb7fc615317ec66c5e2ff54661f5575f79
+event.v1 typed_outputs declared=154 names_sha256=49f5bf3b444257665b9bf32c256d3715e7473f27e0d184dbeabc6c15f57c9134
+event.v1 declare_back declared=241 names_sha256=7794e15bd4468f94ab116cdc97365005c021914853a4f6e72c7614beb7ee4a76
+event.v1 lost_recovery_loaded declared=241 names_sha256=7794e15bd4468f94ab116cdc97365005c021914853a4f6e72c7614beb7ee4a76
+event.v1 read_policies declared=241 names_sha256=7794e15bd4468f94ab116cdc97365005c021914853a4f6e72c7614beb7ee4a76
 log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
-event.v1 anchor_gap_resolved declared=240 names_sha256=a7a81db7a6971268060bb690d1a064e099c4e8aac0713022db002cbcb5f2c66d
+event.v1 anchor_gap_resolved declared=241 names_sha256=7794e15bd4468f94ab116cdc97365005c021914853a4f6e72c7614beb7ee4a76
 log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
-event.v1 map_backend declared=244 names_sha256=e005c5c9098778c3a8adfd3718be6857df6719bea25b44bb73b5b84affc83f2a
+event.v1 map_backend declared=245 names_sha256=9809a9cb160aac7998078d2b0131989f46a456a69d4d35cf44cf2a36b88f00fa
 log INFO laser_mapping "p_pre->lidar_type 1"
-event.v1 read_inputs declared=244 names_sha256=e005c5c9098778c3a8adfd3718be6857df6719bea25b44bb73b5b84affc83f2a
-event.v1 filter_init declared=244 names_sha256=e005c5c9098778c3a8adfd3718be6857df6719bea25b44bb73b5b84affc83f2a
+event.v1 read_inputs declared=245 names_sha256=9809a9cb160aac7998078d2b0131989f46a456a69d4d35cf44cf2a36b88f00fa
+event.v1 filter_init declared=245 names_sha256=9809a9cb160aac7998078d2b0131989f46a456a69d4d35cf44cf2a36b88f00fa
 log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
 log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
-event.v1 subscriptions declared=244 names_sha256=e005c5c9098778c3a8adfd3718be6857df6719bea25b44bb73b5b84affc83f2a
-event.v1 cloud_publishers declared=244 names_sha256=e005c5c9098778c3a8adfd3718be6857df6719bea25b44bb73b5b84affc83f2a
-event.v1 odometry_publishers declared=248 names_sha256=89bbca35a0cec576550dd96a4964db6a14d6c549a60dad0dcabd1fbc7843015e
-event.v1 scan_timer declared=248 names_sha256=89bbca35a0cec576550dd96a4964db6a14d6c549a60dad0dcabd1fbc7843015e
-event.v1 map_timer declared=248 names_sha256=89bbca35a0cec576550dd96a4964db6a14d6c549a60dad0dcabd1fbc7843015e
+event.v1 subscriptions declared=245 names_sha256=9809a9cb160aac7998078d2b0131989f46a456a69d4d35cf44cf2a36b88f00fa
+event.v1 cloud_publishers declared=245 names_sha256=9809a9cb160aac7998078d2b0131989f46a456a69d4d35cf44cf2a36b88f00fa
+event.v1 odometry_publishers declared=249 names_sha256=e921f198a55935a7e20dcb12e096964295bc59987ec287a2c9ed87ee605273da
+event.v1 scan_timer declared=249 names_sha256=e921f198a55935a7e20dcb12e096964295bc59987ec287a2c9ed87ee605273da
+event.v1 map_timer declared=249 names_sha256=e921f198a55935a7e20dcb12e096964295bc59987ec287a2c9ed87ee605273da
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
-event.v1 config_id declared=248 names_sha256=89bbca35a0cec576550dd96a4964db6a14d6c549a60dad0dcabd1fbc7843015e
+event.v1 config_id declared=249 names_sha256=e921f198a55935a7e20dcb12e096964295bc59987ec287a2c9ed87ee605273da
 log INFO laser_mapping "Node init finished."
-event.v1 constructed declared=248 names_sha256=89bbca35a0cec576550dd96a4964db6a14d6c549a60dad0dcabd1fbc7843015e
-parameters 248
+event.v1 constructed declared=249 names_sha256=e921f198a55935a7e20dcb12e096964295bc59987ec287a2c9ed87ee605273da
+parameters 249
 param lidar_attitude_hold_en type=bool value=true read_only=0 descriptor_type=1
-effective.v1.count 314
+effective.v1.count 315
 effective.v1 lidar_attitude_hold_en bool 1

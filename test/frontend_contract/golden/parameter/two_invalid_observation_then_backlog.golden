@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/two_invalid_observation_then_backlog
-# fork_sha: 7603d5f6aaaa005a8624b8b8cd13da50591905bf
+# fork_sha: f3a7e45e165bb50e8bc3bc2647f59f4f5fa56ef8
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -11,4 +11,4 @@ override mapping.extrinsic_T type=double_array value=[0,0,0]
 override max_imu_backlog_sec type=double value=nan:0x7ff8000000000000
 override publish.frontend_observation type=bool value=true
 outcome threw std::invalid_argument: "frontend observation requires an explicit clock domain (1..48 bytes) and idle period 1ns..3600s"
-event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
+event.v1 declare_front declared=150 names_sha256=df2197af8d2c2d53e0ce280616476cfb7fc615317ec66c5e2ff54661f5575f79

@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/type_double_for_integer
-# fork_sha: 7603d5f6aaaa005a8624b8b8cd13da50591905bf
+# fork_sha: f3a7e45e165bb50e8bc3bc2647f59f4f5fa56ef8
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -10,5 +10,5 @@ override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
 override mapping.extrinsic_T type=double_array value=[0,0,0]
 override point_filter_num type=double value=2
 outcome threw rclcpp::exceptions::InvalidParameterTypeException: "parameter 'point_filter_num' has invalid type: Wrong parameter type, parameter {point_filter_num} is of type {integer}, setting it to {double} is not allowed."
-event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
-event.v1 typed_outputs declared=153 names_sha256=2ea6b8f17ef100433f2047577867e9f0985d22eefd59b7b0df0f2ac6604a3aa9
+event.v1 declare_front declared=150 names_sha256=df2197af8d2c2d53e0ce280616476cfb7fc615317ec66c5e2ff54661f5575f79
+event.v1 typed_outputs declared=154 names_sha256=49f5bf3b444257665b9bf32c256d3715e7473f27e0d184dbeabc6c15f57c9134

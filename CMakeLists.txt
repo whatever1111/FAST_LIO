@@ -579,6 +579,10 @@ ${sanitizer_tests}
       rosidl_target_interfaces(${timing_test} ${PROJECT_NAME} "rosidl_typesupport_cpp")
     endif()
   endforeach()
+  # Header only, no ROS: esekf::predict carries the covariance through the step's SO3 and S2 transport.
+  ament_add_gtest(test_predict_manifold_transport test/test_predict_manifold_transport.cpp)
+  target_include_directories(test_predict_manifold_transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(test_predict_manifold_transport Eigen3::Eigen)
   ament_add_pytest_test(test_analyze_kalman_channels
     test/test_analyze_kalman_channels.py
   )

@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/type_integer_for_double
-# fork_sha: 7603d5f6aaaa005a8624b8b8cd13da50591905bf
+# fork_sha: ecd75f2278c93b1d24fa1c57bd451470619a9311
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -10,5 +10,5 @@ override filter_size_map type=integer value=1
 override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
 override mapping.extrinsic_T type=double_array value=[0,0,0]
 outcome threw rclcpp::exceptions::InvalidParameterTypeException: "parameter 'filter_size_map' has invalid type: Wrong parameter type, parameter {filter_size_map} is of type {double}, setting it to {integer} is not allowed."
-event.v1 declare_front declared=149 names_sha256=69cfd640da707fbd52d8e0cc2ef4fd5f3a9475d210a1e8a638ffd9cdc2fea15f
-event.v1 typed_outputs declared=153 names_sha256=2ea6b8f17ef100433f2047577867e9f0985d22eefd59b7b0df0f2ac6604a3aa9
+event.v1 declare_front declared=150 names_sha256=57c21bf14f1f2405b8e498dc18086a16b5599514a3851e09b8526c04add31147
+event.v1 typed_outputs declared=154 names_sha256=a0ef66ae28b60819cd5156d7a53984a07d0636a2cfa77fa2c588e40539d7e12b

@@ -1,0 +1,15 @@
+# frontend contract golden: parameter/lost_recovery_relevel_needs_lost_recovery
+# fork_sha: ecd75f2278c93b1d24fa1c57bd451470619a9311
+# arch: x86_64
+# ros_distro: humble
+# build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
+case lost_recovery_relevel_needs_lost_recovery
+config overrides-only
+overrides 3
+override lost_recovery_relevel_en type=bool value=true
+override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
+override mapping.extrinsic_T type=double_array value=[0,0,0]
+outcome threw std::invalid_argument: "lost_recovery_relevel_en=true requires lost_recovery_en=true (only then is a rebuilt map the one a new coordinate epoch is committed on)"
+event.v1 declare_front declared=150 names_sha256=57c21bf14f1f2405b8e498dc18086a16b5599514a3851e09b8526c04add31147
+event.v1 typed_outputs declared=154 names_sha256=a0ef66ae28b60819cd5156d7a53984a07d0636a2cfa77fa2c588e40539d7e12b
+event.v1 declare_back declared=241 names_sha256=e6fdb287099517628f9e563a3305ffaed5ea41a9b74e2d46b4de0478025b6dff

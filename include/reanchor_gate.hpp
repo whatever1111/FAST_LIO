@@ -25,6 +25,12 @@
 // corrections, with a floor so that a very clean scene does not demand the
 // impossible.
 //
+// The divergence guard debounces its own verdict: it counts a scan whose far field collapsed (or whose
+// correspondences starved) at once, and declares the scene degraded only after a streak of them. The first scan of
+// such a stretch is therefore not degraded yet, but the guard has already called it bad, and a bad scan proves
+// nothing about the frozen map. With require_guard_clear the verification takes as evidence only scans the guard
+// counted nothing against.
+//
 // Pure C++. No ROS, no Eigen.
 
 #pragma once
@@ -163,15 +169,28 @@ struct ReanchorDecision
   bool just_lost = false;        ///< edge: verification timed out this scan
 };
 
+/// What one scan brings to the gate.
+struct ReanchorScan
+{
+  int effct = 0;          ///< effective correspondences of the match against the (still frozen) map
+  double res_mean = 0.0;  ///< m; their mean point-to-plane residual
+  double now = 0.0;       ///< s; the scan's time
+  /// The divergence guard counted nothing against this scan: no engulfment or starvation vote, whether or not a
+  /// streak of such votes has made the scene degraded.
+  bool guard_clear = true;
+  /// true: a verification scan must also be guard_clear (reanchor_require_guard_clear). The caller keeps this switch
+  /// with its other parameters and hands it over with every scan. false = the match alone decides.
+  bool require_guard_clear = false;
+};
+
 /// One scan of gate bookkeeping. `guard_degraded` is the divergence guard's own
-/// verdict (starvation / engulfment / velocity runaway); `effct` and `res_mean`
-/// describe the match this scan achieved against the (still frozen) map;
-/// `reference` is what healthy scans look like (only read by the relative tests).
+/// verdict (starvation / engulfment / velocity runaway); `scan` is the match this
+/// scan achieved against the (still frozen) map and whether the guard counted
+/// against it; `reference` is what healthy scans look like (only read by the
+/// relative tests).
 inline ReanchorDecision updateReanchorGate(ReanchorGate * gate,
                                            bool guard_degraded,
-                                           int effct,
-                                           double res_mean,
-                                           double now,
+                                           const ReanchorScan & scan,
                                            const ReanchorParams & params,
                                            const ReanchorReference & reference = ReanchorReference{})
 {
@@ -209,11 +228,14 @@ inline ReanchorDecision updateReanchorGate(ReanchorGate * gate,
       // frozen: this scan is the first piece of evidence, not a licence to grow.
       gate->state = ReanchorState::kVerifying;
       gate->ok_streak = 0;
-      gate->verify_start = now;
+      gate->verify_start = scan.now;
       [[fallthrough]];
 
     case ReanchorState::kVerifying: {
-      const bool match_ok = reanchorMatchOk(effct, res_mean, params, reference);
+      // Under require_guard_clear a scan the guard counted against is a failed match: it breaks the run, and the
+      // timeout runs on.
+      const bool match_ok = reanchorMatchOk(scan.effct, scan.res_mean, params, reference) &&
+                            (scan.guard_clear || !scan.require_guard_clear);
       gate->ok_streak = match_ok ? gate->ok_streak + 1 : 0;
       if (gate->ok_streak >= params.confirm_scans) {
         gate->state = ReanchorState::kHealthy;
@@ -224,8 +246,8 @@ inline ReanchorDecision updateReanchorGate(ReanchorGate * gate,
         break;  // trusted again from this scan on
       }
       // A clock that jumps backwards (bag restart) must not expire the window.
-      const bool timed_out = params.timeout_sec > 0.0 && gate->verify_start >= 0.0 && now >= gate->verify_start &&
-                             (now - gate->verify_start) > params.timeout_sec;
+      const bool timed_out = params.timeout_sec > 0.0 && gate->verify_start >= 0.0 && scan.now >= gate->verify_start &&
+                             (scan.now - gate->verify_start) > params.timeout_sec;
       if (timed_out) {
         gate->state = ReanchorState::kLost;
         gate->ok_streak = 0;
@@ -245,6 +267,18 @@ inline ReanchorDecision updateReanchorGate(ReanchorGate * gate,
       break;
   }
   return decision;
+}
+
+/// The same with the match as separate values and the guard's count left out: the match alone decides.
+inline ReanchorDecision updateReanchorGate(ReanchorGate * gate,
+                                           bool guard_degraded,
+                                           int effct,
+                                           double res_mean,
+                                           double now,
+                                           const ReanchorParams & params,
+                                           const ReanchorReference & reference = ReanchorReference{})
+{
+  return updateReanchorGate(gate, guard_degraded, ReanchorScan{effct, res_mean, now, true, false}, params, reference);
 }
 
 /// Declare the front end lost from outside the gate — the runaway watchdog sees

@@ -63,6 +63,7 @@ struct RecoveryParameterSpecs
   const ParameterSpec<double> reanchor_max_res_ratio{"reanchor_max_res_ratio", 0.0, 0.0};
   const ParameterSpec<double> reanchor_res_floor{"reanchor_res_floor", 0.04, 0.04};
   const ParameterSpec<double> reanchor_min_eff_ratio{"reanchor_min_eff_ratio", 0.0, 0.0};
+  const ParameterSpec<bool> reanchor_require_guard_clear{"reanchor_require_guard_clear", false, false};
   const ParameterSpec<int> reanchor_healthy_window{"reanchor_healthy_window", 100, 100};
   const ParameterSpec<double> reanchor_total_timeout_sec{"reanchor_total_timeout_sec", 0.0, 0.0};
   const ParameterSpec<double> reanchor_recovery_stable_sec{"reanchor_recovery_stable_sec", 1.0, 1.0};

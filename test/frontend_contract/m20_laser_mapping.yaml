@@ -137,6 +137,7 @@ laser_mapping:
     reanchor_confirm_scans: 3
     reanchor_timeout_sec: 5.0
     reanchor_on_fail: reset_map
+    reanchor_require_guard_clear: true
     reanchor_total_timeout_sec: 10.0
     reanchor_recovery_stable_sec: 1.0
     reanchor_recovery_entry_view: true

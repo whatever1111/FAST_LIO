@@ -4632,6 +4632,7 @@ private:
     record.value("reanchor_max_res_ratio", reanchor_params.max_res_ratio);
     record.value("reanchor_res_floor", reanchor_params.res_floor);
     record.value("reanchor_min_eff_ratio", reanchor_params.min_eff_ratio);
+    record.value("reanchor_require_guard_clear", params_.values().reanchor_require_guard_clear);
     record.value("reanchor_recovery_entry_view", params_.values().reanchor_recovery_entry_view);
     record.value("runaway_watchdog_en", params_.values().runaway.enabled);
     record.value("runaway_parked_speed_thresh", params_.values().runaway.parked_speed_thresh);
@@ -6552,13 +6553,11 @@ private:
         reanchor_reference.res_median = reanchor_healthy_res.median();
         reanchor_reference.eff_median = reanchor_healthy_eff.median();
       }
-      const auto reanchor = fast_lio::updateReanchorGate(&reanchor_gate,
-                                                         flio_in_degraded,
-                                                         effct_feat_num,
-                                                         res_mean_last,
-                                                         lidar_end_time,
-                                                         reanchor_params,
-                                                         reanchor_reference);
+      const bool guard_clear = consec_engulf == 0 && consec_low_eff == 0;  // no guard vote, latched or not
+      const fast_lio::ReanchorScan reanchor_scan{
+        effct_feat_num, res_mean_last, lidar_end_time, guard_clear, p.reanchor_require_guard_clear};
+      const auto reanchor = fast_lio::updateReanchorGate(
+        &reanchor_gate, flio_in_degraded, reanchor_scan, reanchor_params, reanchor_reference);
       if (!reanchor.degraded && !reanchor.just_reanchored && effct_feat_num >= reanchor_params.min_eff) {
         reanchor_healthy_res.push(res_mean_last);
         reanchor_healthy_eff.push(static_cast<double>(effct_feat_num));

@@ -152,6 +152,161 @@ TEST(ReanchorGate, DisabledGateReproducesThePreGateRelease)
   EXPECT_EQ(g.state, ReanchorState::kHealthy);
 }
 
+// ---- the guard's own count: a scan it has already called bad is no evidence ----
+
+namespace
+{
+/// A scan whose match against the frozen map passes every bound. `guard_clear` is false when the divergence guard
+/// counted against it (a near-field scan before the streak latches); `require` is reanchor_require_guard_clear.
+fast_lio::ReanchorScan goodMatch(double now, bool guard_clear, bool require)
+{
+  return fast_lio::ReanchorScan{kGoodEff, kGoodRes, now, guard_clear, require};
+}
+
+/// Blind, then two clean good matches, then a good match the guard counted against. Returns that third decision.
+fast_lio::ReanchorDecision twoCleanThenACountedScan(ReanchorGate * g, const ReanchorParams & p, bool require)
+{
+  updateReanchorGate(g, true, kBlindEff, kBlindRes, 0.0, p);
+  updateReanchorGate(g, false, goodMatch(0.1, true, require), p);
+  updateReanchorGate(g, false, goodMatch(0.2, true, require), p);
+  return updateReanchorGate(g, false, goodMatch(0.3, false, require), p);
+}
+}  // namespace
+
+// Three good matches in a row, but the last one the guard already called bad: with the rule on that is no proof.
+TEST(ReanchorGate, AScanTheGuardCountedCannotCompleteTheProof)
+{
+  ReanchorGate g;
+  ReanchorParams p;  // confirm_scans = 3
+  const auto d = twoCleanThenACountedScan(&g, p, true);
+  EXPECT_EQ(g.state, ReanchorState::kVerifying);
+  EXPECT_FALSE(d.just_reanchored);
+  EXPECT_TRUE(d.map_frozen);
+  EXPECT_TRUE(d.degraded);
+  EXPECT_EQ(g.reanchors, 0u);
+}
+
+// The counted scan breaks the run like a failed match: confirm_scans clean matches are needed again after it.
+TEST(ReanchorGate, AScanTheGuardCountedBreaksTheStreak)
+{
+  ReanchorGate g;
+  ReanchorParams p;  // confirm_scans = 3
+  twoCleanThenACountedScan(&g, p, true);
+  for (int i = 1; i <= 2; ++i) {
+    const auto d = updateReanchorGate(&g, false, goodMatch(0.3 + 0.1 * i, true, true), p);
+    EXPECT_FALSE(d.just_reanchored) << i;
+    EXPECT_TRUE(d.map_frozen) << i;
+    EXPECT_EQ(g.state, ReanchorState::kVerifying) << i;
+  }
+  const auto d = updateReanchorGate(&g, false, goodMatch(0.6, true, true), p);
+  EXPECT_TRUE(d.just_reanchored);
+  EXPECT_FALSE(d.map_frozen);
+  EXPECT_FALSE(d.degraded);
+  EXPECT_EQ(g.state, ReanchorState::kHealthy);
+  EXPECT_EQ(g.reanchors, 1u);
+}
+
+// Counted scans neither restart the verification window nor hold the gate in it: the timeout runs from the first
+// verification scan, and the gate is lost exactly once.
+TEST(ReanchorGate, GuardCountedScansStillTimeOutIntoLost)
+{
+  ReanchorGate g;
+  ReanchorParams p;
+  p.timeout_sec = 1.0;
+  updateReanchorGate(&g, true, kBlindEff, kBlindRes, 10.0, p);
+  const double start = 10.1;  // the first scan after the blind one opens the verification
+  constexpr double kStep = 0.1;
+  int lost_edges = 0;
+  double lost_at = -1.0;
+  for (int i = 0; i < 30; ++i) {
+    const double now = start + kStep * i;
+    const auto d = updateReanchorGate(&g, false, goodMatch(now, false, true), p);
+    EXPECT_FALSE(d.just_reanchored) << now;
+    EXPECT_TRUE(d.map_frozen) << now;
+    EXPECT_TRUE(d.degraded) << now;
+    if (d.just_lost) {
+      ++lost_edges;
+      lost_at = now;
+    }
+  }
+  EXPECT_EQ(lost_edges, 1);
+  EXPECT_GT(lost_at - start, p.timeout_sec);
+  EXPECT_LE(lost_at - start, p.timeout_sec + kStep + 1e-9);
+  EXPECT_EQ(g.state, ReanchorState::kLost);
+  EXPECT_EQ(g.losses, 1u);
+  EXPECT_EQ(g.reanchors, 0u);
+}
+
+// Off, the guard's count is not read: the same sequence re-registers on the third scan, and every scan of a
+// sequence through all four states decides exactly as the signature without the count does.
+TEST(ReanchorGate, WithTheRuleOffAGuardCountedScanCountsAsToday)
+{
+  ReanchorParams p;
+  {
+    ReanchorGate g;
+    const auto d = twoCleanThenACountedScan(&g, p, false);
+    EXPECT_TRUE(d.just_reanchored);
+    EXPECT_FALSE(d.map_frozen);
+    EXPECT_FALSE(d.degraded);
+    EXPECT_EQ(g.state, ReanchorState::kHealthy);
+  }
+  struct Step
+  {
+    bool guard_degraded;
+    int effct;
+    double res_mean;
+    double now;
+    bool guard_clear;
+  };
+  const Step steps[] = {
+    {true, kBlindEff, kBlindRes, 0.0, false},  // blind
+    {false, kGoodEff, kGoodRes, 0.1, true},    // verification opens
+    {false, kGoodEff, kGoodRes, 0.2, true},
+    {false, kGoodEff, kGoodRes, 0.3, false},   // counted, completes the proof
+    {false, kGoodEff, kGoodRes, 0.4, false},   // counted while healthy
+    {true, kBlindEff, kBlindRes, 0.5, false},  // blind again
+    {false, kGoodEff, kGoodRes, 0.6, false},   // counted scan opens the verification
+    {false, 40, 0.5, 0.7, false},              // counted and a failed match
+    {false, kGoodEff, kGoodRes, 0.8, false},
+    {false, 40, 0.5, 6.0, true},              // past the timeout: lost
+    {false, kGoodEff, kGoodRes, 6.1, false},  // lost stays lost
+  };
+  ReanchorGate with_count;
+  ReanchorGate without_count;
+  for (const Step & s : steps) {
+    const auto a = updateReanchorGate(
+      &with_count, s.guard_degraded, fast_lio::ReanchorScan{s.effct, s.res_mean, s.now, s.guard_clear, false}, p);
+    const auto b = updateReanchorGate(&without_count, s.guard_degraded, s.effct, s.res_mean, s.now, p);
+    EXPECT_EQ(a.map_frozen, b.map_frozen) << s.now;
+    EXPECT_EQ(a.degraded, b.degraded) << s.now;
+    EXPECT_EQ(a.just_reanchored, b.just_reanchored) << s.now;
+    EXPECT_EQ(a.just_lost, b.just_lost) << s.now;
+    EXPECT_EQ(with_count.state, without_count.state) << s.now;
+    EXPECT_EQ(with_count.ok_streak, without_count.ok_streak) << s.now;
+    EXPECT_EQ(with_count.verify_start, without_count.verify_start) << s.now;
+  }
+  EXPECT_EQ(with_count.reanchors, 1u);
+  EXPECT_EQ(with_count.losses, 1u);
+  EXPECT_EQ(with_count.state, ReanchorState::kLost);
+}
+
+// The rule judges verification evidence only: a healthy gate takes a scan the guard counted against as before, and
+// one such scan alone is not degradation.
+TEST(ReanchorGate, AHealthyGateIgnoresTheGuardCount)
+{
+  ReanchorGate g;
+  ReanchorParams p;
+  const auto d = updateReanchorGate(&g, false, goodMatch(0.1, false, true), p);
+  EXPECT_FALSE(d.map_frozen);
+  EXPECT_FALSE(d.degraded);
+  EXPECT_FALSE(d.just_reanchored);
+  EXPECT_FALSE(d.just_lost);
+  EXPECT_EQ(g.state, ReanchorState::kHealthy);
+  EXPECT_EQ(g.ok_streak, 0);
+  EXPECT_EQ(g.reanchors, 0u);
+  EXPECT_EQ(g.losses, 0u);
+}
+
 // ---- relative verification: the residual judged against what this scene gives when healthy ----
 
 namespace

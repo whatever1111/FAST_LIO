@@ -196,6 +196,7 @@ void FrontendParameters::declareHoleToLostRecovery(rclcpp::Node & node)
   declareOnly(node, recovery.reanchor_max_res_ratio);
   declareOnly(node, recovery.reanchor_res_floor);
   declareOnly(node, recovery.reanchor_min_eff_ratio);
+  declareOnly(node, recovery.reanchor_require_guard_clear);
   declareOnly(node, recovery.reanchor_healthy_window);
   declareOnly(node, recovery.reanchor_total_timeout_sec);
   declareOnly(node, recovery.reanchor_recovery_stable_sec);
@@ -692,6 +693,7 @@ void FrontendParameters::readReanchor(const rclcpp::Node & node,
   readInto(node, recovery.reanchor_max_res_ratio, reanchor_params.max_res_ratio);
   readInto(node, recovery.reanchor_res_floor, reanchor_params.res_floor);
   readInto(node, recovery.reanchor_min_eff_ratio, reanchor_params.min_eff_ratio);
+  readInto(node, recovery.reanchor_require_guard_clear, values_.reanchor_require_guard_clear);
   readInto(node, recovery.reanchor_healthy_window, startup.reanchor_healthy_window);
   if (!std::isfinite(reanchor_params.max_res_ratio) || reanchor_params.max_res_ratio < 0.0 ||
       !std::isfinite(reanchor_params.res_floor) || reanchor_params.res_floor < 0.0 ||

@@ -202,6 +202,9 @@ struct FrontendParams
   // "reset_map" rebuilds the local map at the current pose — the robot keeps
   // working, having traded absolute anchoring for a live estimate.
   std::string reanchor_on_fail = "hold";
+  // A verification scan the divergence guard has already counted against, before its streak declared the scene
+  // degraded, is no re-registration evidence (reanchor_gate.hpp, ReanchorScan); off, the match alone decides.
+  bool reanchor_require_guard_clear = false;
   // A pending recovery is qualified against the map it began with, iVox's entry view, and its scans keep going into
   // the map; off, the map stays frozen until the recovery ends.
   bool reanchor_recovery_entry_view = false;

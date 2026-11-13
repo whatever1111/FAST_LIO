@@ -137,10 +137,11 @@ enum class Imu : std::uint8_t
 // What a scan slot puts on the point-cloud topic.
 enum class Cloud : std::uint8_t
 {
-  kDense,   // the fixture's 2000-point scan
-  kSparse,  // three points: the scan path leaves before the anchor step
-  kEmpty,   // no point: dropped when taken, for having no usable timing
-  kNone,    // nothing is sent: the slot is a hole in the scan stream
+  kDense,      // the fixture's 2000-point scan
+  kNearField,  // as many points, all within guard_engulf_far_range of the sensor: the engulfment guard counts it
+  kSparse,     // three points: the scan path leaves before the anchor step
+  kEmpty,      // no point: dropped when taken, for having no usable timing
+  kNone,       // nothing is sent: the slot is a hole in the scan stream
 };
 
 enum class Guard : std::int8_t
@@ -1010,15 +1011,19 @@ private:
 
   void sendLidar(double start, Cloud kind = Cloud::kDense)
   {
-    const std::size_t points = kind == Cloud::kDense ? kScanPoints : kind == Cloud::kSparse ? 3u : 0u;
+    const bool near_field = kind == Cloud::kNearField;
+    const std::size_t points = kind == Cloud::kDense || near_field ? kScanPoints : kind == Cloud::kSparse ? 3u : 0u;
     const auto length_ns = static_cast<std::uint64_t>(std::llround(scenario_.scan_length * 1e9));
     pcl::PointCloud<ouster_ros::Point> cloud;
     cloud.resize(points);
     for (std::size_t i = 0; i < points; ++i) {
       auto & point = cloud[i];
       point = ouster_ros::Point{};
-      point.x = 10.0f + static_cast<float>(i % 317) * 0.01f;
-      point.y = -1.6f + static_cast<float>(i / 317) * 0.01f;
+      // The near-field strip lies 1.0-1.64 m out, every point well inside the guard's 2 m far range.
+      const float column = static_cast<float>(i % 317);
+      const float row = static_cast<float>(i / 317);
+      point.x = near_field ? 1.0f + column * 0.002f : 10.0f + column * 0.01f;
+      point.y = near_field ? -0.03f + row * 0.01f : -1.6f + row * 0.01f;
       point.z = 1.0f;
       point.intensity = 1.0f;
       point.t = static_cast<std::uint32_t>(i * length_ns / (points - 1));
@@ -2776,6 +2781,36 @@ Scenario verificationTimesOut(double total)
   append(s, 1, slot(Phase::kEvent, Imu::kStatic, Guard::kDegraded));
   append(s, kVerifyingScans, slot(Phase::kAfter));
   append(s, 5, slot(Phase::kLater));
+  return s;
+}
+
+// ---- F03b: a near-field scan in the verification, which the guard counts before it latches ---------------------
+
+constexpr std::size_t kEngulfReleaseScans = 5;  // guard_engulf_release_scans
+constexpr std::size_t kReanchorConfirmScans = 3;
+constexpr std::size_t kFarScansAfterNearField = 5;
+// Indices into Phase::kAfter: the far scan that releases the guard opens the verification as its first scan, and
+// the near-field scan is its third.
+constexpr std::size_t kVerificationOpens = kEngulfReleaseScans - 1;
+constexpr std::size_t kNearFieldVerifying = kVerificationOpens + 2;
+
+// Parked and anchored in front of the fixture's far strip, on the real gate and the guard's natural verdict. Two
+// near-field scans latch the engulfment guard: the first one is only counted, is not degraded and goes into the
+// map. Far scans release the guard; the verification's first two scans are far scans, its third is a near-field
+// scan, which matches the near points the first one left in the map, and far scans follow. Input-driven slots, as
+// inputScenario's, with the per-scan trace on for map_updated.
+Scenario nearFieldDuringVerification(bool require_guard_clear)
+{
+  Scenario s = baseParams(require_guard_clear ? "near_field_rule_on" : "near_field_rule_off", true);
+  s.flexible = true;
+  setParam(s, rclcpp::Parameter("reanchor_en", true));
+  if (require_guard_clear)
+    setParam(s, rclcpp::Parameter("reanchor_require_guard_clear", true));
+  append(s, 5, slot(Phase::kBefore, Imu::kStatic, Guard::kNatural));
+  append(s, 2, slot(Phase::kEvent, Imu::kStatic, Guard::kNatural, Cloud::kNearField));
+  append(s, static_cast<int>(kNearFieldVerifying), slot(Phase::kAfter, Imu::kStatic, Guard::kNatural));
+  append(s, 1, slot(Phase::kAfter, Imu::kStatic, Guard::kNatural, Cloud::kNearField));
+  append(s, static_cast<int>(kFarScansAfterNearField), slot(Phase::kAfter, Imu::kStatic, Guard::kNatural));
   return s;
 }
 
@@ -4969,6 +5004,91 @@ TEST(AnchorLifecycleGate, TheScanThatDeclaresLostReportsItAlthoughItsResetReArms
     EXPECT_EQ(counterValue(r, "lost"), "1");
     EXPECT_EQ(counterValue(r, "map_reset"), "1");
   }
+}
+
+// What both arms of nearFieldDuringVerification share up to the near-field scan: parked on a valid anchor; the first
+// near-field scan counted, not degraded and put into the map, the second latching the guard; the far scans blind
+// until the one that releases the guard opens the verification; the next one verifying; and the near-field scan,
+// counted and not latched on, reaching a verifying gate.
+void expectANearFieldScanReachesAVerifyingGate(const ChildResult & r)
+{
+  ASSERT_NE(validAnchorAfter(r, Phase::kBefore), 0u);
+  const auto latch = r.phase(Phase::kEvent);
+  ASSERT_EQ(latch.size(), 2u);
+  EXPECT_FALSE(latch[0]->record.guard_degraded) << "a single near-field scan is no degradation";
+  EXPECT_EQ(latch[0]->record.gate_post, fast_lio::AnchorTraceGate::kHealthy);
+  EXPECT_TRUE(latch[0]->record.map_updated) << "the near points the later near-field scan matches";
+  EXPECT_TRUE(latch[1]->record.guard_degraded) << "the second near-field scan latches the guard";
+  EXPECT_EQ(latch[1]->record.gate_post, fast_lio::AnchorTraceGate::kBlind);
+  const auto after = r.phase(Phase::kAfter);
+  ASSERT_EQ(after.size(), kNearFieldVerifying + 1 + kFarScansAfterNearField);
+  for (std::size_t i = 0; i < kVerificationOpens; ++i) {
+    EXPECT_TRUE(after[i]->record.guard_degraded) << "step " << after[i]->step;
+    EXPECT_EQ(after[i]->record.gate_post, fast_lio::AnchorTraceGate::kBlind) << "step " << after[i]->step;
+  }
+  const auto & opens = after[kVerificationOpens]->record;
+  EXPECT_FALSE(opens.guard_degraded) << "the guard released on this scan";
+  EXPECT_EQ(opens.gate_pre, fast_lio::AnchorTraceGate::kBlind);
+  EXPECT_EQ(opens.gate_post, fast_lio::AnchorTraceGate::kVerifying);
+  EXPECT_EQ(after[kVerificationOpens + 1]->record.gate_post, fast_lio::AnchorTraceGate::kVerifying);
+  const auto & near_field = after[kNearFieldVerifying]->record;
+  EXPECT_FALSE(near_field.guard_degraded) << "the guard latched on the near-field scan";
+  EXPECT_EQ(near_field.gate_pre, fast_lio::AnchorTraceGate::kVerifying);
+}
+
+// The run re-registered once, on `at`, and lost nothing.
+void expectReRegisteredOnlyOn(const ChildResult & r, const Observation & at)
+{
+  for (const auto & o : r.observations) {
+    EXPECT_EQ(hasEvent(o, fast_lio::kAnchorEventReanchored), &o == &at) << "step " << o.step;
+    EXPECT_FALSE(hasEvent(o, fast_lio::kAnchorEventLost)) << "step " << o.step;
+  }
+  EXPECT_EQ(counterValue(r, "lost"), "0");
+}
+
+// reanchor_require_guard_clear on, the guard's natural verdict. The verification's third scan is a near-field scan
+// that matches the frozen map, but the guard has counted it: it does not complete the proof, the map does not take
+// it and it is reported degraded. The streak starts again after it, and the third far scan re-registers.
+TEST(AnchorLifecycleGate, ANearFieldScanDuringVerificationDoesNotThawTheMap)
+{
+  const Scenario scenario = nearFieldDuringVerification(true);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+  ASSERT_TRUE(r.ok());
+  ASSERT_NO_FATAL_FAILURE(expectANearFieldScanReachesAVerifyingGate(r));
+  const auto after = r.phase(Phase::kAfter);
+  const Observation & near_field = *after[kNearFieldVerifying];
+  EXPECT_EQ(near_field.record.gate_post, fast_lio::AnchorTraceGate::kVerifying);
+  EXPECT_FALSE(near_field.record.map_updated) << "the near-field scan went into the frozen map";
+  ASSERT_TRUE(near_field.odom_seen);
+  EXPECT_NE(odomFlags(near_field) & kFlagDegraded, 0u);
+  const std::size_t reregisters = kNearFieldVerifying + kReanchorConfirmScans;
+  for (std::size_t i = kNearFieldVerifying + 1; i < after.size(); ++i) {
+    const auto & x = after[i]->record;
+    EXPECT_EQ(x.gate_post,
+              i < reregisters ? fast_lio::AnchorTraceGate::kVerifying : fast_lio::AnchorTraceGate::kHealthy)
+      << "step " << after[i]->step;
+    EXPECT_EQ(x.map_updated, i >= reregisters) << "step " << after[i]->step;
+  }
+  expectReRegisteredOnlyOn(r, *after[reregisters]);
+}
+
+// The same run with reanchor_require_guard_clear at its default: the near-field scan completes the proof and goes
+// into the map, as the gate did before the switch existed.
+TEST(AnchorLifecycleGate, WithTheRuleOffTheSameScanThawsTheMap)
+{
+  const Scenario scenario = nearFieldDuringVerification(false);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+  ASSERT_TRUE(r.ok());
+  ASSERT_NO_FATAL_FAILURE(expectANearFieldScanReachesAVerifyingGate(r));
+  const auto after = r.phase(Phase::kAfter);
+  const Observation & near_field = *after[kNearFieldVerifying];
+  EXPECT_EQ(near_field.record.gate_post, fast_lio::AnchorTraceGate::kHealthy);
+  EXPECT_TRUE(near_field.record.map_updated);
+  ASSERT_TRUE(near_field.odom_seen);
+  EXPECT_EQ(odomFlags(near_field) & kFlagDegraded, 0u);
+  expectReRegisteredOnlyOn(r, near_field);
 }
 
 // Parked on healthy scans with the parked prior pulling toward the anchor, when a runaway map reset runs after the

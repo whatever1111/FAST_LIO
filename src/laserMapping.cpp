@@ -251,13 +251,13 @@ int corr_dump_iter = 0;              // measurement-model evaluations dumped so 
 // Attitude hold (FrontendParams::attitude_hold is the policy): this scan's verdicts and the telemetry.
 bool lidar_attitude_hold_active = false;   // this scan's scene-rule verdict; read by the measurement model
 bool lidar_attitude_hold_allowed = false;  // release conditions satisfied this scan (starvation, age, holes)
-int lidar_attitude_hold_scans = 0;         // telemetry
-double lidar_attitude_hold_since = -1.0;   // lidar_end_time when the current hold began (-1 = off)
+int lidar_attitude_hold_scans = 0;             // telemetry
+double lidar_attitude_hold_since = -1.0;       // lidar_end_time when the current hold began (-1 = off)
 
 // Engulfment latch; FrontendParams documents the divergence guard and the engulfment release.
-int consec_engulf_clear = 0;      // running healthy-scan streak while latched
-bool engulf_latched = false;      // sticky engulfed state (entered, not yet released)
-double engulf_latch_time = -1.0;  // lidar_end_time of the scan that latched (blind duration at release)
+int consec_engulf_clear = 0;                  // running healthy-scan streak while latched
+bool engulf_latched = false;                  // sticky engulfed state (entered, not yet released)
+double engulf_latch_time = -1.0;              // lidar_end_time of the scan that latched (blind duration at release)
 // Release policy (engulf_release.hpp), its velocity side: what velocity leaves the blind stretch. The default
 // reproduces the legacy zero velocity; FrontendParams::release_inflate holds the covariance side.
 fast_lio::ReleaseVelocityParams release_vel_params;
@@ -511,7 +511,7 @@ esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 // innovations after a release are explained as a roll error (docs/PGO_LOOP_TUNING.md §7.7). With a
 // sigma > 0 the assigned velocity gets that 1-σ and no cross terms; 0 keeps the legacy behaviour bit for bit.
 // The sigma of a discarded velocity (engulfment release, hole clamp, runaway/parked) is in FrontendParams.
-double zupt_vel_reset_sigma = 0.0;  // m/s; a velocity zeroed on static evidence (ZUPT, parked hold)
+double zupt_vel_reset_sigma = 0.0;   // m/s; a velocity zeroed on static evidence (ZUPT, parked hold)
 int vel_cov_resets = 0;
 inline void resetVelocityCovariance(double sigma_v)
 {

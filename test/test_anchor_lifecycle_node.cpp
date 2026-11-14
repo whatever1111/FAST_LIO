@@ -8,6 +8,8 @@
 // trip for the watchdog's late map reset or hold, and a normal initial map
 // build whose points the map backend all skips. The static verdict is the
 // real one, computed from the IMU windows the fixture sends.
+// Wheel evidence comes from the newest causal sample: an expired or non-finite
+// sample, or only another epoch inside the freshness window, proves nothing.
 //
 // The anchor and pre-event positions are the three frozen cases F1-F3.
 // Attitude, velocity and covariance are fixed fixture values (identity, a
@@ -170,6 +172,7 @@ enum class Phase : int
   kEvent,             // the scan slot(s) the event is on
   kAfter,             // the stretch after it
   kLater,             // a second stretch after that
+  kWheelSilence,      // wheel publication stopped while its last causal sample is still fresh
 };
 
 struct Step
@@ -2730,6 +2733,7 @@ Scenario inputEpochFault()
 // ---- Wheel evidence ---------------------------------------------------------------------------------------------
 
 constexpr int kWheelFreshScans = 4;
+constexpr int kWheelSilenceScans = 4;  // 0.41 s since the last wheel sample; the following scan reaches 0.51 s.
 
 Step wheelSlot(Phase phase, double speed, double age)
 {
@@ -2740,8 +2744,8 @@ Step wheelSlot(Phase phase, double speed, double age)
   return s;
 }
 
-// A wheel sample is required. None at first; then four fresh zeros before each bad one: stale, non-finite, and
-// stamped in another clock epoch.
+// A wheel sample is required. Stop publishing before the stale/other-epoch scans so the newest causal sample is
+// expired; the non-finite scan supplies its own newest causal sample.
 Scenario wheelEvidence()
 {
   Scenario s = inputScenario("wheel_evidence");
@@ -2749,10 +2753,12 @@ Scenario wheelEvidence()
   setParam(s, rclcpp::Parameter("wheel_topic", kWheelTopic));
   append(s, 4, slot(Phase::kBefore));
   append(s, kWheelFreshScans, wheelSlot(Phase::kAnchorStatic, 0.0, 0.01));
+  append(s, kWheelSilenceScans, slot(Phase::kWheelSilence));
   s.steps.push_back(wheelSlot(Phase::kEvent, 0.0, 0.8));
   append(s, kWheelFreshScans, wheelSlot(Phase::kAnchorStatic, 0.0, 0.01));
   s.steps.push_back(wheelSlot(Phase::kEvent, std::numeric_limits<double>::quiet_NaN(), 0.01));
   append(s, kWheelFreshScans, wheelSlot(Phase::kAnchorStatic, 0.0, 0.01));
+  append(s, kWheelSilenceScans, slot(Phase::kWheelSilence));
   s.steps.push_back(wheelSlot(Phase::kEvent, 0.0, -1000.0));
   return s;
 }
@@ -4786,8 +4792,8 @@ TEST(AnchorLifecycleInputs, AnInputClockFaultShutsTheNodeDownOnlyUnderFaultExit)
   }
 }
 
-// With a wheel sample required, the static verdict is "unknown" without one, and whenever the newest one is stale,
-// non-finite or stamped in another clock epoch: no candidate starts, and an anchor built on fresh samples ends.
+// With a wheel sample required, missing evidence, an expired/non-finite newest causal sample, or only another
+// epoch inside the freshness window is "unknown": no candidate starts, and an anchor built on fresh samples ends.
 TEST(AnchorLifecycleInputs, WheelEvidenceThatIsMissingStaleOrNotANumberProvesNothing)
 {
   const Scenario scenario = wheelEvidence();
@@ -4825,6 +4831,48 @@ TEST(AnchorLifecycleInputs, WheelEvidenceThatIsMissingStaleOrNotANumberProvesNot
     EXPECT_FALSE(b.wheel_valid) << name;
     EXPECT_EQ(b.anchor_state, fast_lio::AnchorState::kEmpty) << name;
     expectInvalidatedOnce(r, id, "evidence_unknown", name);
+  }
+  const auto silence = r.phase(Phase::kWheelSilence);
+  ASSERT_EQ(silence.size(), 2u * kWheelSilenceScans);
+  for (std::size_t round = 0; round < 2u; ++round) {
+    const std::size_t fresh_round = round == 0u ? 0u : 2u;
+    const auto id = fresh[(fresh_round + 1u) * kWheelFreshScans - 1u]->record.anchor_id;
+    for (int i = 0; i < kWheelSilenceScans; ++i) {
+      const auto & o = silence[round * kWheelSilenceScans + static_cast<std::size_t>(i)]->record;
+      EXPECT_GT(o.wheel_age, 0.0);
+      EXPECT_LE(o.wheel_age, 0.5);
+      EXPECT_EQ(o.evidence, fast_lio::StaticEvidence::kStationary);
+      EXPECT_EQ(o.evidence_reason, fast_lio::StaticEvidenceReason::kImuAndWheel);
+      EXPECT_TRUE(o.wheel_valid);
+      EXPECT_EQ(o.anchor_state, fast_lio::AnchorState::kValid);
+      EXPECT_EQ(o.anchor_id, id);
+    }
+  }
+}
+
+// An unrelated arrival cannot erase a fresh causal zero that still proves the platform is parked.
+TEST(AnchorLifecycleInputs, LateOrFutureWheelSamplesPreserveFreshCausalEvidence)
+{
+  for (const double age : {0.8, -1000.0}) {
+    Scenario scenario = inputScenario(age > 0.0 ? "wheel_late_preserves_causal" : "wheel_future_preserves_causal");
+    setParam(scenario, rclcpp::Parameter("zupt_require_wheel", true));
+    setParam(scenario, rclcpp::Parameter("wheel_topic", kWheelTopic));
+    append(scenario, kWheelFreshScans, wheelSlot(Phase::kAnchorStatic, 0.0, 0.01));
+    scenario.steps.push_back(wheelSlot(Phase::kEvent, 0.0, age));
+    const ChildResult r = runScenario(scenario);
+    SCOPED_TRACE(describeRun(r));
+    ASSERT_TRUE(r.ok());
+    const std::uint64_t id = validAnchorAfter(r, Phase::kAnchorStatic);
+    ASSERT_NE(id, 0u);
+    const auto event = r.phase(Phase::kEvent);
+    ASSERT_EQ(event.size(), 1u);
+    const auto & o = event.front()->record;
+    EXPECT_EQ(o.evidence, fast_lio::StaticEvidence::kStationary);
+    EXPECT_EQ(o.evidence_reason, fast_lio::StaticEvidenceReason::kImuAndWheel);
+    EXPECT_TRUE(o.wheel_valid);
+    EXPECT_EQ(o.anchor_state, fast_lio::AnchorState::kValid);
+    EXPECT_EQ(o.anchor_id, id);
+    EXPECT_TRUE(anchorLines(r, "invalidated", id).empty());
   }
 }
 

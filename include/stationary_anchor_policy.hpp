@@ -57,9 +57,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <iterator>
 #include <limits>
+#include <utility>
 
 #include "static_evidence.hpp"
 
@@ -94,6 +99,48 @@ struct WheelEvidence
   bool valid = false;
   double age = -1.0;  ///< s between the sample and the scan, in the scan's clock
   double speed = std::numeric_limits<double>::quiet_NaN();
+};
+
+/// Bounded independently of wheel updates and variance pairing. Keep invalid samples
+/// too: a latest "cannot measure" must not expose an older zero.
+class WheelEvidenceHistory
+{
+public:
+  static constexpr std::size_t kCapacity = 250;  ///< 5 s at the bridge's 50 Hz
+
+  void observe(double stamp, double speed)
+  {
+    if (!std::isfinite(stamp)) {
+      return;
+    }
+    const auto at = std::lower_bound(
+      samples_.begin(), samples_.end(), stamp, [](const auto & sample, double time) { return sample.first < time; });
+    if (at != samples_.end() && at->first == stamp) {
+      at->second = speed;
+    } else {
+      samples_.insert(at, {stamp, speed});
+    }
+    while (samples_.size() > kCapacity) {
+      samples_.pop_front();
+    }
+  }
+
+  WheelEvidence at(double now) const
+  {
+    if (!std::isfinite(now)) {
+      return {};
+    }
+    const auto end = std::upper_bound(
+      samples_.begin(), samples_.end(), now, [](double time, const auto & sample) { return time < sample.first; });
+    if (end == samples_.begin()) {
+      return {};
+    }
+    const auto & sample = *std::prev(end);
+    return {sample.first > 0.0, now - sample.first, sample.second};
+  }
+
+private:
+  std::deque<std::pair<double, double>> samples_;
 };
 
 struct StaticEvidenceVerdict

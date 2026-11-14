@@ -26,6 +26,7 @@
 #include <string>
 #include <utility>
 
+#include "stationary_anchor_policy.hpp"
 #include "wheel_measurement.hpp"
 
 namespace fast_lio
@@ -137,6 +138,9 @@ public:
   }
 
   // The callbacks' part: the caller holds the node's mtx_twist.
+
+  void observeEvidence(double stamp, double speed) { evidence_.observe(stamp, speed); }
+  WheelEvidence evidenceAt(double now) const { return evidence_.at(now); }
 
   /// A gated sample the caller has found to be a measurement (wheelSampleIsEvidence). Without a variance topic it is
   /// paired at once with the parameter variances.
@@ -278,6 +282,7 @@ public:
 private:
   // Shared with the callbacks, under the node's mtx_twist.
   WheelSampleRing ring_;
+  WheelEvidenceHistory evidence_;
   std::uint64_t malformed_stamps_ = 0;
   // Written before the callbacks can reach the object, read-only afterwards.
   bool variances_from_topic_ = false;

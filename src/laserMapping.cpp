@@ -251,13 +251,13 @@ int corr_dump_iter = 0;              // measurement-model evaluations dumped so 
 // Attitude hold (FrontendParams::attitude_hold is the policy): this scan's verdicts and the telemetry.
 bool lidar_attitude_hold_active = false;   // this scan's scene-rule verdict; read by the measurement model
 bool lidar_attitude_hold_allowed = false;  // release conditions satisfied this scan (starvation, age, holes)
-int lidar_attitude_hold_scans = 0;             // telemetry
-double lidar_attitude_hold_since = -1.0;       // lidar_end_time when the current hold began (-1 = off)
+int lidar_attitude_hold_scans = 0;         // telemetry
+double lidar_attitude_hold_since = -1.0;   // lidar_end_time when the current hold began (-1 = off)
 
 // Engulfment latch; FrontendParams documents the divergence guard and the engulfment release.
-int consec_engulf_clear = 0;                  // running healthy-scan streak while latched
-bool engulf_latched = false;                  // sticky engulfed state (entered, not yet released)
-double engulf_latch_time = -1.0;              // lidar_end_time of the scan that latched (blind duration at release)
+int consec_engulf_clear = 0;      // running healthy-scan streak while latched
+bool engulf_latched = false;      // sticky engulfed state (entered, not yet released)
+double engulf_latch_time = -1.0;  // lidar_end_time of the scan that latched (blind duration at release)
 // Release policy (engulf_release.hpp), its velocity side: what velocity leaves the blind stretch. The default
 // reproduces the legacy zero velocity; FrontendParams::release_inflate holds the covariance side.
 fast_lio::ReleaseVelocityParams release_vel_params;
@@ -472,8 +472,8 @@ SteadyTimePoint last_latency_log_time;
 LatencyStats sensor_to_odom_latency_stats;
 
 // The wheel update's samples live in the node's wheel_speed_ (wheel_speed_input.hpp); the two wheel callbacks are
-// free functions and reach it through this pointer. It owns nothing. The node sets it in subscribeInputs, only with
-// wheel_odom_en and before the twist subscription exists, and clears it first thing in its destructor, both under
+// free functions and reach it through this pointer. It owns nothing. The node sets it for every wheel consumer,
+// before the twist subscription exists, and clears it first thing in its destructor, both under
 // mtx_twist: the destructor body runs before the members go, so a callback holding mtx_twist sees either a live
 // object or null. One node per process, as for the rest of this file's state.
 // mtx_twist guards this pointer, what the callbacks fill through it, last_twist_* and gravity_align_leg_hist. It is
@@ -511,7 +511,7 @@ esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 // innovations after a release are explained as a roll error (docs/PGO_LOOP_TUNING.md §7.7). With a
 // sigma > 0 the assigned velocity gets that 1-σ and no cross terms; 0 keeps the legacy behaviour bit for bit.
 // The sigma of a discarded velocity (engulfment release, hole clamp, runaway/parked) is in FrontendParams.
-double zupt_vel_reset_sigma = 0.0;   // m/s; a velocity zeroed on static evidence (ZUPT, parked hold)
+double zupt_vel_reset_sigma = 0.0;  // m/s; a velocity zeroed on static evidence (ZUPT, parked hold)
 int vel_cov_resets = 0;
 inline void resetVelocityCovariance(double sigma_v)
 {
@@ -1247,6 +1247,8 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
   // consumes the buffer, but the hold needs to know how OLD the evidence is.
   last_twist_stamp = get_time_sec(msg_in->header.stamp);
   last_twist_speed = v.norm();
+  if (wheel_speed_input != nullptr)
+    wheel_speed_input->observeEvidence(last_twist_stamp, last_twist_speed);
   if (v.allFinite()) {
     last_twist_v_body = v;
   }
@@ -1293,14 +1295,12 @@ static_evidence_of(const MeasureGroup & meas, double now, fast_lio::AnchorScanRe
   if (imu.samples > 0)
     imu.acc_mean = acc_sum / static_cast<double>(imu.samples);
 
-  double wheel_stamp = -1.0;
-  double wheel_speed = 0.0;
+  fast_lio::WheelEvidence wheel;
   {
     std::lock_guard<std::mutex> lk(mtx_twist);
-    wheel_stamp = last_twist_stamp;
-    wheel_speed = last_twist_speed;
+    if (wheel_speed_input != nullptr)
+      wheel = wheel_speed_input->evidenceAt(now);
   }
-  const double wheel_age = wheel_stamp > 0.0 ? std::fabs(now - wheel_stamp) : -1.0;
 
   fast_lio::StaticEvidenceParams params;
   params.gyro_thresh = zupt_gyro_thresh;
@@ -1308,10 +1308,6 @@ static_evidence_of(const MeasureGroup & meas, double now, fast_lio::AnchorScanRe
   params.wheel_speed_thresh = zupt_wheel_speed_thresh;
   params.wheel_max_age = zupt_wheel_max_age;
   params.require_wheel = zupt_require_wheel;
-  fast_lio::WheelEvidence wheel;
-  wheel.valid = wheel_stamp > 0.0;
-  wheel.age = wheel_age;
-  wheel.speed = wheel_speed;
   const fast_lio::StaticEvidenceVerdict verdict = fast_lio::classifyStaticEvidence(imu, wheel, params);
   if (trace != nullptr) {
     trace->body = verdict.stationary() ? fast_lio::AnchorTraceBody::kStatic : fast_lio::AnchorTraceBody::kMoving;
@@ -1319,8 +1315,8 @@ static_evidence_of(const MeasureGroup & meas, double now, fast_lio::AnchorScanRe
     trace->gyr_max = imu.samples > 0 ? imu.gyr_max : std::numeric_limits<double>::quiet_NaN();
     trace->acc_span = imu.samples > 0 && imu.acc_mean > 0.0 ? (imu.acc_max - imu.acc_min) / imu.acc_mean
                                                             : std::numeric_limits<double>::quiet_NaN();
-    trace->wheel_age = wheel_age;
-    trace->wheel_speed = wheel_stamp > 0.0 ? wheel_speed : std::numeric_limits<double>::quiet_NaN();
+    trace->wheel_age = wheel.age;
+    trace->wheel_speed = wheel.speed;
     trace->evidence = verdict.evidence;
     trace->evidence_reason = verdict.reason;
     trace->imu_only = verdict.imu_only;
@@ -4339,9 +4335,8 @@ private:
         });
       RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", startup.imu_topic.c_str());
     }
-    if (params_.values().wheel_odom_en)
-      attachWheelSpeedInput(startup);
     if (params_.values().wheel_odom_en || params_.values().zupt_en || params_.values().parked_hold.enabled) {
+      attachWheelSpeedInput(startup);
       sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(startup.wheel_topic, 2000, twist_cbk);
       RCLCPP_INFO(this->get_logger(),
                   "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s, parked hold %s)",
@@ -4365,6 +4360,8 @@ private:
       assert(wheel_speed_input == nullptr && "one LaserMappingNode per process");
       wheel_speed_input = &wheel_speed_;
     }
+    if (!p.wheel_odom_en)
+      return;
     if (!variances_from_topic) {
       RCLCPP_INFO(this->get_logger(),
                   "Wheel speed variances: the parameter sigmas, vx %.3f m/s lateral %.3f m/s (no wheel_cov_topic)",

@@ -872,6 +872,16 @@ TEST(WheelMeasurementModel, NonFiniteInputsGiveNoMeasurement)
   EXPECT_FALSE(singular->pack(H, residual, variance));
 }
 
+TEST(WheelSpeedInput, StaticEvidenceDoesNotRequireAWheelUpdateOrVariancePair)
+{
+  fast_lio::WheelSpeedInput input;
+  input.observeEvidence(1.0, 1.0);
+  input.observeEvidence(3.0, 0.0);
+  EXPECT_DOUBLE_EQ(input.evidenceAt(1.1).speed, 1.0);
+  EXPECT_FALSE(fast_lio::wheelEvidenceUsable(input.evidenceAt(2.0), {}));
+  EXPECT_FALSE(input.evidenceAt(0.9).valid);
+}
+
 // The front end's holder of the wheel samples (wheel_speed_input.hpp): the two callbacks' halves paired by the
 // integer header stamp, the scan's own span fitted at its end, the slip regressor from the raw IMU, and why a scan
 // makes no update.

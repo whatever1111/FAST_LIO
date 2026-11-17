@@ -1,10 +1,10 @@
 # frontend contract golden: parameter/typed_profile_m20
-# fork_sha: 2aa092e2f299cc174d06790e76d46da4918cf21b
+# fork_sha: f182f410711ad55b7aaa1a21c74c83453c334636
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
 case typed_profile_m20
-config test/frontend_contract/m20_laser_mapping.yaml sha256 336364da74a56074729d25ce042357ca8c79c0e0773bb9005b84fec7a5d07b82
+config test/frontend_contract/m20_laser_mapping.yaml sha256 00445c3f27e3c69179e0199c616cd0b9902bfc4bc51590641169dd0b5663e5bf
 overrides 3
 override publish.frontend_clock_domain type=string value="fixture"
 override publish.frontend_observation type=bool value=true
@@ -99,7 +99,6 @@ param publish.path_en type=bool value=false read_only=0 descriptor_type=1
 param publish.reference_health type=bool value=true read_only=1 descriptor_type=1
 param reanchor_on_fail type=string value="reset_map" read_only=0 descriptor_type=4
 param reanchor_recovery_entry_view type=bool value=true read_only=0 descriptor_type=1
-param reanchor_require_guard_clear type=bool value=true read_only=0 descriptor_type=1
 param reanchor_total_timeout_sec type=double value=10 read_only=0 descriptor_type=3
 param runaway_on_trip type=string value="reset_map" read_only=0 descriptor_type=4
 param wheel_extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1] read_only=0 descriptor_type=8
@@ -118,7 +117,7 @@ effective.v1 corr_gate_mad_scale float64 0x3ff0000000000000
 effective.v1 corr_gate_rot_sigma_floor_deg float64 0x3fd3333333333333
 effective.v1 corr_innov_gate_k float64 0x4004000000000000
 effective.v1 cube_side_length float64 0x4072c00000000000
-effective.v1 derived:config_id:reference_config_id bytes[32] 9b6c9cce031460bae8af249ae91ae19f8740e00ee1e98520dc705c6847597902
+effective.v1 derived:config_id:reference_config_id bytes[32] b58744e92db04fa5466bf3fcbf1e7819e6d161bfd059eeade438e1cba35d8264
 effective.v1 derived:config_id:reference_contract_id bytes[32] 7f76d47e6a3b97253e1d11c9fe21871a0fe9f723b749c0bd0ad894d84054de06
 effective.v1 derived:extrinsic_and_noise:Lidar_T_wrt_IMU float64[3x1] [0xbfd03e425aee6320,0x0000000000000000,0xbfd1e00d1b71758e]
 effective.v1 derived:extrinsic_and_noise:p_imu->Lidar_T_wrt_IMU float64[3x1] [0xbfd03e425aee6320,0x0000000000000000,0xbfd1e00d1b71758e]
@@ -194,7 +193,6 @@ effective.v1 publish.path_en bool 0
 effective.v1 publish.reference_health bool 1
 effective.v1 reanchor_on_fail string[9] "reset_map"
 effective.v1 reanchor_recovery_entry_view bool 1
-effective.v1 reanchor_require_guard_clear bool 1
 effective.v1 reanchor_total_timeout_sec float64 0x4024000000000000
 effective.v1 runaway_on_trip string[9] "reset_map"
 effective.v1 wheel_extrinsic_R float64[9] [0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000]

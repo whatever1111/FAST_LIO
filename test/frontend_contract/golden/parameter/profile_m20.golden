@@ -1,10 +1,10 @@
 # frontend contract golden: parameter/profile_m20
-# fork_sha: 2aa092e2f299cc174d06790e76d46da4918cf21b
+# fork_sha: f182f410711ad55b7aaa1a21c74c83453c334636
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
 case profile_m20
-config test/frontend_contract/m20_laser_mapping.yaml sha256 336364da74a56074729d25ce042357ca8c79c0e0773bb9005b84fec7a5d07b82
+config test/frontend_contract/m20_laser_mapping.yaml sha256 00445c3f27e3c69179e0199c616cd0b9902bfc4bc51590641169dd0b5663e5bf
 overrides 0
 outcome constructed
 event.v1 declare_front declared=150 names_sha256=df2197af8d2c2d53e0ce280616476cfb7fc615317ec66c5e2ff54661f5575f79
@@ -93,7 +93,6 @@ param publish.dense_publish_en type=bool value=false read_only=0 descriptor_type
 param publish.path_en type=bool value=false read_only=0 descriptor_type=1
 param reanchor_on_fail type=string value="reset_map" read_only=0 descriptor_type=4
 param reanchor_recovery_entry_view type=bool value=true read_only=0 descriptor_type=1
-param reanchor_require_guard_clear type=bool value=true read_only=0 descriptor_type=1
 param reanchor_total_timeout_sec type=double value=10 read_only=0 descriptor_type=3
 param runaway_on_trip type=string value="reset_map" read_only=0 descriptor_type=4
 param wheel_extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1] read_only=0 descriptor_type=8
@@ -180,7 +179,6 @@ effective.v1 publish.dense_publish_en bool 0
 effective.v1 publish.path_en bool 0
 effective.v1 reanchor_on_fail string[9] "reset_map"
 effective.v1 reanchor_recovery_entry_view bool 1
-effective.v1 reanchor_require_guard_clear bool 1
 effective.v1 reanchor_total_timeout_sec float64 0x4024000000000000
 effective.v1 runaway_on_trip string[9] "reset_map"
 effective.v1 wheel_extrinsic_R float64[9] [0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000]

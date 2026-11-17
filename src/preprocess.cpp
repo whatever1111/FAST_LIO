@@ -541,7 +541,6 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
     for (int i = 0; i < plsize; i++)
     {
       PointType added_pt;
-      // cout<<"!!!!!!"<<i<<" "<<plsize<<endl;
 
       added_pt.normal_x = 0;
       added_pt.normal_y = 0;
@@ -556,11 +555,12 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
       if (!given_offset_time)
       {
         int layer = pl_orig.points[i].ring;
+        if (layer >= N_SCANS)
+          continue;
         double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
         if (is_first[layer])
         {
-          // printf("layer: %d; is first: %d", layer, is_first[layer]);
           yaw_fp[layer] = yaw_angle;
           is_first[layer] = false;
           added_pt.curvature = 0.0;

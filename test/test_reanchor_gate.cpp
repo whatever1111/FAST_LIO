@@ -307,6 +307,121 @@ TEST(ReanchorGate, AHealthyGateIgnoresTheGuardCount)
   EXPECT_EQ(g.losses, 0u);
 }
 
+// ---- the recovery once the guard clears: a counted scan moves the proof, it does not withhold it ----
+
+namespace
+{
+// The contract both tests below derive their expectations from: reanchor_confirm_scans 3 and reanchor_timeout_sec
+// 5 s, the defaults in src/frontend_parameter_specs_recovery.hpp and the values
+// test/frontend_contract/m20_laser_mapping.yaml sets, at that fixture's 10 Hz scan_rate.
+constexpr int kContractConfirmScans = 3;
+constexpr double kContractTimeoutSec = 5.0;
+constexpr double kContractScanPeriod = 0.1;  // s
+
+ReanchorParams contractParams()
+{
+  ReanchorParams p;
+  p.confirm_scans = kContractConfirmScans;
+  p.timeout_sec = kContractTimeoutSec;
+  return p;
+}
+}  // namespace
+
+// A near-field scan in the verification where it would complete the proof, then clean scans that fit before the
+// timeout. On, the proof completes on the confirm_scans-th clean scan after the counted one; off, on the counted scan
+// itself. Either way the gate re-registers exactly once, stays healthy afterwards and is never lost.
+TEST(ReanchorGate, ACountedScanDelaysTheProofButDoesNotStarveIt)
+{
+  const ReanchorParams p = contractParams();
+  const double blind_at = 10.0;
+  const double opens = blind_at + kContractScanPeriod;
+  const int window = static_cast<int>(std::lround(p.timeout_sec / kContractScanPeriod));
+  const int counted = kContractConfirmScans - 1;
+  for (const bool require : {false, true}) {
+    SCOPED_TRACE(require ? "rule on" : "rule off");
+    const int proof = require ? counted + kContractConfirmScans : counted;
+    ASSERT_LT(proof, window) << "the clean scans must fit in the verification window";
+    ReanchorGate g;
+    updateReanchorGate(&g, true, kBlindEff, kBlindRes, blind_at, p);
+    int reanchored_at = -1;
+    for (int i = 0; i <= window + 2; ++i) {
+      const auto d =
+        updateReanchorGate(&g, false, goodMatch(opens + kContractScanPeriod * i, i != counted, require), p);
+      if (d.just_reanchored) {
+        EXPECT_EQ(reanchored_at, -1) << "re-registered again on scan " << i;
+        reanchored_at = i;
+      }
+      EXPECT_FALSE(d.just_lost) << i;
+      EXPECT_EQ(d.map_frozen, i < proof) << i;
+      EXPECT_EQ(d.degraded, i < proof) << i;
+      EXPECT_EQ(g.state, i < proof ? ReanchorState::kVerifying : ReanchorState::kHealthy) << i;
+    }
+    EXPECT_EQ(reanchored_at, proof);
+    EXPECT_EQ(g.reanchors, 1u);
+    EXPECT_EQ(g.losses, 0u);
+  }
+}
+
+// Near-field scans scattered through the verification so that confirm_scans clean ones never follow each other: on,
+// the clean scans between them never add up to a proof, and the gate is lost when the timeout passes, on the same
+// scan as when every scan is counted. Every period-th scan from the opening is counted; period 1 is counted scans
+// alone, and period confirm_scans leaves the longest clean runs that still fall one short. In the node two counted
+// scans in a row latch the guard (guard_engulf_streak 2 in the specs, kept by the m20 fixture), so the longer
+// periods are the inputs that reach a verifying gate there. Off, the same scans re-registered on the third.
+TEST(ReanchorGate, InterleavedCountedScansTimeOutLikeCountedScansAlone)
+{
+  const ReanchorParams p = contractParams();
+  const double blind_at = 10.0;
+  const double opens = blind_at + kContractScanPeriod;
+  const int scans = static_cast<int>(std::lround(p.timeout_sec / kContractScanPeriod)) + 10;
+  int lost_alone = -1;
+  for (const int period : {1, 2, kContractConfirmScans}) {
+    for (const bool require : {true, false}) {
+      SCOPED_TRACE(::testing::Message() << "period " << period << (require ? ", rule on" : ", rule off"));
+      ReanchorGate g;
+      updateReanchorGate(&g, true, kBlindEff, kBlindRes, blind_at, p);
+      int lost_at = -1;
+      int reanchored_at = -1;
+      for (int i = 0; i < scans; ++i) {
+        const double now = opens + kContractScanPeriod * i;
+        const bool clean = i % period != period - 1;
+        const auto d = updateReanchorGate(&g, false, goodMatch(now, clean, require), p);
+        if (d.just_lost) {
+          EXPECT_EQ(lost_at, -1) << "lost again on scan " << i;
+          lost_at = i;
+          EXPECT_GT(now - opens, p.timeout_sec) << i;
+          EXPECT_LE(now - opens, p.timeout_sec + kContractScanPeriod + 1e-9) << i;
+        }
+        if (d.just_reanchored) {
+          EXPECT_EQ(reanchored_at, -1) << "re-registered again on scan " << i;
+          reanchored_at = i;
+        }
+        if (require) {
+          EXPECT_TRUE(d.map_frozen) << i;
+          EXPECT_TRUE(d.degraded) << i;
+        }
+      }
+      if (require) {
+        if (period == 1) {
+          lost_alone = lost_at;
+        }
+        EXPECT_NE(lost_at, -1);
+        EXPECT_EQ(lost_at, lost_alone) << "lost on another scan than with counted scans alone";
+        EXPECT_EQ(reanchored_at, -1);
+        EXPECT_EQ(g.state, ReanchorState::kLost);
+        EXPECT_EQ(g.losses, 1u);
+        EXPECT_EQ(g.reanchors, 0u);
+      } else {
+        EXPECT_EQ(reanchored_at, kContractConfirmScans - 1);
+        EXPECT_EQ(lost_at, -1);
+        EXPECT_EQ(g.state, ReanchorState::kHealthy);
+        EXPECT_EQ(g.losses, 0u);
+        EXPECT_EQ(g.reanchors, 1u);
+      }
+    }
+  }
+}
+
 // ---- relative verification: the residual judged against what this scene gives when healthy ----
 
 namespace

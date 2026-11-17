@@ -2792,8 +2792,8 @@ Scenario verificationTimesOut(double total)
 
 // ---- F03b: a near-field scan in the verification, which the guard counts before it latches ---------------------
 
-constexpr std::size_t kEngulfReleaseScans = 5;  // guard_engulf_release_scans
-constexpr std::size_t kReanchorConfirmScans = 3;
+constexpr std::size_t kEngulfReleaseScans = 5;    // guard_engulf_release_scans
+constexpr std::size_t kReanchorConfirmScans = 3;  // reanchor_confirm_scans: the specs' default, the m20 fixture's value
 constexpr std::size_t kFarScansAfterNearField = 5;
 // Indices into Phase::kAfter: the far scan that releases the guard opens the verification as its first scan, and
 // the near-field scan is its third.
@@ -2817,6 +2817,32 @@ Scenario nearFieldDuringVerification(bool require_guard_clear)
   append(s, static_cast<int>(kNearFieldVerifying), slot(Phase::kAfter, Imu::kStatic, Guard::kNatural));
   append(s, 1, slot(Phase::kAfter, Imu::kStatic, Guard::kNatural, Cloud::kNearField));
   append(s, static_cast<int>(kFarScansAfterNearField), slot(Phase::kAfter, Imu::kStatic, Guard::kNatural));
+  return s;
+}
+
+// The m20 fixture's way from a loss to a new coordinate epoch (test/frontend_contract/m20_laser_mapping.yaml):
+// reanchor_on_fail reset_map, reanchor_total_timeout_sec 10 s, reanchor_recovery_stable_sec 1 s and lost_recovery_en,
+// with lost_recovery_stable_sec at the default of src/frontend_parameter_specs_recovery.hpp, 2 s.
+constexpr double kM20RecoveryBudgetSec = 10.0;
+constexpr double kM20RecoveryStableSec = 1.0;
+// At 10 Hz: reanchor_timeout_sec 5 s, the specs' default and the fixture's value, and lost_recovery_stable_sec 2 s.
+constexpr std::size_t kReanchorTimeoutScans = 50;
+constexpr std::size_t kLostRecoveryStableScans = 20;
+// Far scans after nearFieldDuringVerification's last one. With the verification's own scans from its opening on they
+// outlast its timeout and then a lost recovery's stable time, ten scans to spare: a recovery the rule starved would
+// show as a loss, a map reset and a new coordinate epoch within the run.
+constexpr std::size_t kFarTailScans = kReanchorTimeoutScans + kLostRecoveryStableScans + 10 -
+                                      (kNearFieldVerifying + 1 + kFarScansAfterNearField - kVerificationOpens);
+
+// nearFieldDuringVerification on the m20 fixture's way from a loss to a new coordinate epoch, and far scans after it.
+Scenario nearFieldThenFarTail(bool require_guard_clear)
+{
+  Scenario s = nearFieldDuringVerification(require_guard_clear);
+  s.name += "_far_tail";
+  setParam(s, rclcpp::Parameter("reanchor_on_fail", "reset_map"));
+  setPolicy(s, kM20RecoveryBudgetSec, kM20RecoveryStableSec);
+  setParam(s, rclcpp::Parameter("lost_recovery_en", true));
+  append(s, static_cast<int>(kFarTailScans), slot(Phase::kLater, Imu::kStatic, Guard::kNatural));
   return s;
 }
 
@@ -5137,6 +5163,116 @@ TEST(AnchorLifecycleGate, WithTheRuleOffTheSameScanThawsTheMap)
   ASSERT_TRUE(near_field.odom_seen);
   EXPECT_EQ(odomFlags(near_field) & kFlagDegraded, 0u);
   expectReRegisteredOnlyOn(r, near_field);
+}
+
+// nearFieldThenFarTail with the rule off, then on. Each arm pins the output to the anchor and keeps the map frozen
+// from the scan that latches the guard to the scan that completes the proof; from that scan on the map grows and the
+// output is the scan's own. On, that is the third far scan after the near-field scan; off, the near-field scan itself,
+// reanchor_confirm_scans scans earlier. Neither arm is lost, resets the map, starts a recovery, ends the anchor or
+// moves the coordinate epoch on, and every scan is published, one scan period after the one before: the longest
+// stretch without a trusted pose in the verification is the delay of the proof, far inside reanchor_timeout_sec.
+TEST(AnchorLifecycleGate, TheFarScansAfterTheNearFieldScanReRegisterOnceAndNothingIsLost)
+{
+  // Indices into the scans from Phase::kEvent on: the two near-field scans, Phase::kAfter, then the far tail.
+  constexpr std::size_t kLatch = 1;
+  constexpr std::size_t kOpens = 2 + kVerificationOpens;
+  constexpr std::size_t kNearField = 2 + kNearFieldVerifying;
+  constexpr std::int64_t kTimeoutNs = static_cast<std::int64_t>(kReanchorTimeoutScans) * kScanPeriodNs;
+  for (const bool rule : {false, true}) {
+    const Scenario scenario = nearFieldThenFarTail(rule);
+    const ChildResult r = runScenario(scenario);
+    SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+    ASSERT_TRUE(r.ok());
+    ASSERT_NO_FATAL_FAILURE(expectANearFieldScanReachesAVerifyingGate(r));
+    EXPECT_TRUE(writeTraceSample(r, scenario.name)) << scenario.name;
+    const std::uint64_t anchor = validAnchorAfter(r, Phase::kBefore);
+    const auto run = fromPhase(r, Phase::kEvent);
+    ASSERT_EQ(run.size(), 2 + kNearFieldVerifying + 1 + kFarScansAfterNearField + kFarTailScans);
+    // reanchor_confirm_scans clean scans in a row prove the pose; with the rule on the near-field scan is not one.
+    const std::size_t proof = rule ? kNearField + kReanchorConfirmScans : kNearField;
+    for (std::size_t i = kLatch; i < run.size(); ++i) {
+      const Observation & o = *run[i];
+      const auto & x = o.record;
+      const bool held = i < proof;
+      const std::string at = "step " + std::to_string(o.step);
+      EXPECT_EQ(x.map_updated, !held) << at;
+      const auto gate = !held        ? fast_lio::AnchorTraceGate::kHealthy
+                        : i < kOpens ? fast_lio::AnchorTraceGate::kBlind
+                                     : fast_lio::AnchorTraceGate::kVerifying;
+      EXPECT_EQ(x.gate_post, gate) << at;
+      EXPECT_EQ(x.anchor_state, fast_lio::AnchorState::kValid) << at;
+      EXPECT_EQ(x.anchor_id, anchor) << at;
+      EXPECT_EQ(x.action == fast_lio::AnchorTraceAction::kPin, held) << at;
+      EXPECT_EQ(x.anchor_used, held ? anchor : 0u) << at;
+      EXPECT_EQ(x.trust_post, fast_lio::RecoveryTrust::kLocalQualified) << at;
+      ASSERT_TRUE(x.published && o.odom_seen) << at;
+      EXPECT_EQ(odomFlags(o), held ? kFlagDegraded | kFlagStaticHold : 0u) << at;
+      if (held) {
+        EXPECT_TRUE(sameArray(o.odom_p, x.anchor_p, 3)) << at << ": " << formatPosition(o.odom_p);
+      }
+      EXPECT_EQ(o.odom_twist_cov[6], 1.0) << at << ": the coordinate epoch moved";
+    }
+
+    // The anchor is let go on the proof scan and nowhere else, and nothing else happens to it from the first
+    // near-field scan on.
+    const auto engaged = linesWhere(r, "[ZUPT-ANCHOR]", "event", "pin_engaged");
+    const auto released = linesWhere(r, "[ZUPT-ANCHOR]", "event", "pin_released");
+    ASSERT_EQ(engaged.size(), 1u);
+    ASSERT_EQ(released.size(), 1u);
+    EXPECT_EQ(valueOf(engaged.front(), "scan_seq"), std::to_string(run[kLatch]->record.scan_seq)) << engaged.front();
+    EXPECT_EQ(valueOf(released.front(), "scan_seq"), std::to_string(run[proof]->record.scan_seq)) << released.front();
+    EXPECT_EQ(valueOf(released.front(), "reason"), "scan_healthy") << released.front();
+    for (const auto & line : linesTagged(r, "[ZUPT-ANCHOR]")) {
+      const std::string event = valueOf(line, "event");
+      if (event != "counters" && event != "pin_engaged" && event != "pin_released") {
+        EXPECT_LT(toI64(valueOf(line, "scan_seq")), static_cast<std::int64_t>(run.front()->record.scan_seq)) << line;
+      }
+    }
+    EXPECT_TRUE(anchorLines(r, "invalidated", anchor).empty());
+    EXPECT_EQ(counterValue(r, "pin_applied"), std::to_string(proof - kLatch));
+
+    // One re-registration, on the proof scan; no loss, map reset, recovery or new coordinate epoch.
+    expectReRegisteredOnlyOn(r, *run[proof]);
+    EXPECT_EQ(counterValue(r, "map_reset"), "0");
+    EXPECT_EQ(counterValue(r, "recovery_started"), "0");
+    EXPECT_TRUE(linesTagged(r, "[FE-RECOVERY]").empty());
+    for (const auto & line : r.lines) {
+      EXPECT_NE(line.rfind("BPLUS_STATE ", 0), 0u) << line;
+    }
+
+    // Output: one /Odometry per scan, each one scan period after the one before; the stretch without a trusted pose
+    // runs from the latch to the proof, and its verification part stays within the timeout contract.
+    expectOdometryOnlyForPublishedScans(r);
+    const auto scans = afterWarmup(r);
+    std::int64_t longest_gap_ns = 0;
+    for (std::size_t i = 1; i < scans.size(); ++i) {
+      const std::int64_t gap = scans[i]->odom_stamp_ns - scans[i - 1]->odom_stamp_ns;
+      longest_gap_ns = std::max(longest_gap_ns, gap);
+      EXPECT_NEAR(static_cast<double>(gap), static_cast<double>(kScanPeriodNs), 1000.0) << "step " << scans[i]->step;
+    }
+    const std::int64_t degraded_ns = run[proof]->record.end_ns - run[kLatch]->record.end_ns;
+    const std::int64_t verifying_ns = run[proof]->record.end_ns - run[kOpens]->record.end_ns;
+    const auto scans_ns = [](std::size_t n) {
+      return static_cast<double>(static_cast<std::int64_t>(n) * kScanPeriodNs);
+    };
+    EXPECT_NEAR(static_cast<double>(degraded_ns), scans_ns(proof - kLatch), 1000.0);
+    EXPECT_NEAR(static_cast<double>(verifying_ns), scans_ns(proof - kOpens), 1000.0);
+    EXPECT_LE(verifying_ns, kTimeoutNs + kScanPeriodNs);
+    std::printf(
+      "[GUARD-CLEAR-TAIL] arm=%s proof_step=%d pinned_scans=%zu degraded_ns=%lld verifying_ns=%lld "
+      "longest_odom_gap_ns=%lld scans=%zu lost=%s map_reset=%s recovery_started=%s epoch=%.0f\n",
+      rule ? "on" : "off",
+      run[proof]->step,
+      proof - kLatch,
+      static_cast<long long>(degraded_ns),
+      static_cast<long long>(verifying_ns),
+      static_cast<long long>(longest_gap_ns),
+      run.size(),
+      counterValue(r, "lost").c_str(),
+      counterValue(r, "map_reset").c_str(),
+      counterValue(r, "recovery_started").c_str(),
+      run.back()->odom_twist_cov[6]);
+  }
 }
 
 // Parked on healthy scans with the parked prior pulling toward the anchor, when a runaway map reset runs after the

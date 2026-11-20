@@ -64,7 +64,6 @@
             gyr_cov: 0.005
             b_acc_cov: 0.0001
             b_gyr_cov: 0.0001
-            fov_degree:    360.0
             det_range:     60.0
             extrinsic_est_en:  false       # LOCKED: 9.36m lever-arm is real (FP_POI/IMU ~9m from baselink, verified); online estimation of a large lever is ill-conditioned — it drifts yaw +22° (non-converging) and makes results worse
             # LiDAR-in-IMU extrinsic. The cloud is in the `baselink` frame, so

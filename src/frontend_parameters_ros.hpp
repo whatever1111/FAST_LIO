@@ -33,7 +33,6 @@ struct FrontendStartup
   int reanchor_healthy_window = 100;
   double reanchor_total_timeout_sec = 0.0;
   std::string lid_topic, imu_topic, imu_input_type = "sensor_msgs", imu_bias_topic = "/fixposition/fpa/imubias";
-  double fov_deg = 0;
   double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
   std::vector<double> extrinT = std::vector<double>(3, 0.0);
   std::vector<double> extrinR = std::vector<double>(9, 0.0);

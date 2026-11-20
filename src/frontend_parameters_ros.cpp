@@ -269,12 +269,10 @@ void FrontendParameters::declareRunawayToPreprocess(rclcpp::Node & node)
   declareOnly(node, input.common_time_sync_en);
   declareOnly(node, input.common_time_offset_lidar_to_imu);
   declareOnly(node, input.common_imu_time_offset);
-  declareOnly(node, map.filter_size_corner);
   declareOnly(node, map.filter_size_surf);
   declareOnly(node, map.filter_size_map);
   declareOnly(node, map.cube_side_length);
   declareOnly(node, map.mapping_det_range);
-  declareOnly(node, map.mapping_fov_degree);
   declareOnly(node, imu.mapping_gyr_cov);
   declareOnly(node, imu.mapping_acc_cov);
   declareOnly(node, imu.mapping_b_gyr_cov);
@@ -842,20 +840,15 @@ void FrontendParameters::readMapAndNoise(const rclcpp::Node & node,
 {
   const MapParameterSpecs map{};
   const ImuParameterSpecs imu{};
-  double filter_size_corner_min = 0;
-  readInto(node, map.filter_size_corner, filter_size_corner_min);
   readInto(node, map.filter_size_surf, values_.filter_size_surf_min);
   readInto(node, map.filter_size_map, filter_size_map_min);
   readInto(node, map.cube_side_length, cube_len);
   readInto(node, map.mapping_det_range, det_range);
-  readInto(node, map.mapping_fov_degree, startup.fov_deg);
   readInto(node, imu.mapping_gyr_cov, startup.gyr_cov);
   readInto(node, imu.mapping_acc_cov, startup.acc_cov);
   readInto(node, imu.mapping_b_gyr_cov, startup.b_gyr_cov);
   readInto(node, imu.mapping_b_acc_cov, startup.b_acc_cov);
 #ifdef FASTLIO_TEST_HOOKS
-  locals_for_test_.value("filter_size_corner", filter_size_corner_min);
-  locals_for_test_.value("mapping.fov_degree", startup.fov_deg);
   locals_for_test_.value("mapping.gyr_cov", startup.gyr_cov);
   locals_for_test_.value("mapping.acc_cov", startup.acc_cov);
   locals_for_test_.value("mapping.b_gyr_cov", startup.b_gyr_cov);

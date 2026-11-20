@@ -2180,23 +2180,6 @@ private:
     h_dyn_share(x, data);
   }
 
-  template<typename T>
-  T check_safe_update(T _temp_vec)
-  {
-    T temp_vec = _temp_vec;
-    if (std::isnan(temp_vec(0, 0))) {
-      temp_vec.setZero();
-      return temp_vec;
-    }
-    double angular_dis = temp_vec.block(0, 0, 3, 1).norm() * 57.3;
-    double pos_dis = temp_vec.block(3, 0, 3, 1).norm();
-    if (angular_dis >= 20 || pos_dis > 1) {
-      printf("Angular dis = %.2f, pos dis = %.2f\r\n", angular_dis, pos_dis);
-      temp_vec.setZero();
-    }
-    return temp_vec;
-  }
-
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };

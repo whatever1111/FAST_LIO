@@ -13,12 +13,10 @@ namespace fast_lio
 struct MapParameterSpecs
 {
   const ParameterSpec<std::string> map_file_path{"map_file_path", "", ""};
-  const ParameterSpec<double> filter_size_corner{"filter_size_corner", 0.5, 0.5};
   const ParameterSpec<double> filter_size_surf{"filter_size_surf", 0.5, 0.5};
   const ParameterSpec<double> filter_size_map{"filter_size_map", 0.5, 0.5};
   const ParameterSpec<double> cube_side_length{"cube_side_length", 200., 200.f};
   const ParameterSpec<float> mapping_det_range{"mapping.det_range", 300., 300.f};
-  const ParameterSpec<double> mapping_fov_degree{"mapping.fov_degree", 180., 180.f};
   const ParameterSpec<int> mapping_map_insert_delay_scans{"mapping.map_insert_delay_scans", 0, 0};
   const ParameterSpec<bool> pcd_save_pcd_save_en{"pcd_save.pcd_save_en", false, false};
   const ParameterSpec<int> pcd_save_interval{"pcd_save.interval", -1, -1};

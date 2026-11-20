@@ -497,8 +497,6 @@ pcl::VoxelGrid<PointType> downSizeFilterMap;
 // only the init check, the dead flatten block, and the constructor Init are #ifdef'd.
 MapBackend ikdtree;
 
-V3F XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0);
-V3F XAxisPoint_world(LIDAR_SP_LEN, 0.0, 0.0);
 V3D euler_cur;
 V3D position_last(Zero3d);
 
@@ -592,17 +590,6 @@ static void transformMapSeed(bool prior_map_installed)
   }
 }
 
-template<typename T>
-void pointBodyToWorld(const Matrix<T, 3, 1> & pi, Matrix<T, 3, 1> & po)
-{
-  V3D p_body(pi[0], pi[1], pi[2]);
-  V3D p_global(state_point.rot * (state_point.offset_R_L_I * p_body + state_point.offset_T_L_I) + state_point.pos);
-
-  po[0] = p_global(0);
-  po[1] = p_global(1);
-  po[2] = p_global(2);
-}
-
 void RGBpointBodyToWorld(const PointType * const pi, PointType * const po)
 {
   V3D p_body(pi->x, pi->y, pi->z);
@@ -639,7 +626,6 @@ void lasermap_fov_segment()
   cub_needrm.clear();
   kdtree_delete_counter = 0;
   kdtree_delete_time = 0.0;
-  pointBodyToWorld(XAxisPoint_body, XAxisPoint_world);
   V3D pos_LiD = pos_lid;
   if (!Localmap_Initialized) {
     for (int i = 0; i < 3; i++) {
@@ -3894,8 +3880,6 @@ public:
     // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0,
     // aver_time_solve = 0, aver_time_const_H_time = 0; bool flg_EKF_converged, EKF_stop_flg = 0;
 
-    const double FOV_DEG = (startup.fov_deg + 10.0) > 179.9 ? 179.9 : (startup.fov_deg + 10.0);
-    [[maybe_unused]] const double HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
 
     _featsArray.reset(new PointCloudXYZI());
 
@@ -3920,8 +3904,6 @@ public:
     fill(epsi, epsi + 23, 0.001);
     kf.init_dyn_share_context(get_f, df_dx, df_dw, measurementModel, &measurement_, startup.num_max_iterations, epsi);
 #ifdef FASTLIO_TEST_HOOKS
-    effective_locals_for_test.value("derived:fov:FOV_DEG", FOV_DEG);
-    effective_locals_for_test.value("derived:fov:HALF_FOV_COS", HALF_FOV_COS);
     effective_locals_for_test.matrix("derived:extrinsic_and_noise:Lidar_T_wrt_IMU", Lidar_T_wrt_IMU);
     effective_locals_for_test.matrix("derived:extrinsic_and_noise:Lidar_R_wrt_IMU", Lidar_R_wrt_IMU);
     constructionStageForTest("filter_init");

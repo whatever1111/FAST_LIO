@@ -5567,7 +5567,7 @@ private:
       tilt.noise_moving = p.gravity_align_noise_moving;
       tilt.motion_init_sigma = p.gravity_align_grav_cap_deg * (M_PI / 180.0);
       tilt.accel_tol = p.gravity_align_accel_tol;
-      tilt.gravity_m_s2 = G_m_s2;
+      tilt.gravity_m_s2 = fast_lio::G_m_s2;
       tilt.mag_ref = p.gravity_align_mag_ref;
       tilt.vel_sigma_scale = p.gravity_align_vel_sigma_scale;
     }
@@ -6437,7 +6437,7 @@ private:
             if (w_i.norm() > p.gravity_align_gyro_tol) {
               continue;
             }
-            agg.sum += a_i - (w_i - bg_now).cross(v_body_now) * (g_raw / G_m_s2);
+            agg.sum += a_i - (w_i - bg_now).cross(v_body_now) * (g_raw / fast_lio::G_m_s2);
             agg.n++;
           }
           grav_win.push_back(agg);
@@ -6485,10 +6485,10 @@ private:
               lin_term = fast_lio::linearAccelerationTerm(grav_win.front().edge,
                                                           grav_win.back().edge,
                                                           leg_source ? false : overwritten,
-                                                          G_m_s2,
+                                                          fast_lio::G_m_s2,
                                                           p.gravity_align_vel_sigma_scale);
               if (lin_term.valid) {
-                f_meas -= lin_term.accel * (g_raw / G_m_s2);
+                f_meas -= lin_term.accel * (g_raw / fast_lio::G_m_s2);
               }
             }
           } else {
@@ -6497,7 +6497,7 @@ private:
               imu_last->linear_acceleration.x, imu_last->linear_acceleration.y, imu_last->linear_acceleration.z);
             V3D w_raw(imu_last->angular_velocity.x, imu_last->angular_velocity.y, imu_last->angular_velocity.z);
             if (w_raw.norm() <= p.gravity_align_gyro_tol) {
-              f_meas = a_raw - (w_raw - bg_now).cross(v_body_now) * (g_raw / G_m_s2);
+              f_meas = a_raw - (w_raw - bg_now).cross(v_body_now) * (g_raw / fast_lio::G_m_s2);
               win_n = 1;
               win_span = 1.0;
             }
@@ -6531,12 +6531,12 @@ private:
             V3D u_world = -grav_w.normalized();              // world up (unit)
             V3D g_body = Rw.transpose() * u_world;           // up in body (unit)
             V3D m_body = f_meas / a_norm;                    // measured up in body (unit)
-            const V3D h_body = fast_lio::levellingPrediction(g_body, st.ba, G_m_s2);
+            const V3D h_body = fast_lio::levellingPrediction(g_body, st.ba, fast_lio::G_m_s2);
             V3D residual = m_body - h_body;                  // z − h(x)
             if (residual.norm() <= 0.5) {                    // ~30° outlier gate (never inject a wild window)
               Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
               H.block<3, 3>(0, 3) = skew_sym_mat(g_body);  // ∂h/∂(rot); yaw in null space
-              H.block<3, 3>(0, 18) = fast_lio::levellingBiasJacobian(g_body, G_m_s2);
+              H.block<3, 3>(0, 18) = fast_lio::levellingBiasJacobian(g_body, fast_lio::G_m_s2);
               // [v5] degraded/held strength is an attitude measure; the gravity
               // state neither takes the residual nor leaks while it is in force.
               const bool grav_frozen = p.gravity_align_grav_freeze_degraded && (ga_trig || ga_held);
@@ -6603,7 +6603,7 @@ private:
                           << " sigma=" << sigma << " sig_eff=" << std::sqrt(n2) << " gvar=" << kf.get_P()(21, 21)
                           << " tilt_deg=" << ang_deg << " alin=" << (lin_term.valid ? lin_term.accel.norm() : 0.0)
                           << " alin_deg="
-                          << (lin_term.valid ? fast_lio::leanOfAcceleration(lin_term.accel, G_m_s2) * 57.2958 : 0.0)
+                          << (lin_term.valid ? fast_lio::leanOfAcceleration(lin_term.accel, fast_lio::G_m_s2) * 57.2958 : 0.0)
                           << " dRPY_deg=[" << deul.x() << "," << deul.y() << "," << deul.z() << "]"
                           << " posZ=" << state_point.pos[2] << "m" << std::endl;
               } else {

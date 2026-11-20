@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include "frontend_gravity.hpp"
+
 #include <Eigen/Cholesky>
 #include <Eigen/Core>
 #include <Eigen/Geometry>  // cross()
@@ -49,8 +51,8 @@ namespace fast_lio
 /// (m/s)^2; the bridge's "this axis is not observed" variance (fslam
 /// joints_to_wheelspeed kUnobservedVariance). A contract marker, not a threshold.
 constexpr double kBridgeUnobservedVariance = 1e6;
-/// m/s^2; the g that expresses the slip regressor phi in units of g.
-constexpr double kSlipGravity = 9.81;
+/// Fixed g units of the calibrated longitudinal slip feature.
+constexpr double kSlipGravity = G_m_s2;
 
 /// Error-state layout of state_ikfom (use-ikfom.hpp) that the Jacobian is written for.
 constexpr int kWheelStateDim = 23;

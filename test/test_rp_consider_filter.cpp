@@ -710,7 +710,7 @@ public:
     filter_.change_P(P);
     Q_.setZero();
     Q_.block<3, 3>(3, 3) = kAccCov * Eigen::Matrix3d::Identity();
-    // At rest the specific force is the state's own gravity reversed (S2 keeps |g| = 9.809), so nothing drifts.
+    // At rest specific force reverses the S2 gravity, so nothing drifts.
     in_.acc = Eigen::Vector3d(-x0.grav.get_vect());
     in_.gyro = Eigen::Vector3d::Zero();
   }

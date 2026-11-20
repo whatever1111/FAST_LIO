@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "frontend_correlated_update.hpp"
+#include "frontend_gravity.hpp"
 
 namespace fastlio::lidar_joint
 {
@@ -22,7 +23,7 @@ inline constexpr Eigen::Index kPoseDof = 6;
 inline constexpr std::size_t kSupportCount = 5;
 inline constexpr std::uint32_t kContractVersion = 2;  // Adds explicit range-amplitude provenance to design v1.
 inline constexpr double kProductionVariance = 0.001;
-inline constexpr double kGravityMagnitude = 98090.0 / 10000.0;
+inline constexpr double kGravityMagnitude = fast_lio::G_m_s2;
 using Vector23 = Eigen::Matrix<double, kStateDof, 1>;
 using Matrix23 = Eigen::Matrix<double, kStateDof, kStateDof>;
 using StateRowJacobian = Eigen::Matrix<double, 1, kStateDof>;

@@ -170,7 +170,7 @@ TEST(ImuProcessValidity, T14MovingTimeoutCompletesAndDegradationSurvivesReset)
   }
   // Timeout retains the current batch's legacy mean/bias and covariance calculation.
   EXPECT_DOUBLE_EQ(f.filter.get_x().bg.z(), 0.2) << frameReasons.str();
-  const S2 expectedGravity(V3D(0.0, 0.0, -G_m_s2));
+  const S2 expectedGravity(V3D(0.0, 0.0, -fast_lio::G_m_s2));
   EXPECT_DOUBLE_EQ(f.filter.get_x().grav.get_vect().z(), expectedGravity.get_vect().z()) << frameReasons.str();
   EXPECT_EQ(f.process.cov_acc, V3D::Constant(0.1)) << frameReasons.str();
   f.process.Reset();
@@ -428,7 +428,7 @@ TEST(ImuProcessValidity, GapPriorHoldsTheVelocityRotatesWithTheGyroAndInflatesTh
   EXPECT_NEAR(yawOf(x), 0.5 * 0.5 + 0.5 * 0.005, 1e-3);
   // Constant velocity from 10.1 to 10.7.
   EXPECT_NEAR(x.pos.x(), 0.6, 0.01);
-  EXPECT_NEAR(x.pos.z(), 0.0, 1e-4);  // S2 gravity is 9.809 against G_m_s2 9.81: 1 mm/s^2 at rest
+  EXPECT_NEAR(x.pos.z(), 0.0, 1e-4);  // Static specific force balances the normalized S2 gravity.
   const auto & summary = f.process.gap_summary;
   EXPECT_EQ(summary.gaps, 1);
   EXPECT_NEAR(summary.longest_s, 0.5, 1e-6);
@@ -1313,7 +1313,7 @@ TEST(ImuProcessValidity, DeskewConstantYawIncludesStartWithNonzeroExtrinsics)
   state.offset_T_L_I = translation;
   fixture.filter.change_x(state);
   // Match the actual S2 gravity magnitude, so this is truly constant velocity.
-  const V3D restAcceleration = -state.grav.get_vect() * fixture.process.gravity_norm() / G_m_s2;
+  const V3D restAcceleration = -state.grav.get_vect() * fixture.process.gravity_norm() / fast_lio::G_m_s2;
   auto input = scan(10.1);
   deskewPoints(input, {0.0f, 49.999f, 50.0f, 50.001f, 100.0f});
   addImu(input, 10.095, restAcceleration, V3D(0, 0, 1));

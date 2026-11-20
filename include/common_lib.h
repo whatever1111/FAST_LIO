@@ -21,7 +21,6 @@ using namespace Eigen;
 #define USE_IKFOM
 
 #define PI_M (3.14159265358)
-#define G_m_s2 (9.81)         // Gravaty const in GuangDong/China
 
 #define MAT_FROM_ARRAY(v)        v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]
 #define CONSTRAIN(v,min,max)     ((v>min)?((v<max)?v:max):min)

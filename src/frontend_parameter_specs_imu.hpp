@@ -1,5 +1,7 @@
 #pragma once
 
+#include "frontend_gravity.hpp"
+
 #include <string>
 #include <vector>
 
@@ -19,7 +21,8 @@ struct ImuParameterSpecs
   const ParameterSpec<double> imu_init_still_min_duration_s{"imu_init_still_min_duration_s", 1.0, 1.0};
   const ParameterSpec<int> imu_init_still_min_samples{"imu_init_still_min_samples", 100, 100};
   const ParameterSpec<double> imu_init_still_gyro_rms_max{"imu_init_still_gyro_rms_max", 0.1, 0.1};
-  const ParameterSpec<double> imu_init_still_gravity_ref{"imu_init_still_gravity_ref", 9.81, 9.81};
+  const ParameterSpec<double> imu_init_still_gravity_ref{
+    "imu_init_still_gravity_ref", kDefaultRawImuStillGravity, kDefaultRawImuStillGravity};
   const ParameterSpec<double> imu_init_still_gravity_tol{"imu_init_still_gravity_tol", 0.05, 0.05};
   const ParameterSpec<double> imu_init_still_max_gap_s{"imu_init_still_max_gap_s", 0.1, 0.1};
   const ParameterSpec<double> mapping_gyr_cov{"mapping.gyr_cov", 0.1, 0.1};

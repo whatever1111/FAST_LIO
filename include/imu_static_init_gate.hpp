@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 
+#include "frontend_gravity.hpp"
 #include "population_moments.hpp"
 
 namespace fast_lio
@@ -16,7 +17,7 @@ struct ImuStaticInitParams
   double minDurationS = 1.0;
   int minSamples = 100;
   double gyroRmsMax = 0.1;   // rad/s
-  double gravityRef = 9.81;  // raw IMU acceleration units
+  double gravityRef = kDefaultRawImuStillGravity;  // raw IMU acceleration units
   double gravityTol = 0.05;  // relative to gravityRef
   double maxGapS = 0.1;
 };

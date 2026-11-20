@@ -32,8 +32,7 @@ constexpr double kPoolMinimumDof = 60.0;
 constexpr double kTypicalRangeSigma = 0.015, kWebsiteRangeSigma = 0.01;
 constexpr double kQuarter = 0.25;
 constexpr std::size_t kSparseEntryBytes = sizeof(double) + sizeof(int);
-constexpr int kGravityNumerator = 98090, kGravityDenominator = 10000;
-using Gravity = MTK::S2<double, kGravityNumerator, kGravityDenominator, 1>;
+using Gravity = MTK::S2<double, fast_lio::kGravityNumerator, fast_lio::kGravityDenominator, 1>;
 using Clock = std::chrono::steady_clock;
 using PoseMatrix = Eigen::Matrix<double, kPoseDof, kPoseDof>;
 

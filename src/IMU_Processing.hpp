@@ -364,7 +364,7 @@ fast_lio::ImuProcessOutcome ImuProcess::IMU_init(const MeasureGroup & meas,
   V3D aligned_acc = gravity_align * mean_acc;
 
   init_state.rot  = SO3(gravity_align);
-  init_state.grav = S2(- aligned_acc / aligned_acc.norm() * G_m_s2);
+  init_state.grav = S2(- aligned_acc / aligned_acc.norm() * fast_lio::G_m_s2);
   // get_f subtracts bg directly from the incoming IMU/body-frame gyro.
   // Gravity alignment changes the world orientation, not the gyro input frame.
   init_state.bg   = mean_gyr;
@@ -503,7 +503,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup & meas,
                << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
     }
 
-    acc_avr     = acc_avr * G_m_s2 / mean_acc.norm(); // - state_inout.ba;
+    acc_avr     = acc_avr * fast_lio::G_m_s2 / mean_acc.norm(); // - state_inout.ba;
 
     if(head_stamp < prop_time)
     {
@@ -870,7 +870,7 @@ bool ImuProcess::Process(const MeasureGroup & meas,
         std::cerr << "[IMU-INIT] WARN still-gate timeout after " << init_still_timeout_s
                   << " s — initializing from a MOVING mean (gravity may be tilted; scatter "
                   << still_ratio << ")" << std::endl;
-      cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
+      cov_acc *= pow(fast_lio::G_m_s2 / mean_acc.norm(), 2);
       imu_need_init_ = false;
       initialiseTiltReference(meas, timed_out);
 

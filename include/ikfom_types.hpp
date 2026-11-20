@@ -6,9 +6,11 @@
 
 #include <IKFoM_toolkit/esekfom/esekfom.hpp>
 
+#include "frontend_gravity.hpp"
+
 typedef MTK::vect<3, double> vect3;
 typedef MTK::SO3<double> SO3;
-typedef MTK::S2<double, 98090, 10000, 1> S2;
+typedef MTK::S2<double, fast_lio::kGravityNumerator, fast_lio::kGravityDenominator, 1> S2;
 typedef MTK::vect<1, double> vect1;
 typedef MTK::vect<2, double> vect2;
 

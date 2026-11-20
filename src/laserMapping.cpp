@@ -6536,7 +6536,8 @@ private:
               // [v4] fading memory on the gravity block: with no process noise the
               // grav variance collapses and even a correct H routes nothing into it.
               // Gentle multiplicative leak (congruence row/col scaling — correlations
-              // and PSD preserved, no covariance shock) capped at (3°)².
+              // and PSD preserved, no covariance shock) capped at the configured gravity sigma squared.
+              // 重力切空间方差上限为配置的重力 σ 的平方。
               if (p.gravity_align_grav_leak > 1.0 && !grav_frozen) {
                 const double kGravVarCap = std::pow(p.gravity_align_grav_cap_deg * M_PI / 180.0, 2);
                 auto Pg = kf.get_P();

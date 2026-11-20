@@ -11,9 +11,9 @@
 // The principled gate is the innovation test used by MSCKF-style filters (OpenVINS) and, with the
 // plane covariance, by VoxelMap: a residual is admitted when it lies within k sigma of its own
 // predicted variance S = H P Hᵀ + R, H = [n_world, A_body] over the [pos, rot] block of the prior.
-// It is a 3-sigma test of the measurement noise when the pose is certain and opens by r·sigma_theta +
-// sigma_pos when it is not (after a scan hole, at start-up), so the convergence basin is kept without
-// a range heuristic. The first-neighbour bound is the separate, weaker statement that a point on a
+// k 由配置决定（M20 用 2.5），位置和姿态先验越不确定，创新门越宽。
+// The configured k sets the cutoff (2.5 on M20). The gate expands with the projected pose uncertainty
+// at start-up or after a scan hole. The first-neighbour bound is the separate, weaker statement that a point on a
 // mapped surface has a map point within the grid spacing.
 //
 // Pure C++ + Eigen. No ROS, no estimator types.

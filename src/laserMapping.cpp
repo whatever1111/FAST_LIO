@@ -140,6 +140,25 @@
 #define MAXN (fast_lio::kTimingLogCapacity)
 #define PUBFRAME_PERIOD (20)
 
+namespace
+{
+constexpr std::size_t kMappingOutputDepth = 20;
+constexpr std::size_t kOfflineStepDepth = 100;
+constexpr std::size_t kLivoxInputDepth = 20;
+constexpr std::size_t kImuInputDepth = 1000;
+constexpr std::size_t kWheelInputDepth = 2000;
+
+rclcpp::QoS reliableKeepLastQos(std::size_t depth)
+{
+  return rclcpp::QoS(rclcpp::KeepLast(depth)).reliable().durability_volatile();
+}
+
+rclcpp::QoS latestLatchedQos()
+{
+  return reliableKeepLastQos(1).transient_local();
+}
+}  // namespace
+
 struct FileCloser
 {
   void operator()(std::FILE * file) const noexcept
@@ -3925,10 +3944,11 @@ public:
                   floor_params.rel_uncertainty,
                   params_.values().degeneracy_params.schur_ridge);
     }
-    pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
-    pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
-    pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
-    pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
+    const auto mappingOutputQos = reliableKeepLastQos(kMappingOutputDepth);
+    pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", mappingOutputQos);
+    pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", mappingOutputQos);
+    pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", mappingOutputQos);
+    pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", mappingOutputQos);
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("cloud_publishers");
 #endif
@@ -3936,8 +3956,8 @@ public:
         (!fast_lio::frontendIdentifier(odom_frame_id, 64) || !fast_lio::frontendIdentifier(body_frame_id, 64))) {
       throw std::invalid_argument("frontend observation frame identifiers must contain 1..64 bytes");
     }
-    pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
-    pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+    pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", mappingOutputQos);
+    pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", mappingOutputQos);
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("odometry_publishers");
@@ -3957,7 +3977,7 @@ public:
     }
     if (offline_step_en_) {
       subOfflineStep_ = this->create_subscription<std_msgs::msg::Empty>(
-        "/lio/offline_step", 100, [this](std_msgs::msg::Empty::UniquePtr) {
+        "/lio/offline_step", reliableKeepLastQos(kOfflineStepDepth), [this](std_msgs::msg::Empty::UniquePtr) {
           size_t queued = 0;
           {
             std::lock_guard<std::mutex> lk(mtx_buffer);
@@ -4395,7 +4415,7 @@ private:
     /*** ROS subscribe initialization ***/
     if (p_pre->lidar_type == AVIA) {
       sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
-        startup.lid_topic, 20, [this](livox_ros_driver2::msg::CustomMsg::UniquePtr msg) {
+        startup.lid_topic, reliableKeepLastQos(kLivoxInputDepth), [this](livox_ros_driver2::msg::CustomMsg::UniquePtr msg) {
           livox_pcl_cbk(std::move(msg), lidar_input_lead_);
         });
     } else if (p_pre->lidar_type == ALLPOINT) {
@@ -4447,14 +4467,14 @@ private:
                   imu_time_offset);
     } else {
       sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
-        startup.imu_topic, 1000, [this](sensor_msgs::msg::Imu::UniquePtr msg) {
+        startup.imu_topic, reliableKeepLastQos(kImuInputDepth), [this](sensor_msgs::msg::Imu::UniquePtr msg) {
           imu_cbk(std::move(msg), imu_input_lead_, admissionObserver());
         });
       RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", startup.imu_topic.c_str());
     }
     if (params_.values().wheel_odom_en || params_.values().zupt_en || params_.values().parked_hold.enabled) {
       attachWheelSpeedInput(startup);
-      sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(startup.wheel_topic, 2000, twist_cbk);
+      sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(startup.wheel_topic, reliableKeepLastQos(kWheelInputDepth), twist_cbk);
       RCLCPP_INFO(this->get_logger(),
                   "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s, parked hold %s)",
                   startup.wheel_topic.c_str(),
@@ -4505,7 +4525,7 @@ private:
     // Mapping pause/resume: latched (transient_local) subscription so we
     // pick up the most recent state even if PGO published before we
     // started.  The PGO node is the sole publisher; we only read.
-    auto mapping_qos = rclcpp::QoS(1).transient_local();
+    auto mapping_qos = latestLatchedQos();
     // transient_local durability is incompatible with intra-process comms, which
     // this node enables for the point-cloud zero-copy path. This latched gate is a
     // tiny, low-rate Bool from the (separate-process) PGO node, so force it onto the
@@ -4535,7 +4555,7 @@ private:
       align_sub_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
       prior_map_align_sub_ = this->create_subscription<geometry_msgs::msg::TransformStamped>(
         "/relocalization/result",
-        rclcpp::QoS(1).transient_local(),
+        latestLatchedQos(),
         [this](geometry_msgs::msg::TransformStamped::SharedPtr msg) {
           const auto & q = msg->transform.rotation;
           const auto & t = msg->transform.translation;

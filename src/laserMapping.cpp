@@ -118,6 +118,7 @@
 #include "gravity_levelled_insertion.hpp"
 #include "imu_backlog_policy.hpp"
 #include "imu_gap_prior.hpp"
+#include "lidar_custody_input.hpp"
 #include "lost_recovery_policy.hpp"
 #include "map_backend_reference.hpp"
 #include "normal_noise_floor.hpp"
@@ -942,9 +943,9 @@ fast_lio::AdmissionInputResult acceptInputEpoch(double previous,
   return result;
 }
 
-void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg,
-                      fast_lio::InputLeadFilter & lead,
-                      fast_lio::TimeAdmissionAccounting * observer)
+fast_lio::LidarIngress standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg,
+                                        fast_lio::InputLeadFilter & lead,
+                                        fast_lio::TimeAdmissionAccounting * observer)
 {
   fast_lio::AdmissionCallbackScope accounting{observer};
   if (observer)
@@ -956,7 +957,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg,
       rclcpp::get_logger("laser_mapping"), "[STARTUP][FAST_LIO] first lidar cb (PointCloud2) stamp=%.3f", cur_time);
     diag_first_lidar_cb_logged = true;
   }
-  mtx_buffer.lock();
+  std::unique_lock lock(mtx_buffer);
   scan_count++;
   if (observer) {
     observer->canonical_header_known = true;
@@ -967,10 +968,19 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg,
     if (observer)
       observer->recordInputRejection(input, std::uint64_t(msg->width) * msg->height);
     accounting.resolve();
-    mtx_buffer.unlock();
+    lock.unlock();
     if (frontend_observation_en)
       publishFrontendObservation(false);
-    return;
+    switch (input) {
+      case fast_lio::AdmissionInputResult::kEpochRejected:
+        return fast_lio::LidarIngress::kEpochRejected;
+      case fast_lio::AdmissionInputResult::kLeadRejected:
+        return fast_lio::LidarIngress::kLeadRejected;
+      case fast_lio::AdmissionInputResult::kTransactionRejected:
+        return fast_lio::LidarIngress::kTransactionRejected;
+      case fast_lio::AdmissionInputResult::kAccepted:
+        return fast_lio::LidarIngress::kUnresolved;
+    }
   }
   double preprocess_start_time = omp_get_wtime();
   if (degeneracy_debug) {
@@ -992,8 +1002,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg,
     if (observer)
       observer->record(fast_lio::AdmissionBucket::kLateRejected, std::uint64_t(msg->width) * msg->height);
     accounting.resolve();
-    mtx_buffer.unlock();
-    return;
+    return fast_lio::LidarIngress::kLateRejected;
   }
   if (is_first_lidar) {
     is_first_lidar = false;
@@ -1015,8 +1024,9 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg,
   if (fast_lio::timingLogAccepts(scan_count)) {
     s_plot11[fast_lio::timingLogSlot(scan_count)] = omp_get_wtime() - preprocess_start_time;
   }
-  mtx_buffer.unlock();
+  lock.unlock();
   sig_buffer.notify_all();
+  return fast_lio::LidarIngress::kEnqueued;
 }
 
 // Direct subscriber for shm_msgs/PointCloud8mAndPose (/pre/all_point). Decodes the
@@ -2797,6 +2807,9 @@ std::function<void(
   afterHModelIdentities;
 std::function<void(std::uint64_t, int, int, std::size_t, std::size_t, std::uint64_t)> afterImuConsumption;
 std::function<void()> beforeImuProcess;
+std::function<void(const fast_lio::LidarWindowHeader &, const sensor_msgs::msg::PointCloud2 &)> beforeCustodyIngress;
+std::function<void(const fast_lio::LidarWindowHeader &, fast_lio::LidarIngress)> afterCustodyIngress;
+std::function<std::shared_ptr<rclcpp::ServiceBase>(rclcpp::Node &)> installCustodyTestHold;
 std::function<int(double)> overrideGuardDegraded;
 std::function<void(double, AnchorFixtureState &)> beforeAnchorStep;
 std::function<bool(double)> forceRunawayTrip;
@@ -4423,8 +4436,39 @@ private:
 
   void subscribeInputs(const fast_lio::FrontendStartup & startup)
   {
+    std::string custodyEndpoint;
+    if (get_node_parameters_interface()->get_parameter_overrides().count("lidar_custody_endpoint")) {
+      rcl_interfaces::msg::ParameterDescriptor descriptor;
+      descriptor.read_only = true;
+      custodyEndpoint = declare_parameter<std::string>("lidar_custody_endpoint", "", descriptor);
+    }
+    const char * qd = std::getenv("FLIO_LIDAR_QDEPTH");
+    const int qdepth = (qd && std::atoi(qd) > 0) ? std::atoi(qd) : 0;
     /*** ROS subscribe initialization ***/
-    if (p_pre->lidar_type == AVIA) {
+    if (!custodyEndpoint.empty()) {
+      custodyInput_ = std::make_unique<fast_lio::LidarCustodyInput>(
+        *this,
+        custodyEndpoint,
+        qdepth == 0 && p_pre->lidar_type != AVIA && p_pre->lidar_type != ALLPOINT,
+        [this](const fast_lio::LidarWindowHeader & header, sensor_msgs::msg::PointCloud2::UniquePtr cloud) {
+#ifdef FASTLIO_TEST_HOOKS
+          if (fast_lio_test::beforeCustodyIngress)
+            fast_lio_test::beforeCustodyIngress(header, *cloud);
+#else
+          (void)header;
+#endif
+          const auto result = standard_pcl_cbk(std::move(cloud), lidar_input_lead_, admissionObserver());
+#ifdef FASTLIO_TEST_HOOKS
+          if (fast_lio_test::afterCustodyIngress)
+            fast_lio_test::afterCustodyIngress(header, result);
+#endif
+          return result;
+        });
+#ifdef FASTLIO_TEST_HOOKS
+      if (fast_lio_test::installCustodyTestHold)
+        custodyTestHold_ = fast_lio_test::installCustodyTestHold(*this);
+#endif
+    } else if (p_pre->lidar_type == AVIA) {
       sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
         startup.lid_topic, reliableKeepLastQos(kLivoxInputDepth), [this](livox_ros_driver2::msg::CustomMsg::UniquePtr msg) {
           livox_pcl_cbk(std::move(msg), lidar_input_lead_);
@@ -4448,8 +4492,6 @@ private:
       // an identical scan sequence every run — required to turn the metastable bag2
       // raw-Z into a repeatable, measurable metric. Unset → SensorDataQoS (depth 5),
       // the production default. best_effort stays compatible with the bag publisher.
-      const char * qd = std::getenv("FLIO_LIDAR_QDEPTH");
-      const int qdepth = (qd && std::atoi(qd) > 0) ? std::atoi(qd) : 0;
       // Default RELIABLE KeepLast(5) to MATCH the lidar_adapter publisher
       // (it publishes canonical /lio/points reliable so no 8MB scan is silently
       // dropped). The matched reliable+volatile+keep_last pair is also what lets
@@ -5587,6 +5629,8 @@ private:
 
   void timer_callback()
   {
+    if (custodyInput_ && custodyInput_->failed())
+      return;
     const fast_lio::FrontendParams & p = params_.values();
     auto * observer = admissionObserver();
     const bool ready = sync_packages(Measures, observer);
@@ -7569,6 +7613,10 @@ private:
   rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImu>::SharedPtr sub_imu_fpa_;
   rclcpp::Subscription<fixposition_driver_msgs::msg::FpaImubias>::SharedPtr sub_imu_bias_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
+  std::unique_ptr<fast_lio::LidarCustodyInput> custodyInput_;
+#ifdef FASTLIO_TEST_HOOKS
+  rclcpp::ServiceBase::SharedPtr custodyTestHold_;
+#endif
   rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
   rclcpp::Subscription<shm_msgs::msg::PointCloud8mAndPose>::SharedPtr sub_pcl_shm_;
   rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr sub_twist_;

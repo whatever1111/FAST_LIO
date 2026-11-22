@@ -1,0 +1,8 @@
+# The initial request has a zero receiver. Subsequent queries pin both instances.
+uint8[16] sender
+uint8[16] receiver
+uint64 challenge
+---
+uint64 challenge
+bool ready
+LidarWindowAck prefix

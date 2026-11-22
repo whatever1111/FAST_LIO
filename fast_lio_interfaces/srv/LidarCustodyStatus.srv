@@ -1,0 +1,13 @@
+---
+bool bound
+bool eos
+bool drained
+bool failed
+uint64 raw
+uint64 after_eos_raw
+uint64 core_windows
+uint64 core_points
+uint64 generated
+uint64 issued
+uint64 acknowledged
+string summary

@@ -264,7 +264,7 @@ if(BUILD_TESTING)
     # third heavy compilation after BOTH normal production targets finish.
     add_library(fastlio_mapping_test_component SHARED
       src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp
-      src/frontend_parameters_ros.cpp src/frontend_measurement.cpp)
+      src/frontend_parameters_ros.cpp src/frontend_measurement.cpp test/lidar_custody_test_probe.cpp)
     target_compile_definitions(fastlio_mapping_test_component PRIVATE
       FASTLIO_AS_COMPONENT FASTLIO_TEST_HOOKS USE_IVOX)
     target_include_directories(fastlio_mapping_test_component PRIVATE
@@ -530,6 +530,10 @@ ${sanitizer_tests}
   target_include_directories(test_time_admission_accounting PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_features(test_time_admission_accounting PRIVATE cxx_std_17)
   ament_add_gtest(test_time_admission_policy test/test_time_admission_policy.cpp)
+  ament_add_gtest(test_lidar_custody_receiver test/test_lidar_custody_receiver.cpp)
+  if(TARGET test_lidar_custody_receiver)
+    target_include_directories(test_lidar_custody_receiver PRIVATE include)
+  endif()
   target_include_directories(test_time_admission_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_features(test_time_admission_policy PRIVATE cxx_std_17)
   ament_add_gtest(test_population_moments test/test_population_moments.cpp)

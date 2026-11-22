@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sensor_msgs/msg/point_cloud2.hpp>
+
 #include <Eigen/Core>
 
 #include <array>
@@ -10,14 +12,22 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "anchor_trace.hpp"
+#include "lidar_custody_receiver.hpp"
 #include "map_point_identity.hpp"
 #include "time_admission_accounting.hpp"
+
+namespace rclcpp
+{
+class Node;
+class ServiceBase;
+}  // namespace rclcpp
 
 // Only the non-installed test component defines or references these callbacks.
 // Install before starting the worker/reset threads, clear only after joining both.
@@ -45,6 +55,10 @@ extern std::function<void(std::size_t, double)> afterScanPrepared;
 extern std::function<void(std::size_t, double, int)> afterHModelRows;
 extern std::function<void(std::uint64_t, int, int, std::size_t, std::size_t, std::uint64_t)> afterImuConsumption;
 extern std::function<void()> beforeImuProcess;
+extern std::function<void(const fast_lio::LidarWindowHeader &, const sensor_msgs::msg::PointCloud2 &)>
+  beforeCustodyIngress;
+extern std::function<void(const fast_lio::LidarWindowHeader &, fast_lio::LidarIngress)> afterCustodyIngress;
+extern std::function<std::shared_ptr<rclcpp::ServiceBase>(rclcpp::Node &)> installCustodyTestHold;
 /// Scan end time -> -1 keep the divergence guard's verdict, 0 healthy, 1 degraded.
 extern std::function<int(double)> overrideGuardDegraded;
 extern std::function<void(double, AnchorFixtureState &)> beforeAnchorStep;

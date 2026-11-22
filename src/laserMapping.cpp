@@ -6528,23 +6528,20 @@ private:
               std::abs(a_norm - g_ref) <= p.gravity_align_accel_tol * g_ref) {
             V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
             V3D u_world = -grav_w.normalized();              // world up (unit)
-            V3D g_body = Rw.transpose() * u_world;           // predicted up in body (unit)
+            V3D g_body = Rw.transpose() * u_world;           // up in body (unit)
             V3D m_body = f_meas / a_norm;                    // measured up in body (unit)
-            V3D residual = m_body - g_body;                  // z − h(x)
+            const V3D h_body = fast_lio::levellingPrediction(g_body, st.ba, G_m_s2);
+            V3D residual = m_body - h_body;                  // z − h(x)
             if (residual.norm() <= 0.5) {                    // ~30° outlier gate (never inject a wild window)
               Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
               H.block<3, 3>(0, 3) = skew_sym_mat(g_body);  // ∂h/∂(rot); yaw in null space
+              H.block<3, 3>(0, 18) = fast_lio::levellingBiasJacobian(g_body, G_m_s2);
               // [v5] degraded/held strength is an attitude measure; the gravity
               // state neither takes the residual nor leaks while it is in force.
               const bool grav_frozen = p.gravity_align_grav_freeze_degraded && (ga_trig || ga_held);
-              // [v4] gravity-state observability: h = Rᵀ·(−g/‖g‖) also depends on the
-              // S2 gravity state — without these two columns a motion-biased gravity
-              // INIT is permanently unobservable (m20_0831: the bag starts walking →
-              // the world frame is tilted 6.7° for the entire run and the rot-only
-              // update just pulls attitude onto the tilted gravity — measured as the
-              // 3-5° tug-of-war [GALIGN] tilt that never converges). With the columns
-              // in, the Kalman gain splits the residual by covariance: rot follows
-              // the (tight) lidar, grav follows the absolute accel reference.
+              // [v4] An init window in motion can bias the S2 gravity state (m20_0831).
+              // These columns let the Kalman gain split the residual among attitude,
+              // accelerometer bias and gravity according to the covariance.
               // ∂h/∂δg = −(1/‖g‖)·Rᵀ·M(g), M = S2_Mx (same helper df_dx uses).
               if (!grav_frozen) {
                 Eigen::Matrix<state_ikfom::scalar, 2, 1> dz0 = Eigen::Matrix<state_ikfom::scalar, 2, 1>::Zero();
@@ -6613,7 +6610,7 @@ private:
               }
               if (p.kalman_channel_diag_en) {
                 writeKalmanChannel(
-                  "gravity", st, state_point, gravityCovarianceBefore, gravityDiagnostics, m_body, g_body);
+                  "gravity", st, state_point, gravityCovarianceBefore, gravityDiagnostics, m_body, h_body);
               }
             }  // outlier gate
           }

@@ -1,3 +1,5 @@
+#include <Eigen/LU>
+
 #include <cmath>
 #include <cstring>
 #include <gtest/gtest.h>
@@ -243,6 +245,89 @@ TEST(ImuTiltReference, PriorMapAndUnavailableReferencePreserveQuaternionBytes)
   tilt.initialise(kAccel, kZero, true, params);
   ASSERT_FALSE(tilt.initialised());
   expectSameRotation(rot, fast_lio::insertionRotationFromImuTilt(rot, tilt, false, 0.0));
+}
+
+// The measured vertical is the direction of G·up + b_a; the bias column is its derivative at zero bias, and the
+// prediction its first-order expansion.
+TEST(GravityAlignKinematics, LevellingBiasColumnIsTheDerivativeOfTheBiasedVertical)
+{
+  constexpr double G = 9.81;
+  for (const Eigen::Vector3d & up :
+       {Eigen::Vector3d(Eigen::Vector3d::UnitZ()), Eigen::Vector3d(Eigen::Vector3d(0.3, -0.2, 0.93).normalized())}) {
+    const auto measured = [&up, G](const Eigen::Vector3d & bias) {
+      return Eigen::Vector3d((G * up + bias).normalized());
+    };
+    const double step = 1e-4;
+    Eigen::Matrix3d numeric;
+    for (int axis = 0; axis < 3; ++axis) {
+      const Eigen::Vector3d delta = step * Eigen::Vector3d::Unit(axis);
+      numeric.col(axis) = (measured(delta) - measured(-delta)) / (2.0 * step);
+    }
+    EXPECT_LT((numeric - fast_lio::levellingBiasJacobian(up, G)).cwiseAbs().maxCoeff(), 1e-8);
+    const Eigen::Vector3d bias(0.03, -0.02, 0.05);
+    EXPECT_LT((fast_lio::levellingPrediction(up, bias, G) - measured(bias)).norm(), 2.0 * bias.squaredNorm() / (G * G));
+  }
+}
+
+TEST(GravityAlignKinematics, ZeroBiasMatchesTheLegacyVerticalAndRetainsTheDerivative)
+{
+  const Eigen::Vector3d up = Eigen::Vector3d(0.1, 0.2, 0.97).normalized();
+  EXPECT_EQ(fast_lio::levellingPrediction(up, Eigen::Vector3d::Zero(), 9.81), up);
+  const Eigen::Matrix3d jacobian = fast_lio::levellingBiasJacobian(up, 9.81);
+  EXPECT_LT((jacobian * up).norm(), 1e-15);
+  EXPECT_NEAR(jacobian.trace(), 2.0 / 9.81, 1e-15);
+}
+
+TEST(GravityAlignKinematics, BiasedVerticalAtTruthLeavesOnlySecondOrderResidual)
+{
+  const Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
+  const Eigen::Vector3d horizontal(0.0316, 0.0, 0.0);
+  const Eigen::Vector3d axial(0.0, 0.0, 0.0316);
+  for (const auto & bias : {horizontal, axial, Eigen::Vector3d(horizontal + axial)}) {
+    const Eigen::Vector3d measured = (kG * up + bias).normalized();
+    const double bound = 2.0 * bias.squaredNorm() / (kG * kG);
+    const double legacy_residual = (measured - up).norm();
+    const double horizontal_ratio = (bias - up * up.dot(bias)).norm() / kG;
+    EXPECT_LE((measured - fast_lio::levellingPrediction(up, bias, kG)).norm(), bound);
+    EXPECT_LE(std::abs(legacy_residual - horizontal_ratio), bound);
+    if (bias == horizontal)
+      EXPECT_GT(legacy_residual, 0.5 * horizontal_ratio);
+  }
+}
+
+TEST(GravityAlignKinematics, LevellingBiasColumnNullSpaceIsTheVertical)
+{
+  const Eigen::Vector3d up = Eigen::Vector3d(0.25, -0.11, 0.96).normalized();
+  const Eigen::Matrix3d jacobian = fast_lio::levellingBiasJacobian(up, kG);
+  Eigen::FullPivLU<Eigen::Matrix3d> rank(jacobian);
+  rank.setThreshold(1e-12);
+  EXPECT_EQ(rank.rank(), 2);
+  EXPECT_LE((jacobian * up).norm(), 1e-12);
+}
+
+TEST(GravityAlignKinematics, HeadingChangeSeparatesHorizontalBiasFromWorldTilt)
+{
+  const auto levelling_rows = [](double yaw) {
+    const Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
+    const Eigen::Matrix3d rot = Eigen::AngleAxisd(yaw, up).toRotationMatrix();
+    Eigen::Matrix3d attitude;
+    for (int i = 0; i < 3; ++i)
+      attitude.col(i) = up.cross(Eigen::Vector3d::Unit(i));
+    Eigen::Matrix<double, 3, 4> rows;
+    rows.leftCols<2>() = attitude * rot.transpose().leftCols<2>();
+    rows.rightCols<2>() = fast_lio::levellingBiasJacobian(up, kG).leftCols<2>();
+    return rows;
+  };
+  const auto parked = levelling_rows(0.0);
+  Eigen::Matrix<double, 6, 4> turned;
+  turned.topRows<3>() = parked;
+  turned.bottomRows<3>() = levelling_rows(M_PI / 2.0);
+  Eigen::FullPivLU<Eigen::Matrix<double, 3, 4>> parked_rank(parked);
+  Eigen::FullPivLU<Eigen::Matrix<double, 6, 4>> turned_rank(turned);
+  parked_rank.setThreshold(1e-12);
+  turned_rank.setThreshold(1e-12);
+  EXPECT_EQ(parked_rank.rank(), 2);
+  EXPECT_EQ(turned_rank.rank(), 4);
 }
 
 // ── The case this header exists for ──────────────────────────────────────────

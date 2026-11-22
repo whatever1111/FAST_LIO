@@ -159,4 +159,30 @@ inline double leanOfAcceleration(const Eigen::Vector3d & accel, double gravity)
   return std::atan2(std::hypot(accel.x(), accel.y()), gravity);
 }
 
+// ── The accelerometer bias in the levelling measurement ──────────────────────
+// At rest the accelerometer reads b_a − Rᵀg (FAST-LIO's IMU model, g the gravity state), a specific force of
+// magnitude G — the IMU scaling makes the accelerometer mean exactly G_m_s2, and b_a is in the same units. Its
+// direction is, to first order in b_a/G, up_body + P⊥·b_a/G with P⊥ = I − up_body·up_bodyᵀ: the bias across the
+// vertical tilts the measured vertical, the bias along it only changes the length the normalisation drops. A
+// levelling measurement therefore carries both the bias term and its column.
+
+/// I − u·uᵀ for a unit vector u: the projection across it.
+inline Eigen::Matrix3d projectionAcross(const Eigen::Vector3d & unit)
+{
+  return Eigen::Matrix3d::Identity() - unit * unit.transpose();
+}
+
+/// The body-frame vertical with the first-order horizontal bias contribution P⊥·b_a/G.
+inline Eigen::Vector3d
+levellingPrediction(const Eigen::Vector3d & up_body, const Eigen::Vector3d & bias, double gravity)
+{
+  return up_body + projectionAcross(up_body) * bias / gravity;
+}
+
+/// ∂ levellingPrediction / ∂b_a: P⊥/G.
+inline Eigen::Matrix3d levellingBiasJacobian(const Eigen::Vector3d & up_body, double gravity)
+{
+  return projectionAcross(up_body) / gravity;
+}
+
 }  // namespace fast_lio

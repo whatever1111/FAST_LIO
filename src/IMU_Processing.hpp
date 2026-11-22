@@ -29,6 +29,7 @@
 #include "imu_initialization_validity.hpp"
 #include "imu_process_outcome.hpp"
 #include "imu_static_init_gate.hpp"
+#include "imu_tilt_reference.hpp"
 #include "population_moments.hpp"
 #include "scan_history_policy.hpp"
 #include "scan_time_policy.hpp"
@@ -139,12 +140,47 @@ class ImuProcess
   // gate "linear acceleration ≈ 0" (|‖a_raw‖ − g_raw| small) in a scale-agnostic
   // way, regardless of whether the IMU reports in m/s² or g.
   double gravity_norm() const { return mean_acc.norm(); }
+  void configureTiltReference(const fast_lio::ImuTiltReferenceParams & params) { tilt_reference_params_ = params; }
+  const fast_lio::ImuTiltReference & tiltReference() const { return tilt_reference_; }
+  void propagateTiltReference(const MeasureGroup & meas)
+  {
+    if (!tilt_reference_.initialised())
+      return;
+    for (const auto & imu : meas.imu) {
+      const double t = get_time_sec(imu->header.stamp);
+      const double dt = t - get_time_sec(tilt_last_imu_->header.stamp);
+      if (!(dt > 0.0))
+        continue;
+      const auto & prev = tilt_last_imu_->angular_velocity;
+      const auto & gyro = imu->angular_velocity;
+      const auto & accel = imu->linear_acceleration;
+      tilt_reference_.propagate(
+        V3D(prev.x, prev.y, prev.z), V3D(gyro.x, gyro.y, gyro.z), V3D(accel.x, accel.y, accel.z), dt);
+      tilt_last_imu_ = imu;
+    }
+  }
+  void closeTiltWindow(const fast_lio::ImuTiltLegEdge & edge, bool scan_static, double t)
+  {
+    tilt_reference_.closeWindow(edge, scan_static, t);
+  }
 #ifdef FASTLIO_TEST_HOOKS
   const M3D & lidarRotationForTest() const { return Lidar_R_wrt_IMU; }
   const V3D & lidarTranslationForTest() const { return Lidar_T_wrt_IMU; }
 #endif
 
  private:
+   void initialiseTiltReference(const MeasureGroup & meas, bool timed_out)
+   {
+     if (!(tilt_reference_params_.window_s > 0.0))
+       return;
+     tilt_reference_params_.gravity_raw = gravity_norm();
+     tilt_last_imu_ = meas.imu.back();
+     tilt_reference_.initialise(
+       mean_acc, mean_gyr, !timed_out, tilt_reference_params_, get_time_sec(tilt_last_imu_->header.stamp));
+   }
+   fast_lio::ImuTiltReferenceParams tilt_reference_params_;
+   fast_lio::ImuTiltReference tilt_reference_;
+   sensor_msgs::msg::Imu::ConstSharedPtr tilt_last_imu_;
    fast_lio::ScanHistoryAction
    prepareHistoryCloud(const MeasureGroup & meas, PointCloudXYZI::Ptr & history_cloud, fast_lio::ProcessAudit * audit);
    // Discard only the invalid initialization window. In particular, keep the
@@ -223,6 +259,8 @@ void ImuProcess::Reset()
   mean_gyr      = V3D(0, 0, 0);
   angvel_last       = Zero3d;
   imu_need_init_    = true;
+  tilt_reference_ = {};
+  tilt_last_imu_.reset();
   start_timestamp_  = -1;
   initialization_attempt_start_ = 0.0;
   has_initialization_attempt_start_ = false;
@@ -834,6 +872,7 @@ bool ImuProcess::Process(const MeasureGroup & meas,
                   << still_ratio << ")" << std::endl;
       cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init_ = false;
+      initialiseTiltReference(meas, timed_out);
 
       cov_acc = cov_acc_scale;
       cov_gyr = cov_gyr_scale;

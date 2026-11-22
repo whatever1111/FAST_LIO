@@ -1,10 +1,15 @@
-#include <gtest/gtest.h>
-
 #include <cmath>
+#include <cstring>
+#include <gtest/gtest.h>
 #include <limits>
 
 #include "gravity_align_kinematics.hpp"
+#include "gravity_levelled_insertion.hpp"
 
+using fast_lio::ImuTiltLegEdge;
+using fast_lio::ImuTiltReference;
+using fast_lio::ImuTiltReferenceParams;
+using fast_lio::ImuTiltWindowRejection;
 using fast_lio::kLegEdgeMinSamples;
 using fast_lio::kLegEdgeStandstillSpeed;
 using fast_lio::leanOfAcceleration;
@@ -21,6 +26,41 @@ namespace
 {
 constexpr double kG = 9.81;
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+constexpr int kImuHz = 200;
+constexpr double kDt = 1.0 / kImuHz;
+const Eigen::Vector3d kDown(0.0, 0.0, -1.0);
+const Eigen::Vector3d kAccel(0.0, 0.0, kG);
+const Eigen::Vector3d kZero = Eigen::Vector3d::Zero();
+
+ImuTiltReferenceParams tiltParams()
+{
+  ImuTiltReferenceParams params;
+  params.window_s = 1.0;
+  params.gyr_cov = 0.0015636343949698187;
+  params.b_gyr_cov = 3.564031869636761e-05;
+  params.noise_static = 0.008;
+  params.noise_moving = 0.045;
+  params.motion_init_sigma = 8.0 * M_PI / 180.0;
+  params.gravity_raw = kG;
+  params.mag_ref = kG;
+  params.vel_sigma_scale = 1.0;
+  return params;
+}
+
+ImuTiltLegEdge legEdge(double speed, bool valid = true)
+{
+  return {Eigen::Vector3d(speed, 0.0, 0.0), 0.15 * 0.15, valid, true};
+}
+
+double angle(const Eigen::Vector3d & lhs, const Eigen::Vector3d & rhs)
+{
+  return std::atan2(lhs.cross(rhs).norm(), lhs.dot(rhs));
+}
+
+void expectSameRotation(const Eigen::Quaterniond & expected, const Eigen::Quaterniond & used)
+{
+  EXPECT_EQ(std::memcmp(expected.coeffs().data(), used.coeffs().data(), sizeof(double) * 4), 0);
+}
 
 LevellingWindowScan scan(double t_start, double t_end, const Eigen::Vector3d & v_start, const Eigen::Vector3d & v_end)
 {
@@ -32,6 +72,178 @@ LevellingWindowScan scan(double t_start, double t_end, const Eigen::Vector3d & v
   return s;
 }
 }  // namespace
+
+TEST(ImuTiltReference, LevelStationaryFor100SecondsPreservesQuaternionBytes)
+{
+  ImuTiltReference tilt;
+  tilt.initialise(kAccel, kZero, true, tiltParams());
+  ASSERT_TRUE(tilt.initialised());
+  tilt.closeWindow({}, true, 0.0);
+  for (int i = 1; i <= 100 * kImuHz; ++i) {
+    tilt.propagate(kZero, kZero, kAccel, kDt);
+    if (i % kImuHz == 0)
+      tilt.closeWindow({}, true, i * kDt);
+  }
+  const Eigen::Vector3d down = tilt.downBodyAt(100.0);
+  EXPECT_LE(angle(down, kDown), 1e-12);
+  Eigen::Quaterniond rot(Eigen::AngleAxisd(0.34, Eigen::Vector3d::UnitZ()));
+  rot.x() = -0.0;
+  expectSameRotation(rot, fast_lio::levelledInsertionRotation(rot, down));
+}
+
+TEST(ImuTiltReference, PurePitchRotatesTheEntireForceSumIntoTheEndFrame)
+{
+  ImuTiltReference tilt;
+  tilt.initialise(kAccel, kZero, true, tiltParams());
+  tilt.closeWindow(legEdge(0.0), true, 0.0);
+  const double rate = 10.0 * M_PI / 180.0;
+  const Eigen::Vector3d gyro = rate * Eigen::Vector3d::UnitY();
+  for (int i = 1; i <= kImuHz; ++i) {
+    const double t = i * kDt;
+    const Eigen::AngleAxisd world_to_body(-rate * t, Eigen::Vector3d::UnitY());
+    tilt.propagate(gyro, gyro, world_to_body * kAccel, kDt);
+    EXPECT_LE(angle(tilt.downBodyAt(t), world_to_body * kDown), 1e-6) << "sample " << i;
+  }
+  tilt.closeWindow(legEdge(0.0), false, 1.0);
+  ASSERT_TRUE(tilt.diagnostics().updated);
+  EXPECT_LE(tilt.diagnostics().residual_angle, 1e-6);
+  const Eigen::AngleAxisd one_period_ahead(-rate * (1.0 + kDt), Eigen::Vector3d::UnitY());
+  EXPECT_LE(angle(tilt.downBodyAt(1.0 + 5.0 * kDt), one_period_ahead * kDown), 1e-6);
+}
+
+TEST(ImuTiltReference, SustainedAccelerationUsesBothLegEdgesOrWithholdsWindow)
+{
+  const Eigen::Vector3d accel = kAccel + Eigen::Vector3d(0.5, 0.0, 0.0);
+  for (int invalid_edge : {-1, 0, 1}) {
+    SCOPED_TRACE(invalid_edge);
+    auto params = tiltParams();
+    params.window_s = 2.0;
+    ImuTiltReference tilt;
+    tilt.initialise(kAccel, kZero, true, params);
+    tilt.closeWindow(legEdge(0.4, invalid_edge != 0), false, 0.0);
+    for (int i = 0; i < 2 * kImuHz; ++i)
+      tilt.propagate(kZero, kZero, accel, kDt);
+    tilt.closeWindow(legEdge(1.4, invalid_edge != 1), false, 2.0);
+    const auto & diag = tilt.diagnostics();
+    if (invalid_edge == -1) {
+      ASSERT_TRUE(diag.updated);
+      EXPECT_LE(diag.residual_angle, 1e-6);
+    } else {
+      EXPECT_FALSE(diag.updated);
+      EXPECT_EQ(diag.rejection, ImuTiltWindowRejection::kLegEdge);
+    }
+    EXPECT_LE(angle(tilt.downBodyAt(2.0), kDown), 1e-6);
+  }
+}
+
+TEST(ImuTiltReference, EstimatesPostInitialisationHorizontalGyroBias)
+{
+  const auto params = tiltParams();
+  const double bias = 100.0 * M_PI / (180.0 * 3600.0);
+  const double rc = params.noise_static * params.noise_static * params.window_s;
+  const double k1 = std::sqrt(params.gyr_cov * kDt / rc + 2.0 * std::sqrt(params.b_gyr_cov * kDt / rc));
+  const Eigen::Vector3d rate(bias, 0.0, 0.0);
+  ImuTiltReference tilt;
+  tilt.initialise(kAccel, kZero, true, params);
+  tilt.closeWindow({}, true, 0.0);
+  double peak = 0.0;
+  for (int i = 1; i <= 50 * kImuHz; ++i) {
+    tilt.propagate(i == 1 ? kZero : rate, rate, kAccel, kDt);
+    const double t = i * kDt;
+    peak = std::max(peak, angle(tilt.downBodyAt(t), kDown));
+    if (i % kImuHz == 0) {
+      tilt.closeWindow({}, true, t);
+      ASSERT_TRUE(tilt.diagnostics().updated);
+      peak = std::max(peak, angle(tilt.downBodyAt(t), kDown));
+    }
+  }
+  EXPECT_LE(peak, bias / k1);
+  EXPECT_LE(std::abs(tilt.bias().x() - bias), 3.0 * std::sqrt(tilt.covarianceDiagonal()(3)));
+}
+
+TEST(ImuTiltReference, NonOverlappingWindowsCountEachSampleOnce)
+{
+  constexpr double duration = 3.5;
+  const auto params = tiltParams();
+  ImuTiltReference tilt;
+  tilt.initialise(kAccel, kZero, true, params);
+  tilt.closeWindow({}, true, 0.0);
+  int windows = 0;
+  int samples = 0;
+  for (int i = 1; i <= duration * kImuHz; ++i) {
+    tilt.propagate(kZero, kZero, kAccel, kDt);
+    if (i % (kImuHz / 10) != 0)
+      continue;
+    tilt.closeWindow({}, true, i * kDt);
+    const auto & diag = tilt.diagnostics();
+    if (diag.windows > windows) {
+      ASSERT_TRUE(diag.updated);
+      EXPECT_EQ(diag.samples, kImuHz);
+      samples += diag.samples;
+      ++windows;
+    }
+  }
+  EXPECT_EQ(windows, static_cast<int>(std::floor(duration / params.window_s)));
+  EXPECT_EQ(samples, windows * kImuHz);
+}
+
+TEST(ImuTiltReference, HorizontalAccelerometerBiasKeepsItsPhysicalTiltFloor)
+{
+  const Eigen::Vector3d accel = kAccel + Eigen::Vector3d(kG * 1e-3, 0.0, 0.0);
+  ImuTiltReference tilt;
+  tilt.initialise(kAccel, kZero, true, tiltParams());
+  tilt.closeWindow({}, true, 0.0);
+  for (int i = 1; i <= 60 * kImuHz; ++i) {
+    tilt.propagate(kZero, kZero, accel, kDt);
+    if (i % kImuHz == 0)
+      tilt.closeWindow({}, true, i * kDt);
+  }
+  ASSERT_TRUE(tilt.diagnostics().updated);
+  const double error = angle(tilt.downBodyAt(60.0), kDown);
+  EXPECT_GE(error, 0.9e-3);
+  EXPECT_LE(error, 1.1e-3);
+}
+
+TEST(ImuTiltReference, InsertionMatchesBodyDownAndChangesYawAtSecondOrder)
+{
+  const auto yaw = [](const Eigen::Quaterniond & q) {
+    const Eigen::Vector3d forward = q * Eigen::Vector3d::UnitX();
+    return std::atan2(forward.y(), forward.x());
+  };
+  const Eigen::Quaterniond heading(Eigen::AngleAxisd(0.66, Eigen::Vector3d::UnitZ()));
+  const Eigen::Vector3d tilt_axis = Eigen::Vector3d(1.0, -2.0, 0.0).normalized();
+  const Eigen::Vector3d reference_axis = Eigen::Vector3d(2.0, 1.0, 0.0).normalized();
+  double previous_heading_change = 0.0;
+  for (double theta : {0.06, 0.03}) {
+    const Eigen::Quaterniond rot = heading * Eigen::AngleAxisd(theta, tilt_axis);
+    const Eigen::Vector3d down = Eigen::AngleAxisd(-theta, reference_axis) * kDown;
+    const auto used = fast_lio::levelledInsertionRotation(rot, down);
+    EXPECT_LE(angle(used.conjugate() * kDown, down), 1e-12);
+    const double heading_change = std::abs(yaw(used) - yaw(rot));
+    ASSERT_GT(heading_change, 0.0);
+    if (previous_heading_change > 0.0) {
+      EXPECT_GT(heading_change / previous_heading_change, 0.24);
+      EXPECT_LT(heading_change / previous_heading_change, 0.26);
+    }
+    previous_heading_change = heading_change;
+  }
+}
+
+TEST(ImuTiltReference, PriorMapAndUnavailableReferencePreserveQuaternionBytes)
+{
+  Eigen::Quaterniond rot(Eigen::AngleAxisd(0.25, Eigen::Vector3d::UnitY()));
+  rot.x() = -0.0;
+  ImuTiltReference tilt;
+  expectSameRotation(rot, fast_lio::insertionRotationFromImuTilt(rot, tilt, false, 0.0));
+  auto params = tiltParams();
+  tilt.initialise(kAccel, kZero, true, params);
+  ASSERT_TRUE(tilt.initialised());
+  expectSameRotation(rot, fast_lio::insertionRotationFromImuTilt(rot, tilt, true, 0.0));
+  params.window_s = 0.0;
+  tilt.initialise(kAccel, kZero, true, params);
+  ASSERT_FALSE(tilt.initialised());
+  expectSameRotation(rot, fast_lio::insertionRotationFromImuTilt(rot, tilt, false, 0.0));
+}
 
 // ── The case this header exists for ──────────────────────────────────────────
 // m20 0826 131 s: the dog walks into a doorway at 0.86 m/s and stops inside the

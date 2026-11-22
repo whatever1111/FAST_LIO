@@ -115,6 +115,7 @@
 #include "frontend_observation.hpp"
 #include "frontend_parameters_ros.hpp"
 #include "gravity_align_kinematics.hpp"
+#include "gravity_levelled_insertion.hpp"
 #include "imu_backlog_policy.hpp"
 #include "imu_gap_prior.hpp"
 #include "lost_recovery_policy.hpp"
@@ -562,15 +563,33 @@ void pointBodyToWorld_ikfom(const PointType * const pi, PointType * const po, st
   po->intensity = pi->intensity;
 }
 
-void pointBodyToWorld(const PointType * const pi, PointType * const po)
+static Eigen::Quaterniond mapInsertionRotation(bool prior_map_installed)
+{
+#ifdef USE_IVOX
+  prior_map_installed = prior_map_installed || ikdtree.pinnedVoxels() > 0;
+#endif
+  return fast_lio::insertionRotationFromImuTilt(
+    state_point.rot, p_imu->tiltReference(), prior_map_installed, lidar_end_time);
+}
+
+void pointBodyToWorld(const PointType * const pi, PointType * const po, const Eigen::Quaterniond & insert_rot)
 {
   V3D p_body(pi->x, pi->y, pi->z);
-  V3D p_global(state_point.rot * (state_point.offset_R_L_I * p_body + state_point.offset_T_L_I) + state_point.pos);
+  V3D p_global(insert_rot * (state_point.offset_R_L_I * p_body + state_point.offset_T_L_I) + state_point.pos);
 
   po->x = p_global(0);
   po->y = p_global(1);
   po->z = p_global(2);
   po->intensity = pi->intensity;
+}
+
+static void transformMapSeed(bool prior_map_installed)
+{
+  feats_down_world->resize(feats_down_size);
+  const Eigen::Quaterniond insert_rot = mapInsertionRotation(prior_map_installed);
+  for (int i = 0; i < feats_down_size; i++) {
+    pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]), insert_rot);
+  }
 }
 
 template<typename T>
@@ -1329,6 +1348,114 @@ bool body_is_static(const MeasureGroup & meas, double now)
 {
   return static_evidence_of(meas, now).stationary();
 }
+
+struct GravityLegEdgeSamples
+{
+  double vx_mean = 0.0;
+  V3D gyro_mean = V3D::Zero();
+  int n_leg = 0;
+  int n_w = 0;
+  double variance = 0.0;
+  bool valid = false;
+  bool stream_alive = false;
+
+  V3D velocity(const fast_lio::FrontendParams & p, const V3D & bias) const
+  {
+    V3D w_mean = V3D::Zero();
+    if (n_w > 0)
+      w_mean = gyro_mean - bias;
+    return fast_lio::legEdgeVelocity(vx_mean, p.R_robot_to_imu, w_mean, p.gravity_align_leg_lever_arm);
+  }
+};
+
+static GravityLegEdgeSamples
+sampleGravityLegEdge(const fast_lio::FrontendParams & p, bool body_static, bool record_gyro)
+{
+  GravityLegEdgeSamples edge;
+  const double t_lo = lidar_end_time - p.gravity_align_leg_edge_window_s;
+  double vx_sum = 0.0;
+  {
+    std::lock_guard<std::mutex> lk(mtx_twist);
+    for (const auto & sample : gravity_align_leg_hist) {
+      if (sample.first >= t_lo && sample.first <= lidar_end_time + 0.02) {
+        vx_sum += sample.second;
+        ++edge.n_leg;
+      }
+    }
+    edge.stream_alive = last_twist_stamp > 0.0 && lidar_end_time - last_twist_stamp < 1.0;
+  }
+  V3D w_sum = V3D::Zero();
+  const auto accumulate_gyro = [&](double time, const V3D & gyro) {
+    if (time >= t_lo && time <= lidar_end_time) {
+      w_sum += gyro;
+      ++edge.n_w;
+    }
+  };
+  if (record_gyro) {
+    for (const auto & imu : Measures.imu) {
+      gravity_align_gyro_hist.emplace_back(
+        get_time_sec(imu->header.stamp),
+        V3D(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z));
+    }
+    while (!gravity_align_gyro_hist.empty() &&
+           (gravity_align_gyro_hist.front().first < lidar_end_time - 2.5 || gravity_align_gyro_hist.size() > 1000)) {
+      gravity_align_gyro_hist.pop_front();
+    }
+  }
+  for (const auto & sample : gravity_align_gyro_hist)
+    accumulate_gyro(sample.first, sample.second);
+  // Initialisation and early exits close the independent window without adding
+  // observations to the main levelling prior's legacy scan history.
+  if (!record_gyro) {
+    for (const auto & imu : Measures.imu) {
+      accumulate_gyro(get_time_sec(imu->header.stamp),
+                      V3D(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z));
+    }
+  }
+  edge.vx_mean = edge.n_leg > 0 ? vx_sum / double(edge.n_leg) * p.wheel_speed_scale : 0.0;
+  if (edge.n_w > 0)
+    edge.gyro_mean = w_sum / double(edge.n_w);
+  edge.valid = fast_lio::legEdgeValid(edge.n_leg, edge.vx_mean, body_static);
+  edge.variance = fast_lio::legEdgeVariance(edge.vx_mean, body_static, p.gravity_align_leg_vel_sigma);
+  return edge;
+}
+
+static void closeImuTiltWindow(const fast_lio::FrontendParams & p, const GravityLegEdgeSamples & edge, bool body_static)
+{
+  p_imu->closeTiltWindow(
+    {edge.velocity(p, p_imu->tiltReference().bias()), edge.variance, edge.valid, edge.stream_alive},
+    body_static,
+    lidar_end_time);
+}
+
+class ScanTiltWindow
+{
+public:
+  explicit ScanTiltWindow(const fast_lio::FrontendParams & p)
+      : params_(p), pending_(p_imu->tiltReference().initialised())
+  {}
+
+  ~ScanTiltWindow()
+  {
+    if (pending_) {
+      const bool still = body_is_static(Measures, lidar_end_time);
+      close(sampleGravityLegEdge(params_, still, false), still);
+    }
+  }
+
+  bool pending() const { return pending_; }
+
+  void close(const GravityLegEdgeSamples & edge, bool still)
+  {
+    if (pending_)
+      closeImuTiltWindow(params_, edge, still);
+    pending_ = false;
+  }
+
+private:
+  const fast_lio::FrontendParams & params_;
+  bool pending_;
+};
 
 double max_scan_duration_s = 0.0;  // 0 disables the device-specific upper bound.
 std::uint64_t invalid_scan_time_count = 0;
@@ -2942,7 +3069,10 @@ void readMapEnvironment(const rclcpp::Logger & logger)
 
 // The recovery callback and the worker-ordering fixture use this exact boundary.
 // Join precedes every map read/write and discarding delayed world-frame batches.
-bool rebuildLocalMapStorage(int & map_before, std::uint64_t seed_scan_seq, fast_lio::TimeAdmissionAccounting * observer)
+bool rebuildLocalMapStorage(int & map_before,
+                            std::uint64_t seed_scan_seq,
+                            fast_lio::TimeAdmissionAccounting * observer,
+                            bool prior_map_installed = false)
 {
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::beforeResetJoin)
@@ -2962,8 +3092,9 @@ bool rebuildLocalMapStorage(int & map_before, std::uint64_t seed_scan_seq, fast_
     fast_lio_test::afterPendingReset();
 #endif
   feats_down_world->resize(feats_down_size);
+  const Eigen::Quaterniond insert_rot = mapInsertionRotation(prior_map_installed);
   for (int i = 0; i < feats_down_size; i++) {
-    pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+    pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]), insert_rot);
   }
   bool kept_prior = false;
   map_before = ikdtree.size();
@@ -3013,7 +3144,9 @@ bool rebuildLocalMapStorage(int & before, std::uint64_t seed_scan_seq)
 #endif
 
 // nearest: each scan point's map neighbours from the measurement model's last search.
-void map_incremental(const std::vector<PointVector> & nearest, fast_lio::TimeAdmissionAccounting * observer)
+void map_incremental(const std::vector<PointVector> & nearest,
+                     fast_lio::TimeAdmissionAccounting * observer,
+                     bool prior_map_installed)
 {
   PointVector PointToAdd;
   PointVector PointNoNeedDownsample;
@@ -3021,9 +3154,10 @@ void map_incremental(const std::vector<PointVector> & nearest, fast_lio::TimeAdm
   PointNoNeedDownsample.reserve(feats_down_size);
   fast_lio::MapInsertProvenance provenance = fast_lio::beginScanProvenance(
     fast_lio::mapPointIdentityStatus(ikdtree) == fast_lio::MapIdentityStatus::kOk, lifecycle_scan_seq, feats_down_size);
+  const Eigen::Quaterniond insert_rot = mapInsertionRotation(prior_map_installed);
   for (int i = 0; i < feats_down_size; i++) {
     /* transform to world frame */
-    pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+    pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]), insert_rot);
     /* decide if need add to map */
     if (!nearest[i].empty() && flg_EKF_inited) {
       const PointVector & points_near = nearest[i];
@@ -3781,6 +3915,7 @@ public:
     p_imu->set_acc_cov(V3D(startup.acc_cov, startup.acc_cov, startup.acc_cov));
     p_imu->set_gyr_bias_cov(V3D(startup.b_gyr_cov, startup.b_gyr_cov, startup.b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(startup.b_acc_cov, startup.b_acc_cov, startup.b_acc_cov));
+    configureImuTiltReference(startup);
 
     fill(epsi, epsi + 23, 0.001);
     kf.init_dyn_share_context(get_f, df_dx, df_dw, measurementModel, &measurement_, startup.num_max_iterations, epsi);
@@ -4929,7 +5064,8 @@ private:
     if (std::strcmp(tag, "TEST_PRE_REFERENCE") == 0)
       seed_scan_seq = 0;
 #endif
-    const bool kept_prior = rebuildLocalMapStorage(map_before, seed_scan_seq, admissionObserver());
+    const bool kept_prior =
+      rebuildLocalMapStorage(map_before, seed_scan_seq, admissionObserver(), prior_map_installed_);
     const auto prior =
       fast_lio::priorMapAfterReset(prior_map_installed_, kept_prior, params_.values().prior_map_freeze);
 #ifdef FASTLIO_TEST_HOOKS
@@ -5376,6 +5512,10 @@ private:
       return false;
     }
     anchor_scan_scope.noteImuSettlement(p_imu->lastOutcome());
+    p_imu->propagateTiltReference(Measures);
+    if (p_imu->lastOutcome().reason == fast_lio::ImuProcessReason::kInitializationComplete) {
+      const ScanTiltWindow tilt_initialising(params_.values());
+    }
     if (required_prior_lost) {
       accounting.finish(fast_lio::AdmissionExit::kRequiredPriorLost);
       fast_lio::tripReanchorLost(&reanchor_gate);
@@ -5406,6 +5546,31 @@ private:
       return false;
     }
     return true;
+  }
+
+  void configureImuTiltReference(const fast_lio::FrontendStartup & startup)
+  {
+    const auto & p = params_.values();
+    fast_lio::ImuTiltReferenceParams tilt;
+    if (!(p.gravity_align_window_s > 0.0) ||
+        (p.gravity_align_lin_accel_comp && p.gravity_align_lin_accel_source != "leg")) {
+      RCLCPP_WARN(this->get_logger(),
+                  "IMU tilt reference unavailable: scan window must be positive and acceleration compensation must use "
+                  "leg speed");
+    } else {
+      tilt.window_s = p.gravity_align_window_s;
+      tilt.gyr_cov = startup.gyr_cov;
+      tilt.b_gyr_cov = startup.b_gyr_cov;
+      tilt.noise_static = p.gravity_align_noise_static;
+      tilt.noise_moving = p.gravity_align_noise_moving;
+      tilt.motion_init_sigma = p.gravity_align_grav_cap_deg * (M_PI / 180.0);
+      tilt.gyro_tol = p.gravity_align_gyro_tol;
+      tilt.accel_tol = p.gravity_align_accel_tol;
+      tilt.gravity_m_s2 = G_m_s2;
+      tilt.mag_ref = p.gravity_align_mag_ref;
+      tilt.vel_sigma_scale = p.gravity_align_vel_sigma_scale;
+    }
+    p_imu->configureTiltReference(tilt);
   }
 
   void timer_callback()
@@ -5452,6 +5617,7 @@ private:
 
       if (!processImuScan(observer, accounting, anchor_scan_scope))
         return;
+      ScanTiltWindow tilt_window(p);
       t_undist = omp_get_wtime();
       state_point = kf.get_x();
       if (p_imu->gap_summary.gaps > 0) {
@@ -5714,10 +5880,7 @@ private:
 
               // 4. Transform current scan to world frame
               ikdtree.set_downsample_param(filter_size_map_min);
-              feats_down_world->resize(feats_down_size);
-              for (int i = 0; i < feats_down_size; i++) {
-                pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
-              }
+              transformMapSeed(true);
 
               // 5. Prior map + current scan → map backend. Pinned, the prior map goes into a
               //    tier of its own; unpinned, it is merged in and lives or dies with the rest.
@@ -5820,10 +5983,7 @@ private:
                            prior_map_pcd_.c_str());
               // Fall back: build from current scan only
               ikdtree.set_downsample_param(filter_size_map_min);
-              feats_down_world->resize(feats_down_size);
-              for (int i = 0; i < feats_down_size; i++) {
-                pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
-              }
+              transformMapSeed(prior_map_installed_);
               observeMapOperation(
                 observer,
                 fast_lio::AdmissionMapKind::kInitialBuild,
@@ -5835,10 +5995,7 @@ private:
           } else {
             // Normal init: build from current scan only
             ikdtree.set_downsample_param(filter_size_map_min);
-            feats_down_world->resize(feats_down_size);
-            for (int i = 0; i < feats_down_size; i++) {
-              pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
-            }
+            transformMapSeed(prior_map_installed_);
 #ifdef FASTLIO_TEST_HOOKS
             if (fast_lio_test::initialBuildTakesNoPoint && fast_lio_test::initialBuildTakesNoPoint(lidar_end_time)) {
               for (auto & point : feats_down_world->points)
@@ -6227,13 +6384,20 @@ private:
        *   (skew(g_body) sends a yaw-axis δθ to 0), so the LiDAR-excellent
        *   heading is untouched. h(x)=Rᵀ·u_world, right-perturbation
        *   R=R̂·Exp(δθ) ⇒ ∂h/∂δθ=skew(g_body), same form as planar/wheel. ***/
-      if (p.gravity_align_en && !Measures.imu.empty()) {
+      const bool use_gravity_prior = p.gravity_align_en && !Measures.imu.empty();
+      const bool main_uses_leg = use_gravity_prior && p.gravity_align_window_s > 0.0 &&
+                                 p.gravity_align_lin_accel_comp && p.gravity_align_lin_accel_source == "leg";
+      const bool body_static_now =
+        (use_gravity_prior || tilt_window.pending()) && body_is_static(Measures, lidar_end_time);
+      const GravityLegEdgeSamples leg_edge = main_uses_leg || tilt_window.pending()
+                                               ? sampleGravityLegEdge(p, body_static_now, true)
+                                               : GravityLegEdgeSamples{};
+      if (use_gravity_prior) {
         const double g_raw = p_imu->gravity_norm();  // gravity magnitude, raw units
         state_ikfom st = kf.get_x();
         M3D Rw = st.rot.toRotationMatrix();
         const V3D bg_now(st.bg[0], st.bg[1], st.bg[2]);
-        const V3D v_body_now = Rw.transpose() * st.vel;                         // velocity in IMU frame
-        const bool body_static_now = body_is_static(Measures, lidar_end_time);  // one verdict for this block
+        const V3D v_body_now = Rw.transpose() * st.vel;  // velocity in IMU frame
         const bool sigma_by_measurement = p.gravity_align_sigma_policy == "measurement";
         // [v6] velocity covariance trace at this scan's end (the compensation sigma's input)
         const double vel_var_now = p.gravity_align_vel_sigma_scale > 0.0 ? kf.get_P().block<3, 3>(12, 12).trace() : 0.0;
@@ -6247,45 +6411,10 @@ private:
           V3D v_edge = v_body_now;
           double var_edge = vel_var_now;
           bool edge_valid = !gravity_align_vel_overwritten;
-          if (p.gravity_align_lin_accel_comp && p.gravity_align_lin_accel_source == "leg") {
-            // trailing edge means of the leg forward speed and the body rate over the same span
-            for (const auto & imu : Measures.imu) {
-              gravity_align_gyro_hist.emplace_back(
-                get_time_sec(imu->header.stamp),
-                V3D(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z));
-            }
-            while (!gravity_align_gyro_hist.empty() && (gravity_align_gyro_hist.front().first < lidar_end_time - 2.5 ||
-                                                        gravity_align_gyro_hist.size() > 1000)) {
-              gravity_align_gyro_hist.pop_front();
-            }
-            const double t_lo = lidar_end_time - p.gravity_align_leg_edge_window_s;
-            double vx_sum = 0.0;
-            int n_leg = 0;
-            {
-              std::lock_guard<std::mutex> lk(mtx_twist);
-              for (const auto & sample : gravity_align_leg_hist) {
-                if (sample.first >= t_lo && sample.first <= lidar_end_time + 0.02) {
-                  vx_sum += sample.second;
-                  ++n_leg;
-                }
-              }
-            }
-            V3D w_sum = V3D::Zero();
-            int n_w = 0;
-            for (const auto & sample : gravity_align_gyro_hist) {
-              if (sample.first >= t_lo && sample.first <= lidar_end_time) {
-                w_sum += sample.second;
-                ++n_w;
-              }
-            }
-            const double vx_mean = n_leg > 0 ? vx_sum / double(n_leg) * p.wheel_speed_scale : 0.0;
-            V3D w_mean = V3D::Zero();
-            if (n_w > 0) {
-              w_mean = w_sum / double(n_w) - bg_now;
-            }
-            edge_valid = fast_lio::legEdgeValid(n_leg, vx_mean, body_static_now);
-            v_edge = fast_lio::legEdgeVelocity(vx_mean, p.R_robot_to_imu, w_mean, p.gravity_align_leg_lever_arm);
-            var_edge = fast_lio::legEdgeVariance(vx_mean, body_static_now, p.gravity_align_leg_vel_sigma);
+          if (main_uses_leg) {
+            edge_valid = leg_edge.valid;
+            v_edge = leg_edge.velocity(p, bg_now);
+            var_edge = leg_edge.variance;
           }
           agg.edge.t_start = gravity_align_prev_t;
           agg.edge.t_end = lidar_end_time;
@@ -6383,8 +6512,7 @@ private:
             p.gravity_align_window_s <= 0.0 || (win_span >= 0.7 * p.gravity_align_window_s && win_n >= 20);
           // [v6] with the compensation on, a window whose velocity history is broken cannot be levelled to.
           // A platform with no leg stream at all keeps the legacy measurement (the stream, not an edge, is absent).
-          const bool leg_stream_alive = p.gravity_align_lin_accel_source != "leg" ||
-                                        (last_twist_stamp > 0.0 && lidar_end_time - last_twist_stamp < 1.0);
+          const bool leg_stream_alive = p.gravity_align_lin_accel_source != "leg" || leg_edge.stream_alive;
           const bool lin_ok =
             !p.gravity_align_lin_accel_comp || p.gravity_align_window_s <= 0.0 || lin_term.valid || !leg_stream_alive;
           // [v6] blind stretch with the body moving: the acceleration is unobservable, so is the vertical
@@ -6491,6 +6619,8 @@ private:
           }
         }
       }
+
+      tilt_window.close(leg_edge, body_static_now);
 
       /*** A'-2 planar-motion soft constraint: pseudo-measurement that the
        *   BODY-frame vertical velocity is ~0 (a ground-robot non-holonomic
@@ -7118,7 +7248,7 @@ private:
           observer->add(observer->map_gates[2]);
       }
       if (map_enabled && !flio_map_frozen && !frozen_by_prior) {
-        map_incremental(measurement_.nearestPoints(), observer);
+        map_incremental(measurement_.nearestPoints(), observer, prior_map_installed_);
         anchorTraceMapUpdated();
       }
       t5 = omp_get_wtime();

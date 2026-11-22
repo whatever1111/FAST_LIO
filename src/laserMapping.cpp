@@ -346,9 +346,7 @@ bool anchor_trace_body_was_static = false;  // the previous evaluated verdict, f
 bool anchor_trace_gap_run = false;          // inside a run of scans with IMU coverage gaps
 bool anchor_trace_bridge_run = false;       // inside a run of scans with bridged IMU gaps
 double input_epoch_fault_stamp = std::numeric_limits<double>::quiet_NaN();  // under mtx_buffer
-double last_twist_stamp = -1.0;       // newest wheel-speed sample time (s); -1 = none yet
-double last_twist_speed = 0.0;        // |v| of the newest wheel sample (m/s)
-V3D last_twist_v_body = V3D::Zero();  // the newest finite wheel sample, body frame (m/s), under mtx_twist
+double last_twist_stamp = -1.0;  // newest wheel-speed sample time (s); -1 = none yet
 // Re-anchor gate: the guard used to unfreeze the map the moment the scene
 // looked healthy again, which is where a recoverable blind stretch became a
 // permanent runaway — the pose error survived the release, the map was rebuilt
@@ -496,7 +494,7 @@ LatencyStats sensor_to_odom_latency_stats;
 // before the twist subscription exists, and clears it first thing in its destructor, both under
 // mtx_twist: the destructor body runs before the members go, so a callback holding mtx_twist sees either a live
 // object or null. One node per process, as for the rest of this file's state.
-// mtx_twist guards this pointer, what the callbacks fill through it, last_twist_* and gravity_align_leg_hist. It is
+// mtx_twist guards this pointer, what the callbacks fill through it, last_twist_stamp and gravity_align_leg_hist. It is
 // taken alone: no other lock is acquired while it is held, and it is never acquired under another lock.
 fast_lio::WheelSpeedInput * wheel_speed_input = nullptr;
 mutex mtx_twist;
@@ -1262,21 +1260,15 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
   std::lock_guard<std::mutex> lk(mtx_twist);
   // NaN is the wheelspeed bridge saying "cannot measure", not a number. Only a
   // real measurement may enter the buffer the iEKF update consumes; what the
-  // absence of one means is decided once, in static_evidence.hpp, which is why
-  // the stamp and speed below are still recorded as they arrive.
+  // absence of one means is decided by the guards, which also see invalid
+  // samples in their timestamped evidence history.
   if (fast_lio::wheelSampleIsEvidence(v(0), v(1), v(2))) {
     if (wheel_speed_input != nullptr)
       wheel_speed_input->addTwist(msg_in->header.stamp.sec, msg_in->header.stamp.nanosec, v(0));
   }
-  // Stamped newest sample for the static hold: the wheel-odom fusion below
-  // consumes the buffer, but the hold needs to know how OLD the evidence is.
   last_twist_stamp = get_time_sec(msg_in->header.stamp);
-  last_twist_speed = v.norm();
   if (wheel_speed_input != nullptr)
-    wheel_speed_input->observeEvidence(last_twist_stamp, last_twist_speed);
-  if (v.allFinite()) {
-    last_twist_v_body = v;
-  }
+    wheel_speed_input->observeEvidence(last_twist_stamp, v);
   // [v6] stamped forward-speed history for the levelling prior's leg-velocity edges
   if (std::isfinite(v(0))) {
     gravity_align_leg_hist.emplace_back(last_twist_stamp, v(0));
@@ -1297,10 +1289,16 @@ void twist_cov_cbk(const geometry_msgs::msg::TwistWithCovarianceStamped::UniqueP
       msg_in->header.stamp.sec, msg_in->header.stamp.nanosec, msg_in->twist.covariance[0], msg_in->twist.covariance[7]);
 }
 
+fast_lio::WheelEvidence wheelEvidenceAt(double end)
+{
+  std::lock_guard<std::mutex> lk(mtx_twist);
+  return wheel_speed_input != nullptr ? wheel_speed_input->evidenceAt(end) : fast_lio::WheelEvidence{};
+}
+
 // Independent, front-end-agnostic evidence that the platform is parked. The
 // verdict itself lives in static_evidence.hpp and stationary_anchor_policy.hpp (pure, unit-tested); this only
-// summarises the scan's IMU window and reads the newest wheel sample. `trace`, when given, receives the verdict and
-// its inputs for the anchor trace.
+// summarises the scan's IMU window and reads wheel evidence at its endpoint. `trace`, when given, receives the verdict
+// and its inputs for the anchor trace.
 fast_lio::StaticEvidenceVerdict
 static_evidence_of(const MeasureGroup & meas, double now, fast_lio::AnchorScanRecord * trace = nullptr)
 {
@@ -1320,12 +1318,7 @@ static_evidence_of(const MeasureGroup & meas, double now, fast_lio::AnchorScanRe
   if (imu.samples > 0)
     imu.acc_mean = acc_sum / static_cast<double>(imu.samples);
 
-  fast_lio::WheelEvidence wheel;
-  {
-    std::lock_guard<std::mutex> lk(mtx_twist);
-    if (wheel_speed_input != nullptr)
-      wheel = wheel_speed_input->evidenceAt(now);
-  }
+  const auto wheel = wheelEvidenceAt(now);
 
   fast_lio::StaticEvidenceParams params;
   params.gyro_thresh = zupt_gyro_thresh;
@@ -6328,17 +6321,12 @@ private:
               // policy (engulf_release.hpp) can take the legs or keep the estimate, each with the 1-σ the
               // assignment deserves, so the next innovations are not forced through stale cross terms.
               state_ikfom st = kf.get_x();
-              V3D leg_v = V3D::Zero();
-              double leg_age = -1.0;
-              {
-                std::lock_guard<std::mutex> lk(mtx_twist);
-                leg_v = last_twist_v_body;
-                leg_age = last_twist_stamp > 0.0 ? lidar_end_time - last_twist_stamp : -1.0;
-              }
+              const auto wheel = wheelEvidenceAt(lidar_end_time);
+              const V3D leg_v(wheel.body_velocity[0], wheel.body_velocity[1], wheel.body_velocity[2]);
               release_vel_params.zero_sigma = p.guard_vel_reset_sigma;
               release_vel_params.max_speed = p.divergence_guard_max_speed;
-              const auto rel =
-                fast_lio::releaseVelocity(st.vel, st.rot.toRotationMatrix(), leg_v, leg_age, release_vel_params);
+              const auto rel = fast_lio::releaseVelocity(
+                st.vel, st.rot.toRotationMatrix(), leg_v, wheel.valid ? wheel.age : -1.0, release_vel_params);
               st.vel = rel.velocity;
               gravity_align_vel_overwritten = true;
               kf.change_x(st);
@@ -7013,16 +7001,10 @@ private:
        *   and the IMU's static verdict — and act when they contradict it for
        *   long enough that noise cannot explain it. ***/
       if (p.runaway.enabled) {
-        double wheel_stamp = -1.0;
-        double wheel_speed = 0.0;
-        {
-          std::lock_guard<std::mutex> lk(mtx_twist);
-          wheel_stamp = last_twist_stamp;
-          wheel_speed = last_twist_speed;
-        }
-        const double wheel_age = wheel_stamp > 0.0 ? std::fabs(lidar_end_time - wheel_stamp) : -1.0;
+        const auto wheel = wheelEvidenceAt(lidar_end_time);
+        const double wheel_age = wheel.valid ? wheel.age : -1.0;
         const auto runaway = runawayVerdictForTest(fast_lio::updateRunawayWatchdog(
-          &runaway_state, lidar_end_time, state_point.vel.norm(), body_static, wheel_age, wheel_speed, p.runaway));
+          &runaway_state, lidar_end_time, state_point.vel.norm(), body_static, wheel_age, wheel.speed, p.runaway));
         if (runaway.tripped) {
           frontend_runaway = true;
           if (anchor_scan_record_open)
@@ -7033,7 +7015,7 @@ private:
                        runaway.bad_for,
                        fast_lio::runawayReasonName(runaway.reason),
                        state_point.vel.norm(),
-                       wheel_age >= 0.0 ? wheel_speed : -1.0,
+                       wheel_age >= 0.0 ? wheel.speed : -1.0,
                        effct_feat_num,
                        res_mean_last,
                        runaway_state.trips,

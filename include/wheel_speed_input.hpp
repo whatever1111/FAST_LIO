@@ -139,7 +139,10 @@ public:
 
   // The callbacks' part: the caller holds the node's mtx_twist.
 
-  void observeEvidence(double stamp, double speed) { evidence_.observe(stamp, speed); }
+  void observeEvidence(double stamp, const Eigen::Vector3d & velocity)
+  {
+    evidence_.observe(stamp, velocity.norm(), {velocity.x(), velocity.y(), velocity.z()});
+  }
   WheelEvidence evidenceAt(double now) const { return evidence_.at(now); }
 
   /// A gated sample the caller has found to be a measurement (wheelSampleIsEvidence). Without a variance topic it is

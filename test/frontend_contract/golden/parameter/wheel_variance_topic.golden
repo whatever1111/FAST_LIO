@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/wheel_variance_topic
-# fork_sha: 2aa092e2f299cc174d06790e76d46da4918cf21b
+# fork_sha: aa6c92edcc5685d3b2a94092f0ebeda0c7feea1d
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -26,6 +26,7 @@ log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=
 event.v1 map_backend declared=245 names_sha256=9809a9cb160aac7998078d2b0131989f46a456a69d4d35cf44cf2a36b88f00fa
 log INFO laser_mapping "p_pre->lidar_type 1"
 event.v1 read_inputs declared=245 names_sha256=9809a9cb160aac7998078d2b0131989f46a456a69d4d35cf44cf2a36b88f00fa
+log WARN laser_mapping "IMU tilt reference unavailable: scan window must be positive and acceleration compensation must use leg speed"
 event.v1 filter_init declared=245 names_sha256=9809a9cb160aac7998078d2b0131989f46a456a69d4d35cf44cf2a36b88f00fa
 log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
 log INFO laser_mapping "Wheel speed variances subscribed: topic=/wheel_odom/twist_cov depth=250, paired with /wheel_odom/twist by stamp; forward sigma floor 0.075 m/s"

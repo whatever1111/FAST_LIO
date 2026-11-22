@@ -103,25 +103,22 @@ struct WheelEvidence
   std::array<double, 3> body_velocity{};
 };
 
-/// Bounded independently of wheel updates and variance pairing. Keep invalid samples
-/// too: a latest "cannot measure" must not expose an older zero.
+/// Keep measurement order in original header nanoseconds, independently of wheel
+/// updates and variance pairing. An invalid measurement must mask any older zero.
 class WheelEvidenceHistory
 {
 public:
   static constexpr std::size_t kCapacity = 250;  ///< 5 s at the bridge's 50 Hz
 
-  void observe(double stamp, double speed, const std::array<double, 3> & body_velocity = {})
+  void observe(std::int64_t stamp_ns, double speed, const std::array<double, 3> & body_velocity = {})
   {
-    if (!std::isfinite(stamp)) {
-      return;
-    }
     const auto at = std::lower_bound(
-      samples_.begin(), samples_.end(), stamp, [](const auto & sample, double time) { return sample.first < time; });
-    const WheelEvidence evidence{stamp > 0.0, -1.0, speed, body_velocity};
-    if (at != samples_.end() && at->first == stamp) {
+      samples_.begin(), samples_.end(), stamp_ns, [](const auto & sample, auto time) { return sample.first < time; });
+    const WheelEvidence evidence{stamp_ns > 0, -1.0, speed, body_velocity};
+    if (at != samples_.end() && at->first == stamp_ns) {
       at->second = evidence;
     } else {
-      samples_.insert(at, {stamp, evidence});
+      samples_.insert(at, {stamp_ns, evidence});
     }
     while (samples_.size() > kCapacity) {
       samples_.pop_front();
@@ -133,19 +130,39 @@ public:
     if (!std::isfinite(now)) {
       return {};
     }
-    const auto end = std::upper_bound(
-      samples_.begin(), samples_.end(), now, [](double time, const auto & sample) { return time < sample.first; });
+    double whole = 0.0;
+    const double fraction = std::modf(now, &whole);
+    // Modf and signed integer division both truncate toward zero. If their
+    // whole seconds agree, the fused residual tests the exact sign, even
+    // when rounding the fractional product would land on the sample stamp.
+    const auto end = std::partition_point(samples_.begin(), samples_.end(), [&](const auto & sample) {
+      const auto seconds = static_cast<double>(sample.first / kNanosPerSecond);
+      if (seconds != whole) {
+        return seconds < whole;
+      }
+      const auto nanos = static_cast<double>(sample.first % kNanosPerSecond);
+      return std::fma(fraction, kNanosPerSecond, -nanos) >= 0.0;
+    });
     if (end == samples_.begin()) {
       return {};
     }
     const auto & sample = *std::prev(end);
     auto evidence = sample.second;
-    evidence.age = now - sample.first;
+    const double elapsed_seconds = whole - static_cast<double>(sample.first / kNanosPerSecond);
+    const auto nanos = static_cast<double>(sample.first % kNanosPerSecond);
+    // Keep the nanosecond residual for close samples, including across a
+    // second boundary. For older samples the whole-second term dominates.
+    if (elapsed_seconds <= 1.0) {
+      evidence.age = std::fma(fraction, kNanosPerSecond, elapsed_seconds * kNanosPerSecond - nanos) / kNanosPerSecond;
+    } else {
+      evidence.age = elapsed_seconds + (fraction - nanos / kNanosPerSecond);
+    }
     return evidence;
   }
 
 private:
-  std::deque<std::pair<double, WheelEvidence>> samples_;
+  static constexpr std::int64_t kNanosPerSecond = 1'000'000'000;
+  std::deque<std::pair<std::int64_t, WheelEvidence>> samples_;
 };
 
 struct StaticEvidenceVerdict

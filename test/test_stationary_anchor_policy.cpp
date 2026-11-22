@@ -21,12 +21,17 @@ using fast_lio::RecoveryState;
 using fast_lio::RecoveryTrust;
 using fast_lio::StartupReference;
 
+namespace
+{
+constexpr std::int64_t kSecond = 1000000000;
+}
+
 TEST(WheelEvidenceHistory, FutureStandstillCannotSupplyPastStaticEvidence)
 {
   fast_lio::WheelEvidenceHistory history;
   fast_lio::StaticEvidenceParams params;
-  history.observe(1.0, 1.0);
-  history.observe(3.0, 0.0);
+  history.observe(kSecond, 1.0);
+  history.observe(3 * kSecond, 0.0);
   const auto earlier = history.at(1.2);
   ASSERT_TRUE(fast_lio::wheelEvidenceUsable(earlier, params));
   EXPECT_DOUBLE_EQ(earlier.speed, 1.0);
@@ -47,9 +52,9 @@ TEST(WheelEvidenceHistory, FutureStandstillCannotSupplyPastStaticEvidence)
 TEST(WheelEvidenceHistory, LatestCausalInvalidSampleDoesNotExposeAnOlderZero)
 {
   fast_lio::WheelEvidenceHistory history;
-  history.observe(1.0, 0.0);
-  history.observe(1.1, std::numeric_limits<double>::quiet_NaN());
-  history.observe(1.3, 0.0);
+  history.observe(kSecond, 0.0);
+  history.observe(1'100'000'000, std::numeric_limits<double>::quiet_NaN());
+  history.observe(1'300'000'000, 0.0);
   EXPECT_FALSE(fast_lio::wheelEvidenceUsable(history.at(1.2), {}));
   EXPECT_TRUE(fast_lio::wheelEvidenceUsable(history.at(1.0), {}));
 }
@@ -57,11 +62,11 @@ TEST(WheelEvidenceHistory, LatestCausalInvalidSampleDoesNotExposeAnOlderZero)
 TEST(WheelEvidenceHistory, HistoryIsBoundedAndOrdersMeasurementTimes)
 {
   fast_lio::WheelEvidenceHistory history;
-  history.observe(2.0, 0.0);
-  history.observe(1.0, 1.0);
+  history.observe(2 * kSecond, 0.0);
+  history.observe(kSecond, 1.0);
   EXPECT_DOUBLE_EQ(history.at(1.0).speed, 1.0);
   for (std::size_t i = 0; i <= fast_lio::WheelEvidenceHistory::kCapacity; ++i) {
-    history.observe(3.0 + static_cast<double>(i), 0.0);
+    history.observe((3 + static_cast<std::int64_t>(i)) * kSecond, 0.0);
   }
   EXPECT_FALSE(history.at(3.0).valid);
   EXPECT_FALSE(history.at(std::numeric_limits<double>::quiet_NaN()).valid);
@@ -73,7 +78,6 @@ using fast_lio::StationaryAnchorParams;
 
 namespace
 {
-constexpr std::int64_t kSecond = 1000000000;
 constexpr std::int64_t kPeriod = 100000000;  // 10 Hz scans that span their period
 constexpr std::int64_t kFirstBegin = 5 * kSecond;
 

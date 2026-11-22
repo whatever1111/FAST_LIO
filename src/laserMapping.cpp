@@ -1267,7 +1267,7 @@ void twist_cbk(const geometry_msgs::msg::TwistStamped::UniquePtr msg_in)
   }
   last_twist_stamp = get_time_sec(msg_in->header.stamp);
   if (wheel_speed_input != nullptr)
-    wheel_speed_input->observeEvidence(last_twist_stamp, v);
+    wheel_speed_input->observeEvidence(msg_in->header.stamp.sec, msg_in->header.stamp.nanosec, v);
   // [v6] stamped forward-speed history for the levelling prior's leg-velocity edges
   if (std::isfinite(v(0))) {
     gravity_align_leg_hist.emplace_back(last_twist_stamp, v(0));

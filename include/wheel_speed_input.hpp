@@ -139,9 +139,11 @@ public:
 
   // The callbacks' part: the caller holds the node's mtx_twist.
 
-  void observeEvidence(double stamp, const Eigen::Vector3d & velocity)
+  void observeEvidence(std::int32_t sec, std::uint32_t nanosec, const Eigen::Vector3d & velocity)
   {
-    evidence_.observe(stamp, velocity.norm(), {velocity.x(), velocity.y(), velocity.z()});
+    if (const auto stamp = wheelStampNs(sec, nanosec)) {
+      evidence_.observe(*stamp, velocity.norm(), {velocity.x(), velocity.y(), velocity.z()});
+    }
   }
   WheelEvidence evidenceAt(double now) const { return evidence_.at(now); }
 

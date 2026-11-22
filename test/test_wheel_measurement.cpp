@@ -877,8 +877,8 @@ TEST(WheelMeasurementModel, NonFiniteInputsGiveNoMeasurement)
 TEST(WheelSpeedInput, StaticEvidenceDoesNotRequireAWheelUpdateOrVariancePair)
 {
   fast_lio::WheelSpeedInput input;
-  input.observeEvidence(1.0, Eigen::Vector3d::UnitX());
-  input.observeEvidence(3.0, Eigen::Vector3d::Zero());
+  input.observeEvidence(1, 0, Eigen::Vector3d::UnitX());
+  input.observeEvidence(3, 0, Eigen::Vector3d::Zero());
   EXPECT_DOUBLE_EQ(input.evidenceAt(1.1).speed, 1.0);
   EXPECT_FALSE(fast_lio::wheelEvidenceUsable(input.evidenceAt(2.0), {}));
   EXPECT_FALSE(input.evidenceAt(0.9).valid);
@@ -888,9 +888,9 @@ TEST(WheelSpeedInput, EngulfReleaseUsesTheBodyVelocityAndAgeOfTheSameCausalSampl
 {
   constexpr double end = 1793353363.5;
   fast_lio::WheelSpeedInput input;
-  input.observeEvidence(std::nextafter(end, end + 1.0), Eigen::Vector3d(2.0, 0.0, 0.0));
+  input.observeEvidence(1793353363, 500'000'120, Eigen::Vector3d(2.0, 0.0, 0.0));
   EXPECT_FALSE(input.evidenceAt(end).valid);
-  input.observeEvidence(end - 0.125, Eigen::Vector3d(0.0, 0.75, 0.0));
+  input.observeEvidence(1793353363, 375'000'000, Eigen::Vector3d(0.0, 0.75, 0.0));
   const auto wheel = input.evidenceAt(end);
   ASSERT_TRUE(wheel.valid);
   EXPECT_DOUBLE_EQ(wheel.age, 0.125);
@@ -908,20 +908,88 @@ TEST(WheelSpeedInput, ACloseFutureSampleCannotTestifyToTheRunawayWatchdogAtScanE
 {
   constexpr double end = 1793353363.5;
   fast_lio::WheelSpeedInput input;
-  input.observeEvidence(std::nextafter(end, end + 1.0), Eigen::Vector3d(0.5, 0.0, 0.0));
+  input.observeEvidence(1793353363, 500'000'001, Eigen::Vector3d(0.5, 0.0, 0.0));
   const auto futureOnly = input.evidenceAt(end);
   ASSERT_FALSE(futureOnly.valid);
   fast_lio::RunawayState state;
   EXPECT_EQ(fast_lio::updateRunawayWatchdog(&state, end, 3.0, false, futureOnly.age, futureOnly.speed, {}).reason,
             fast_lio::RunawayReason::kNone);
 
-  input.observeEvidence(end, Eigen::Vector3d::UnitX());
+  input.observeEvidence(1793353363, 500'000'000, Eigen::Vector3d::UnitX());
   const auto atEnd = input.evidenceAt(end);
   ASSERT_TRUE(atEnd.valid);
   EXPECT_DOUBLE_EQ(atEnd.age, 0.0);
   EXPECT_DOUBLE_EQ(atEnd.speed, 1.0);
   EXPECT_EQ(fast_lio::updateRunawayWatchdog(&state, end, 3.0, false, atEnd.age, atEnd.speed, {}).reason,
             fast_lio::RunawayReason::kWheel);
+}
+
+TEST(WheelSpeedInput, BothGuardsUseTheExactCausalRosStamp)
+{
+  constexpr std::int32_t sec = 1793353363;
+  constexpr std::uint32_t end_ns = 500'000'000;
+  constexpr double end = 1793353363.5;
+  const Eigen::Vector3d before(0.0, 0.75, 0.0);
+  const Eigen::Vector3d at(0.0, 0.0, 1.0);
+  const Eigen::Vector3d after(2.25, 0.0, 0.0);
+  fast_lio::WheelSpeedInput input;
+  fast_lio::ReleaseVelocityParams release;
+  release.source = fast_lio::ReleaseVelocitySource::kLeg;
+
+  const auto check_guards = [&](bool valid, double age, const Eigen::Vector3d & velocity) {
+    const auto wheel = input.evidenceAt(end);
+    ASSERT_EQ(wheel.valid, valid);
+    EXPECT_DOUBLE_EQ(wheel.age, age);
+    const Eigen::Vector3d leg(wheel.body_velocity[0], wheel.body_velocity[1], wheel.body_velocity[2]);
+    const double used_age = wheel.valid ? wheel.age : -1.0;
+    const auto decision =
+      fast_lio::releaseVelocity(Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity(), leg, used_age, release);
+    EXPECT_EQ(decision.used, valid ? fast_lio::ReleaseVelocitySource::kLeg : fast_lio::ReleaseVelocitySource::kKeep);
+    EXPECT_EQ(decision.velocity, velocity);
+
+    if (valid) {
+      EXPECT_DOUBLE_EQ(wheel.speed, velocity.norm());
+    }
+    fast_lio::RunawayState watchdog;
+    const auto verdict = fast_lio::updateRunawayWatchdog(&watchdog, end, 3.0, false, used_age, wheel.speed, {});
+    EXPECT_EQ(verdict.reason, valid ? fast_lio::RunawayReason::kWheel : fast_lio::RunawayReason::kNone);
+  };
+
+  check_guards(false, -1.0, Eigen::Vector3d::Zero());
+  input.observeEvidence(sec, end_ns + 1, after);
+  check_guards(false, -1.0, Eigen::Vector3d::Zero());
+  input.observeEvidence(sec, end_ns - 1, before);  // Older measurement arrives late.
+  check_guards(true, 1e-9, before);
+  input.observeEvidence(sec, end_ns, at);
+  check_guards(true, 0.0, at);
+  // E and E + 1 ns coexist despite rounding to the same epoch double.
+  const auto later = input.evidenceAt(std::nextafter(end, kInf));
+  ASSERT_TRUE(later.valid);
+  EXPECT_DOUBLE_EQ(later.speed, after.norm());
+  input.observeEvidence(sec, end_ns + 120, Eigen::Vector3d(2.5, 0.0, 0.0));
+  check_guards(true, 0.0, at);
+}
+
+TEST(WheelSpeedInput, RoundedFractionCannotAdmitAFutureRosStamp)
+{
+  fast_lio::WheelSpeedInput input;
+  // The literal is below 300 ms although multiplying it by 1e9 rounds to 300000000.
+  constexpr double end = 0.3;
+  input.observeEvidence(0, 300'000'000, Eigen::Vector3d(2.0, 0.0, 0.0));
+  input.observeEvidence(0, 299'999'999, Eigen::Vector3d::UnitX());
+  EXPECT_DOUBLE_EQ(input.evidenceAt(end).speed, 1.0);
+  const auto next = input.evidenceAt(std::nextafter(end, kInf));
+  EXPECT_DOUBLE_EQ(next.speed, 2.0);
+  EXPECT_GT(next.age, 0.0);
+}
+
+TEST(WheelSpeedInput, NanosecondAgeSurvivesASecondBoundary)
+{
+  fast_lio::WheelSpeedInput input;
+  input.observeEvidence(1793353362, 999'999'999, Eigen::Vector3d::UnitX());
+  const auto wheel = input.evidenceAt(1793353363.0);
+  ASSERT_TRUE(wheel.valid);
+  EXPECT_DOUBLE_EQ(wheel.age, 1e-9);
 }
 
 // The front end's holder of the wheel samples (wheel_speed_input.hpp): the two callbacks' halves paired by the

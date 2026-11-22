@@ -950,15 +950,14 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg,
   if (observer)
     observer->record(fast_lio::AdmissionBucket::kReceived, std::uint64_t(msg->width) * msg->height);
   const auto receive_time = SteadyClock::now();
+  const double cur_time = fast_lio::pointCloudStampSeconds(msg->header.stamp.sec, msg->header.stamp.nanosec);
   if (!diag_first_lidar_cb_logged) {
-    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                "[STARTUP][FAST_LIO] first lidar cb (PointCloud2) stamp=%.3f",
-                get_time_sec(msg->header.stamp));
+    RCLCPP_INFO(
+      rclcpp::get_logger("laser_mapping"), "[STARTUP][FAST_LIO] first lidar cb (PointCloud2) stamp=%.3f", cur_time);
     diag_first_lidar_cb_logged = true;
   }
   mtx_buffer.lock();
   scan_count++;
-  double cur_time = get_time_sec(msg->header.stamp);
   if (observer) {
     observer->canonical_header_known = true;
     observer->canonical_header_bits = fast_lio::admissionDoubleBits(cur_time);

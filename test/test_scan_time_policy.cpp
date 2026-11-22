@@ -1,3 +1,4 @@
+#include <cmath>
 #include <gtest/gtest.h>
 #include <limits>
 #include <vector>
@@ -11,6 +12,24 @@ auto timing(double begin, const std::vector<double> & offsets, double limit = 0.
   return fast_lio::scanTime(begin, offsets, [](double offset) { return offset; }, limit);
 }
 }  // namespace
+
+TEST(ScanTime, SplitPointCloudStampPreservesOrderAcrossAnAdjacentWindowBoundary)
+{
+  constexpr std::int32_t seconds = 1793353363;
+  constexpr double first = 1793353363.4000065;
+  constexpr double next = 1793353363.5;
+  const double last = std::nextafter(next, first);
+  const auto begin = fast_lio::pointCloudStampSeconds(seconds, 400006533);
+  const auto nextBegin = fast_lio::pointCloudStampSeconds(seconds, 500000000);
+  // Same float seconds -> float milliseconds path as the canonical cloud.
+  const auto offsetMs = static_cast<float>(last - first) * 1000.0F;
+  const auto result = timing(begin, {0.0, offsetMs}, 0.2);
+  ASSERT_TRUE(result.valid());
+  EXPECT_EQ(begin, first);
+  EXPECT_EQ(result.end, last);
+  EXPECT_LT(result.end, nextBegin);
+  EXPECT_FALSE(timing(fast_lio::pointCloudStampSeconds(seconds, 1000000000), {0.0}).valid());
+}
 
 TEST(ScanTime, UsesMaximumWithoutReorderingTheEffectivePointSet)
 {

@@ -3,10 +3,22 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 namespace fast_lio
 {
+
+/// Convert a split PointCloud2 header directly to seconds. Rounding the whole
+/// epoch in double nanoseconds first can move a scan start by one double tick.
+inline double pointCloudStampSeconds(std::int32_t seconds, std::uint32_t nanoseconds)
+{
+  constexpr std::uint32_t kNanosPerSecond = 1000000000;
+  if (seconds < 0 || nanoseconds >= kNanosPerSecond) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  return static_cast<double>(seconds) + static_cast<double>(nanoseconds) / kNanosPerSecond;
+}
 
 enum class ScanTimeStatus
 {

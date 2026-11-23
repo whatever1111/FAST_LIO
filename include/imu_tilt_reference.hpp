@@ -19,7 +19,6 @@ struct ImuTiltReferenceParams
   double noise_static = 0.0;
   double noise_moving = 0.0;
   double motion_init_sigma = 0.0;
-  double gyro_tol = 0.35;
   double accel_tol = 0.05;
   double gravity_raw = 0.0;
   double gravity_m_s2 = 9.81;
@@ -99,12 +98,11 @@ public:
     down_ = (rotation * down_).normalized();
     sum_ = rotation * sum_;
     start_edge_.velocity = rotation * start_edge_.velocity;
-    if (gyro_cur.norm() <= params_.gyro_tol) {
-      sum_ += accel_cur;
-      if (samples_++ == 0)
-        first_sample_ = last_sample_time_;
-      last_sample_ = last_sample_time_;
-    }
+    // The force average and the leg velocity difference span the same window.
+    sum_ += accel_cur;
+    if (samples_++ == 0)
+      first_sample_ = last_sample_time_;
+    last_sample_ = last_sample_time_;
 
     const Eigen::Matrix3d pi = tiltProjector();
     Matrix6 phi = Matrix6::Identity();

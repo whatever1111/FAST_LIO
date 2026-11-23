@@ -5564,7 +5564,6 @@ private:
       tilt.noise_static = p.gravity_align_noise_static;
       tilt.noise_moving = p.gravity_align_noise_moving;
       tilt.motion_init_sigma = p.gravity_align_grav_cap_deg * (M_PI / 180.0);
-      tilt.gyro_tol = p.gravity_align_gyro_tol;
       tilt.accel_tol = p.gravity_align_accel_tol;
       tilt.gravity_m_s2 = G_m_s2;
       tilt.mag_ref = p.gravity_align_mag_ref;

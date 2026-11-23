@@ -1,9 +1,11 @@
 #include <Eigen/LU>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <gtest/gtest.h>
 #include <limits>
+#include <string>
 
 #include "gravity_align_kinematics.hpp"
 #include "gravity_levelled_insertion.hpp"
@@ -136,6 +138,61 @@ TEST(ImuTiltReference, SustainedAccelerationUsesBothLegEdgesOrWithholdsWindow)
     }
     EXPECT_LE(angle(tilt.downBodyAt(2.0), kDown), 1e-6);
   }
+}
+
+TEST(ImuTiltReference, StraightTurnStraightUsesTheWholeForceWindow)
+{
+  constexpr double turnStart = 0.25;
+  constexpr double turnDuration = 0.5;
+  constexpr double peakRate = 1.2;
+  constexpr double speed = 1.0;
+  const double frequency = 2.0 * M_PI / turnDuration;
+  const Eigen::Vector3d lever(0.3238, 0.0, 0.2793);
+  const Eigen::Vector3d forward = speed * Eigen::Vector3d::UnitX();
+  const auto params = tiltParams();
+
+  const auto edge = [&](const Eigen::Vector3d & rate) {
+    auto value = legEdge(speed);
+    value.velocity = legEdgeVelocity(speed, Eigen::Matrix3d::Identity(), rate, lever);
+    return value;
+  };
+  ImuTiltReference tilt;
+  tilt.initialise(kAccel, kZero, true, params);
+  tilt.closeWindow(edge(kZero), false, 0.0);
+  Eigen::Vector3d ratePrev = kZero;
+  for (int i = 1; i <= kImuHz; ++i) {
+    const double phase = frequency * std::clamp(i * kDt - turnStart, 0.0, turnDuration);
+    const Eigen::Vector3d rate = (0.5 * peakRate * (1.0 - std::cos(phase))) * Eigen::Vector3d::UnitZ();
+    const Eigen::Vector3d rateDot = (0.5 * peakRate * frequency * std::sin(phase)) * Eigen::Vector3d::UnitZ();
+    const Eigen::Vector3d imuVelocity = forward + rate.cross(lever);
+    const Eigen::Vector3d accel = kAccel + rateDot.cross(lever) + rate.cross(imuVelocity);
+    tilt.propagate(ratePrev, rate, accel, kDt);
+    ratePrev = rate;
+  }
+  tilt.closeWindow(edge(ratePrev), false, params.window_s);
+  const auto & diag = tilt.diagnostics();
+  RecordProperty("residual_deg", std::to_string(diag.residual_angle * 180.0 / M_PI));
+  RecordProperty("window_samples", diag.samples);
+  ASSERT_TRUE(diag.updated);
+
+  // d(R v_imu)/dt is the world acceleration. Translation is constant on the
+  // straight segments. During the turn, differentiate R*(omega x v_imu + omega_dot x lever)
+  // to bound the jerk and thus the right-endpoint rule error in the mean force.
+  const double radius = lever.head<2>().norm();
+  const double rateSlope = 0.5 * peakRate * frequency;
+  const double rateCurvature = rateSlope * frequency;
+  const double maxSpeed = speed + peakRate * radius;
+  const double maxAcceleration = peakRate * maxSpeed + rateSlope * radius;
+  const double maxJerk =
+    peakRate * maxAcceleration + rateSlope * (maxSpeed + peakRate * radius) + rateCurvature * radius;
+  const double quadratureError = 0.5 * kDt * maxJerk * turnDuration / params.window_s;
+  // Trapezoidal yaw integration bounds the rotation error of both the
+  // acceleration samples and the starting leg edge. Yaw leaves gravity unchanged.
+  const double yawError = params.window_s * kDt * kDt * rateCurvature / 12.0;
+  const double forceError = quadratureError + yawError * (maxAcceleration + speed / params.window_s);
+  const double angleBound = std::atan2(forceError, kG);
+  RecordProperty("angle_bound_deg", std::to_string(angleBound * 180.0 / M_PI));
+  EXPECT_LE(diag.residual_angle, angleBound);
 }
 
 TEST(ImuTiltReference, EstimatesPostInitialisationHorizontalGyroBias)

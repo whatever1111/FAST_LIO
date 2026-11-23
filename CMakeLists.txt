@@ -264,7 +264,7 @@ if(BUILD_TESTING)
     # third heavy compilation after BOTH normal production targets finish.
     add_library(fastlio_mapping_test_component SHARED
       src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp
-      src/frontend_parameters_ros.cpp src/frontend_measurement.cpp test/lidar_custody_test_probe.cpp)
+      src/frontend_parameters_ros.cpp src/frontend_measurement.cpp)
     target_compile_definitions(fastlio_mapping_test_component PRIVATE
       FASTLIO_AS_COMPONENT FASTLIO_TEST_HOOKS USE_IVOX)
     target_include_directories(fastlio_mapping_test_component PRIVATE
@@ -290,6 +290,21 @@ if(BUILD_TESTING)
       fastlio_test_sanitize(fastlio_tsan_negative_control)
       add_dependencies(fastlio_test_sanitizer_suite fastlio_tsan_negative_control)
     endif()
+    # Both factories register with the probe's loader when it opens the mapping dependency.
+    add_library(fastlio_lidar_custody_test_probe SHARED test/lidar_custody_test_probe.cpp)
+    target_include_directories(fastlio_lidar_custody_test_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(fastlio_lidar_custody_test_probe fastlio_mapping_test_component Eigen3::Eigen)
+    ament_target_dependencies(fastlio_lidar_custody_test_probe
+      rclcpp rclcpp_components sensor_msgs std_msgs std_srvs fast_lio_interfaces)
+    fastlio_test_sanitize(fastlio_lidar_custody_test_probe)
+
+    ament_add_gtest(test_lidar_custody_probe_load test/test_lidar_custody_probe_load.cpp)
+    target_compile_definitions(test_lidar_custody_probe_load PRIVATE
+      FASTLIO_CUSTODY_PROBE_PATH="$<TARGET_FILE:fastlio_lidar_custody_test_probe>")
+    ament_target_dependencies(test_lidar_custody_probe_load class_loader rclcpp_components)
+    add_dependencies(test_lidar_custody_probe_load fastlio_lidar_custody_test_probe)
+    fastlio_test_sanitize(test_lidar_custody_probe_load)
+
     # Map worker: the blocking Add, reset join, delayed batches and old-epoch interleavings run
     # under test barriers on the real worker functions.
     ament_add_gtest(test_async_map_reset test/test_async_map_reset.cpp TIMEOUT 30)

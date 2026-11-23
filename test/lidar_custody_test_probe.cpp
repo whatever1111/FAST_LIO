@@ -14,8 +14,8 @@
 
 #include "laser_mapping_test_hooks.hpp"
 
-// Only in the noninstalled FAST test DSO. Load before LaserMappingNode and
-// release all barriers and unload LaserMappingNode before destroying this probe.
+// Load this test probe before constructing LaserMappingNode so the hooks are ready.
+// Release the barriers and destroy LaserMappingNode before destroying the probe.
 class LidarCustodyTestProbe : public rclcpp::Node
 {
 public:

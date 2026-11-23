@@ -243,6 +243,9 @@ function(fastlio_test_sanitizer_select test target)
 endfunction()
 
 if(BUILD_TESTING)
+  option(FASTLIO_CUSTODY_LIBRARIES_ONLY
+    "Allow building the custody test libraries without building the production mapping targets first" OFF)
+
   # Link the real production model: do not compile a copied h-model into the test.
   ament_add_gtest(test_h_model_scan_bounds test/test_h_model_scan_bounds.cpp TIMEOUT 120)
   target_include_directories(test_h_model_scan_bounds PRIVATE
@@ -260,8 +263,7 @@ if(BUILD_TESTING)
     rosidl_target_interfaces(test_h_model_scan_bounds ${PROJECT_NAME} "rosidl_typesupport_cpp")
   endif()
   if(USE_IVOX)
-    # Non-installed real node TU with test-only worker barriers. Serialize this
-    # third heavy compilation after BOTH normal production targets finish.
+    # Non-installed real node TU with test-only worker barriers.
     add_library(fastlio_mapping_test_component SHARED
       src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp
       src/frontend_parameters_ros.cpp src/frontend_measurement.cpp)
@@ -281,14 +283,15 @@ if(BUILD_TESTING)
       rosidl_target_interfaces(fastlio_mapping_test_component ${PROJECT_NAME} "rosidl_typesupport_cpp")
     endif()
     fastlio_test_sanitize(fastlio_mapping_test_component)
-    if(NOT FASTLIO_TEST_SANITIZER)
-      add_dependencies(fastlio_mapping_test_component fastlio_mapping fastlio_mapping_component)
-    else()
+    if(FASTLIO_TEST_SANITIZER)
       add_custom_target(fastlio_test_sanitizer_suite)
       add_dependencies(fastlio_test_sanitizer_suite fastlio_mapping_test_component)
       add_executable(fastlio_tsan_negative_control test/tsan_negative_control.cpp)
       fastlio_test_sanitize(fastlio_tsan_negative_control)
       add_dependencies(fastlio_test_sanitizer_suite fastlio_tsan_negative_control)
+    elseif(NOT FASTLIO_CUSTODY_LIBRARIES_ONLY)
+      # The full FAST build serializes this heavy TU after both production targets.
+      add_dependencies(fastlio_mapping_test_component fastlio_mapping fastlio_mapping_component)
     endif()
     # Both factories register with the probe's loader when it opens the mapping dependency.
     add_library(fastlio_lidar_custody_test_probe SHARED test/lidar_custody_test_probe.cpp)

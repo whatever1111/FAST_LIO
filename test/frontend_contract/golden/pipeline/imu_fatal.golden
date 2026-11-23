@@ -1,5 +1,5 @@
 # frontend contract golden: pipeline/imu_fatal
-# fork_sha: f475d3f1b272d7b2e9af350a64c5458d39917683
+# fork_sha: 26168a671fddc463ffd573862665fa87c187aae5
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=

@@ -39,6 +39,7 @@
 #include <Eigen/Core>
 
 #include <cmath>
+#include <cstdint>
 
 #include "covariance_reset.hpp"
 
@@ -63,7 +64,8 @@ struct ImuGapPriorParams
   double rate_rp_max = 0.0;  ///< rad/s (imu_gap_rate_rp_max is in deg/s): roll/pitch rate the gyro average misses
   double rate_yaw_max = 10.0 * kImuGapDegToRad;  ///< rad/s (imu_gap_rate_yaw_max in deg/s): the same about gravity
   /// imu_gap_empty_scans: also carry a scan that has no IMU sample at all (the lidar kept recording through the
-  /// IMU dropout), at the held velocity and the last yaw rate, instead of dropping it unregistered.
+  /// IMU dropout) instead of dropping it unregistered: as part of the IMU interval across it (imuFrameTail), or at the
+  /// held velocity and the last yaw rate when the sample after it has not arrived.
   bool empty_scans = false;
 };
 
@@ -109,6 +111,64 @@ inline Eigen::Vector3d rotationAboutGravityInput(const Eigen::Vector3d & gyro,
   const Eigen::Vector3d u = up_body / norm;
   const Eigen::Vector3d rate = gyro - bg;
   return rate.dot(u) * u + bg;
+}
+
+/// How a scan's tail, from the propagated time to the scan end, is integrated. The scan end falls into the IMU
+/// interval (t_last, t_next]: t_last is the last sample at or before it, t_next the first sample after it. When t_next
+/// is known (laserMapping processes a scan only once a sample at or after its end has arrived), the tail is the first
+/// part of that interval and is integrated the way the propagation loop integrates an interval: with the mean of its
+/// two samples, bridged as a gap when the interval is one. The next scan integrates the rest of the interval from its
+/// head with the same two samples, so a scan end inside an interval does not change the rotation up to t_next.
+/// Without t_next the last interval's input is held to the scan end, and the tail's own length decides the gap branch.
+struct ImuFrameTail
+{
+  bool bracketed = false;      ///< integrated with the interval (t_last, t_next]
+  double begin = 0.0;          ///< where the tail starts: the propagated time, never before t_last
+  double dt = 0.0;             ///< scan end - begin
+  bool gap = false;            ///< bridged as an IMU gap
+  bool gap_by_length = false;  ///< the gap decision on the tail's own length (the held-input rule)
+  double interval = 0.0;       ///< the IMU interval the tail belongs to, for the gap summary
+};
+
+/// The tail of a scan ending at scan_end, propagated up to prop_time, whose last sample is at t_last. has_next says
+/// whether the first sample after the scan end is known and t_next is its stamp.
+inline ImuFrameTail imuFrameTail(
+  double prop_time, double t_last, double scan_end, bool has_next, double t_next, const ImuGapPriorParams & p)
+{
+  ImuFrameTail tail;
+  const double begin = std::fmax(prop_time, t_last);
+  tail.bracketed = has_next && std::isfinite(begin) && std::isfinite(t_next) && t_last <= scan_end &&
+                   begin < scan_end && scan_end < t_next;
+  tail.begin = tail.bracketed ? begin : prop_time;
+  tail.dt = scan_end - tail.begin;
+  tail.gap_by_length = isImuGap(tail.dt, p);
+  tail.interval = tail.bracketed ? t_next - t_last : scan_end - t_last;
+  tail.gap = tail.bracketed ? isImuGap(tail.interval, p) : tail.gap_by_length;
+  return tail;
+}
+
+/// Scan tails by how they were integrated, for the end-of-run summary.
+struct ImuFrameTailCounts
+{
+  std::uint64_t bracketed = 0;        ///< with the interval that spans the scan end
+  std::uint64_t extrapolated = 0;     ///< no usable sample after the scan end: the last input held to it
+  std::uint64_t gap_by_interval = 0;  ///< bracketed tails bridged as a gap that their own length would not bridge
+};
+
+/// Count one tail; a tail of zero length (a sample at the scan end) is no tail.
+inline void countImuFrameTail(ImuFrameTailCounts * counts, const ImuFrameTail & tail)
+{
+  if (counts == nullptr || !(tail.dt > 0.0)) {
+    return;
+  }
+  if (!tail.bracketed) {
+    ++counts->extrapolated;
+    return;
+  }
+  ++counts->bracketed;
+  if (tail.gap && !tail.gap_by_length) {
+    ++counts->gap_by_interval;
+  }
 }
 
 /// The covariance a gap adds. pos and vel are world-frame blocks, rot is IKFoM's rotation error, which is body-frame

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <gtest/gtest.h>
 #include <limits>
+#include <utility>
 
 #include "imu_gap_prior.hpp"
 
@@ -326,4 +327,70 @@ TEST(ImuGapPrior, ExtrapolationKeepsOnlyTheRotationAboutGravity)
   EXPECT_EQ(rotationAboutGravityInput(gyro, bg, Eigen::Matrix3d::Identity(), Eigen::Vector3d::Zero()), gyro);
   const Eigen::Vector3d bad(kNaN, 0.0, 0.1);
   EXPECT_TRUE(rotationAboutGravityInput(bad, bg, Eigen::Matrix3d::Identity(), grav).hasNaN());
+}
+
+TEST(ImuGapPrior, FrameTailIsTheFirstPartOfTheIntervalAcrossTheScanEnd)
+{
+  ImuGapPriorParams p = enabledParams();
+  p.min_gap_s = 0.1;  // the m20 threshold
+  // Propagated to the last sample at 10.185, the scan ends at 10.2 and the next sample is at 10.21: the 15 ms tail
+  // belongs to the 25 ms interval, which is not a gap.
+  auto tail = fast_lio::imuFrameTail(10.185, 10.185, 10.2, true, 10.21, p);
+  EXPECT_TRUE(tail.bracketed);
+  EXPECT_DOUBLE_EQ(tail.begin, 10.185);
+  EXPECT_NEAR(tail.dt, 0.015, 1e-12);
+  EXPECT_NEAR(tail.interval, 0.025, 1e-12);
+  EXPECT_FALSE(tail.gap);
+  // A 120 ms interval is bridged as a gap although its 15 ms tail alone would not be.
+  tail = fast_lio::imuFrameTail(10.185, 10.185, 10.2, true, 10.305, p);
+  EXPECT_TRUE(tail.bracketed);
+  EXPECT_TRUE(tail.gap);
+  EXPECT_FALSE(tail.gap_by_length);
+  EXPECT_NEAR(tail.interval, 0.12, 1e-12);
+  // The state was propagated past the last sample (a scan holding only old samples): the tail starts there.
+  tail = fast_lio::imuFrameTail(10.19, 10.185, 10.2, true, 10.21, p);
+  EXPECT_TRUE(tail.bracketed);
+  EXPECT_DOUBLE_EQ(tail.begin, 10.19);
+  EXPECT_NEAR(tail.dt, 0.01, 1e-12);
+  EXPECT_NEAR(tail.interval, 0.025, 1e-12);
+}
+
+TEST(ImuGapPrior, FrameTailWithoutTheNextSampleHoldsTheLastInput)
+{
+  ImuGapPriorParams p = enabledParams();
+  p.min_gap_s = 0.1;
+  // No sample after the scan end, or one that is not after it, or not finite: the tail runs from the propagated time,
+  // and its own length decides the gap branch.
+  const std::pair<bool, double> nexts[] = {{false, 10.21}, {true, 10.2}, {true, kNaN}};
+  for (const auto & next : nexts) {
+    const auto tail = fast_lio::imuFrameTail(10.185, 10.185, 10.2, next.first, next.second, p);
+    EXPECT_FALSE(tail.bracketed);
+    EXPECT_DOUBLE_EQ(tail.begin, 10.185);
+    EXPECT_NEAR(tail.dt, 0.015, 1e-12);
+    EXPECT_NEAR(tail.interval, 0.015, 1e-12);
+    EXPECT_FALSE(tail.gap);
+  }
+  const auto long_tail = fast_lio::imuFrameTail(10.05, 10.05, 10.2, false, 0.0, p);
+  EXPECT_TRUE(long_tail.gap);
+  EXPECT_TRUE(long_tail.gap_by_length);
+  // A sample on the scan end leaves no tail to integrate.
+  const auto none = fast_lio::imuFrameTail(10.2, 10.2, 10.2, true, 10.205, p);
+  EXPECT_FALSE(none.bracketed);
+  EXPECT_EQ(none.dt, 0.0);
+}
+
+TEST(ImuGapPrior, FrameTailCountsSeparateTheIntervalFromTheHeldInput)
+{
+  ImuGapPriorParams p = enabledParams();
+  p.min_gap_s = 0.1;
+  fast_lio::ImuFrameTailCounts counts;
+  fast_lio::countImuFrameTail(&counts, fast_lio::imuFrameTail(10.185, 10.185, 10.2, true, 10.21, p));
+  fast_lio::countImuFrameTail(&counts, fast_lio::imuFrameTail(10.185, 10.185, 10.2, true, 10.305, p));
+  fast_lio::countImuFrameTail(&counts, fast_lio::imuFrameTail(10.05, 10.05, 10.2, true, 10.3, p));
+  fast_lio::countImuFrameTail(&counts, fast_lio::imuFrameTail(10.185, 10.185, 10.2, false, 0.0, p));
+  fast_lio::countImuFrameTail(&counts, fast_lio::imuFrameTail(10.2, 10.2, 10.2, true, 10.205, p));
+  fast_lio::countImuFrameTail(nullptr, fast_lio::imuFrameTail(10.185, 10.185, 10.2, true, 10.21, p));
+  EXPECT_EQ(counts.bracketed, 3u);
+  EXPECT_EQ(counts.gap_by_interval, 1u);  // the 150 ms tail is a gap by its own length as well
+  EXPECT_EQ(counts.extrapolated, 1u);
 }

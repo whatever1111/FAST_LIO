@@ -22,6 +22,7 @@
 #include <mutex>
 #include <so3_math.h>
 #include <thread>
+#include <utility>
 
 #include "imu_consumption_policy.hpp"
 #include "imu_coverage_policy.hpp"
@@ -86,6 +87,9 @@ class ImuProcess
   const fast_lio::ImuProcessOutcome & lastOutcome() const { return last_outcome_; }
   const fast_lio::ImuIntegrationLedger & integrationLedger() const { return integration_ledger_; }
   std::uint64_t staleOutputReuseCount() const { return stale_output_reuse_count_; }
+  /// How the propagated scans' tails were integrated (imu_gap_prior.hpp: imuFrameTail).
+  const fast_lio::ImuFrameTailCounts & frameTailCounts() const { return frame_tail_counts_; }
+  void setFrameTailImu(sensor_msgs::msg::Imu::ConstSharedPtr sample) { imu_after_end_ = std::move(sample); }
   const V3D & lastDeskewAcceleration() const { return acc_s_last; }
   const V3D & lastDeskewAngularVelocity() const { return angvel_last; }
   fast_lio::ImuCoverageParams coverage_params;
@@ -202,10 +206,22 @@ class ImuProcess
                     esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state,
                     PointCloudXYZI & pcl_in_out,
                     const PointCloudXYZI & working_cloud);
+  template<typename GapInput, typename CloseGap>
+  void integrateFrameTail(const MeasureGroup & meas,
+                          const sensor_msgs::msg::Imu::ConstSharedPtr & head,
+                          double imu_end_time,
+                          double prop_time,
+                          esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state,
+                          input_ikfom & in,
+                          const GapInput & gap_input,
+                          const CloseGap & close_gap,
+                          double & gap_run,
+                          double & gap_interval);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
   // sensor_msgs::ImuConstPtr last_imu_;
   sensor_msgs::msg::Imu::ConstSharedPtr last_imu_;
+  sensor_msgs::msg::Imu::ConstSharedPtr imu_after_end_;
   deque<sensor_msgs::msg::Imu::ConstSharedPtr> v_imu_;
   vector<Pose6D> IMUpose;
   vector<M3D>    v_rot_pcl_;
@@ -227,6 +243,7 @@ class ImuProcess
   fast_lio::ImuProcessOutcome last_outcome_;
   fast_lio::ImuIntegrationLedger integration_ledger_;
   std::uint64_t stale_output_reuse_count_ = 0;
+  fast_lio::ImuFrameTailCounts frame_tail_counts_;
   std::size_t init_iter_num = 0;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -275,6 +292,7 @@ void ImuProcess::Reset()
   last_outcome_ = {};
   integration_ledger_ = {};
   stale_output_reuse_count_ = 0;
+  frame_tail_counts_ = {};
   b_first_frame_ = true;
   if (sustainedInitActive())
     init_static_gate_.reset();
@@ -384,6 +402,120 @@ fast_lio::ImuProcessOutcome ImuProcess::IMU_init(const MeasureGroup & meas,
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
   return {fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationAccumulated};
+}
+
+template<typename GapInput, typename CloseGap>
+void ImuProcess::integrateFrameTail(const MeasureGroup & meas,
+                                    const sensor_msgs::msg::Imu::ConstSharedPtr & head,
+                                    double imu_end_time,
+                                    double prop_time,
+                                    esekfom::esekf<state_ikfom, 12, input_ikfom> & kf_state,
+                                    input_ikfom & in,
+                                    const GapInput & gap_input,
+                                    const CloseGap & close_gap,
+                                    double & gap_run,
+                                    double & gap_interval)
+{
+  const double pcl_beg_time = meas.lidar_beg_time;
+  const double pcl_end_time = meas.lidar_end_time;
+  // A short advancing scan can contain only duplicate old IMU samples.
+  // They were already integrated up to last_lidar_end_time_; never integrate
+  // that old interval a second time while extrapolating to this scan's end.
+  const auto & after_end = imu_after_end_;
+  const fast_lio::ImuFrameTail frame_tail =
+    fast_lio::imuFrameTail(prop_time,
+                           imu_end_time,
+                           pcl_end_time,
+                           static_cast<bool>(after_end),
+                           after_end ? rclcpp::Time(after_end->header.stamp).seconds() : 0.0,
+                           gap_params);
+  fast_lio::countImuFrameTail(&frame_tail_counts_, frame_tail);
+  double dt = frame_tail.dt;
+  state_ikfom imu_state;
+  if (frame_tail.bracketed) {
+    // The scan end lies inside the interval from the last sample to the next one: integrate the tail with that pair
+    // exactly as the loop above integrates a pair. The next scan integrates the rest of the interval from its head
+    // with the same pair, so the rotation up to the next sample does not depend on where the scan ended.
+    V3D angvel_avr, acc_avr;
+    angvel_avr << 0.5 * (head->angular_velocity.x + after_end->angular_velocity.x),
+      0.5 * (head->angular_velocity.y + after_end->angular_velocity.y),
+      0.5 * (head->angular_velocity.z + after_end->angular_velocity.z);
+    acc_avr << 0.5 * (head->linear_acceleration.x + after_end->linear_acceleration.x),
+      0.5 * (head->linear_acceleration.y + after_end->linear_acceleration.y),
+      0.5 * (head->linear_acceleration.z + after_end->linear_acceleration.z);
+    acc_avr = acc_avr * fast_lio::G_m_s2 / mean_acc.norm();
+    Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
+    Q.block<3, 3>(3, 3).diagonal() = cov_acc;
+    Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
+    Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
+    if (frame_tail.gap) {
+      in = gap_input(angvel_avr);
+      integration_ledger_.observe(frame_tail.begin, pcl_end_time);
+      kf_state.predict(dt, Q, in);
+      gap_run += dt;
+      gap_interval = std::max(gap_interval, frame_tail.interval);
+      close_gap();
+      imu_state = kf_state.get_x();
+      acc_s_last = Zero3d;
+    } else {
+      close_gap();
+      in.acc = acc_avr;
+      in.gyro = angvel_avr;
+      integration_ledger_.observe(frame_tail.begin, pcl_end_time);
+      kf_state.predict(dt, Q, in);
+      imu_state = kf_state.get_x();
+      acc_s_last = imu_state.rot * (acc_avr - imu_state.ba) + imu_state.grav.get_vect();
+    }
+    angvel_last = angvel_avr - imu_state.bg;
+    // A knot at the scan end: the points after the last sample are deskewed with this pair's motion, and a point
+    // stamped at the scan end lands on the frame-end pose.
+    IMUpose.push_back(set_pose6d(pcl_end_time - pcl_beg_time,
+                                 acc_s_last,
+                                 angvel_last,
+                                 imu_state.vel,
+                                 imu_state.pos,
+                                 imu_state.rot.toRotationMatrix()));
+  } else if (frame_tail.gap) {
+    // No usable sample after the scan end: the last pair's input is held to it (imuFrameTail).
+    // The IMU stops before the scan ends: hold the velocity to the end as well, carry on only the rotation about
+    // gravity (imu_gap_prior.hpp: rotationAboutGravityInput), and give the points past the last sample a deskew pose
+    // that moves the way the state did.
+    const state_ikfom s_end = kf_state.get_x();
+    const V3D gyro_last =
+      fast_lio::rotationAboutGravityInput(V3D(in.gyro), s_end.bg, s_end.rot.toRotationMatrix(), s_end.grav.get_vect());
+    in = gap_input(gyro_last);
+    integration_ledger_.observe(prop_time, pcl_end_time);
+    kf_state.predict(dt, Q, in);
+    gap_run += dt;
+    gap_interval = std::max(gap_interval, pcl_end_time - imu_end_time);
+    close_gap();
+    imu_state = kf_state.get_x();
+    angvel_last = gyro_last - imu_state.bg;
+    acc_s_last = Zero3d;
+    IMUpose.push_back(set_pose6d(pcl_end_time - pcl_beg_time,
+                                 acc_s_last,
+                                 angvel_last,
+                                 imu_state.vel,
+                                 imu_state.pos,
+                                 imu_state.rot.toRotationMatrix()));
+  } else {
+    // No usable sample after the scan end (or a sample on it, leaving no tail): the last pair's input is held to it.
+    close_gap();
+    integration_ledger_.observe(prop_time, pcl_end_time);
+    kf_state.predict(dt, Q, in);
+    if (IMUpose.size() == 1) {
+      // No new IMU knot: the actual tail prediction still defines one deskew segment.
+      const state_ikfom tail_state = kf_state.get_x();
+      angvel_last = in.gyro - tail_state.bg;
+      acc_s_last = tail_state.rot * (in.acc - tail_state.ba) + tail_state.grav.get_vect();
+      IMUpose.push_back(set_pose6d(pcl_end_time - pcl_beg_time,
+                                   acc_s_last,
+                                   angvel_last,
+                                   tail_state.vel,
+                                   tail_state.pos,
+                                   tail_state.rot.toRotationMatrix()));
+    }
+  }
 }
 
 void ImuProcess::UndistortPcl(const MeasureGroup & meas,
@@ -558,45 +690,8 @@ void ImuProcess::UndistortPcl(const MeasureGroup & meas,
     IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
   }
 
-  /*** calculated the pos and attitude prediction at the frame-end ***/
-  // A short advancing scan can contain only duplicate old IMU samples.
-  // They were already integrated up to last_lidar_end_time_; never integrate
-  // that old interval a second time while extrapolating to this scan's end.
-  dt = pcl_end_time - prop_time;
-  if (fast_lio::isImuGap(dt, gap_params))
-  {
-    // The IMU stops before the scan ends: hold the velocity to the end as well, carry on only the rotation about
-    // gravity (imu_gap_prior.hpp: rotationAboutGravityInput), and give the points past the last sample a deskew pose
-    // that moves the way the state did.
-    const state_ikfom s_end = kf_state.get_x();
-    const V3D gyro_last = fast_lio::rotationAboutGravityInput(
-      V3D(in.gyro), s_end.bg, s_end.rot.toRotationMatrix(), s_end.grav.get_vect());
-    in = gap_input(gyro_last);
-    integration_ledger_.observe(prop_time, pcl_end_time);
-    kf_state.predict(dt, Q, in);
-    gap_run += dt;
-    gap_interval = std::max(gap_interval, pcl_end_time - imu_end_time);
-    close_gap();
-    imu_state = kf_state.get_x();
-    angvel_last = gyro_last - imu_state.bg;
-    acc_s_last = Zero3d;
-    IMUpose.push_back(set_pose6d(pcl_end_time - pcl_beg_time, acc_s_last, angvel_last, imu_state.vel, imu_state.pos,
-                                 imu_state.rot.toRotationMatrix()));
-  }
-  else
-  {
-    close_gap();
-    integration_ledger_.observe(prop_time, pcl_end_time);
-    kf_state.predict(dt, Q, in);
-    if (IMUpose.size() == 1) {
-      // No new IMU knot: the actual tail prediction still defines one deskew segment.
-      const state_ikfom tail_state = kf_state.get_x();
-      angvel_last = in.gyro - tail_state.bg;
-      acc_s_last = tail_state.rot * (in.acc - tail_state.ba) + tail_state.grav.get_vect();
-      IMUpose.push_back(set_pose6d(pcl_end_time - pcl_beg_time, acc_s_last, angvel_last, tail_state.vel,
-                                   tail_state.pos, tail_state.rot.toRotationMatrix()));
-    }
-  }
+  integrateFrameTail(
+    meas, v_imu.back(), imu_end_time, prop_time, kf_state, in, gap_input, close_gap, gap_run, gap_interval);
 
   imu_state = kf_state.get_x();
   if (!meas.imu.empty())

@@ -35,6 +35,20 @@ std::size_t imuPrefixThrough(const Queue & queue, double end, const Stamp & stam
   return count;
 }
 
+// The queued sample right after a scan's prefix (imuPrefixThrough(queue, end)): the first one stamped after the scan
+// end, which closes the IMU interval the scan end falls into. The scan's tail reads it without borrowing it, so it
+// stays queued and the next scan consumes it. Returns queue.size() when the queue holds no such sample or it is not
+// valid for consumption; the tail then holds the last interval's input to the scan end.
+template<class Queue, class Stamp, class Valid>
+std::size_t
+imuSampleAfterPrefix(const Queue & queue, std::size_t prefix, double end, const Stamp & stamp, const Valid & valid)
+{
+  if (prefix >= queue.size() || !valid(queue[prefix]))
+    return queue.size();
+  const double after = stamp(queue[prefix]);
+  return std::isfinite(after) && after > end ? prefix : queue.size();
+}
+
 enum class ImuConfirmation
 {
   kRetained,

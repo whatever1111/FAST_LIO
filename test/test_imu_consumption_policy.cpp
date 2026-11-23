@@ -1,6 +1,8 @@
 #include <deque>
 #include <gtest/gtest.h>
 #include <limits>
+#include <map>
+#include <vector>
 
 #include "imu_backlog_policy.hpp"
 #include "imu_consumption_policy.hpp"
@@ -230,4 +232,61 @@ TEST(ImuConsumptionPolicy, InvalidOrNestedSelectionFailsClosed)
   nested.borrow(queue, 1);
   EXPECT_THROW(nested.borrow(queue, 1), std::logic_error);
   EXPECT_EQ(queue.size(), 1u);
+}
+
+TEST(ImuConsumptionPolicy, SampleAfterTheScanEndIsReadAndConsumedOnlyByTheNextScan)
+{
+  // Stamps in ms: 200 Hz to 95, a 25 ms dropout across the scan end at 100, 200 Hz again from 120; scans end at 100,
+  // 200 (on a sample) and 300.
+  Queue queue;
+  int identity = 0;
+  for (int i = 0; i < 20; ++i)
+    queue.push_back({++identity, i * 5.0});
+  for (int i = 0; i <= 40; ++i)
+    queue.push_back({++identity, 120.0 + i * 5.0});
+  const int total = identity;
+  Transaction transaction;
+  std::map<int, int> released;
+  std::vector<std::size_t> prefixes;
+  std::vector<int> read;
+  for (const double end : {100.0, 200.0, 300.0}) {
+    const auto count = fast_lio::imuPrefixThrough(queue, end, stamp);
+    const auto token = transaction.borrow(queue, count);
+    const auto after = fast_lio::imuSampleAfterPrefix(queue, count, end, stamp, valid);
+    ASSERT_LT(after, queue.size());
+    EXPECT_EQ(after, count);
+    EXPECT_GT(queue[after].stamp, end);
+    read.push_back(queue[after].identity);
+    // Reading it changes neither the borrowed prefix nor the queue.
+    ASSERT_EQ(token.prefix.size(), count);
+    for (const auto & sample : token.prefix) {
+      EXPECT_LE(sample.stamp, end);
+      EXPECT_NE(sample.identity, queue[after].identity);
+    }
+    prefixes.push_back(count);
+    ASSERT_EQ(transaction.settle(queue, token, ImuDisposition::kCommitted), ImuConfirmation::kReleased);
+    for (const auto & sample : token.prefix)
+      ++released[sample.identity];
+    // The read sample is the next scan's first.
+    ASSERT_FALSE(queue.empty());
+    EXPECT_EQ(queue.front().identity, read.back());
+  }
+  EXPECT_EQ(prefixes, (std::vector<std::size_t>{20, 17, 20}));
+  EXPECT_EQ(read, (std::vector<int>{21, 38, 58}));
+  for (int id = 1; id <= 57; ++id)
+    EXPECT_EQ(released[id], 1) << "sample " << id;
+  EXPECT_EQ(released.count(58), 0u);
+  EXPECT_EQ(queue.size(), static_cast<std::size_t>(total - 57));
+  EXPECT_EQ(transaction.duplicateConfirmations(), 0u);
+}
+
+TEST(ImuConsumptionPolicy, NoUsableSampleAfterTheScanEndIsReported)
+{
+  // None queued after the prefix (the newest sample lands on the end), an invalid one, a non-finite stamp.
+  EXPECT_EQ(fast_lio::imuSampleAfterPrefix(Queue{{1, 0.095}, {2, 0.1}}, 2, 0.1, stamp, valid), 2u);
+  EXPECT_EQ(fast_lio::imuSampleAfterPrefix(Queue{{1, 0.095}, {2, 0.12, false}}, 1, 0.1, stamp, valid), 2u);
+  EXPECT_EQ(fast_lio::imuSampleAfterPrefix(
+              Queue{{1, 0.095}, {2, std::numeric_limits<double>::quiet_NaN()}}, 1, 0.1, stamp, valid),
+            2u);
+  EXPECT_EQ(fast_lio::imuSampleAfterPrefix(Queue{}, 0, 0.1, stamp, valid), 0u);
 }

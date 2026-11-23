@@ -1595,3 +1595,157 @@ TEST(ImuProcessValidity, RepeatedUnavailableHistoryRejectionsDoNotConsumeOrMoveT
   EXPECT_EQ(fixture.process.integrationLedger().duplicateIntegrations(), 0u);
   EXPECT_EQ(fixture.process.staleOutputReuseCount(), 0u);
 }
+
+namespace
+{
+sensor_msgs::msg::Imu::ConstSharedPtr imuSample(double stamp, const V3D & acc, const V3D & gyro)
+{
+  MeasureGroup holder;
+  addImu(holder, stamp, acc, gyro);
+  return holder.imu.back();
+}
+
+// The scan (10.1, 10.2] turns about gravity with a constant angular acceleration of 10 rad/s^2 from 10.1: samples
+// every 5 ms up to 10.185, then the next one only at 10.21, a 25 ms interval across the scan end.
+constexpr double kTurnStart = 10.1;
+constexpr double kTurnAcceleration = 10.0;
+V3D turnRate(double t)
+{
+  return V3D(0.0, 0.0, kTurnAcceleration * (t - kTurnStart));
+}
+MeasureGroup acceleratingTurn()
+{
+  auto input = scan(kTurnStart);
+  for (int i = 0; i <= 17; ++i)
+    addImu(input, kTurnStart + i * 0.005, V3D(0.0, 0.0, 9.81), turnRate(kTurnStart + i * 0.005));
+  return input;
+}
+sensor_msgs::msg::Imu::ConstSharedPtr acceleratingTurnNextSample()
+{
+  return imuSample(10.21, V3D(0.0, 0.0, 9.81), turnRate(10.21));
+}
+}  // namespace
+
+TEST(ImuProcessValidity, FrameTailIntegratesTheIntervalAcrossTheScanEnd)
+{
+  constexpr double last = 10.185, next = 10.21, end = 10.2;
+  // Pair means integrate a linear rate exactly: up to the last sample, then the 25 ms interval's mean over the 15 ms
+  // tail. Holding the last 5 ms interval's mean to the scan end instead gives 0.0485 rad.
+  const double through_last = 0.5 * kTurnAcceleration * (last - kTurnStart) * (last - kTurnStart);
+  const double expected = through_last + kTurnAcceleration * (0.5 * (last + next) - kTurnStart) * (end - last);
+  const double held = through_last + kTurnAcceleration * (last - 0.0025 - kTurnStart) * (end - last);
+  ASSERT_GT(std::abs(expected - held), 2e-3);
+
+  GapFixture f(true);
+  f.process.gap_params.min_gap_s = 0.1;  // m20: the 25 ms interval is not a gap
+  f.process.setFrameTailImu(acceleratingTurnNextSample());
+  ASSERT_TRUE(f.process.Process(acceleratingTurn(), f.filter, f.output));
+  EXPECT_NEAR(yawOf(f.filter.get_x()), expected, 1e-9);
+  EXPECT_EQ(f.process.frameTailCounts().bracketed, 1u);
+  EXPECT_EQ(f.process.frameTailCounts().extrapolated, 0u);
+  EXPECT_EQ(f.process.gap_summary.gaps, 0);
+
+  // Without the sample after the scan end the last interval's input is held to the end.
+  GapFixture without(true);
+  without.process.gap_params.min_gap_s = 0.1;
+  ASSERT_TRUE(without.process.Process(acceleratingTurn(), without.filter, without.output));
+  EXPECT_NEAR(yawOf(without.filter.get_x()), held, 1e-9);
+  EXPECT_EQ(without.process.frameTailCounts().bracketed, 0u);
+  EXPECT_EQ(without.process.frameTailCounts().extrapolated, 1u);
+}
+
+TEST(ImuProcessValidity, ScanEndInsideAnIntervalDoesNotChangeTheRotationAtItsNextSample)
+{
+  const auto next = acceleratingTurnNextSample();
+  const double next_stamp = rclcpp::Time(next->header.stamp).seconds();
+
+  // One scan that ends on the sample at 10.21...
+  GapFixture whole(true);
+  whole.process.gap_params.min_gap_s = 0.1;
+  auto one = acceleratingTurn();
+  one.lidar_end_time = next_stamp;
+  one.imu.push_back(next);
+  ASSERT_TRUE(whole.process.Process(one, whole.filter, whole.output));
+
+  // ...or two, the first ending at 10.2 inside the interval (10.185, 10.21].
+  GapFixture cut(true);
+  cut.process.gap_params.min_gap_s = 0.1;
+  auto first = acceleratingTurn();
+  cut.process.setFrameTailImu(next);
+  ASSERT_TRUE(cut.process.Process(first, cut.filter, cut.output));
+  auto second = scan(first.lidar_end_time);
+  second.lidar_end_time = next_stamp;
+  second.lidar->points[0].curvature = 5.0f;
+  second.imu.push_back(next);
+  cut.process.setFrameTailImu(nullptr);
+  ASSERT_TRUE(cut.process.Process(second, cut.filter, cut.output));
+
+  const M3D whole_rotation = whole.filter.get_x().rot.toRotationMatrix();
+  const M3D cut_rotation = cut.filter.get_x().rot.toRotationMatrix();
+  EXPECT_LT(Eigen::AngleAxisd(whole_rotation.transpose() * cut_rotation).angle(), 1e-12);
+  // Both are the exact integral of the linear rate up to 10.21.
+  const double through_next = 0.5 * kTurnAcceleration * (0.085 * 0.085) + kTurnAcceleration * 0.0975 * 0.025;
+  EXPECT_NEAR(yawOf(cut.filter.get_x()), through_next, 1e-9);
+  EXPECT_EQ(cut.process.integrationLedger().duplicateIntegrations(), 0u);
+}
+
+TEST(ImuProcessValidity, PointsAfterTheLastSampleAreDeskewedWithTheIntervalAcrossTheScanEnd)
+{
+  // 1 rad/s up to the last sample at 10.185 and 3 rad/s at the next one (10.21): the points between the last sample
+  // and the scan end at 10.2 turn with that interval's 2 rad/s, as the state does.
+  GapFixture f(true);
+  f.process.gap_params.min_gap_s = 0.1;
+  // Match the actual S2 gravity magnitude, so this is truly constant velocity.
+  const V3D rest = -f.filter.get_x().grav.get_vect() * f.process.gravity_norm() / fast_lio::G_m_s2;
+  auto input = scan(10.1);
+  deskewPoints(input, {0.0f, 50.0f, 90.0f, 95.0f, 100.0f});
+  for (int i = 0; i <= 17; ++i)
+    addImu(input, 10.1 + i * 0.005, rest, V3D(0, 0, 1));
+  f.process.setFrameTailImu(imuSample(10.21, rest, V3D(0, 0, 3)));
+  ASSERT_TRUE(f.process.Process(input, f.filter, f.output));
+  const auto yaw = [](double t) {  // t from the scan start
+    return t <= 0.085 ? t : 0.085 + 2.0 * (t - 0.085);
+  };
+  EXPECT_NEAR(yawOf(f.filter.get_x()), yaw(0.1), 1e-9);
+  const M3D end = Eigen::AngleAxisd(yaw(0.1), V3D::UnitZ()).toRotationMatrix();
+  ASSERT_EQ(f.output->size(), 5u);
+  for (const auto & point : *f.output) {
+    const double t = point.curvature / 1000.0;
+    const V3D expected =
+      end.transpose() * (Eigen::AngleAxisd(yaw(t), V3D::UnitZ()) * V3D(8, 0, 0) + V3D(t - 0.1, 0, 0));
+    EXPECT_NEAR(point.x, expected.x(), 2e-6);
+    EXPECT_NEAR(point.y, expected.y(), 2e-6);
+    EXPECT_NEAR(point.z, expected.z(), 2e-6);
+  }
+  // The point at the scan end is where the frame-end pose sees it.
+  EXPECT_FLOAT_EQ(f.output->back().curvature, 100.0f);
+  EXPECT_NEAR(f.output->back().x, 8.0, 2e-6);
+  EXPECT_NEAR(f.output->back().y, 0.0, 2e-6);
+}
+
+TEST(ImuProcessValidity, EmptyScanBridgeUsesTheIntervalAcrossTheScanEnd)
+{
+  // The IMU stops after 10.195 and resumes at 10.33 at 1.5 rad/s: the scan (10.2, 10.3] has no sample, and the
+  // 135 ms interval across it, a gap, turns at the mean of its two samples, 1 rad/s.
+  GapFixture f(true);
+  f.process.gap_params.min_gap_s = 0.1;
+  f.process.gap_params.empty_scans = true;
+  const auto resumed = imuSample(10.33, V3D(0.0, 0.0, 9.81), V3D(0.0, 0.0, 1.5));
+  auto turning = scan(10.1);
+  for (int i = 0; i < 20; ++i)
+    addImu(turning, 10.1 + i * 0.005, V3D(0.0, 0.0, 9.81), V3D(0.0, 0.0, 0.5));
+  f.process.setFrameTailImu(resumed);
+  ASSERT_TRUE(f.process.Process(turning, f.filter, f.output));
+  EXPECT_NEAR(yawOf(f.filter.get_x()), 0.5 * 0.095 + 1.0 * 0.005, 1e-9);
+  ASSERT_TRUE(f.process.bridgesEmptyScan(10.3));
+  f.process.setFrameTailImu(resumed);
+  ASSERT_TRUE(f.process.Process(scan(10.2), f.filter, f.output));
+  const auto x = f.filter.get_x();
+  EXPECT_FALSE(f.output->empty());
+  EXPECT_NEAR(yawOf(x), 0.5 * 0.095 + 1.0 * 0.105, 1e-9);
+  EXPECT_NEAR((x.vel - V3D(1.0, 0.0, 0.0)).norm(), 0.0, 1e-3);  // held
+  EXPECT_EQ(f.process.gap_summary.gaps, 1);
+  EXPECT_NEAR(f.process.gap_summary.longest_s, 0.1, 1e-6);
+  EXPECT_NEAR(f.process.gap_summary.longest_interval_s, 0.135, 1e-6);  // from 10.195 to 10.33
+  EXPECT_EQ(f.process.frameTailCounts().bracketed, 2u);
+}

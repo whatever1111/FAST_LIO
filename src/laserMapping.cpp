@@ -879,6 +879,7 @@ void clearBufferedInputsLocked(fast_lio::TimeAdmissionAccounting * observer, fas
   imu_buffer.clear();
   lidar_pushed = false;
   Measures.imu.clear();
+  p_imu->setFrameTailImu(nullptr);
   Measures.lidar.reset();
   feats_undistort->clear();
   flio_map_frozen = true;
@@ -2571,9 +2572,22 @@ bool finishImuBatch(const fast_lio::ImuProcessOutcome & outcome, fast_lio::TimeA
   return settled;
 }
 
+// Called with mtx_buffer held. The sample closes the tail's IMU interval and stays queued for the next scan.
+static void setFrameTailImuFromQueue(std::size_t count, double scan_end)
+{
+  const std::size_t after = fast_lio::imuSampleAfterPrefix(
+    imu_buffer,
+    count,
+    scan_end,
+    [](const auto & sample) { return get_time_sec(sample->header.stamp); },
+    [](const auto & sample) { return validImuForConsumption(sample.message); });
+  p_imu->setFrameTailImu(after < imu_buffer.size() ? imu_buffer[after].message : nullptr);
+}
+
 bool sync_packages(MeasureGroup & meas, fast_lio::TimeAdmissionAccounting * observer)
 {
   std::unique_lock<std::mutex> lock(mtx_buffer);
+  p_imu->setFrameTailImu(nullptr);
   if (input_epoch_guard.faulted() && !input_epoch_handled) {
     input_epoch_handled = true;
     anchorEvidence(fast_lio::AnchorTraceReason::kTimeEpoch,
@@ -2677,6 +2691,7 @@ bool sync_packages(MeasureGroup & meas, fast_lio::TimeAdmissionAccounting * obse
   pending_imu_token = imu_fifo_transaction.borrow(imu_buffer, count);
   for (const auto & sample : pending_imu_token.prefix)
     meas.imu.push_back(sample.message);
+  setFrameTailImuFromQueue(count, lidar_end_time);
   popLidarScan(observer, fast_lio::AdmissionBucket::kBorrowed);
   if (meas.imu.empty() && p_imu->bridgesEmptyScan(meas.lidar_end_time)) {
     // No IMU sample in this scan, but the lidar kept recording through the IMU dropout: the IMU-gap prior carries
@@ -4083,7 +4098,8 @@ public:
         "exception_valid_lost=%lu duplicate_confirm=%lu duplicate_integration=%lu watermark_regressions=%lu "
         "stale_output_reuse=%lu history_rejected=%lu bridged_scans=%lu empty=%lu nonadvancing=%lu "
         "max_pending_age=%.9f pending_valid=%lu pending_retained=%lu max_imu_backlog_sec=%.9f faulted=%d "
-        "fault_valid_lost=%lu fault_discarded_lidar=%lu fault_discarded_imu=%lu rejected_lidar=%lu rejected_imu=%lu",
+        "fault_valid_lost=%lu fault_discarded_lidar=%lu fault_discarded_imu=%lu rejected_lidar=%lu rejected_imu=%lu "
+        "tail_bracketed=%lu tail_extrapolated=%lu tail_gap_by_interval=%lu",
         static_cast<unsigned long>(counts.retainedBatches),
         static_cast<unsigned long>(counts.retainedUniqueSamples),
         static_cast<unsigned long>(counts.committedSamples),
@@ -4109,7 +4125,10 @@ public:
         static_cast<unsigned long>(counts.faultDiscardedLidar),
         static_cast<unsigned long>(counts.faultDiscardedImu),
         static_cast<unsigned long>(counts.rejectedLidar),
-        static_cast<unsigned long>(counts.rejectedImu));
+        static_cast<unsigned long>(counts.rejectedImu),
+        static_cast<unsigned long>(p_imu->frameTailCounts().bracketed),
+        static_cast<unsigned long>(p_imu->frameTailCounts().extrapolated),
+        static_cast<unsigned long>(p_imu->frameTailCounts().gap_by_interval));
       for (std::size_t i = 0; i < counts.events.size(); ++i)
         RCLCPP_INFO(this->get_logger(),
                     "[IMU-CONSUMPTION-REASON] reason=%s events=%lu valid_lost=%lu",

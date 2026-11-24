@@ -2160,13 +2160,18 @@ private:
     }
   }
 
+  // Returns the evaluation that ended the wait: a condition that held there may stop holding right after,
+  // as a periodic timer's readiness does when it comes due again.
   template<class Predicate>
   bool spinUntil(Predicate ready, double seconds = kScanWaitSeconds)
   {
     const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
-    while (!ready() && std::chrono::steady_clock::now() < end)
+    bool done = ready();
+    while (!done && std::chrono::steady_clock::now() < end) {
       executor_->spin_once(std::chrono::milliseconds(2));
-    return ready();
+      done = ready();
+    }
+    return done;
   }
 
   double scanStart(int scan) const { return kFirstScan + kScanPeriod * scan; }

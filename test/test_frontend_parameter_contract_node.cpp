@@ -1248,70 +1248,6 @@ TEST(FrontendParameterContract, TypedMergedM20BodyImu)
     "typed_merged_m20_bodyimu"));
 }
 
-// initial_pose_full_rpy_override and its deprecated name initial_pose_apply_roll_pitch, alone and together.
-TEST(FrontendParameterContract, AliasNewNameOnly)
-{
-  ParameterCase c = overridesCase("alias_new_name_only", Expect::kConstructed);
-  setOverride(c, rclcpp::Parameter("initial_pose_full_rpy_override", true));
-  checkCase(c);
-}
-
-TEST(FrontendParameterContract, AliasDeprecatedNameOnly)
-{
-  ParameterCase c = overridesCase("alias_deprecated_name_only", Expect::kConstructed);
-  setOverride(c, rclcpp::Parameter("initial_pose_apply_roll_pitch", true));
-  checkCase(c);
-}
-
-TEST(FrontendParameterContract, AliasBothNamesSet)
-{
-  ParameterCase c = overridesCase("alias_both_names_set", Expect::kConstructed);
-  setOverride(c, rclcpp::Parameter("initial_pose_full_rpy_override", true));
-  setOverride(c, rclcpp::Parameter("initial_pose_apply_roll_pitch", true));
-  checkCase(c);
-}
-
-TEST(FrontendParameterContract, AliasBothNamesDisagree)
-{
-  ParameterCase c = overridesCase("alias_both_names_disagree", Expect::kConstructed);
-  setOverride(c, rclcpp::Parameter("initial_pose_full_rpy_override", false));
-  setOverride(c, rclcpp::Parameter("initial_pose_apply_roll_pitch", true));
-  checkCase(c);
-}
-
-// The same four alias configurations with typed outputs on. The configuration ID hashes the parameter server's
-// values, not the effective configuration: all four give the same effective full-RPY override, the three different
-// pairs of server values three different IDs, and the same pair of values given through other overrides the same ID.
-TEST(FrontendParameterContract, TypedAliasConfigIds)
-{
-  const std::string config_id = "derived:config_id:reference_config_id";
-  const std::string override_rpy = "derived:initial_pose_alias:initial_pose_full_rpy_override_";
-  std::map<std::string, std::string> ids;
-  const auto run = [&](const std::string & name, const std::vector<rclcpp::Parameter> & aliases) {
-    ParameterCase c = typedCase(overridesCase(name, Expect::kConstructed), name);
-    for (const auto & alias : aliases)
-      setOverride(c, alias);
-    std::string record;
-    checkCase(c, &record);
-    EXPECT_EQ(effectiveValue(record, override_rpy), "1") << name;
-    ids[name] = effectiveValue(record, config_id);
-    EXPECT_EQ(ids[name].size(), 64u) << name << " recorded no configuration ID";
-    EXPECT_NE(ids[name], std::string(64, '0')) << name << " computed no configuration ID";
-  };
-  run("typed_alias_new_name_only", {rclcpp::Parameter("initial_pose_full_rpy_override", true)});
-  run("typed_alias_deprecated_name_only", {rclcpp::Parameter("initial_pose_apply_roll_pitch", true)});
-  run("typed_alias_both_names_set",
-      {rclcpp::Parameter("initial_pose_full_rpy_override", true),
-       rclcpp::Parameter("initial_pose_apply_roll_pitch", true)});
-  run("typed_alias_both_names_disagree",
-      {rclcpp::Parameter("initial_pose_full_rpy_override", false),
-       rclcpp::Parameter("initial_pose_apply_roll_pitch", true)});
-  EXPECT_NE(ids["typed_alias_new_name_only"], ids["typed_alias_deprecated_name_only"]);
-  EXPECT_NE(ids["typed_alias_new_name_only"], ids["typed_alias_both_names_set"]);
-  EXPECT_NE(ids["typed_alias_deprecated_name_only"], ids["typed_alias_both_names_set"]);
-  EXPECT_EQ(ids["typed_alias_deprecated_name_only"], ids["typed_alias_both_names_disagree"]);
-}
-
 // Type errors: an override whose type is not the declared one.
 TEST(FrontendParameterContract, TypeStringForDouble)
 {
@@ -1337,7 +1273,7 @@ TEST(FrontendParameterContract, TypeDoubleForInteger)
 TEST(FrontendParameterContract, TypeIntegerForBool)
 {
   ParameterCase c = overridesCase("type_integer_for_bool", Expect::kRejected);
-  setOverride(c, rclcpp::Parameter("feature_extract_enable", 1));
+  setOverride(c, rclcpp::Parameter("pcd_save.pcd_save_en", 1));
   checkCase(c);
 }
 
@@ -1499,35 +1435,6 @@ TEST(FrontendParameterContract, TimeAdmissionAccountingIsDefaultOffAndStartupRea
   EXPECT_NE(on.record.find("set diagnostics.time_admission_counts_enable type=bool value=false -> rejected"),
             std::string::npos);
   EXPECT_NE(on.record.find("effective.v1 diagnostics.time_admission_counts_enable bool 1"), std::string::npos);
-}
-
-// The attitude hold projects only the attitude columns of H, so the node refuses it together with online extrinsic
-// estimation, and says which two parameters and why. On its own the hold starts: estimation is off unless asked for.
-TEST(FrontendParameterContract, AttitudeHoldWithOnlineExtrinsic)
-{
-  ParameterCase c = overridesCase("attitude_hold_with_online_extrinsic", Expect::kRejected);
-  setOverride(c, rclcpp::Parameter("lidar_attitude_hold_en", true));
-  setOverride(c, rclcpp::Parameter("mapping.extrinsic_est_en", true));
-  std::string record;
-  checkCase(c, &record);
-  EXPECT_NE(record.find("\noutcome threw std::invalid_argument: "), std::string::npos) << record;
-  EXPECT_NE(record.find("\nlog FATAL "), std::string::npos) << record;
-  for (const auto & line : splitLines(record)) {
-    if (line.rfind("outcome ", 0) != 0 && line.rfind("log FATAL ", 0) != 0)
-      continue;
-    EXPECT_NE(line.find("lidar_attitude_hold_en"), std::string::npos) << line;
-    EXPECT_NE(line.find("mapping.extrinsic_est_en"), std::string::npos) << line;
-  }
-}
-
-TEST(FrontendParameterContract, AttitudeHoldAlone)
-{
-  ParameterCase c = overridesCase("attitude_hold_alone", Expect::kConstructed);
-  setOverride(c, rclcpp::Parameter("lidar_attitude_hold_en", true));
-  std::string record;
-  checkCase(c, &record);
-  EXPECT_EQ(effectiveValue(record, "lidar_attitude_hold_en"), "1");
-  EXPECT_EQ(effectiveValue(record, "mapping.extrinsic_est_en"), "0");
 }
 
 // Two invalid values in one configuration: the record shows which check refuses it, and the stages and lines the

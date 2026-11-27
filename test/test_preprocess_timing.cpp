@@ -23,7 +23,7 @@ TEST(PreprocessTiming, PresentTimeWithZeroTailPreservesStrideAndTimes)
   auto message = std::make_unique<sensor_msgs::msg::PointCloud2>();
   pcl::toROSMsg(points, *message);
   Preprocess preprocess;
-  preprocess.set(false, VELO16, 0.1, 2);
+  preprocess.set(VELO16, 0.1, 2);
   preprocess.time_unit = SEC;
   preprocess.N_SCANS = 16;
   auto output = std::make_shared<PointCloudXYZI>();
@@ -78,7 +78,7 @@ std::unique_ptr<sensor_msgs::msg::PointCloud2> velodyneScan(const std::vector<Sc
 PointCloudXYZI preprocessed(const std::unique_ptr<sensor_msgs::msg::PointCloud2> & message)
 {
   Preprocess preprocess;
-  preprocess.set(false, VELO16, 0.1, 1);
+  preprocess.set(VELO16, 0.1, 1);
   preprocess.time_unit = SEC;
   preprocess.N_SCANS = kScanLine;
   auto output = std::make_shared<PointCloudXYZI>();

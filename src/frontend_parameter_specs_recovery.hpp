@@ -25,18 +25,9 @@ struct RecoveryParameterSpecs
   const ParameterSpec<double> guard_release_leg_max_age_s{"guard_release_leg_max_age_s", 0.5, 0.5};
   const ParameterSpec<double> guard_release_leg_sigma{"guard_release_leg_sigma", 0.3, 0.3};
   const ParameterSpec<double> guard_release_keep_sigma{"guard_release_keep_sigma", 0.5, 0.5};
-  const ParameterSpec<bool> guard_release_inflate_en{"guard_release_inflate_en", false, false};
-  const ParameterSpec<double> guard_release_pos_sigma_min{"guard_release_pos_sigma_min", 0.1, 0.1};
-  const ParameterSpec<double> guard_release_pos_sigma_rate{"guard_release_pos_sigma_rate", 0.2, 0.2};
-  const ParameterSpec<double> guard_release_pos_sigma_max{"guard_release_pos_sigma_max", 1.0, 1.0};
-  const ParameterSpec<double> guard_release_rp_sigma_deg{"guard_release_rp_sigma_deg", 0.5, 0.5};
-  const ParameterSpec<double> guard_release_rp_sigma_rate_deg{"guard_release_rp_sigma_rate_deg", 0.3, 0.3};
-  const ParameterSpec<double> guard_release_rp_sigma_max_deg{"guard_release_rp_sigma_max_deg", 3.0, 3.0};
-  const ParameterSpec<double> guard_release_yaw_sigma_deg{"guard_release_yaw_sigma_deg", 0.0, 0.0};
   const ParameterSpec<bool> guard_hole_en{"guard_hole_en", false, false};
   const ParameterSpec<double> guard_hole_min_sec{"guard_hole_min_sec", 0.3, 0.3};
   const ParameterSpec<double> guard_hole_max_accel{"guard_hole_max_accel", 1.0, 1.0};
-  const ParameterSpec<bool> guard_hole_reanchor_pos{"guard_hole_reanchor_pos", true, true};
   const ParameterSpec<int> divergence_guard_streak{"divergence_guard_streak", 5, 5};
   const ParameterSpec<double> divergence_guard_max_speed{"divergence_guard_max_speed", 30.0, 30.0};
   const ParameterSpec<bool> zupt_en{"zupt_en", true, true};

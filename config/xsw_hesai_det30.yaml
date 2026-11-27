@@ -1,6 +1,5 @@
 /**:
     ros__parameters:
-        feature_extract_enable: false
         point_filter_num: 3
         max_iteration: 2
         filter_size_surf: 0.3
@@ -15,7 +14,6 @@
         common:
             lid_topic:  "/hesai210/original"
             imu_topic:  "/fp_standard/imu"
-            time_sync_en: false
             time_offset_lidar_to_imu: 0.0
 
         preprocess:

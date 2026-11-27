@@ -77,11 +77,11 @@ public:
                    int & max_buffered_scans,
                    double & max_scan_backlog_sec,
                    double & max_imu_backlog_sec);
-  void readDownsampleAndDegeneracy(const rclcpp::Node & node, bool & degeneracy_debug);
+  void readDegeneracy(const rclcpp::Node & node, bool & degeneracy_debug);
   void readConstraints(const rclcpp::Node & node, bool & health_pub_en);
   void readCorrespondence(const rclcpp::Node & node);
   void readCorrespondenceDump(const rclcpp::Node & node);
-  void readAttitudeAndGravity(const rclcpp::Node & node, double & zupt_vel_reset_sigma);
+  void readResetSigmasAndGravity(const rclcpp::Node & node, double & zupt_vel_reset_sigma);
   void readImuInit(const rclcpp::Node & node, FrontendStartup & startup);
   void readGuards(const rclcpp::Node & node, ReleaseVelocityParams & release_vel_params);
   void readHoleAndZupt(const rclcpp::Node & node,
@@ -107,7 +107,6 @@ public:
   void readDataPaths(const rclcpp::Node & node, std::string & map_file_path, std::string & root_dir);
   void readInputs(const rclcpp::Node & node,
                   FrontendStartup & startup,
-                  bool & time_sync_en,
                   double & time_diff_lidar_to_imu,
                   double & imu_time_offset);
   void readMapAndNoise(const rclcpp::Node & node,
@@ -127,10 +126,7 @@ public:
                        ImuCoverageParams & coverage,
                        ImuGapPriorParams & gap,
                        bool reanchor_en);
-  void readFeatureInputs(const rclcpp::Node & node,
-                         int & point_filter_num,
-                         bool & feature_enabled,
-                         bool & runtime_pos_log);
+  void readFeatureInputs(const rclcpp::Node & node, int & point_filter_num, bool & runtime_pos_log);
 #ifdef USE_IVOX
   IvoxDeclaredValues declareIvox(rclcpp::Node & node);
 #endif

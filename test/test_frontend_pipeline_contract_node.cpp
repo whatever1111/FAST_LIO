@@ -35,10 +35,10 @@
 //                     asked for and whether the call searched (the refresh gate skips a search the state has not
 //                     moved enough for), the gate's refusals and the scan's robust residual scale, the rows the ground
 //                     recovery added, and the SHA-256 of the selection in point order, of the kept points' residuals
-//                     and of the rows' points, normals, residuals and kernel weights;
+//                     and of the rows' points, normals, residuals and weights (all 1);
 //   h_exit.v1         every H-model exit: validity and rows, the mean residual, the rows' position information, the
-//                     attitude hold's verdicts and the roll/pitch information, the subspace weighting's verdict,
-//                     spectrum and dose, and whether the call appended to the correspondence dump;
+//                     removed attitude hold's four fields (0) and the roll/pitch information, the subspace weighting's
+//                     verdict, spectrum and dose, and whether the call appended to the correspondence dump;
 //   h_dump.v1         the correspondence dump scenario only, at its end: each dump file's size, lines and SHA-256 (the
 //                     test build writes the files to the scenario's result directory);
 //   identity.v1, frontend_observation.v1, reference_health.v1
@@ -652,8 +652,8 @@ std::string valuesDigest(const std::vector<double> & values)
 
 // The h_select.v1 line of one H-model call. The selection is digested as one byte per point (1: the point has a row),
 // the residuals as the kept points' |residual| in point order; a refused or unmatched point's entries are stale and
-// left out. `weighted` returns the rows whose kernel weight is below 1.
-std::string formatSelection(const fast_lio_test::HModelSelection & s, std::size_t * weighted)
+// left out. rows_weighted counts the rows whose weight is below 1: none, the rows are unweighted.
+std::string formatSelection(const fast_lio_test::HModelSelection & s)
 {
   const std::size_t points = s.points > 0 ? static_cast<std::size_t>(s.points) : 0u;
   std::string flags;
@@ -671,7 +671,7 @@ std::string formatSelection(const fast_lio_test::HModelSelection & s, std::size_
     }
   }
   std::vector<double> row_points, row_normals, row_residuals, row_weights;
-  *weighted = 0;
+  std::size_t weighted = 0;
   for (const auto & row : s.rows) {
     for (int d = 0; d < 3; ++d) {
       row_points.push_back(static_cast<double>(row.point[d]));
@@ -680,7 +680,7 @@ std::string formatSelection(const fast_lio_test::HModelSelection & s, std::size_
     row_residuals.push_back(static_cast<double>(row.residual));
     row_weights.push_back(row.weight);
     if (row.weight < 1.0)
-      ++*weighted;
+      ++weighted;
   }
   std::ostringstream out;
   out << "h_select.v1 end=" << bits(s.scan_end) << " call=" << s.call << " requested=" << (s.search_requested ? 1 : 0)
@@ -689,7 +689,7 @@ std::string formatSelection(const fast_lio_test::HModelSelection & s, std::size_
       << " selected_sha256=" << (flags.empty() ? std::string("none") : sha256Hex(flags))
       << " residuals_sha256=" << valuesDigest(residuals) << " gate_rejected=" << s.gate_rejected
       << " gate_scan_sigma=" << bits(s.gate_scan_sigma) << " ground_rows=" << s.ground_rows << " rows=" << s.rows.size()
-      << " rows_weighted=" << *weighted << " row_points_sha256=" << valuesDigest(row_points)
+      << " rows_weighted=" << weighted << " row_points_sha256=" << valuesDigest(row_points)
       << " row_normals_sha256=" << valuesDigest(row_normals) << " row_residuals_sha256=" << valuesDigest(row_residuals)
       << " row_weights_sha256=" << valuesDigest(row_weights);
   return out.str();
@@ -982,7 +982,6 @@ Scenario baseScenario(const std::string & name)
         rclcpp::Parameter("preprocess.lidar_type", 3),
         rclcpp::Parameter("preprocess.timestamp_unit", 3),
         rclcpp::Parameter("point_filter_num", 1),
-        rclcpp::Parameter("feature_extract_enable", false),
         rclcpp::Parameter("filter_size_surf", 0.001),
         rclcpp::Parameter("filter_size_map", 0.05),
         rclcpp::Parameter("imu_init_require_still", false),
@@ -1257,19 +1256,6 @@ Scenario gateNearestScenario()
   return s;
 }
 
-// A robust kernel on the rows (corr_kernel, its scale the larger of corr_kernel_mad_scale times the scan's residual
-// scale and corr_kernel_min_scale): every row with a residual is weighted below 1, the outliers far below.
-Scenario kernelScenario(const std::string & name, const char * kernel)
-{
-  Scenario s = measurementScenario(name, Cloud::kRoom);
-  setParam(s, rclcpp::Parameter("corr_kernel", kernel));
-  append(s, 3, sceneSlot(Cloud::kRoom));
-  append(s, 2, outlierSlot());
-  append(s, 2, sceneSlot(Cloud::kRoom));
-  s.claims = {"h_kernel_weighted"};
-  return s;
-}
-
 // The neighbour refresh gate (nn_refresh_gate_en): on parked scans the iteration that asks for a new search after
 // converging has hardly moved, and the gate skips the search; the turning scans need iterations that do not converge,
 // which reuse the cached planes without asking.
@@ -1313,28 +1299,6 @@ Scenario degeneracyScenario()
   s.wheel_fit = true;
   append(s, 8, sceneSlot(Cloud::kCorridor));
   s.claims = {"h_floor_projected"};
-  return s;
-}
-
-// The attitude hold (lidar_attitude_hold_en; it rules out online extrinsic estimation). Its scene rule holds a room
-// scan after a room scan, whose weakest position direction is near vertical (z_weak about 0.9 > 0.5); the information
-// rule holds the fixture's plane, whose roll/pitch information (about 30) is below 300, where the room's (about 3000)
-// is not. The first plane scan matches nothing and goes into the map; the far scan matches nothing and releases the
-// hold on the next scan.
-Scenario attitudeHoldScenario()
-{
-  Scenario s = measurementScenario("h_attitude_hold", Cloud::kRoom);
-  setParam(s, rclcpp::Parameter("mapping.extrinsic_est_en", false));
-  setParam(s, rclcpp::Parameter("lidar_attitude_hold_en", true));
-  setParam(s, rclcpp::Parameter("lidar_attitude_hold_far_frac", 2.0));
-  setParam(s, rclcpp::Parameter("lidar_attitude_hold_z_weak", 0.5));
-  setParam(s, rclcpp::Parameter("lidar_attitude_hold_min_rp_info", 300.0));
-  append(s, 3, sceneSlot(Cloud::kRoom));
-  append(s, 4, sceneSlot(Cloud::kDense));
-  append(s, 3, sceneSlot(Cloud::kRoom));
-  s.slots.push_back(sceneSlot(Cloud::kFar));
-  append(s, 2, sceneSlot(Cloud::kRoom));
-  s.claims = {"h_hold_rows", "h_hold_info"};
   return s;
 }
 
@@ -1481,10 +1445,6 @@ constexpr Branch kBranches[] = {
   {"h_gate_rejected",
    "H-model calls whose correspondence gate refused at least one match (h_select.v1 gate_rejected > 0)",
    "test_correspondence_gate CorrespondenceGate.*"},
-  {"h_kernel_weighted",
-   "H-model calls with a row whose robust kernel weight is below 1 (h_select.v1 rows_weighted > 0)",
-   "test_correspondence_gate CorrespondenceGate.KernelWeightsAreOneAtZeroAndDecayWithTheResidual; "
-   "test_correspondence_compaction CorrespondenceCompaction.*"},
   {"h_nn_skip", "H-model calls whose requested neighbour search the refresh gate skipped (nn_refresh_gate_en)", ""},
   {"h_nn_reuse",
    "H-model calls that kept the cached planes because the filter asked for no search (an unconverged iteration)",
@@ -1499,16 +1459,10 @@ constexpr Branch kBranches[] = {
    "H-model calls with rows on scans an applying floor observed because the wheel update found no speed "
    "(fast_lio::scanFloorMode)",
    "test_normal_noise_floor ScanFloorMode.*; test_wheel_measurement WheelSpeedInput.HasFit*"},
-  {"h_hold_rows",
-   "H-model calls with rows whose rotation rows the attitude hold's scene rule restricted to yaw",
-   "test_attitude_hold AttitudeHold.*"},
-  {"h_hold_info",
-   "H-model calls with rows whose rotation rows the information rule alone restricted to yaw "
-   "(lidar_attitude_hold_min_rp_info)",
-   "test_attitude_hold AttitudeHold.RollPitchInformationSeparatesFloorFromNearWall"},
   {"h_rp_consider",
    "H-model calls with rows on scans whose update leaves roll/pitch to the gyro (lidar_consider_rp_en)",
-   "test_rp_consider ConsiderPolicy.*; test_rp_consider_filter ConsiderFilter.*"},
+   "test_rp_consider ConsiderPolicy.*; test_rp_consider ConsiderInformation.*; "
+   "test_rp_consider_filter ConsiderFilter.*"},
   {"h_extrinsic_rows",
    "H-model exits with rows whose extrinsic columns are filled (mapping.extrinsic_est_en true)",
    ""},
@@ -1886,13 +1840,10 @@ private:
         ++counts_[extrinsic ? "h_extrinsic_rows" : "h_extrinsic_fixed"];
       };
     fast_lio_test::afterHModelSelection = [this](const fast_lio_test::HModelSelection & s) {
-      std::size_t weighted = 0;
-      if (!note("afterHModelSelection", formatSelection(s, &weighted)))
+      if (!note("afterHModelSelection", formatSelection(s)))
         return;
       if (s.gate_rejected > 0)
         ++counts_["h_gate_rejected"];
-      if (weighted > 0)
-        ++counts_["h_kernel_weighted"];
       if (s.search_requested && !s.searched)
         ++counts_["h_nn_skip"];
       if (!s.search_requested)
@@ -1937,10 +1888,6 @@ private:
         ++counts_["h_floor_projected"];
       if (e.valid && e.degeneracy_no_wheel)
         ++counts_["h_floor_no_wheel"];
-      if (e.valid && e.hold_rows && e.hold_scene)
-        ++counts_["h_hold_rows"];
-      if (e.valid && e.hold_rows && e.hold_info && !e.hold_scene)
-        ++counts_["h_hold_info"];
       if (e.valid && e.rp_consider)
         ++counts_["h_rp_consider"];
       if (e.dump_written)
@@ -3240,16 +3187,6 @@ TEST(FrontendPipelineContract, MeasurementGateNearestNeighbour)
   checkScenario(gateNearestScenario());
 }
 
-TEST(FrontendPipelineContract, MeasurementKernelGemanMcClure)
-{
-  checkScenario(kernelScenario("h_kernel_gm", "gm"));
-}
-
-TEST(FrontendPipelineContract, MeasurementKernelCauchy)
-{
-  checkScenario(kernelScenario("h_kernel_cauchy", "cauchy"));
-}
-
 TEST(FrontendPipelineContract, MeasurementNeighbourRefresh)
 {
   checkScenario(refreshScenario());
@@ -3495,11 +3432,6 @@ TEST(FrontendPipelineContract, FloorSchema2UsesThePublishedFrameEndQuaternionAnd
 TEST(FrontendPipelineContract, MeasurementNoiseFloorApplied)
 {
   checkScenario(degeneracyScenario());
-}
-
-TEST(FrontendPipelineContract, MeasurementAttitudeHold)
-{
-  checkScenario(attitudeHoldScenario());
 }
 
 TEST(FrontendPipelineContract, MeasurementExtrinsicEstimationOn)

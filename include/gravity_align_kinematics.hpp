@@ -7,16 +7,15 @@
 // mean of dv_b/dt is not zero: it is (v_b(end) − v_b(start))/span, and on the m20
 // a doorway stop or start moves that by 4–7° of lean inside a window the prior
 // then trusts at 0.46° (docs/PGO_LOOP_TUNING.md §7.3). Only the body velocity at
-// the two window edges enters, so the filter's own per-scan velocity history is
-// enough to compute it — as long as nothing overwrote that velocity inside the
-// window. A reset, pin or clamp has no derivative; the term is undefined there,
+// the two window edges enters, and the legs measure it there (legEdgeVelocity).
+// An edge without a leg velocity has no derivative; the term is undefined there,
 // and the honest answer is to withhold the prior for that window rather than
 // level onto a number that is neither gravity nor acceleration.
 //
-// The same edges carry the filter's velocity covariance, which bounds the error
+// The same edges carry the leg velocity's variance, which bounds the error
 // of the compensation: σ = scale · sqrt(var_start + var_end) / (g · span), in the
 // unit-vector units the prior's residual uses. Where the velocity is
-// unobserved the sigma grows and the prior fades on its own — no threshold.
+// uncertain the sigma grows and the prior fades on its own — no threshold.
 //
 // Pure C++ + Eigen. No ROS, no estimator types.
 
@@ -41,7 +40,7 @@ struct LevellingWindowScan
   Eigen::Vector3d v_end = Eigen::Vector3d::Zero();    ///< body-frame velocity at t_end (m/s)
   double var_start = 0.0;  ///< trace of the velocity covariance block at t_start ((m/s)²)
   double var_end = 0.0;    ///< trace of the velocity covariance block at t_end ((m/s)²)
-  bool velocity_overwritten = false;  ///< the state velocity was assigned (reset/pin/clamp) inside (t_start, t_end]
+  bool velocity_overwritten = false;  ///< an edge without a velocity measurement (no fresh leg sample at either end)
 };
 
 struct LinearAccelerationTerm
@@ -54,12 +53,11 @@ struct LinearAccelerationTerm
 
 /// The window-mean linear acceleration between the oldest scan's start edge and
 /// the newest scan's end edge. Invalid when the span is not positive, any input is
-/// non-finite, or a velocity overwrite lies anywhere inside the window
-/// (`overwritten_inside` is the OR of every scan's flag, the caller's job because
-/// the middle scans are not passed in).
+/// non-finite, or either edge has no velocity (its `velocity_overwritten` flag).
+/// The edges are independent velocity measurements (legEdgeVelocity), so what the
+/// filter's own velocity did between them does not enter.
 inline LinearAccelerationTerm linearAccelerationTerm(const LevellingWindowScan & oldest,
                                                      const LevellingWindowScan & newest,
-                                                     bool overwritten_inside,
                                                      double gravity,
                                                      double sigma_scale)
 {
@@ -68,8 +66,8 @@ inline LinearAccelerationTerm linearAccelerationTerm(const LevellingWindowScan &
   const bool finite = std::isfinite(span) && std::isfinite(gravity) && std::isfinite(sigma_scale) &&
                       oldest.v_start.allFinite() && newest.v_end.allFinite() &&
                       std::isfinite(oldest.var_start) && std::isfinite(newest.var_end);
-  if (!finite || overwritten_inside || oldest.velocity_overwritten || newest.velocity_overwritten || span <= 0.0 ||
-      gravity <= 0.0 || sigma_scale < 0.0) {
+  if (!finite || oldest.velocity_overwritten || newest.velocity_overwritten || span <= 0.0 || gravity <= 0.0 ||
+      sigma_scale < 0.0) {
     return term;
   }
   term.valid = true;

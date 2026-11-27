@@ -1,6 +1,5 @@
 /**:
     ros__parameters:
-        feature_extract_enable: false
         point_filter_num: 3
         max_iteration: 3
         filter_size_surf: 0.5
@@ -12,7 +11,6 @@
         common:
             lid_topic:  "/livox/lidar"
             imu_topic:  "/livox/imu"
-            time_sync_en: false
             time_offset_lidar_to_imu: 0.0
 
         preprocess:

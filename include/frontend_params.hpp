@@ -6,11 +6,8 @@
 #include <utility>
 #include <vector>
 
-#include "adaptive_downsample.hpp"
-#include "attitude_hold.hpp"
 #include "correspondence_gate.hpp"
 #include "degeneracy_policy.hpp"
-#include "engulf_release.hpp"
 #include "normal_noise_floor.hpp"
 #include "parked_hold.hpp"
 #include "prior_map_load.hpp"
@@ -66,31 +63,19 @@ struct FrontendParams
   double gravity_align_mag_ref = 0.0;         // magnitude-gate anchor; 0 = IMU-init g (biased if init in motion)
   double gravity_align_grav_leak = 1.0;       // [v4] per-engaged-scan multiplicative variance leak on the S2
                                               // gravity block (fading memory); 1.0 = off
-  // [v5] Freeze the S2 gravity state while the levelling prior runs at its
-  // degraded strength (trigger or hold): only attitude takes the update then.
-  // The leak makes the gravity block a fading-memory filter whose steady-state
-  // gain is ~(leak-1) per engaged scan whatever the sigma (P* = (leak-1)·σ²), so
-  // at 1.05 the gravity state is a ~2 s low-pass of the accelerometer direction
-  // and inside blind re-anchor windows it swings 1.5-2° with the walking
-  // dynamics while the vendor INS attitude stays put (m20 0825 133/151/164 s,
-  // 0826 111/131 s; docs/PGO_LOOP_TUNING.md §7). The true vertical does not
-  // change in those seconds; the attitude is what the degraded prior is for.
-  bool gravity_align_grav_freeze_degraded = false;
   // [v6] Kinematic compensation of the levelling measurement (gravity_align_kinematics.hpp):
   // f = dv_b/dt + ω×v_b − Rᵀg + b_a, and only the ω×v_b term was subtracted. The window mean
   // of dv_b/dt is (v_b(end) − v_b(start))/span — 4-7° of lean at a doorway stop/start on the
   // m20, taken as a 0.46° measurement (docs/PGO_LOOP_TUNING.md §7.3). With the option on the
-  // term comes from the filter's own per-scan body-velocity history, the prior is withheld
-  // while a velocity overwrite (reset/pin/clamp) lies inside the window, and the velocity
-  // covariance at the window edges widens the measurement sigma (scale 0 = off).
+  // term comes from the leg velocities at the window edges (below), the prior is withheld
+  // while an edge has no leg velocity, and the edges' velocity variance widens the
+  // measurement sigma (scale 0 = off).
   bool gravity_align_lin_accel_comp = false;
   double gravity_align_vel_sigma_scale = 0.0;
-  // [v6] velocity source for the term: "leg" (default) takes the leg-odometry forward speed
-  // (wheel_topic) averaged over the last gravity_align_leg_edge_window_s at each scan end,
-  // moved to the IMU point over gravity_align_leg_lever_arm; "filter" takes the iEKF's own
-  // velocity — which drifts with the attitude error where the LiDAR does not observe it and
-  // then cancels the gravity leakage the prior exists to correct (m20 0831: +3° frame tilt).
-  std::string gravity_align_lin_accel_source = "leg";
+  // [v6] The term's velocity is the leg-odometry forward speed (wheel_topic) averaged over the last
+  // gravity_align_leg_edge_window_s at each scan end, moved to the IMU point over gravity_align_leg_lever_arm: an
+  // independent measurement of the motion. The iEKF's own velocity drifts with the attitude error where the LiDAR
+  // does not observe it and would cancel the gravity leakage the prior exists to correct.
   double gravity_align_leg_vel_sigma = 0.15;     // m/s; gait residual of the edge mean while moving
   double gravity_align_leg_edge_window_s = 0.2;  // s; trailing mean at each scan end
   Eigen::Vector3d gravity_align_leg_lever_arm =
@@ -112,21 +97,15 @@ struct FrontendParams
   double gravity_align_grav_cap_deg = 3.0;    // [v4] leak cap: grav tangent std ceiling (deg) — bounds how far
                                               // the gravity state may be steered per run
 
-  // [v8] Attitude hold (attitude_hold.hpp): scans registered against a frozen map (or, optionally,
-  // near-field-only scans with no horizontal surface in view) may update translation and yaw but not
-  // roll/pitch — the point-to-plane residuals carry no vertical information there and were tilting
-  // the state 0.4-1.7° per scan (docs/PGO_LOOP_TUNING.md §7.5). Decided once per scan before the
-  // update from the previous scan's guard verdicts and this scan's far-field share.
-  fast_lio::AttitudeHoldParams attitude_hold;
   // [diag] per-correspondence dump (corr_dump_en, corr_dump_windows "t1:t2,t3:t4" in lidar_end_time seconds):
   // inside a window every iEKF iteration writes one row per effective correspondence (every point on the
   // first iteration) to corr_dump.csv: the point in the IMU frame, the matched plane's normal, the signed
-  // residual, the rotation Jacobian row before any hold projection, the nearest-map distances, the 5-NN
-  // patch scatter eigenvalues, the point's in-plane offset from the patch, the view cosine and the
-  // degeneracy weight. corr_iter.csv carries one row per iteration (hold verdict, roll/pitch information,
-  // the vertical in the body frame), corr_scan.csv one row per scan (the applied rotation and translation,
-  // the prior covariance diagonals) — the data a per-correspondence admission rule is designed from
-  // (docs/PGO_LOOP_TUNING.md §7.7).
+  // residual, the rotation Jacobian row, the nearest-map distances, the 5-NN patch scatter eigenvalues, the
+  // point's in-plane offset from the patch, the view cosine and the degeneracy weight. corr_iter.csv carries one
+  // row per iteration (roll/pitch information, the vertical in the body frame), corr_scan.csv one row per scan (the
+  // applied rotation and translation, the prior covariance diagonals) — the data a per-correspondence admission
+  // rule is designed from (docs/PGO_LOOP_TUNING.md §7.7). The attitude hold's columns (corr_iter held,
+  // corr_scan hold_scene and hold_info) keep the files' layout and read 0: the hold was removed.
   bool corr_dump_en = false;
   std::vector<std::pair<double, double>> corr_dump_windows;
 
@@ -173,9 +152,6 @@ struct FrontendParams
   // blind stretch. Position/attitude/biases are kept.
   double guard_engulf_far_frac_release = 0.35;  // release needs far field this healthy
   int guard_engulf_release_scans = 5;           // ...for this many consecutive scans
-  // Release policy (engulf_release.hpp), its covariance side: how much the pose's covariance grows when the blind
-  // stretch is released. The default leaves P untouched, as the legacy release did.
-  fast_lio::ReleaseInflationParams release_inflate;
   // Consider update for roll/pitch (rp_consider.hpp): on the scans the policy names, the lidar update leaves the
   // horizontal rotation at the propagated (gyro) value and updates everything else with the full-P gain.
   fast_lio::RollPitchConsiderParams rp_consider;
@@ -188,9 +164,8 @@ struct FrontendParams
   // map (effct 3400 -> 400) before the runaway reset — quadratic IMU divergence
   // that ground-only geometry cannot re-observe. Default OFF.
   bool guard_hole_en = false;
-  double guard_hole_min_sec = 0.3;      // s; scan gap that counts as a hole (nominal 0.1)
-  double guard_hole_max_accel = 1.0;    // m/s^2; |vel - vel_pre_hole| is capped at this * gap
-  bool guard_hole_reanchor_pos = true;  // also reset pos to pos_pre + vel_pre * gap
+  double guard_hole_min_sec = 0.3;    // s; scan gap that counts as a hole (nominal 0.1)
+  double guard_hole_max_accel = 1.0;  // m/s^2; |vel - vel_pre_hole| is capped at this * gap
   // Static hold (ZUPT) on parked evidence; its evidence thresholds (zupt_*) stay beside the anchor state in
   // laserMapping.cpp, which documents the hold.
   bool zupt_en = true;
@@ -231,9 +206,6 @@ struct FrontendParams
   // gave, without the lost motion.
   double imu_gap_verify_s = 0.3;
 
-  // 自适应降采样:单帧计算越过预算就把扫描体素调粗,让精度降级而不是延迟降级。
-  // Adaptive downsampling: quality degrades instead of latency when a scan costs too much.
-  fast_lio::AdaptiveDownsampleParams adaptive_ds;
   double filter_size_surf_min = 0;
   bool kalman_channel_diag_en = false;
   bool time_admission_counts_enable = false;  // startup-only FE local accounting
@@ -263,7 +235,6 @@ struct FrontendParams
   bool prior_map_freeze = false;  // stop growing the map once a prior map is installed
   fast_lio::PriorMapAlign prior_map_align = fast_lio::PriorMapAlign::kAsDelivered;
   std::vector<double> initial_pose_vec;
-  bool initial_pose_full_rpy_override = false;
 
   // The lidar measurement model's parameters: the model reads them at every evaluation, the node only reports them.
   // The lidar update also estimates the lidar-IMU extrinsic: its rows carry the extrinsic rotation and translation
@@ -287,14 +258,6 @@ struct FrontendParams
   // within corr_innov_gate_k sigma of its own predicted variance H P Hᵀ + R (and, separately, when its
   // nearest map point is within corr_nn0_max). Both 0 = the legacy s > 0.9 test alone.
   fast_lio::CorrespondenceGateParams corr_gate;
-  // [v11] optional robust kernel on the admitted rows (corr_kernel none|gm|cauchy): IRLS weight on the
-  // squared residual with scale c = max(corr_kernel_mad_scale * scan scale, corr_kernel_min_scale); the row
-  // and its residual are scaled by sqrt(w), i.e. R_i <- R / w.
-  int corr_kernel = 0;  // 0 none, 1 Geman-McClure, 2 Cauchy
-  double corr_kernel_mad_scale = 3.0, corr_kernel_min_scale = 0.03;
-  // [v9] Attitude hold's information rule: hold when the scan's own roll/pitch information (attitude_hold.hpp
-  // rollPitchInformation) is below this; 0 = off.
-  double lidar_attitude_hold_min_rp_info = 0.0;
 
   // Near-field ground geometry, in the LiDAR/cloud BODY frame so it is immune to
   // the Z drift it helps repair. Consumed by the ground recovery below; the

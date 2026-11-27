@@ -200,7 +200,7 @@ private:
       edges.v_end = edge_now.velocity;
       edges.var_start = start_edge_.variance;
       edges.var_end = edge_now.variance;
-      const auto term = linearAccelerationTerm(edges, edges, false, params_.gravity_m_s2, params_.vel_sigma_scale);
+      const auto term = linearAccelerationTerm(edges, edges, params_.gravity_m_s2, params_.vel_sigma_scale);
       if (!term.valid)
         return Rejection::kLegEdge;
       force -= term.accel * (params_.gravity_raw / params_.gravity_m_s2);

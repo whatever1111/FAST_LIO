@@ -4,12 +4,13 @@
 // boundary matches inside an engulfment stretch and the 2-5 m wall points above the sensor after the release, in
 // scenes without a horizontal surface (docs/PGO_LOOP_TUNING.md §7.7-7.8). The gyro-propagated attitude agrees with
 // the vendor INS within 0.6° through every window, so the honest estimator there is "roll/pitch follow the gyro,
-// everything else updates". Projecting the rotation rows of H to yaw (attitude_hold.hpp, §7.6) did not do that:
-// the position innovation still rotated the state through P(rot, pos). The consider update does: the rows of the
-// Kalman gain that would move the horizontal rotation directions are zeroed, the other rows keep the gain computed
-// with the full covariance (so the consider uncertainty still widens the innovation covariance), and P is updated
-// in Joseph form with the projected gain — the considered block keeps its variance, the cross terms shrink as the
-// Schmidt filter prescribes. Textbook: Schmidt 1966, Bar-Shalom, Li & Kirubarajan 2001 §10.4 (consider states).
+// everything else updates". Projecting the rotation rows of H to yaw (§7.6) did not do that: the position innovation
+// still rotated the state through P(rot, pos) (test_rp_consider_filter keeps that counterexample). The consider
+// update does: the rows of the Kalman gain that would move the horizontal rotation directions are zeroed, the other
+// rows keep the gain computed with the full covariance (so the consider uncertainty still widens the innovation
+// covariance), and P is updated in Joseph form with the projected gain — the considered block keeps its variance, the
+// cross terms shrink as the Schmidt filter prescribes. Textbook: Schmidt 1966, Bar-Shalom, Li & Kirubarajan 2001
+// §10.4 (consider states).
 //
 // Pure C++ + Eigen. No ROS, no estimator types: the estimator applies `keep` to its gain rows and the covariance
 // helper to its own matrices; the policy takes numbers the front end already has.
@@ -17,7 +18,9 @@
 #pragma once
 
 #include <Eigen/Core>
+#include <Eigen/Eigenvalues>
 
+#include <algorithm>
 #include <cmath>
 
 namespace fast_lio
@@ -37,10 +40,34 @@ struct RollPitchConsiderInputs
 {
   bool engulf_latched = false;
   double since_release_s = -1.0;  ///< s since the last engulfment release; < 0 = none yet
-  double rp_info_prev = 0.0;      ///< the previous scan's roll/pitch information (attitude_hold.hpp)
+  double rp_info_prev = 0.0;      ///< the previous scan's roll/pitch information (rollPitchInformation)
   double z_weak_prev = 0.0;       ///< the previous scan's pos_obs_z_weak
   double consider_age_s = 0.0;    ///< s this stretch has been considering already
 };
+
+/// How much a scan's correspondences say about roll and pitch: the smaller of
+/// the two eigenvalues of the rotation information Σ AAᵀ restricted to the plane
+/// orthogonal to the vertical `up` (unit, body frame). Rows are the point-to-plane
+/// rotation Jacobians A_i = p_i × Rᵀn_i; a floor at range r contributes ~r² per
+/// point to this subspace, a near-field wall only its points' vertical offsets
+/// squared, so a doorway transition sits two orders of magnitude below a healthy
+/// scan. Units: m² per point (before the point covariance). Returns 0 for a
+/// degenerate input.
+inline double rollPitchInformation(const Eigen::Matrix3d & rotation_information, const Eigen::Vector3d & up)
+{
+  if (!rotation_information.allFinite() || !up.allFinite() || up.norm() < 1e-9) {
+    return 0.0;
+  }
+  const Eigen::Vector3d u = up.normalized();
+  const Eigen::Matrix3d proj = Eigen::Matrix3d::Identity() - u * u.transpose();
+  const Eigen::Matrix3d m = proj * rotation_information * proj;
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(m);
+  if (es.info() != Eigen::Success) {
+    return 0.0;
+  }
+  // ascending: the first is the (numerically zero) direction along up, the second the weakest roll/pitch axis
+  return std::max(es.eigenvalues()(1), 0.0);
+}
 
 /// Whether this scan's lidar update considers (does not estimate) roll and pitch.
 inline bool considerRollPitchThisScan(const RollPitchConsiderParams & p, const RollPitchConsiderInputs & in)

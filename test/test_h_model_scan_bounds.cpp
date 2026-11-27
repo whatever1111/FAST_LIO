@@ -60,8 +60,7 @@ protected:
     esekfom::dyn_share_datastruct<double> data;
     data.converge = search;
     data.valid = true;
-    const fast_lio::MeasurementInputs inputs{
-      prior_, map_, body_, world_, point_count_, scan_end_time_, 0.0, false, false, false};
+    const fast_lio::MeasurementInputs inputs{prior_, map_, body_, world_, point_count_, scan_end_time_, 0.0, false};
     const fast_lio::MeasurementOutputs outputs{
       effective_rows_, iterations_, mean_residual_, false, dump_iteration_, dump_rows_, dump_iterations_};
     measurement_.evaluate(state_, data, inputs, outputs);

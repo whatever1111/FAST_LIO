@@ -98,6 +98,18 @@ void sceneModel(state_ikfom & s, esekfom::dyn_share_datastruct<double> & data)
   data.valid = true;
 }
 
+// The same scene with every rotation row projected onto the body-frame vertical of the current iterate, so the rows
+// themselves only ask for yaw: what the removed attitude hold did to H.
+void yawRowsSceneModel(state_ikfom & s, esekfom::dyn_share_datastruct<double> & data)
+{
+  sceneModel(s, data);
+  const Eigen::Vector3d up = s.rot.toRotationMatrix().transpose() * Eigen::Vector3d::UnitZ();
+  for (Eigen::Index i = 0; i < data.h_x.rows(); ++i) {
+    const Eigen::Vector3d A = data.h_x.block<1, 3>(i, 3).transpose();
+    data.h_x.block<1, 3>(i, 3) = (A.dot(up) * up).transpose();
+  }
+}
+
 struct ModelFailure : std::runtime_error
 {
   using std::runtime_error::runtime_error;
@@ -193,6 +205,7 @@ Eigen::Vector3d rollPitchYaw(const Eigen::Matrix3d & R)
 enum class Binding
 {
   kScene,            // init_dyn_share(sceneModel)
+  kSceneYawRows,     // init_dyn_share(yawRowsSceneModel)
   kRecordedPlain,    // init_dyn_share(plainRecordedModel), recording into the fixture's calls
   kRecordedContext,  // init_dyn_share_context(contextRecordedModel) with the fixture's calls as the context
 };
@@ -216,6 +229,8 @@ struct Fixture
     std::fill(std::begin(epsilon), std::end(epsilon), 0.001);
     if (binding == Binding::kScene) {
       filter.init_dyn_share(get_f, df_dx, df_dw, sceneModel, 6, epsilon);
+    } else if (binding == Binding::kSceneYawRows) {
+      filter.init_dyn_share(get_f, df_dx, df_dw, yawRowsSceneModel, 6, epsilon);
     } else if (binding == Binding::kRecordedPlain) {
       g_plain_calls = &calls;
       filter.init_dyn_share(get_f, df_dx, df_dw, plainRecordedModel, 6, epsilon);
@@ -279,6 +294,41 @@ TEST(ConsiderFilter, ConsideredRollPitchStayAtThePriorWhilePositionUpdates)
   EXPECT_LT((P - P.transpose()).norm(), 1e-9 * P.norm());
   f.filter.clearConsiderRotation();
   EXPECT_FALSE(f.filter.considerRotationActive());
+}
+
+// Why the attitude hold was removed: projecting the rotation rows to yaw keeps roll/pitch only while the prior carries
+// no rotation-position cross term. A propagated covariance does carry one, and then the walls' x correction (5 cm)
+// rotates pitch through P(pitch, x); the consider update keeps it.
+TEST(ConsiderFilter, YawOnlyRowsStillMovePitchThroughTheCrossCovariance)
+{
+  const auto correlate = [](Fixture & f) {
+    Filter::cov P = f.filter.get_P();
+    P(0, 4) = P(4, 0) = 5e-4;  // pitch and x correlated, rho = 0.5
+    f.filter.change_P(P);
+  };
+  double solve_time = 0.0;
+
+  Fixture uncorrelated(Binding::kSceneYawRows);
+  uncorrelated.filter.update_iterated_dyn_share_modified(0.001, solve_time);
+  const Eigen::Vector3d uncorrelated_rpy = rollPitchYaw(uncorrelated.filter.get_x().rot.toRotationMatrix());
+  EXPECT_NEAR(uncorrelated_rpy(0), uncorrelated.prior_rpy(0), 1e-6);  // the projection alone keeps roll/pitch
+  EXPECT_NEAR(uncorrelated_rpy(1), uncorrelated.prior_rpy(1), 1e-6);
+
+  Fixture projected(Binding::kSceneYawRows);
+  correlate(projected);
+  projected.filter.update_iterated_dyn_share_modified(0.001, solve_time);
+  const Eigen::Vector3d projected_rpy = rollPitchYaw(projected.filter.get_x().rot.toRotationMatrix());
+  EXPECT_GT(std::abs(projected_rpy(1) - projected.prior_rpy(1)), 1e-3);  // the cross term moves pitch anyway
+
+  Fixture considered;
+  correlate(considered);
+  const auto proj = fast_lio::yawOnlyProjector(considered.up_body);
+  ASSERT_TRUE(proj.valid);
+  considered.filter.setConsiderRotation(3, proj.keep);
+  considered.filter.update_iterated_dyn_share_modified(0.001, solve_time);
+  const Eigen::Vector3d considered_rpy = rollPitchYaw(considered.filter.get_x().rot.toRotationMatrix());
+  EXPECT_NEAR(considered_rpy(0), considered.prior_rpy(0), 1e-6);
+  EXPECT_NEAR(considered_rpy(1), considered.prior_rpy(1), 1e-6);
 }
 
 TEST(ConsiderFilter, ClearingRestoresThePlainUpdate)

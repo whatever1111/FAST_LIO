@@ -1,11 +1,11 @@
-// Tests for rp_consider.hpp: the policy, the projector and the consider covariance form against the explicit
-// Joseph form of a Schmidt-Kalman update on a small synthetic system.
-#include <gtest/gtest.h>
-
+// Tests for rp_consider.hpp: the policy, the roll/pitch information it reads, the projector and the consider
+// covariance form against the explicit Joseph form of a Schmidt-Kalman update on a small synthetic system.
 #include <Eigen/Core>
 #include <Eigen/Dense>
+#include <Eigen/Eigenvalues>
 
 #include <cmath>
+#include <gtest/gtest.h>
 #include <limits>
 
 #include "rp_consider.hpp"
@@ -84,6 +84,54 @@ TEST(ConsiderPolicy, RulesCanBeSwitchedOffIndividuallyAndTheCapEndsAStretch)
   EXPECT_FALSE(fast_lio::considerRollPitchThisScan(p, in));
   in.consider_age_s = 9.5;
   EXPECT_TRUE(fast_lio::considerRollPitchThisScan(p, in));
+}
+
+// The information a scan carries about roll/pitch: a floor patch ahead of the sensor
+// constrains them strongly, a near-field wall barely.
+TEST(ConsiderInformation, RollPitchInformationSeparatesFloorFromNearWall)
+{
+  const Eigen::Vector3d up(0.0, 0.0, 1.0);
+  Eigen::Matrix3d floor = Eigen::Matrix3d::Zero();
+  // a floor patch 2-8 m ahead and 8 m wide (the scan's view of a healthy corridor floor), normal +z: A = p x n
+  for (double x = 2.0; x <= 8.0; x += 0.5) {
+    for (double y = -4.0; y <= 4.0; y += 0.5) {
+      const Eigen::Vector3d a = Eigen::Vector3d(x, y, -0.5).cross(Eigen::Vector3d(0.0, 0.0, 1.0));
+      floor += a * a.transpose();
+    }
+  }
+  Eigen::Matrix3d wall = Eigen::Matrix3d::Zero();
+  // a wall 1.5 m ahead, normal -x, points spanning 1 m vertically and 1 m laterally
+  for (double y = -0.5; y <= 0.5; y += 0.1) {
+    for (double z = -0.5; z <= 0.5; z += 0.1) {
+      const Eigen::Vector3d a = Eigen::Vector3d(1.5, y, z).cross(Eigen::Vector3d(-1.0, 0.0, 0.0));
+      wall += a * a.transpose();
+    }
+  }
+  const double info_floor = fast_lio::rollPitchInformation(floor, up);
+  const double info_wall = fast_lio::rollPitchInformation(wall, up);
+  // one wall facing x says nothing about roll (rotation about x): its weakest roll/pitch eigenvalue is exactly 0
+  EXPECT_NEAR(info_wall, 0.0, 1e-9);
+  EXPECT_GT(info_floor, 100.0);
+  // two walls meeting at a corner (a door frame) constrain both axes, but only through their vertical extent
+  Eigen::Matrix3d corner = wall;
+  for (double x = -0.5; x <= 0.5; x += 0.1) {
+    for (double z = -0.5; z <= 0.5; z += 0.1) {
+      const Eigen::Vector3d a = Eigen::Vector3d(x, 1.5, z).cross(Eigen::Vector3d(0.0, -1.0, 0.0));
+      corner += a * a.transpose();
+    }
+  }
+  const double info_corner = fast_lio::rollPitchInformation(corner, up);
+  EXPECT_GT(info_corner, 0.0);
+  EXPECT_GT(info_floor, 50.0 * info_corner);
+  // a wall constrains yaw well, which must not count: the yaw axis is removed by the projection
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(wall);
+  EXPECT_GT(es.eigenvalues()(2), 100.0 * (info_wall + 1e-9));
+  // degenerate inputs
+  EXPECT_DOUBLE_EQ(fast_lio::rollPitchInformation(Eigen::Matrix3d::Zero(), up), 0.0);
+  EXPECT_DOUBLE_EQ(fast_lio::rollPitchInformation(floor, Eigen::Vector3d::Zero()), 0.0);
+  Eigen::Matrix3d nan = floor;
+  nan(0, 0) = kNaN;
+  EXPECT_DOUBLE_EQ(fast_lio::rollPitchInformation(nan, up), 0.0);
 }
 
 TEST(ConsiderProjector, KeepsOnlyTheVerticalComponentAndRejectsBadVerticals)

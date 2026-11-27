@@ -618,10 +618,6 @@ ${sanitizer_tests}
   if(TARGET test_anchor_trace)
     target_include_directories(test_anchor_trace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
-  ament_add_gtest(test_adaptive_downsample test/test_adaptive_downsample.cpp)
-  if(TARGET test_adaptive_downsample)
-    target_include_directories(test_adaptive_downsample PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  endif()
   # Pure header, Eigen only: which directions of the scan's position information are
   # worth keeping, and by how much to hold back the rest.
   ament_add_gtest(test_degeneracy_policy test/test_degeneracy_policy.cpp)
@@ -718,13 +714,6 @@ ${sanitizer_tests}
   if(TARGET test_gravity_align_kinematics)
     target_include_directories(test_gravity_align_kinematics PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
   endif()
-  # Pure header, Eigen only: whether a scan's lidar update may rotate roll/pitch, and the
-  # Jacobian projection that enforces it (docs/PGO_LOOP_TUNING.md section 7.5).
-  ament_add_gtest(test_attitude_hold test/test_attitude_hold.cpp)
-  if(TARGET test_attitude_hold)
-    target_include_directories(test_attitude_hold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${EIGEN3_INCLUDE_DIR})
-  endif()
-
   # Pure header, Eigen only: the covariance side of a state assignment made outside an update (the
   # velocity block after a release, ZUPT or hole clamp) — docs/PGO_LOOP_TUNING.md section 7.7.
   ament_add_gtest(test_covariance_reset test/test_covariance_reset.cpp)

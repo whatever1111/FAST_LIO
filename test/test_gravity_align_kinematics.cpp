@@ -395,7 +395,7 @@ TEST(GravityAlignKinematics, DoorwayStopIsRecoveredFromTheVelocityEdges)
 {
   const auto oldest = scan(100.0, 100.1, {0.86, 0.0, 0.0}, {0.80, 0.0, 0.0});
   const auto newest = scan(100.9, 101.0, {0.05, 0.0, 0.0}, {0.0, 0.0, 0.0});
-  const LinearAccelerationTerm t = linearAccelerationTerm(oldest, newest, false, kG, 0.0);
+  const LinearAccelerationTerm t = linearAccelerationTerm(oldest, newest, kG, 0.0);
   ASSERT_TRUE(t.valid);
   EXPECT_NEAR(t.span, 1.0, 1e-12);
   EXPECT_NEAR(t.accel.x(), -0.86, 1e-12);
@@ -413,25 +413,24 @@ TEST(GravityAlignKinematics, ConstantBodyVelocityThroughATurnIsZero)
   const Eigen::Vector3d v(1.2, 0.0, 0.0);
   const auto oldest = scan(0.0, 0.1, v, v);
   const auto newest = scan(0.9, 1.0, v, v);
-  const LinearAccelerationTerm t = linearAccelerationTerm(oldest, newest, false, kG, 1.0);
+  const LinearAccelerationTerm t = linearAccelerationTerm(oldest, newest, kG, 1.0);
   ASSERT_TRUE(t.valid);
   EXPECT_NEAR(t.accel.norm(), 0.0, 1e-15);
 }
 
-// A velocity that was overwritten inside the window has no derivative. Any of the
-// three places the flag can arrive from must withhold the term.
-TEST(GravityAlignKinematics, AVelocityOverwriteInsideTheWindowWithholdsTheTerm)
+// An edge without a velocity measurement has no derivative. Either edge's flag
+// withholds the term.
+TEST(GravityAlignKinematics, AnEdgeWithoutAVelocityWithholdsTheTerm)
 {
   const auto oldest = scan(0.0, 0.1, {0.5, 0.0, 0.0}, {0.5, 0.0, 0.0});
   const auto newest = scan(0.9, 1.0, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0});
-  EXPECT_TRUE(linearAccelerationTerm(oldest, newest, false, kG, 1.0).valid);
-  EXPECT_FALSE(linearAccelerationTerm(oldest, newest, true, kG, 1.0).valid);
+  EXPECT_TRUE(linearAccelerationTerm(oldest, newest, kG, 1.0).valid);
   auto o = oldest;
   o.velocity_overwritten = true;
-  EXPECT_FALSE(linearAccelerationTerm(o, newest, false, kG, 1.0).valid);
+  EXPECT_FALSE(linearAccelerationTerm(o, newest, kG, 1.0).valid);
   auto n = newest;
   n.velocity_overwritten = true;
-  EXPECT_FALSE(linearAccelerationTerm(oldest, n, false, kG, 1.0).valid);
+  EXPECT_FALSE(linearAccelerationTerm(oldest, n, kG, 1.0).valid);
 }
 
 TEST(GravityAlignKinematics, SigmaComesFromTheEdgeCovariancesOverTheSpan)
@@ -440,42 +439,42 @@ TEST(GravityAlignKinematics, SigmaComesFromTheEdgeCovariancesOverTheSpan)
   auto newest = scan(0.9, 1.0, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0});
   oldest.var_start = 0.01;  // (0.1 m/s)² per edge
   newest.var_end = 0.01;
-  const LinearAccelerationTerm t = linearAccelerationTerm(oldest, newest, false, kG, 1.0);
+  const LinearAccelerationTerm t = linearAccelerationTerm(oldest, newest, kG, 1.0);
   ASSERT_TRUE(t.valid);
   EXPECT_NEAR(t.sigma, std::sqrt(0.02) / kG, 1e-12);  // 0.0144 rad ≈ 0.83°
   // the scale multiplies, a longer span divides
-  EXPECT_NEAR(linearAccelerationTerm(oldest, newest, false, kG, 2.0).sigma, 2.0 * std::sqrt(0.02) / kG, 1e-12);
+  EXPECT_NEAR(linearAccelerationTerm(oldest, newest, kG, 2.0).sigma, 2.0 * std::sqrt(0.02) / kG, 1e-12);
   auto longer = newest;
   longer.t_end = 2.0;
-  EXPECT_NEAR(linearAccelerationTerm(oldest, longer, false, kG, 1.0).sigma, std::sqrt(0.02) / (2.0 * kG), 1e-12);
+  EXPECT_NEAR(linearAccelerationTerm(oldest, longer, kG, 1.0).sigma, std::sqrt(0.02) / (2.0 * kG), 1e-12);
   // a negative covariance trace (numerical) counts as zero, never as imaginary
   oldest.var_start = -1e-9;
-  EXPECT_NEAR(linearAccelerationTerm(oldest, newest, false, kG, 1.0).sigma, std::sqrt(0.01) / kG, 1e-12);
+  EXPECT_NEAR(linearAccelerationTerm(oldest, newest, kG, 1.0).sigma, std::sqrt(0.01) / kG, 1e-12);
 }
 
 TEST(GravityAlignKinematics, DegenerateInputsAreInvalidNotWild)
 {
   const auto ok_old = scan(0.0, 0.1, {0.3, 0.0, 0.0}, {0.3, 0.0, 0.0});
   const auto ok_new = scan(0.9, 1.0, {0.4, 0.0, 0.0}, {0.4, 0.0, 0.0});
-  EXPECT_TRUE(linearAccelerationTerm(ok_old, ok_new, false, kG, 1.0).valid);
+  EXPECT_TRUE(linearAccelerationTerm(ok_old, ok_new, kG, 1.0).valid);
   // zero or negative span (clock went backwards, or the same scan passed twice)
-  EXPECT_FALSE(linearAccelerationTerm(ok_new, ok_old, false, kG, 1.0).valid);
+  EXPECT_FALSE(linearAccelerationTerm(ok_new, ok_old, kG, 1.0).valid);
   auto same = ok_old;
   same.t_end = same.t_start;
-  EXPECT_FALSE(linearAccelerationTerm(same, same, false, kG, 1.0).valid);
+  EXPECT_FALSE(linearAccelerationTerm(same, same, kG, 1.0).valid);
   // non-finite velocity, gravity, covariance or scale
   auto nan_v = ok_new;
   nan_v.v_end = Eigen::Vector3d(kNaN, 0.0, 0.0);
-  EXPECT_FALSE(linearAccelerationTerm(ok_old, nan_v, false, kG, 1.0).valid);
-  EXPECT_FALSE(linearAccelerationTerm(ok_old, ok_new, false, kNaN, 1.0).valid);
-  EXPECT_FALSE(linearAccelerationTerm(ok_old, ok_new, false, 0.0, 1.0).valid);
-  EXPECT_FALSE(linearAccelerationTerm(ok_old, ok_new, false, kG, kNaN).valid);
-  EXPECT_FALSE(linearAccelerationTerm(ok_old, ok_new, false, kG, -1.0).valid);
+  EXPECT_FALSE(linearAccelerationTerm(ok_old, nan_v, kG, 1.0).valid);
+  EXPECT_FALSE(linearAccelerationTerm(ok_old, ok_new, kNaN, 1.0).valid);
+  EXPECT_FALSE(linearAccelerationTerm(ok_old, ok_new, 0.0, 1.0).valid);
+  EXPECT_FALSE(linearAccelerationTerm(ok_old, ok_new, kG, kNaN).valid);
+  EXPECT_FALSE(linearAccelerationTerm(ok_old, ok_new, kG, -1.0).valid);
   auto nan_var = ok_old;
   nan_var.var_start = kNaN;
-  EXPECT_FALSE(linearAccelerationTerm(nan_var, ok_new, false, kG, 1.0).valid);
+  EXPECT_FALSE(linearAccelerationTerm(nan_var, ok_new, kG, 1.0).valid);
   // an invalid term carries no acceleration at all
-  const LinearAccelerationTerm t = linearAccelerationTerm(ok_new, ok_old, false, kG, 1.0);
+  const LinearAccelerationTerm t = linearAccelerationTerm(ok_new, ok_old, kG, 1.0);
   EXPECT_DOUBLE_EQ(t.accel.norm(), 0.0);
   EXPECT_DOUBLE_EQ(t.sigma, 0.0);
 }

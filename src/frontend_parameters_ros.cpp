@@ -16,7 +16,6 @@
 #include "frontend_parameter_spec.hpp"
 #include "frontend_parameter_specs_constraints.hpp"
 #include "frontend_parameter_specs_diagnostics.hpp"
-#include "frontend_parameter_specs_downsample.hpp"
 #include "frontend_parameter_specs_imu.hpp"
 #include "frontend_parameter_specs_input.hpp"
 #include "frontend_parameter_specs_map.hpp"
@@ -42,7 +41,6 @@ void FrontendParameters::declareOutputsAndMeasurement(rclcpp::Node & node)
   const OutputParameterSpecs output{};
   const MeasurementParameterSpecs measurement{};
   const InputParameterSpecs input{};
-  const DownsampleParameterSpecs downsample{};
   const ConstraintParameterSpecs constraints{};
   const DiagnosticsParameterSpecs diagnostics{};
   declareOnly(node, output.publish_path_en);
@@ -58,13 +56,6 @@ void FrontendParameters::declareOutputsAndMeasurement(rclcpp::Node & node)
   declareOnly(node, input.max_buffered_scans);
   declareOnly(node, input.max_scan_backlog_sec);
   declareOnly(node, input.max_imu_backlog_sec);
-  declareOnly(node, downsample.adaptive_downsample_en);
-  declareOnly(node, downsample.adaptive_downsample_budget_sec);
-  declareOnly(node, downsample.adaptive_downsample_release_sec);
-  declareOnly(node, downsample.adaptive_downsample_step);
-  declareOnly(node, downsample.adaptive_downsample_max_voxel);
-  declareOnly(node, downsample.adaptive_downsample_raise_after);
-  declareOnly(node, downsample.adaptive_downsample_lower_after);
   declareOnly(node, measurement.degeneracy_debug);
   declareOnly(node, measurement.degeneracy_spectrum_trace);
   declareOnly(node, measurement.degeneracy_floor_mode);
@@ -88,15 +79,10 @@ void FrontendParameters::declareOutputsAndMeasurement(rclcpp::Node & node)
   declareOnly(node, constraints.gravity_align_mag_ref);
   declareOnly(node, constraints.gravity_align_grav_leak);
   declareOnly(node, constraints.gravity_align_grav_cap_deg);
-  declareOnly(node, constraints.gravity_align_grav_freeze_degraded);
-  declareOnly(node, measurement.lidar_attitude_hold_en);
   declareOnly(node, measurement.corr_innov_gate_k);
   declareOnly(node, measurement.corr_nn0_max);
   declareOnly(node, measurement.corr_gate_mad_scale);
   declareOnly(node, measurement.corr_gate_rot_sigma_floor_deg);
-  declareOnly(node, measurement.corr_kernel);
-  declareOnly(node, measurement.corr_kernel_mad_scale);
-  declareOnly(node, measurement.corr_kernel_min_scale);
   declareOnly(node, diagnostics.corr_dump_en);
   declareOnly(node, diagnostics.corr_dump_windows);
 }
@@ -107,17 +93,10 @@ void FrontendParameters::declareGravityToConsider(rclcpp::Node & node)
   const RecoveryParameterSpecs recovery{};
   const ConstraintParameterSpecs constraints{};
   const ImuParameterSpecs imu{};
-  declareOnly(node, measurement.lidar_attitude_hold_far_frac);
-  declareOnly(node, measurement.lidar_attitude_hold_min_effct);
-  declareOnly(node, measurement.lidar_attitude_hold_max_s);
-  declareOnly(node, measurement.lidar_attitude_hold_max_scan_gap_s);
-  declareOnly(node, measurement.lidar_attitude_hold_min_rp_info);
   declareOnly(node, recovery.guard_vel_reset_sigma);
   declareOnly(node, recovery.zupt_vel_reset_sigma);
-  declareOnly(node, measurement.lidar_attitude_hold_z_weak);
   declareOnly(node, constraints.gravity_align_lin_accel_comp);
   declareOnly(node, constraints.gravity_align_vel_sigma_scale);
-  declareOnly(node, constraints.gravity_align_lin_accel_source);
   declareOnly(node, constraints.gravity_align_withhold_blind_moving);
   declareOnly(node, constraints.gravity_align_sigma_policy);
   declareOnly(node, constraints.gravity_align_noise_static);
@@ -147,14 +126,6 @@ void FrontendParameters::declareGravityToConsider(rclcpp::Node & node)
   declareOnly(node, recovery.guard_release_leg_max_age_s);
   declareOnly(node, recovery.guard_release_leg_sigma);
   declareOnly(node, recovery.guard_release_keep_sigma);
-  declareOnly(node, recovery.guard_release_inflate_en);
-  declareOnly(node, recovery.guard_release_pos_sigma_min);
-  declareOnly(node, recovery.guard_release_pos_sigma_rate);
-  declareOnly(node, recovery.guard_release_pos_sigma_max);
-  declareOnly(node, recovery.guard_release_rp_sigma_deg);
-  declareOnly(node, recovery.guard_release_rp_sigma_rate_deg);
-  declareOnly(node, recovery.guard_release_rp_sigma_max_deg);
-  declareOnly(node, recovery.guard_release_yaw_sigma_deg);
   declareOnly(node, measurement.lidar_consider_rp_en);
   declareOnly(node, measurement.lidar_consider_rp_while_engulfed);
   declareOnly(node, measurement.lidar_consider_rp_post_release_s);
@@ -169,7 +140,6 @@ void FrontendParameters::declareHoleToLostRecovery(rclcpp::Node & node)
   declareOnly(node, recovery.guard_hole_en);
   declareOnly(node, recovery.guard_hole_min_sec);
   declareOnly(node, recovery.guard_hole_max_accel);
-  declareOnly(node, recovery.guard_hole_reanchor_pos);
   declareOnly(node, recovery.divergence_guard_streak);
   declareOnly(node, recovery.divergence_guard_max_speed);
   declareOnly(node, recovery.zupt_en);
@@ -266,7 +236,6 @@ void FrontendParameters::declareRunawayToPreprocess(rclcpp::Node & node)
   declareOnly(node, input.common_imu_topic);
   declareOnly(node, input.common_imu_input_type);
   declareOnly(node, input.common_imu_bias_topic);
-  declareOnly(node, input.common_time_sync_en);
   declareOnly(node, input.common_time_offset_lidar_to_imu);
   declareOnly(node, input.common_imu_time_offset);
   declareOnly(node, map.filter_size_surf);
@@ -307,7 +276,6 @@ void FrontendParameters::declareImuGapToWheel(rclcpp::Node & node)
   declareOnly(node, measurement.nn_refresh_gate_en);
   declareOnly(node, measurement.nn_refresh_min_shift);
   declareOnly(node, measurement.nn_refresh_ref_range);
-  declareOnly(node, input.feature_extract_enable);
   declareOnly(node, diagnostics.runtime_pos_log_enable);
   declareOnly(node, diagnostics.diagnostics_latency_enable);
   declareOnly(node, diagnostics.diagnostics_latency_log_period_sec);
@@ -325,8 +293,6 @@ void FrontendParameters::declareImuGapToWheel(rclcpp::Node & node)
   declareOnly(node, map.prior_map_voxel);
   declareOnly(node, map.prior_map_freeze);
   declareOnly(node, map.initial_pose);
-  declareOnly(node, map.initial_pose_full_rpy_override);
-  declareOnly(node, map.initial_pose_apply_roll_pitch);
   declareOnly(node, constraints.wheel_odom_en);
   declareOnly(node, constraints.wheel_topic);
   declareOnly(node, constraints.wheel_speed_scale);
@@ -386,17 +352,9 @@ void FrontendParameters::readBacklog(const rclcpp::Node & node,
   }
 }
 
-void FrontendParameters::readDownsampleAndDegeneracy(const rclcpp::Node & node, bool & degeneracy_debug)
+void FrontendParameters::readDegeneracy(const rclcpp::Node & node, bool & degeneracy_debug)
 {
-  const DownsampleParameterSpecs downsample{};
   const MeasurementParameterSpecs measurement{};
-  readInto(node, downsample.adaptive_downsample_en, values_.adaptive_ds.enabled);
-  readInto(node, downsample.adaptive_downsample_budget_sec, values_.adaptive_ds.budget_sec);
-  readInto(node, downsample.adaptive_downsample_release_sec, values_.adaptive_ds.release_sec);
-  readInto(node, downsample.adaptive_downsample_step, values_.adaptive_ds.step);
-  readInto(node, downsample.adaptive_downsample_max_voxel, values_.adaptive_ds.max_voxel);
-  readInto(node, downsample.adaptive_downsample_raise_after, values_.adaptive_ds.raise_after);
-  readInto(node, downsample.adaptive_downsample_lower_after, values_.adaptive_ds.lower_after);
   readInto(node, measurement.degeneracy_debug, degeneracy_debug);
   readInto(node, measurement.degeneracy_spectrum_trace, values_.degeneracy_spectrum_trace);
   std::string floor_mode_name = "off";
@@ -442,7 +400,6 @@ void FrontendParameters::readConstraints(const rclcpp::Node & node, bool & healt
 {
   const OutputParameterSpecs output{};
   const ConstraintParameterSpecs constraints{};
-  const MeasurementParameterSpecs measurement{};
   readInto(node, output.health_pub_en, health_pub_en);
   readInto(node, constraints.planar_constraint_en, values_.planar_constraint_en);
   readInto(node, constraints.planar_constraint_noise, values_.planar_constraint_noise);
@@ -459,8 +416,6 @@ void FrontendParameters::readConstraints(const rclcpp::Node & node, bool & healt
   readInto(node, constraints.gravity_align_mag_ref, values_.gravity_align_mag_ref);
   readInto(node, constraints.gravity_align_grav_leak, values_.gravity_align_grav_leak);
   readInto(node, constraints.gravity_align_grav_cap_deg, values_.gravity_align_grav_cap_deg);
-  readInto(node, constraints.gravity_align_grav_freeze_degraded, values_.gravity_align_grav_freeze_degraded);
-  readInto(node, measurement.lidar_attitude_hold_en, values_.attitude_hold.enabled);
 }
 
 void FrontendParameters::readCorrespondence(const rclcpp::Node & node)
@@ -470,17 +425,6 @@ void FrontendParameters::readCorrespondence(const rclcpp::Node & node)
   readInto(node, measurement.corr_nn0_max, values_.corr_gate.nn0_max);
   readInto(node, measurement.corr_gate_mad_scale, values_.corr_gate.mad_scale);
   readInto(node, measurement.corr_gate_rot_sigma_floor_deg, values_.corr_gate.rot_sigma_floor_deg);
-  std::string corr_kernel_str = "none";
-  readInto(node, measurement.corr_kernel, corr_kernel_str);
-  readInto(node, measurement.corr_kernel_mad_scale, values_.corr_kernel_mad_scale);
-  readInto(node, measurement.corr_kernel_min_scale, values_.corr_kernel_min_scale);
-  values_.corr_kernel = corr_kernel_str == "gm" ? 1 : corr_kernel_str == "cauchy" ? 2 : 0;
-  if (corr_kernel_str != "none" && values_.corr_kernel == 0) {
-    RCLCPP_WARN(node.get_logger(), "corr_kernel '%s' unknown (none|gm|cauchy): kernel off", corr_kernel_str.c_str());
-  }
-#ifdef FASTLIO_TEST_HOOKS
-  locals_for_test_.value("corr_kernel", corr_kernel_str);
-#endif
 }
 
 void FrontendParameters::readCorrespondenceDump(const rclcpp::Node & node)
@@ -505,22 +449,14 @@ void FrontendParameters::readCorrespondenceDump(const rclcpp::Node & node)
 #endif
 }
 
-void FrontendParameters::readAttitudeAndGravity(const rclcpp::Node & node, double & zupt_vel_reset_sigma)
+void FrontendParameters::readResetSigmasAndGravity(const rclcpp::Node & node, double & zupt_vel_reset_sigma)
 {
-  const MeasurementParameterSpecs measurement{};
   const RecoveryParameterSpecs recovery{};
   const ConstraintParameterSpecs constraints{};
-  readInto(node, measurement.lidar_attitude_hold_far_frac, values_.attitude_hold.far_frac_max);
-  readInto(node, measurement.lidar_attitude_hold_min_effct, values_.attitude_hold.min_effct);
-  readInto(node, measurement.lidar_attitude_hold_max_s, values_.attitude_hold.max_hold_s);
-  readInto(node, measurement.lidar_attitude_hold_max_scan_gap_s, values_.attitude_hold.max_scan_gap_s);
-  readInto(node, measurement.lidar_attitude_hold_min_rp_info, values_.lidar_attitude_hold_min_rp_info);
   readInto(node, recovery.guard_vel_reset_sigma, values_.guard_vel_reset_sigma);
   readInto(node, recovery.zupt_vel_reset_sigma, zupt_vel_reset_sigma);
-  readInto(node, measurement.lidar_attitude_hold_z_weak, values_.attitude_hold.z_weak_min);
   readInto(node, constraints.gravity_align_lin_accel_comp, values_.gravity_align_lin_accel_comp);
   readInto(node, constraints.gravity_align_vel_sigma_scale, values_.gravity_align_vel_sigma_scale);
-  readInto(node, constraints.gravity_align_lin_accel_source, values_.gravity_align_lin_accel_source);
   readInto(node, constraints.gravity_align_withhold_blind_moving, values_.gravity_align_withhold_blind_moving);
   readInto(node, constraints.gravity_align_sigma_policy, values_.gravity_align_sigma_policy);
   readInto(node, constraints.gravity_align_noise_static, values_.gravity_align_noise_static);
@@ -543,12 +479,6 @@ void FrontendParameters::readAttitudeAndGravity(const rclcpp::Node & node, doubl
   }
   values_.gravity_align_leg_lever_arm = Eigen::Vector3d(
     gravity_align_leg_lever_arm_vec[0], gravity_align_leg_lever_arm_vec[1], gravity_align_leg_lever_arm_vec[2]);
-  if (values_.gravity_align_lin_accel_source != "leg" && values_.gravity_align_lin_accel_source != "filter") {
-    RCLCPP_FATAL(node.get_logger(),
-                 "gravity_align_lin_accel_source must be 'leg' or 'filter', got '%s'",
-                 values_.gravity_align_lin_accel_source.c_str());
-    throw std::invalid_argument("gravity_align_lin_accel_source");
-  }
 #ifdef FASTLIO_TEST_HOOKS
   locals_for_test_.value("gravity_align_leg_lever_arm", gravity_align_leg_lever_arm_vec);
 #endif
@@ -617,14 +547,6 @@ void FrontendParameters::readGuards(const rclcpp::Node & node, ReleaseVelocityPa
   readInto(node, recovery.guard_release_leg_max_age_s, release_vel_params.leg_max_age_s);
   readInto(node, recovery.guard_release_leg_sigma, release_vel_params.leg_sigma);
   readInto(node, recovery.guard_release_keep_sigma, release_vel_params.keep_sigma);
-  readInto(node, recovery.guard_release_inflate_en, values_.release_inflate.enabled);
-  readInto(node, recovery.guard_release_pos_sigma_min, values_.release_inflate.pos_sigma_min);
-  readInto(node, recovery.guard_release_pos_sigma_rate, values_.release_inflate.pos_sigma_rate);
-  readInto(node, recovery.guard_release_pos_sigma_max, values_.release_inflate.pos_sigma_max);
-  readInto(node, recovery.guard_release_rp_sigma_deg, values_.release_inflate.rp_sigma_min_deg);
-  readInto(node, recovery.guard_release_rp_sigma_rate_deg, values_.release_inflate.rp_sigma_rate_deg);
-  readInto(node, recovery.guard_release_rp_sigma_max_deg, values_.release_inflate.rp_sigma_max_deg);
-  readInto(node, recovery.guard_release_yaw_sigma_deg, values_.release_inflate.yaw_sigma_deg);
   readInto(node, measurement.lidar_consider_rp_en, values_.rp_consider.enabled);
   readInto(node, measurement.lidar_consider_rp_while_engulfed, values_.rp_consider.while_engulfed);
   readInto(node, measurement.lidar_consider_rp_post_release_s, values_.rp_consider.post_release_s);
@@ -657,7 +579,6 @@ void FrontendParameters::readHoleAndZupt(const rclcpp::Node & node,
   readInto(node, recovery.guard_hole_en, values_.guard_hole_en);
   readInto(node, recovery.guard_hole_min_sec, values_.guard_hole_min_sec);
   readInto(node, recovery.guard_hole_max_accel, values_.guard_hole_max_accel);
-  readInto(node, recovery.guard_hole_reanchor_pos, values_.guard_hole_reanchor_pos);
   readInto(node, recovery.divergence_guard_streak, values_.divergence_guard_streak);
   readInto(node, recovery.zupt_en, values_.zupt_en);
   readInto(node, recovery.zupt_gyro_thresh, zupt_gyro_thresh);
@@ -812,7 +733,6 @@ void FrontendParameters::readDataPaths(const rclcpp::Node & node, std::string & 
 
 void FrontendParameters::readInputs(const rclcpp::Node & node,
                                     FrontendStartup & startup,
-                                    bool & time_sync_en,
                                     double & time_diff_lidar_to_imu,
                                     double & imu_time_offset)
 {
@@ -821,7 +741,6 @@ void FrontendParameters::readInputs(const rclcpp::Node & node,
   readInto(node, input.common_imu_topic, startup.imu_topic);
   readInto(node, input.common_imu_input_type, startup.imu_input_type);
   readInto(node, input.common_imu_bias_topic, startup.imu_bias_topic);
-  readInto(node, input.common_time_sync_en, time_sync_en);
   readInto(node, input.common_time_offset_lidar_to_imu, time_diff_lidar_to_imu);
   readInto(node, input.common_imu_time_offset, imu_time_offset);
 #ifdef FASTLIO_TEST_HOOKS
@@ -960,10 +879,7 @@ void FrontendParameters::readImuCoverage(const rclcpp::Node & node,
     throw std::invalid_argument("preprocess.max_scan_duration_s must be finite and nonnegative");
 }
 
-void FrontendParameters::readFeatureInputs(const rclcpp::Node & node,
-                                           int & point_filter_num,
-                                           bool & feature_enabled,
-                                           bool & runtime_pos_log)
+void FrontendParameters::readFeatureInputs(const rclcpp::Node & node, int & point_filter_num, bool & runtime_pos_log)
 {
   const InputParameterSpecs input{};
   const MeasurementParameterSpecs measurement{};
@@ -972,7 +888,6 @@ void FrontendParameters::readFeatureInputs(const rclcpp::Node & node,
   readInto(node, measurement.nn_refresh_gate_en, values_.nn_refresh_gate_en);
   readInto(node, measurement.nn_refresh_min_shift, values_.nn_refresh_min_shift);
   readInto(node, measurement.nn_refresh_ref_range, values_.nn_refresh_ref_range);
-  readInto(node, input.feature_extract_enable, feature_enabled);
   readInto(node, diagnostics.runtime_pos_log_enable, runtime_pos_log);
 }
 
@@ -1015,15 +930,6 @@ void FrontendParameters::readDiagnosticsAndMapSave(const rclcpp::Node & node,
   values_.time_admission_counts_enable =
     node.get_parameter(diagnostics.diagnostics_time_admission_counts_enable.name).as_bool();
   readInto(node, imu.mapping_extrinsic_est_en, values_.extrinsic_est_en);
-  if (values_.attitude_hold.enabled && values_.extrinsic_est_en) {
-    RCLCPP_FATAL(node.get_logger(),
-                 "lidar_attitude_hold_en and mapping.extrinsic_est_en cannot both be true: the hold projects only the "
-                 "attitude columns of H onto yaw, so the extrinsic rotation columns would let roll and pitch "
-                 "information into the state");
-    throw std::invalid_argument(
-      "lidar_attitude_hold_en=true requires mapping.extrinsic_est_en=false "
-      "(the hold does not project the extrinsic rotation columns of H)");
-  }
   readInto(node, map.mapping_map_insert_delay_scans, map_insert_delay_scans);
   if (map_insert_delay_scans > 0) {
     RCLCPP_WARN(node.get_logger(), "[MAP] deterministic insertion lag: %d scan(s)", map_insert_delay_scans);
@@ -1080,29 +986,6 @@ void FrontendParameters::readPriorMapAndPose(const rclcpp::Node & node)
 #endif
   }
   readInto(node, map.initial_pose, values_.initial_pose_vec);
-  {
-    bool full_rpy_override = false;
-    bool legacy_apply_rp = false;
-    readInto(node, map.initial_pose_full_rpy_override, full_rpy_override);
-    readInto(node, map.initial_pose_apply_roll_pitch, legacy_apply_rp);
-    if (legacy_apply_rp) {
-      RCLCPP_WARN(node.get_logger(),
-                  "Parameter 'initial_pose_apply_roll_pitch' is deprecated; "
-                  "use 'initial_pose_full_rpy_override' instead.");
-    }
-    values_.initial_pose_full_rpy_override = full_rpy_override || legacy_apply_rp;
-    if (values_.initial_pose_full_rpy_override) {
-      RCLCPP_WARN(node.get_logger(),
-                  "initial_pose_full_rpy_override=true: overriding IMU-aligned "
-                  "roll/pitch with values from initial_pose. Caller must ensure "
-                  "these match gravity (accel along -Z), else point cloud "
-                  "transforms will be incorrect.");
-    }
-#ifdef FASTLIO_TEST_HOOKS
-    locals_for_test_.value("initial_pose_full_rpy_override", full_rpy_override);
-    locals_for_test_.value("initial_pose_apply_roll_pitch", legacy_apply_rp);
-#endif
-  }
 }
 
 namespace

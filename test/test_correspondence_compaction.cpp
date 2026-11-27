@@ -38,7 +38,6 @@ class CorrespondenceCompaction : public ::testing::Test
 {
 protected:
   Cloud source, sourceNormals, points, normals;
-  std::vector<double> sourceWeights, weights;
   std::vector<bool> selected;
   std::vector<std::size_t> visited;
 
@@ -46,37 +45,26 @@ protected:
   {
     source.resize(count);
     sourceNormals.resize(count);
-    sourceWeights.resize(count);
     selected.assign(count, true);
     for (std::size_t i = 0; i < count; ++i) {
       source[i].x = static_cast<float>(i);
       source[i].intensity = static_cast<float>(i + 10);
       sourceNormals[i].z = -static_cast<float>(i + 1);
       sourceNormals[i].intensity = static_cast<float>(i + 20);
-      sourceWeights[i] = 0.25 * (i + 1);
     }
   }
 
-  std::size_t compact(bool weighted = true)
+  std::size_t compact()
   {
     visited.clear();
-    return fast_lio::compactSelectedCorrespondences(source.size(),
-                                                    source,
-                                                    sourceNormals,
-                                                    selected,
-                                                    sourceWeights,
-                                                    weighted,
-                                                    points,
-                                                    normals,
-                                                    weights,
-                                                    [&](std::size_t i) { visited.push_back(i); });
+    return fast_lio::compactSelectedCorrespondences(
+      source.size(), source, sourceNormals, selected, points, normals, [&](std::size_t i) { visited.push_back(i); });
   }
 
-  void expectRows(const std::vector<std::size_t> & indices, bool weighted = true)
+  void expectRows(const std::vector<std::size_t> & indices)
   {
     ASSERT_EQ(points.size(), indices.size());
     ASSERT_EQ(normals.size(), indices.size());
-    ASSERT_EQ(weights.size(), indices.size());
     EXPECT_EQ(visited, indices);
     EXPECT_EQ(points.width, indices.size());
     EXPECT_EQ(normals.width, indices.size());
@@ -88,7 +76,6 @@ protected:
       EXPECT_EQ(points[row].intensity, static_cast<float>(i + 10));
       EXPECT_EQ(normals[row].z, -static_cast<float>(i + 1));
       EXPECT_EQ(normals[row].intensity, static_cast<float>(i + 20));
-      EXPECT_DOUBLE_EQ(weights[row], weighted ? 0.25 * (i + 1) : 1.0);
     }
   }
 };
@@ -113,14 +100,6 @@ TEST_F(CorrespondenceCompaction, SingleAndSparseMatchesKeepPairsAndOrder)
   selected = {true, false, true, false, false, true};
   EXPECT_EQ(compact(), 3U);
   expectRows({0, 2, 5});
-}
-
-TEST_F(CorrespondenceCompaction, DisabledKernelUsesUnitWeightsWithoutReadingSourceWeights)
-{
-  prepare(3);
-  sourceWeights.clear();
-  EXPECT_EQ(compact(false), 3U);
-  expectRows({0, 1, 2}, false);
 }
 
 TEST_F(CorrespondenceCompaction, RepeatedCallsShrinkClearAndGrowWithoutStaleRows)
@@ -151,10 +130,8 @@ TEST_F(CorrespondenceCompaction, GrowsBeyondLegacyCloudCapacity)
   ASSERT_EQ(compact(), kLegacyCapacity + 1);
   EXPECT_EQ(points.width, kLegacyCapacity + 1);
   EXPECT_EQ(normals.width, kLegacyCapacity + 1);
-  ASSERT_EQ(weights.size(), kLegacyCapacity + 1);
   EXPECT_EQ(points.back().x, static_cast<float>(kLegacyCapacity));
   EXPECT_EQ(normals.back().z, -static_cast<float>(kLegacyCapacity + 1));
-  EXPECT_DOUBLE_EQ(weights.back(), 0.25 * (kLegacyCapacity + 1));
   ASSERT_EQ(visited.size(), kLegacyCapacity + 1);
   EXPECT_EQ(visited.back(), kLegacyCapacity);
 }
@@ -167,7 +144,7 @@ TEST_F(CorrespondenceCompaction, ObserverPreservesResidualAdditionAndDiagnosticO
   double total = 0.0;
   std::vector<double> diagnostics;
   fast_lio::compactSelectedCorrespondences(
-    source.size(), source, sourceNormals, selected, sourceWeights, true, points, normals, weights, [&](std::size_t i) {
+    source.size(), source, sourceNormals, selected, points, normals, [&](std::size_t i) {
       total += residuals[i];
       diagnostics.push_back(residuals[i]);
     });
@@ -191,7 +168,7 @@ TEST_F(CorrespondenceCompaction, InvalidSizesAndAliasingFailBeforeClearingOutput
   compact();
   const auto invoke = [&](std::size_t count) {
     return fast_lio::compactSelectedCorrespondences(
-      count, source, sourceNormals, selected, sourceWeights, true, points, normals, weights, [](std::size_t) {});
+      count, source, sourceNormals, selected, points, normals, [](std::size_t) {});
   };
   EXPECT_THROW(invoke(3), std::invalid_argument);
   sourceNormals.resize(1);
@@ -200,15 +177,11 @@ TEST_F(CorrespondenceCompaction, InvalidSizesAndAliasingFailBeforeClearingOutput
   selected.resize(1);
   EXPECT_THROW(invoke(2), std::invalid_argument);
   selected.resize(2);
-  sourceWeights.resize(1);
-  EXPECT_THROW(invoke(2), std::invalid_argument);
-  sourceWeights.resize(2);
-  EXPECT_THROW(fast_lio::compactSelectedCorrespondences(
-                 2, source, sourceNormals, selected, sourceWeights, true, source, normals, weights, [](std::size_t) {}),
-               std::invalid_argument);
+  EXPECT_THROW(
+    fast_lio::compactSelectedCorrespondences(2, source, sourceNormals, selected, source, normals, [](std::size_t) {}),
+    std::invalid_argument);
   EXPECT_EQ(points.size(), 2U);
   EXPECT_EQ(normals.size(), 2U);
-  EXPECT_EQ(weights.size(), 2U);
   EXPECT_EQ(source.size(), 2U);
 }
 }  // namespace

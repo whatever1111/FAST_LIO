@@ -9,12 +9,10 @@
 
 #include "correspondence_gate.hpp"
 
-using fast_lio::cauchyWeight;
 using fast_lio::correspondenceAdmitted;
 using fast_lio::CorrespondenceGateParams;
 using fast_lio::flooredPriorBlock;
 using fast_lio::gateSigma;
-using fast_lio::gemanMcClureWeight;
 using fast_lio::residualVariance;
 using fast_lio::robustResidualScale;
 
@@ -150,15 +148,4 @@ TEST(CorrespondenceGate, AttitudeFloorRaisesOnlyTheRotationVariances)
   // a floor already below the prior changes nothing
   P6(4, 4) = 1e-2;
   EXPECT_DOUBLE_EQ(flooredPriorBlock(P6, floor_rad)(4, 4), 1e-2);
-}
-
-TEST(CorrespondenceGate, KernelWeightsAreOneAtZeroAndDecayWithTheResidual)
-{
-  EXPECT_DOUBLE_EQ(gemanMcClureWeight(0.0, 0.05), 1.0);
-  EXPECT_DOUBLE_EQ(cauchyWeight(0.0, 0.05), 1.0);
-  EXPECT_NEAR(gemanMcClureWeight(0.05, 0.05), 0.25, 1e-12);
-  EXPECT_NEAR(cauchyWeight(0.05, 0.05), 0.5, 1e-12);
-  EXPECT_LT(gemanMcClureWeight(0.20, 0.05), cauchyWeight(0.20, 0.05));  // GM cuts harder in the tail
-  EXPECT_DOUBLE_EQ(gemanMcClureWeight(0.3, 0.0), 1.0);  // no kernel
-  EXPECT_DOUBLE_EQ(cauchyWeight(kNaN, 0.05), 1.0);
 }

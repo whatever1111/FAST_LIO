@@ -93,7 +93,8 @@ extern std::function<void(double, bool)> afterMapInsertion;
 extern std::function<void(double, bool, const Eigen::MatrixXd &, const Eigen::VectorXd &)> afterHModelMatrices;
 
 /// One row the H-model hands to the filter, in the filter's order: the body-frame point, the world-frame plane
-/// normal, the signed point-to-plane residual the row is built from, and the kernel weight (1 without a kernel).
+/// normal, the signed point-to-plane residual the row is built from, and its weight (always 1: the rows are unweighted;
+/// the field keeps the h_select.v1 layout).
 struct HModelRow
 {
   float point[3];
@@ -103,7 +104,7 @@ struct HModelRow
 };
 
 /// One H-model call's correspondences right after compaction: the search decision, the selection in point order,
-/// what the gate, the kernel and the ground recovery did, and the rows.
+/// what the gate and the ground recovery did, and the rows.
 struct HModelSelection
 {
   double scan_end = 0.0;
@@ -116,7 +117,7 @@ struct HModelSelection
   const std::uint8_t * selected = nullptr;  ///< `points` flags: the point has a row
   const float * residuals = nullptr;        ///< `points` values, read where the point has a row: |residual|
   int gate_rejected = 0;                    ///< points the correspondence gate refused
-  double gate_scan_sigma = 0.0;             ///< the scan's robust residual scale (0 when no gate or kernel uses it)
+  double gate_scan_sigma = 0.0;             ///< the scan's robust residual scale (0 when the gate does not use it)
   int ground_rows = 0;                      ///< rows the ground recovery added
   std::vector<HModelRow> rows;
 };
@@ -133,10 +134,11 @@ struct HModelExit
   double pos_eig_min = 0.0;         ///< the rows' position information sum(n n^T): smallest eigenvalue
   double pos_eig_max = 0.0;         ///< largest eigenvalue
   double pos_z_weak = 0.0;          ///< |z| of the weakest direction
-  bool hold_scene = false;          ///< the scan's attitude hold verdict from its scene
-  bool hold_allowed = false;        ///< the hold's release conditions alone
-  bool hold_rows = false;           ///< this call restricted its rotation rows to yaw (false without rows)
-  bool hold_info = false;           ///< the information rule has held the attitude on this scan
+  // The attitude hold was removed; its four fields keep the h_exit.v1 layout and stay false.
+  bool hold_scene = false;
+  bool hold_allowed = false;
+  bool hold_rows = false;
+  bool hold_info = false;
   double rp_info_min = 0.0;         ///< roll/pitch information of the rows
   bool rp_consider = false;         ///< the scan's update leaves roll/pitch to the gyro (lidar_consider_rp_en)
   // The normal-noise floor's decision of the scan's last evaluation that ran it; neutral (1, 0, 1, 0, 0) while the

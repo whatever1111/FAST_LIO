@@ -36,8 +36,6 @@ struct MeasurementInputs
   int point_count;                           // the downsampled scan's point count
   double scan_end_time;                      // the scan's end time; it keys the ground-plane cache
   double far_fraction;                       // fraction of the raw points beyond far_range, for the spectrum trace
-  bool attitude_hold_active;                 // this scan's attitude-hold scene verdict
-  bool attitude_hold_allowed;                // the attitude hold's release conditions hold this scan
   bool degeneracy_debug;                     // fill the residual range bins
 };
 
@@ -84,13 +82,11 @@ struct MeasurementTelemetry
   long floor_rows_projected = 0;
   double floor_kept_sum = 0.0;
   long floor_no_wheel_scans = 0;
-  // The correspondence gate and robust kernel (FrontendParams::corr_gate and corr_kernel are the policy) on the last
-  // evaluation: the matches the gate refused, and the scan's robust residual scale (1.4826 MAD).
+  // The correspondence gate (FrontendParams::corr_gate is the policy) on the last evaluation: the matches it refused,
+  // and the scan's robust residual scale (1.4826 MAD).
   std::atomic<int> corr_gate_rejected{0};
   double corr_gate_scan_sigma = 0.0;
-  // Attitude hold (FrontendParams::attitude_hold is the policy): whether the information rule held on an evaluation
-  // since the node last cleared it, and the roll/pitch information of the last evaluation that built rows.
-  bool lidar_attitude_hold_info_active = false;
+  // The roll/pitch information of the last evaluation that built rows, which the roll/pitch consider rule reads.
   double lidar_rot_obs_rp_min = 0.0;
   // [RES] trace: the converged point-to-plane residual by body-range bin, count and sum of squares, from the last
   // evaluation (only while the node's degeneracy_debug is on).
@@ -119,10 +115,9 @@ struct MeasurementScratch
   // Per point of the downsampled scan, sized before the parallel loops, which only index them.
   std::vector<float> res_last;
   std::vector<std::uint8_t> point_selected_surf;
-  std::vector<double> gate_var, gate_nn0, gate_w;  // the gate's inputs and the kernel weight
-  std::vector<double> corr_weight;                 // per effective row
-  double total_residual = 0.0;                     // the effective rows' residual sum on this evaluation
-  std::vector<PointVector> Nearest_Points;         // each point's neighbours from its last search
+  std::vector<double> gate_var, gate_nn0;   // the gate's inputs
+  double total_residual = 0.0;              // the effective rows' residual sum on this evaluation
+  std::vector<PointVector> Nearest_Points;  // each point's neighbours from its last search
   std::vector<std::vector<fast_lio::MapPointIdentity>> Nearest_Identities;
   fast_lio::MapIdentityStatus identity_status = fast_lio::MapIdentityStatus::kDisabled;
   // The neighbour set only moves on the iterations that search, so the 5x3 plane fit and the body-range scale in the
@@ -130,8 +125,8 @@ struct MeasurementScratch
   std::vector<fast_lio::CachedPlane, Eigen::aligned_allocator<fast_lio::CachedPlane>> plane_cache;
   // Per point, the scatter of the plane its row was accepted against (plane_cache's own eigen data, written with the
   // selection; null for a ground-recovery row, whose normal is imposed rather than fitted). Per effective row, the
-  // same pointer, compacted with the rows while the floor is on, and the floor's inputs: the weight the row was
-  // scaled by and its normal's covariance.
+  // same pointer, compacted with the rows while the floor is on, and the floor's inputs: the row's weight and its
+  // normal's covariance.
   std::vector<const fast_lio::PlaneFitEigen *> point_plane;
   std::vector<const fast_lio::PlaneFitEigen *> corr_plane;
   std::vector<double> floor_weights;
@@ -178,8 +173,6 @@ public:
   bool prepareScan(std::size_t count, int & point_count);
   void resizeNormals(std::size_t count) { scratch_.normvec.resize(count); }
   void resizeNeighbours(std::size_t count) { scratch_.Nearest_Points.resize(count); }
-  /// Clears the attitude hold's information verdict before a scan's update.
-  void clearAttitudeHoldInfo() { telemetry_.lidar_attitude_hold_info_active = false; }
 
   /// One evaluation at the filter's current iterate: fills data's rows, or sets data.valid to false when no point
   /// is usable.
@@ -188,7 +181,7 @@ public:
                 const MeasurementInputs & inputs,
                 const MeasurementOutputs & outputs);
 
-  /// Condition already-weighted rows and record their actual dose. evaluate() calls this after row construction.
+  /// Condition the built rows and record their actual dose. evaluate() calls this after row construction.
   void applyFloorRows(esekfom::dyn_share_datastruct<double> & data,
                       const std::vector<double> & weights,
                       const std::vector<std::optional<Eigen::Matrix3d>> & covariances,

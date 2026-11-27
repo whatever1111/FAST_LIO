@@ -102,22 +102,19 @@ struct InitialPoseInjection
   bool valid = false;              ///< false when the vector was too short to be used
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
   Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
-  double applied_roll_rad = 0.0;   ///< what was actually used, after the override decision
-  double applied_pitch_rad = 0.0;
-  double applied_yaw_rad = 0.0;
-  bool kept_gravity_rp = false;    ///< true when roll/pitch came from IMU gravity, not the vector
+  double applied_roll_rad = 0.0;   ///< the IMU's gravity-aligned roll
+  double applied_pitch_rad = 0.0;  ///< the IMU's gravity-aligned pitch
+  double applied_yaw_rad = 0.0;    ///< the vector's yaw
 };
 
 /// Resolve [x, y, z, roll°, pitch°, yaw°] against the filter's gravity-aligned attitude.
 ///
-/// Yaw always comes from the vector — it is the one attitude component an operator can
-/// supply and gravity cannot. Roll and pitch stay with the IMU unless the caller overrides:
-/// a supplied roll/pitch that disagrees with gravity makes every body-to-world transform
-/// wrong, so the caller has to say out loud that its values are gravity-consistent.
-inline InitialPoseInjection resolveInitialPose(const std::vector<double> & pose_vec,
-                                               bool full_rpy_override,
-                                               double gravity_roll_rad,
-                                               double gravity_pitch_rad)
+/// Yaw comes from the vector — it is the one attitude component an operator can supply and gravity cannot. Roll
+/// and pitch stay with the IMU: six bare numbers carry no frame, time or covariance that would show a supplied
+/// roll/pitch agrees with gravity, and one that does not makes every body-to-world transform wrong. The vector's
+/// roll and pitch entries are read only for being finite.
+inline InitialPoseInjection
+resolveInitialPose(const std::vector<double> & pose_vec, double gravity_roll_rad, double gravity_pitch_rad)
 {
   InitialPoseInjection out;
   if (pose_vec.size() < kInitialPoseSize) {
@@ -131,10 +128,9 @@ inline InitialPoseInjection resolveInitialPose(const std::vector<double> & pose_
   constexpr double kDegToRad = M_PI / 180.0;
   out.valid = true;
   out.position = Eigen::Vector3d(pose_vec[0], pose_vec[1], pose_vec[2]);
-  out.applied_roll_rad = full_rpy_override ? pose_vec[3] * kDegToRad : gravity_roll_rad;
-  out.applied_pitch_rad = full_rpy_override ? pose_vec[4] * kDegToRad : gravity_pitch_rad;
+  out.applied_roll_rad = gravity_roll_rad;
+  out.applied_pitch_rad = gravity_pitch_rad;
   out.applied_yaw_rad = pose_vec[5] * kDegToRad;
-  out.kept_gravity_rp = !full_rpy_override;
   const Eigen::AngleAxisd roll(out.applied_roll_rad, Eigen::Vector3d::UnitX());
   const Eigen::AngleAxisd pitch(out.applied_pitch_rad, Eigen::Vector3d::UnitY());
   const Eigen::AngleAxisd yaw(out.applied_yaw_rad, Eigen::Vector3d::UnitZ());

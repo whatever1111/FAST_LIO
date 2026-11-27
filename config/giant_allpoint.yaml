@@ -1,6 +1,5 @@
 /**:
     ros__parameters:
-        feature_extract_enable: false
         point_filter_num: 3
         max_iteration: 3
         filter_size_surf: 0.5
@@ -36,7 +35,6 @@
             imu_topic:  "/fixposition/fpa/rawimu"
             imu_input_type: "fixposition_fpa"
             imu_bias_topic: "/fixposition/fpa/imubias"
-            time_sync_en: false
             # NOTE: the LiDAR cloud header lags the FP IMU/RTK clock by ~0.13s (the
             # /odom output leads RTK by that much at offset 0). Correcting it HERE is
             # ineffective: FAST-LIO is self-referential (it registers scans into its own

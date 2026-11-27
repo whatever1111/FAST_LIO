@@ -23,13 +23,13 @@
 #include <so3_math.h>
 #include <vector>
 
-#include "attitude_hold.hpp"
 #include "cached_plane.hpp"
 #include "correspondence_compaction.hpp"
 #include "correspondence_gate.hpp"
 #include "degeneracy_policy.hpp"
 #include "normal_noise_floor.hpp"
 #include "plane_fit.hpp"
+#include "rp_consider.hpp"
 
 #ifdef FASTLIO_TEST_HOOKS
 #include "laser_mapping_test_hooks.hpp"
@@ -73,17 +73,16 @@ static void reportHModelSelection(const fast_lio::MeasurementScratch & scratch,
     row.normal[1] = normal.y;
     row.normal[2] = normal.z;
     row.residual = normal.intensity;
-    row.weight = scratch.corr_weight[i];
+    row.weight = 1.0;
   }
   afterHModelSelection(selection);
 }
 
-// The H-model call's exit. `hold_rows`: the call restricted its rotation rows to yaw (false without rows).
+// The H-model call's exit.
 static HModelExit hModelExit(const fast_lio::MeasurementTelemetry & telemetry,
                              const fast_lio::MeasurementInputs & inputs,
                              const fast_lio::MeasurementOutputs & outputs,
-                             bool valid,
-                             bool hold_rows)
+                             bool valid)
 {
   HModelExit out;
   out.scan_end = inputs.scan_end_time;
@@ -94,10 +93,6 @@ static HModelExit hModelExit(const fast_lio::MeasurementTelemetry & telemetry,
   out.pos_eig_min = telemetry.pos_obs_eig_min;
   out.pos_eig_max = telemetry.pos_obs_eig_max;
   out.pos_z_weak = telemetry.pos_obs_z_weak;
-  out.hold_scene = inputs.attitude_hold_active;
-  out.hold_allowed = inputs.attitude_hold_allowed;
-  out.hold_rows = hold_rows;
-  out.hold_info = telemetry.lidar_attitude_hold_info_active;
   out.rp_info_min = telemetry.lidar_rot_obs_rp_min;
   out.rp_consider = rp_consider_active;
   // The floor's decision (the last evaluation that ran it on this scan): neutral while the floor is off or has not
@@ -279,50 +274,40 @@ void matchPoints(fast_lio::MeasurementScratch & scratch,
   }
 }
 
-// [v11] gate decision and kernel weights: the scan's robust residual scale is known only now.
-void applyGateAndKernels(fast_lio::MeasurementScratch & scratch,
-                         fast_lio::MeasurementTelemetry & telemetry,
-                         const fast_lio::FrontendParams & params,
-                         const fast_lio::MeasurementInputs & inputs,
-                         bool gate_on)
+// [v11] gate decision: the scan's robust residual scale is known only now.
+void applyGate(fast_lio::MeasurementScratch & scratch,
+               fast_lio::MeasurementTelemetry & telemetry,
+               const fast_lio::FrontendParams & params,
+               const fast_lio::MeasurementInputs & inputs,
+               bool gate_on)
 {
   telemetry.corr_gate_scan_sigma = 0.0;
-  if (gate_on || params.corr_kernel != 0) {
-    if (params.corr_gate.mad_scale > 0.0 || params.corr_kernel != 0) {
-      std::vector<double> res;
-      res.reserve(inputs.point_count);
-      for (int i = 0; i < inputs.point_count; i++) {
-        if (scratch.point_selected_surf[i]) {
-          res.push_back(scratch.normvec.points[i].intensity);
-        }
+  if (!gate_on) {
+    return;
+  }
+  if (params.corr_gate.mad_scale > 0.0) {
+    std::vector<double> res;
+    res.reserve(inputs.point_count);
+    for (int i = 0; i < inputs.point_count; i++) {
+      if (scratch.point_selected_surf[i]) {
+        res.push_back(scratch.normvec.points[i].intensity);
       }
-      telemetry.corr_gate_scan_sigma = fast_lio::robustResidualScale(res);
     }
-    const double scan_floor = params.corr_gate.mad_scale * telemetry.corr_gate_scan_sigma;
-    const double kernel_c =
-      params.corr_kernel != 0
-        ? std::max(params.corr_kernel_mad_scale * telemetry.corr_gate_scan_sigma, params.corr_kernel_min_scale)
-        : 0.0;
+    telemetry.corr_gate_scan_sigma = fast_lio::robustResidualScale(res);
+  }
+  const double scan_floor = params.corr_gate.mad_scale * telemetry.corr_gate_scan_sigma;
 #ifdef MP_EN
 #pragma omp parallel for
 #endif
-    for (int i = 0; i < inputs.point_count; i++) {
-      scratch.gate_w[i] = 1.0;
-      if (!scratch.point_selected_surf[i]) {
-        continue;
-      }
-      const double pd2 = scratch.normvec.points[i].intensity;
-      if (gate_on && !fast_lio::correspondenceAdmitted(
-                       params.corr_gate, pd2, scratch.gate_var[i], scratch.gate_nn0[i], scan_floor)) {
-        scratch.point_selected_surf[i] = false;
-        telemetry.corr_gate_rejected.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
-      if (params.corr_kernel == 1) {
-        scratch.gate_w[i] = fast_lio::gemanMcClureWeight(pd2, kernel_c);
-      } else if (params.corr_kernel == 2) {
-        scratch.gate_w[i] = fast_lio::cauchyWeight(pd2, kernel_c);
-      }
+  for (int i = 0; i < inputs.point_count; i++) {
+    if (!scratch.point_selected_surf[i]) {
+      continue;
+    }
+    const double pd2 = scratch.normvec.points[i].intensity;
+    if (!fast_lio::correspondenceAdmitted(
+          params.corr_gate, pd2, scratch.gate_var[i], scratch.gate_nn0[i], scan_floor)) {
+      scratch.point_selected_surf[i] = false;
+      telemetry.corr_gate_rejected.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }
@@ -574,17 +559,14 @@ void compactRows(fast_lio::MeasurementScratch & scratch,
   scratch.corr_plane.clear();
 
   // res_last, point_selected_surf and point_plane have the same extent; the compactor checks
-  // that extent and the point/normal/weight bounds before invoking this observer.
+  // that extent and the point/normal bounds before invoking this observer.
   outputs.effective_rows = static_cast<int>(fast_lio::compactSelectedCorrespondences(
     static_cast<std::size_t>(inputs.point_count),
     inputs.body,
     scratch.normvec,
     scratch.point_selected_surf,
-    scratch.gate_w,
-    params.corr_kernel != 0,
     scratch.laserCloudOri,
     scratch.corr_normvect,
-    scratch.corr_weight,
     [&](std::size_t i) {
       scratch.total_residual += scratch.res_last[i];
       if (floor_on) {
@@ -623,58 +605,37 @@ void observePosition(const fast_lio::MeasurementScratch & scratch,
   telemetry.pos_obs_z_weak = std::abs(es.eigenvectors()(2, 0));  // |Z| of weakest eigenvector
 }
 
-// [v8] attitude hold: the vertical in the body frame (the gravity state's own up), recomputed per
-// iteration; every rotation row below is projected onto it so the update cannot move roll/pitch.
-// [v9] the information rule decides from this iteration's own rows: Σ AAᵀ restricted to the
-// roll/pitch plane, its weakest eigenvalue against lidar_attitude_hold_min_rp_info.
-bool prepareAttitudeHold(const fast_lio::MeasurementScratch & scratch,
-                         fast_lio::MeasurementTelemetry & telemetry,
-                         const fast_lio::FrontendParams & params,
-                         const fast_lio::MeasurementInputs & inputs,
-                         const fast_lio::MeasurementOutputs & outputs,
-                         state_ikfom & s,
-                         V3D & hold_up)
+// The vertical in the body frame (the gravity state's own up), recomputed per iteration, and the roll/pitch
+// information of this iteration's own rows: Σ AAᵀ restricted to the roll/pitch plane, its weakest eigenvalue. The
+// roll/pitch consider rule reads that information (rp_consider.hpp).
+void observeRollPitch(const fast_lio::MeasurementScratch & scratch,
+                      fast_lio::MeasurementTelemetry & telemetry,
+                      const fast_lio::MeasurementOutputs & outputs,
+                      state_ikfom & s,
+                      V3D & up_body)
 {
   {
     V3D grav_w(s.grav[0], s.grav[1], s.grav[2]);
     const V3D up_w = grav_w.norm() > 1e-6 ? V3D(-grav_w.normalized()) : V3D(0.0, 0.0, 1.0);
-    hold_up = (s.rot.conjugate() * up_w).normalized();
+    up_body = (s.rot.conjugate() * up_w).normalized();
   }
-  bool hold_rows = inputs.attitude_hold_active;
-  {
-    M3D rot_info = M3D::Zero();
-    for (int i = 0; i < outputs.effective_rows; i++) {
-      const PointType & laser_p = scratch.laserCloudOri.points[i];
-      const V3D point_this = s.offset_R_L_I * V3D(laser_p.x, laser_p.y, laser_p.z) + s.offset_T_L_I;
-      const PointType & norm_p = scratch.corr_normvect.points[i];
-      const V3D C(s.rot.conjugate() * V3D(norm_p.x, norm_p.y, norm_p.z));
-      const V3D A(point_this.cross(C));
-      rot_info += A * A.transpose();
-    }
-    telemetry.lidar_rot_obs_rp_min = fast_lio::rollPitchInformation(rot_info, hold_up);
-    if (inputs.attitude_hold_allowed && params.lidar_attitude_hold_min_rp_info > 0.0 &&
-        telemetry.lidar_rot_obs_rp_min < params.lidar_attitude_hold_min_rp_info) {
-      hold_rows = true;
-      telemetry.lidar_attitude_hold_info_active = true;
-    }
+  M3D rot_info = M3D::Zero();
+  for (int i = 0; i < outputs.effective_rows; i++) {
+    const PointType & laser_p = scratch.laserCloudOri.points[i];
+    const V3D point_this = s.offset_R_L_I * V3D(laser_p.x, laser_p.y, laser_p.z) + s.offset_T_L_I;
+    const PointType & norm_p = scratch.corr_normvect.points[i];
+    const V3D C(s.rot.conjugate() * V3D(norm_p.x, norm_p.y, norm_p.z));
+    const V3D A(point_this.cross(C));
+    rot_info += A * A.transpose();
   }
-  return hold_rows;
-}
-
-// The weight a row carries into the update: the robust kernel's sqrt(w) on a row the kernel down-weights, 1 on any
-// other. buildRows scales the row and its residual by it, and the floor counts the row's normal noise with it.
-double rowWeight(const fast_lio::FrontendParams & params, double kernel_weight)
-{
-  return params.corr_kernel != 0 && kernel_weight < 1.0 ? std::sqrt(std::max(kernel_weight, 0.0)) : 1.0;
+  telemetry.lidar_rot_obs_rp_min = fast_lio::rollPitchInformation(rot_info, up_body);
 }
 
 void buildRows(const fast_lio::MeasurementScratch & scratch,
                const fast_lio::FrontendParams & params,
                const fast_lio::MeasurementOutputs & outputs,
                state_ikfom & s,
-               esekfom::dyn_share_datastruct<double> & ekfom_data,
-               const V3D & hold_up,
-               bool hold_rows)
+               esekfom::dyn_share_datastruct<double> & ekfom_data)
 {
   for (int i = 0; i < outputs.effective_rows; i++) {
     const PointType & laser_p = scratch.laserCloudOri.points[i];
@@ -692,9 +653,6 @@ void buildRows(const fast_lio::MeasurementScratch & scratch,
     /*** calculate the Measuremnt Jacobian matrix H ***/
     V3D C(s.rot.conjugate() * norm_vec);
     V3D A(point_crossmat * C);
-    if (hold_rows) {
-      A = fast_lio::projectRotationRowToYaw(A, hold_up);
-    }
     if (params.extrinsic_est_en) {
       V3D B(point_be_crossmat * s.offset_R_L_I.conjugate() * C);  // s.rot.conjugate()*norm_vec);
       ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B),
@@ -706,11 +664,6 @@ void buildRows(const fast_lio::MeasurementScratch & scratch,
 
     /*** Measuremnt: distance to the closest surface/corner ***/
     ekfom_data.h(i) = -norm_p.intensity;
-    const double sw = rowWeight(params, scratch.corr_weight[i]);
-    if (sw != 1.0) {
-      ekfom_data.h_x.block<1, 12>(i, 0) *= sw;
-      ekfom_data.h(i) *= sw;
-    }
   }
 }
 
@@ -754,18 +707,16 @@ void traceSpectrum(const fast_lio::FrontendParams & params,
 }
 
 // The normal-noise floor (FrontendParams::degeneracy_floor_mode is the policy, normal_noise_floor.hpp the decision)
-// on every evaluation that built rows, once each row carries its final weight. Each row brings the weight it was
-// scaled by and its normal's covariance: a fitted plane's from its scatter, none for a ground-recovery row, whose
-// imposed normal the floor counts apart and adds nothing for.
-void prepareFloor(fast_lio::MeasurementScratch & scratch,
-                  const fast_lio::FrontendParams & params,
-                  const fast_lio::MeasurementOutputs & outputs)
+// on every evaluation that built rows. Each row brings its weight (1: the rows are unweighted) and its normal's
+// covariance: a fitted plane's from its scatter, none for a ground-recovery row, whose imposed normal the floor counts
+// apart and adds nothing for.
+void prepareFloor(fast_lio::MeasurementScratch & scratch, const fast_lio::MeasurementOutputs & outputs)
 {
   const std::size_t rows = static_cast<std::size_t>(outputs.effective_rows);
   scratch.floor_weights.resize(rows);
   scratch.floor_cov.resize(rows);
   for (std::size_t i = 0; i < rows; ++i) {
-    scratch.floor_weights[i] = rowWeight(params, scratch.corr_weight[i]);
+    scratch.floor_weights[i] = 1.0;
     scratch.floor_cov[i].reset();
     if (scratch.corr_plane[i] != nullptr) {
       scratch.floor_cov[i] = fast_lio::planeNormalCovariance(*scratch.corr_plane[i]);
@@ -779,8 +730,7 @@ void writeDump(const fast_lio::MeasurementScratch & scratch,
                const fast_lio::MeasurementOutputs & outputs,
                state_ikfom & s,
                bool searching,
-               const V3D & hold_up,
-               bool hold_rows,
+               const V3D & up_body,
                const esekfom::dyn_share_datastruct<double> & data)
 {
   const int iter = outputs.dump_iteration++;
@@ -790,10 +740,11 @@ void writeDump(const fast_lio::MeasurementScratch & scratch,
                       << inputs.scan_end_time << " iter=" << iter << '\n';
   }
   const V3D sensor_w = s.rot * s.offset_T_L_I + s.pos;
+  // The held column stays in the layout and reads 0: the attitude hold was removed.
   outputs.dump_iterations << std::setprecision(15) << inputs.scan_end_time << ',' << iter << ','
-                          << outputs.effective_rows << ',' << int(hold_rows) << ',' << std::setprecision(6)
-                          << telemetry.lidar_rot_obs_rp_min << ',' << hold_up(0) << ',' << hold_up(1) << ','
-                          << hold_up(2) << ',' << int(searching) << ',' << int(telemetry.floor.projected) << '\n';
+                          << outputs.effective_rows << ",0," << std::setprecision(6) << telemetry.lidar_rot_obs_rp_min
+                          << ',' << up_body(0) << ',' << up_body(1) << ',' << up_body(2) << ',' << int(searching) << ','
+                          << int(telemetry.floor.projected) << '\n';
   // Compaction preserves selected point order. Row mixing makes a per-point retained fraction undefined.
   int effective_row = 0;
   for (int i = 0; i < inputs.point_count; i++) {
@@ -929,7 +880,6 @@ bool fast_lio::FrontendMeasurement::prepareScan(std::size_t count, int & point_c
     scratch_.point_plane.resize(count, nullptr);
     scratch_.gate_var.resize(count);
     scratch_.gate_nn0.resize(count);
-    scratch_.gate_w.resize(count);
   }
   return true;
 }
@@ -945,7 +895,7 @@ void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state,
   const bool gate_on = gatePrior(telemetry_, params_, inputs, gate_P6);
   prepareIdentities(scratch_, inputs);
   matchPoints(scratch_, params_, inputs, state, searching, gate_on, gate_P6);
-  applyGateAndKernels(scratch_, telemetry_, params_, inputs, gate_on);
+  applyGate(scratch_, telemetry_, params_, inputs, gate_on);
   recoverGround(scratch_, telemetry_, params_, inputs);
   compactRows(scratch_, telemetry_, params_, inputs, outputs);
 
@@ -975,7 +925,7 @@ void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state,
     if (fast_lio_test::afterHModelMatrices)
       fast_lio_test::afterHModelMatrices(inputs.scan_end_time, data.valid, Eigen::MatrixXd(), Eigen::VectorXd());
     if (fast_lio_test::afterHModelExit)
-      fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(telemetry_, inputs, outputs, data.valid, false));
+      fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(telemetry_, inputs, outputs, data.valid));
 #endif
     return;
   }
@@ -989,25 +939,25 @@ void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state,
   /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
   data.h_x = Eigen::MatrixXd::Zero(outputs.effective_rows, 12);  // 23
   data.h.resize(outputs.effective_rows);
-  V3D hold_up = V3D::Zero();
-  const bool hold_rows = prepareAttitudeHold(scratch_, telemetry_, params_, inputs, outputs, state, hold_up);
-  buildRows(scratch_, params_, outputs, state, data, hold_up, hold_rows);
+  V3D up_body = V3D::Zero();
+  observeRollPitch(scratch_, telemetry_, outputs, state, up_body);
+  buildRows(scratch_, params_, outputs, state, data);
   if (params_.degeneracy_spectrum_trace) {
     traceSpectrum(params_, spectrum_clock_, inputs, outputs, data);
   }
   if (params_.degeneracy_floor_mode != fast_lio::FloorMode::kOff) {
-    prepareFloor(scratch_, params_, outputs);
+    prepareFloor(scratch_, outputs);
     applyFloorRows(data, scratch_.floor_weights, scratch_.floor_cov, outputs.iterations);
   }
   if (outputs.dump_scan_active && outputs.dump_rows.is_open()) {
-    writeDump(scratch_, telemetry_, inputs, outputs, state, searching, hold_up, hold_rows, data);
+    writeDump(scratch_, telemetry_, inputs, outputs, state, searching, up_body, data);
   }
 
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterHModelMatrices)
     fast_lio_test::afterHModelMatrices(inputs.scan_end_time, data.valid, data.h_x, data.h);
   if (fast_lio_test::afterHModelExit)
-    fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(telemetry_, inputs, outputs, data.valid, hold_rows));
+    fast_lio_test::afterHModelExit(fast_lio_test::hModelExit(telemetry_, inputs, outputs, data.valid));
 #endif
   telemetry_.solve_time += omp_get_wtime() - solve_start_;
 }

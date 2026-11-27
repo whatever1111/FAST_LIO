@@ -136,7 +136,6 @@ def test_real_scans_idle_duplicate_rollback_restart():
             "preprocess.lidar_type": "3",
             "preprocess.timestamp_unit": "3",
             "point_filter_num": "1",
-            "feature_extract_enable": "false",
             "filter_size_surf": "0.001",
             "filter_size_map": "0.05",
             "imu_init_require_still": "false",

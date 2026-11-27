@@ -109,7 +109,7 @@ TEST(InitialPose, ShortVectorIsRejected)
 {
   for (std::size_t n = 0; n < kInitialPoseSize; ++n) {
     const std::vector<double> v(n, 1.0);
-    EXPECT_FALSE(resolveInitialPose(v, false, 0.0, 0.0).valid) << "size " << n;
+    EXPECT_FALSE(resolveInitialPose(v, 0.0, 0.0).valid) << "size " << n;
   }
 }
 
@@ -117,18 +117,17 @@ TEST(InitialPose, NonFiniteComponentIsRejected)
 {
   std::vector<double> v = {1.0, 2.0, 3.0, 0.0, 0.0, 90.0};
   v[4] = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_FALSE(resolveInitialPose(v, true, 0.0, 0.0).valid);
+  EXPECT_FALSE(resolveInitialPose(v, 0.0, 0.0).valid);
 }
 
-TEST(InitialPose, DefaultKeepsGravityRollPitchAndTakesYaw)
+TEST(InitialPose, KeepsGravityRollPitchAndTakesYaw)
 {
-  // The vector asks for 30° roll; gravity says 2°. Default must keep gravity's.
+  // The vector asks for 30° roll; gravity says 2°. Gravity's is kept.
   const std::vector<double> v = {1.0, 2.0, 3.0, 30.0, -20.0, 90.0};
   const double grav_roll = 2.0 * kDegToRad;
   const double grav_pitch = -1.0 * kDegToRad;
-  const auto out = resolveInitialPose(v, false, grav_roll, grav_pitch);
+  const auto out = resolveInitialPose(v, grav_roll, grav_pitch);
   ASSERT_TRUE(out.valid);
-  EXPECT_TRUE(out.kept_gravity_rp);
   EXPECT_NEAR(out.applied_roll_rad, grav_roll, kTol);
   EXPECT_NEAR(out.applied_pitch_rad, grav_pitch, kTol);
   EXPECT_NEAR(out.applied_yaw_rad, 90.0 * kDegToRad, kTol);
@@ -136,20 +135,10 @@ TEST(InitialPose, DefaultKeepsGravityRollPitchAndTakesYaw)
   EXPECT_NEAR(out.position.z(), 3.0, kTol);
 }
 
-TEST(InitialPose, OverrideTakesRollPitchFromTheVector)
-{
-  const std::vector<double> v = {0.0, 0.0, 0.0, 30.0, -20.0, 45.0};
-  const auto out = resolveInitialPose(v, true, 2.0 * kDegToRad, -1.0 * kDegToRad);
-  ASSERT_TRUE(out.valid);
-  EXPECT_FALSE(out.kept_gravity_rp);
-  EXPECT_NEAR(out.applied_roll_rad, 30.0 * kDegToRad, kTol);
-  EXPECT_NEAR(out.applied_pitch_rad, -20.0 * kDegToRad, kTol);
-}
-
 TEST(InitialPose, YawOnlyPoseRotatesTheXAxisIntoY)
 {
   const std::vector<double> v = {0.0, 0.0, 0.0, 0.0, 0.0, 90.0};
-  const auto out = resolveInitialPose(v, false, 0.0, 0.0);
+  const auto out = resolveInitialPose(v, 0.0, 0.0);
   ASSERT_TRUE(out.valid);
   const Eigen::Vector3d x_world = out.orientation * Eigen::Vector3d::UnitX();
   EXPECT_NEAR(x_world.x(), 0.0, 1e-9);
@@ -160,7 +149,7 @@ TEST(InitialPose, YawOnlyPoseRotatesTheXAxisIntoY)
 TEST(InitialPose, IdentityVectorGivesIdentityRotation)
 {
   const std::vector<double> v(kInitialPoseSize, 0.0);
-  const auto out = resolveInitialPose(v, true, 0.0, 0.0);
+  const auto out = resolveInitialPose(v, 0.0, 0.0);
   ASSERT_TRUE(out.valid);
   EXPECT_NEAR(out.orientation.angularDistance(Eigen::Quaterniond::Identity()), 0.0, 1e-12);
 }
@@ -170,8 +159,8 @@ TEST(InitialPose, CompositionIsYawTimesPitchTimesRoll)
   // Guards the intrinsic Z-Y-X order the filter's own state expects: composing the same
   // angles the other way round gives a different attitude, and a wrong one here silently
   // tilts every body-to-world transform of the prior map.
-  const std::vector<double> v = {0.0, 0.0, 0.0, 10.0, 20.0, 30.0};
-  const auto out = resolveInitialPose(v, true, 0.0, 0.0);
+  const std::vector<double> v = {0.0, 0.0, 0.0, 0.0, 0.0, 30.0};
+  const auto out = resolveInitialPose(v, 10.0 * kDegToRad, 20.0 * kDegToRad);
   ASSERT_TRUE(out.valid);
   const Eigen::Quaterniond expected(Eigen::AngleAxisd(30.0 * kDegToRad, Eigen::Vector3d::UnitZ()) *
                                     Eigen::AngleAxisd(20.0 * kDegToRad, Eigen::Vector3d::UnitY()) *

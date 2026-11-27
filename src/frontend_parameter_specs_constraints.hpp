@@ -27,11 +27,8 @@ struct ConstraintParameterSpecs
   const ParameterSpec<double> gravity_align_mag_ref{"gravity_align_mag_ref", 0.0, 0.0};
   const ParameterSpec<double> gravity_align_grav_leak{"gravity_align_grav_leak", 1.0, 1.0};
   const ParameterSpec<double> gravity_align_grav_cap_deg{"gravity_align_grav_cap_deg", 3.0, 3.0};
-  const ParameterSpec<bool> gravity_align_grav_freeze_degraded{"gravity_align_grav_freeze_degraded", false, false};
   const ParameterSpec<bool> gravity_align_lin_accel_comp{"gravity_align_lin_accel_comp", false, false};
   const ParameterSpec<double> gravity_align_vel_sigma_scale{"gravity_align_vel_sigma_scale", 0.0, 0.0};
-  const ParameterSpec<std::string> gravity_align_lin_accel_source{
-    "gravity_align_lin_accel_source", "leg", std::string("leg")};
   const ParameterSpec<bool> gravity_align_withhold_blind_moving{"gravity_align_withhold_blind_moving", false, false};
   const ParameterSpec<std::string> gravity_align_sigma_policy{
     "gravity_align_sigma_policy", "scene", std::string("scene")};

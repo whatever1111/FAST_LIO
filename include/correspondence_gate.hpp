@@ -87,28 +87,6 @@ inline double gateSigma(double variance, double scan_sigma_floor)
   return std::max(std::sqrt(variance), std::isfinite(scan_sigma_floor) ? std::max(scan_sigma_floor, 0.0) : 0.0);
 }
 
-/// Geman-McClure and Cauchy weights on a residual with kernel scale c (IRLS weights on the squared
-/// residual: GM (c²/(c²+r²))², Cauchy 1/(1+(r/c)²); the caller scales the measurement row and residual
-/// by sqrt(w)). 1 for c <= 0 or bad input.
-inline double gemanMcClureWeight(double residual, double c)
-{
-  if (!(c > 0.0) || !std::isfinite(residual) || !std::isfinite(c)) {
-    return 1.0;
-  }
-  const double c2 = c * c;
-  const double w = c2 / (c2 + residual * residual);
-  return w * w;
-}
-
-inline double cauchyWeight(double residual, double c)
-{
-  if (!(c > 0.0) || !std::isfinite(residual) || !std::isfinite(c)) {
-    return 1.0;
-  }
-  const double r = residual / c;
-  return 1.0 / (1.0 + r * r);
-}
-
 /// Predicted variance of one point-to-plane residual (m²): H P Hᵀ + R with H = [n_world; A_body],
 /// P6 the prior covariance over [pos(3), rot(3)] and point_cov the per-point measurement variance.
 /// Returns a non-finite value for non-finite inputs so the caller's test rejects.

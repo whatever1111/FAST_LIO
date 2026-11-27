@@ -24,7 +24,6 @@ struct InputParameterSpecs
     "common.imu_input_type", "sensor_msgs", std::string("sensor_msgs")};
   const ParameterSpec<std::string> common_imu_bias_topic{
     "common.imu_bias_topic", "/fixposition/fpa/imubias", std::string("/fixposition/fpa/imubias")};
-  const ParameterSpec<bool> common_time_sync_en{"common.time_sync_en", false, false};
   const ParameterSpec<double> common_time_offset_lidar_to_imu{"common.time_offset_lidar_to_imu", 0.0, 0.0};
   const ParameterSpec<double> common_imu_time_offset{"common.imu_time_offset", 0.0, 0.0};
   const ParameterSpec<double> preprocess_blind{"preprocess.blind", 0.01, 0.01};
@@ -34,6 +33,5 @@ struct InputParameterSpecs
   const ParameterSpec<int> preprocess_scan_rate{"preprocess.scan_rate", 10, 10};
   const ParameterSpec<double> preprocess_max_scan_duration_s{"preprocess.max_scan_duration_s", 0.0, 0.0};
   const ParameterSpec<int> point_filter_num{"point_filter_num", 2, 2};
-  const ParameterSpec<bool> feature_extract_enable{"feature_extract_enable", false, false};
 };
 }  // namespace fast_lio

@@ -6,10 +6,10 @@
 
 namespace fast_lio
 {
-/// The lidar measurement update: iterations, the normal-noise floor, attitude hold, correspondence gating and kernels,
-/// canopy and ground recovery, nearest-neighbour refresh. One spec per parameter, in declaration order, named after the
-/// parameter with '.' written '_'. FrontendParameters declares and reads them in the constructor's original order, not
-/// domain by domain.
+/// The lidar measurement update: iterations, the normal-noise floor, correspondence gating, the roll/pitch consider
+/// rule, canopy and ground recovery, nearest-neighbour refresh. One spec per parameter, in declaration order, named
+/// after the parameter with '.' written '_'. FrontendParameters declares and reads them in the constructor's original
+/// order, not domain by domain.
 struct MeasurementParameterSpecs
 {
   const ParameterSpec<int> max_iteration{"max_iteration", 4, 4};
@@ -24,20 +24,10 @@ struct MeasurementParameterSpecs
   const ParameterSpec<double> degeneracy_floor_rel_uncertainty{"degeneracy_floor_rel_uncertainty", 0.3, 0.3};
   // Regularisation of the Schur complement the floor judges, relative to trace(H_rr)/3.
   const ParameterSpec<double> degeneracy_schur_ridge{"degeneracy_schur_ridge", 1e-6, 1e-6};
-  const ParameterSpec<bool> lidar_attitude_hold_en{"lidar_attitude_hold_en", false, false};
   const ParameterSpec<double> corr_innov_gate_k{"corr_innov_gate_k", 0.0, 0.0};
   const ParameterSpec<double> corr_nn0_max{"corr_nn0_max", 0.0, 0.0};
   const ParameterSpec<double> corr_gate_mad_scale{"corr_gate_mad_scale", 0.0, 0.0};
   const ParameterSpec<double> corr_gate_rot_sigma_floor_deg{"corr_gate_rot_sigma_floor_deg", 0.0, 0.0};
-  const ParameterSpec<std::string> corr_kernel{"corr_kernel", "none", std::string("none")};
-  const ParameterSpec<double> corr_kernel_mad_scale{"corr_kernel_mad_scale", 3.0, 3.0};
-  const ParameterSpec<double> corr_kernel_min_scale{"corr_kernel_min_scale", 0.03, 0.03};
-  const ParameterSpec<double> lidar_attitude_hold_far_frac{"lidar_attitude_hold_far_frac", 0.0, 0.0};
-  const ParameterSpec<int> lidar_attitude_hold_min_effct{"lidar_attitude_hold_min_effct", 100, 100};
-  const ParameterSpec<double> lidar_attitude_hold_max_s{"lidar_attitude_hold_max_s", 3.0, 3.0};
-  const ParameterSpec<double> lidar_attitude_hold_max_scan_gap_s{"lidar_attitude_hold_max_scan_gap_s", 0.3, 0.3};
-  const ParameterSpec<double> lidar_attitude_hold_min_rp_info{"lidar_attitude_hold_min_rp_info", 0.0, 0.0};
-  const ParameterSpec<double> lidar_attitude_hold_z_weak{"lidar_attitude_hold_z_weak", 0.9, 0.9};
   const ParameterSpec<bool> lidar_consider_rp_en{"lidar_consider_rp_en", false, false};
   const ParameterSpec<bool> lidar_consider_rp_while_engulfed{"lidar_consider_rp_while_engulfed", true, true};
   const ParameterSpec<double> lidar_consider_rp_post_release_s{"lidar_consider_rp_post_release_s", 0.0, 0.0};

@@ -3,10 +3,10 @@
 Inputs and goldens of the two contract fixtures of the legacy front-end node (laserMapping S0):
 
 - `test/test_frontend_parameter_contract_node.cpp`: what the node does with its parameters: the declared
-  defaults, the platform profiles (this package's own files and the parent repository's merged profiles), the
-  deprecated alias, type errors, vector lengths, NaN and Inf, prior-map settings, the read-only descriptor, typed
-  outputs with their configuration ID, the attitude hold alone and with online extrinsic estimation, two invalid
-  values at once, the entry checks of the normal-noise floor and of the wheel measurement model, the floor in
+  defaults, the platform profiles (this package's own files and the parent repository's merged profiles), type
+  errors, vector lengths, NaN and Inf, prior-map settings, the read-only descriptor, typed outputs with their
+  configuration ID, two invalid values at once, the entry checks of the normal-noise floor and of the wheel
+  measurement model, the floor in
   observe mode, and the wheel update with its variance topic. Per case it records the configuration
   (profile path and sha256, every override), whether construction returned or threw (type and text), what
   construction logged at INFO and above with the constructor's stage boundaries between those lines (`event.v1`),
@@ -23,19 +23,18 @@ Inputs and goldens of the two contract fixtures of the legacy front-end node (la
   and covariance after each lidar update (`filter_update.v1`) and the IMU samples an empty scan leaves queued
   (`imu_retain.v1`); the typed scenario records both typed outputs, field by field, with a fixed instance and a
   fixed repeat clock. The scenarios set `mapping.extrinsic_est_en` to true, which is off by default, so the recorded
-  Jacobian keeps its extrinsic columns; `h_attitude_hold`, `h_extrinsic_off` and `h_m20` set it false.
+  Jacobian keeps its extrinsic columns; `h_extrinsic_off` and `h_m20` set it false.
   The measurement scenarios (`h_*`, laserMapping S2) turn on the H-model branches the default configuration leaves
   off, each on a synthetic scene that reaches it (three tilted walls, near ground with clutter, a corridor with a
   patch across its end): the correspondence gate's innovation test (`h_gate_innov`) and nearest-neighbour bound
-  (`h_gate_nn0`), the Geman-McClure and Cauchy kernels (`h_kernel_gm`, `h_kernel_cauchy`), the neighbour refresh
-  gate's skip and the reuse of the cached planes (`h_nn_refresh`), the ground recovery with sector and whole-scan
-  planes (`h_ground_recovery`), the normal-noise floor applied to the Schur complement with its diagnostics
-  (`h_degeneracy`), the attitude hold's scene and information rules (`h_attitude_hold`), online extrinsic
-  estimation on and off (`h_extrinsic_on`, `h_extrinsic_off`), the correspondence dump (`h_dump`) and the H-model
-  keys of the M20 profile with roll/pitch considered (`h_m20`). Every scenario records each H-model call's
-  correspondence selection (`h_select.v1`: the search decision, the gate, kernel and ground recovery counts, and
-  digests of the selection, the residuals and the rows) and its exit (`h_exit.v1`: position information, the
-  hold's verdicts, roll/pitch information and consideration, and in its `degeneracy_*` fields the normal-noise
+  (`h_gate_nn0`), the neighbour refresh gate's skip and the reuse of the cached planes (`h_nn_refresh`), the ground
+  recovery with sector and whole-scan planes (`h_ground_recovery`), the normal-noise floor applied to the Schur
+  complement with its diagnostics (`h_degeneracy`), online extrinsic estimation on and off (`h_extrinsic_on`,
+  `h_extrinsic_off`), the correspondence dump (`h_dump`) and the H-model keys of the M20 profile with roll/pitch
+  considered (`h_m20`). Every scenario records each H-model call's correspondence selection (`h_select.v1`: the
+  search decision, the gate and ground recovery counts, and digests of the selection, the residuals and the rows,
+  whose weights are all 1) and its exit (`h_exit.v1`: position information, the removed attitude hold's four fields
+  (0), roll/pitch information and consideration, and in its `degeneracy_*` fields the normal-noise
   floor's decision with the schema-2 meanings below, and since construction the transformed rows and their actual
   position-row norms); the dump scenario records
   its three files (`h_dump.v1`), which the test build writes to the scenario's result directory.

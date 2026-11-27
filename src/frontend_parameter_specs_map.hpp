@@ -56,17 +56,9 @@ struct MapParameterSpecs
   // Stop growing the map once a prior map is installed (pure localization). Without this
   // the map is neither: the prior owns its cells, live scans fill the gaps between them.
   const ParameterSpec<bool> prior_map_freeze{"prior_map_freeze", false, false};
+  // [x, y, z, roll°, pitch°, yaw°]: the position and yaw are injected, roll and pitch stay with the IMU's gravity
+  // alignment (prior_map_load.hpp resolveInitialPose).
   const ParameterSpec<std::vector<double>> initial_pose{"initial_pose", std::vector<double>(), std::vector<double>()};
-  // initial_pose_full_rpy_override:
-  //   false (default) — inject only XYZ + yaw from initial_pose; keep
-  //     roll/pitch from the IMU-derived gravity-aligned current state.
-  //   true            — fully overwrite roll/pitch from initial_pose. The
-  //     caller MUST guarantee these match gravity (accel along -Z),
-  //     otherwise point cloud transforms will be incorrect.
-  const ParameterSpec<bool> initial_pose_full_rpy_override{"initial_pose_full_rpy_override", false, false};
-  // Deprecated alias for initial_pose_full_rpy_override. Kept for
-  // backward compatibility; will emit a warning if set to true.
-  const ParameterSpec<bool> initial_pose_apply_roll_pitch{"initial_pose_apply_roll_pitch", false, false};
   // iVox map backend (option B; declared only by USE_IVOX builds). nearby_type MUST be >=18 (Phase-0: NEARBY6
   // inadequate). res=0.5 NN voxels give the best probe NN-agreement (99.9%, tightest normals); a GLOBAL fine-grid
   // dedup (= filter_size_map) keeps the map at ikd-Tree's 542k.

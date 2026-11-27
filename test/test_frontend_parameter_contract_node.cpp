@@ -1521,6 +1521,30 @@ TEST(FrontendParameterContract, NormalNoiseFloorKeysAreNotParameters)
   EXPECT_EQ(record.find("[FLOOR]"), std::string::npos) << record;
 }
 
+// The ground recovery is no part of the front end: none of its keys is a parameter, so overrides that ran it, as
+// giant_allpoint's profile did, construct the node without a parameter or an effective value of theirs.
+TEST(FrontendParameterContract, GroundRecoveryKeysAreNotParameters)
+{
+  const std::vector<rclcpp::Parameter> retired = {rclcpp::Parameter("ground_recover_en", true),
+                                                  rclcpp::Parameter("ground_recover_scan_band", 0.15),
+                                                  rclcpp::Parameter("ground_recover_min_inliers", 100),
+                                                  rclcpp::Parameter("ground_recover_max_residual", 1.0),
+                                                  rclcpp::Parameter("ground_recover_sector_tol", 0.25),
+                                                  rclcpp::Parameter("ground_recover_max_rows", 4000),
+                                                  rclcpp::Parameter("canopy_near_range", 20.0),
+                                                  rclcpp::Parameter("canopy_ground_z", -0.47),
+                                                  rclcpp::Parameter("canopy_ground_halfband", 0.8)};
+  ParameterCase c = overridesCase("ground_recovery_keys_not_parameters", Expect::kConstructed);
+  for (const auto & parameter : retired)
+    setOverride(c, parameter);
+  std::string record;
+  checkCase(c, &record);
+  for (const auto & parameter : retired) {
+    EXPECT_EQ(record.find("\nparam " + parameter.get_name() + " "), std::string::npos) << parameter.get_name();
+    EXPECT_TRUE(effectiveValue(record, parameter.get_name()).empty()) << parameter.get_name();
+  }
+}
+
 // The IMU initialisation always waits for the still window: neither key that turned it off is a parameter, so
 // overrides that would have construct the node without a parameter or an effective value of theirs, and the IMU
 // processing takes the window's defaults.

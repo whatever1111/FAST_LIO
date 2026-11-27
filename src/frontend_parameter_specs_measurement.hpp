@@ -7,7 +7,7 @@
 namespace fast_lio
 {
 /// The lidar measurement update: iterations, the degeneracy traces, correspondence gating, the roll/pitch consider
-/// rule, canopy and ground recovery, nearest-neighbour refresh. One spec per parameter, in declaration order, named
+/// rule, nearest-neighbour refresh. One spec per parameter, in declaration order, named
 /// after the parameter with '.' written '_'. FrontendParameters declares and reads them in the constructor's original
 /// order, not domain by domain.
 struct MeasurementParameterSpecs
@@ -27,15 +27,6 @@ struct MeasurementParameterSpecs
   const ParameterSpec<double> lidar_consider_rp_min_info{"lidar_consider_rp_min_info", 0.0, 0.0};
   const ParameterSpec<double> lidar_consider_rp_z_weak_min{"lidar_consider_rp_z_weak_min", 1.1, 1.1};
   const ParameterSpec<double> lidar_consider_rp_max_s{"lidar_consider_rp_max_s", 0.0, 0.0};
-  const ParameterSpec<double> canopy_near_range{"canopy_near_range", 20.0, 20.0};
-  const ParameterSpec<double> canopy_ground_z{"canopy_ground_z", -0.47, -0.47};
-  const ParameterSpec<double> canopy_ground_halfband{"canopy_ground_halfband", 0.8, 0.8};
-  const ParameterSpec<bool> ground_recover_en{"ground_recover_en", false, false};
-  const ParameterSpec<double> ground_recover_scan_band{"ground_recover_scan_band", 0.15, 0.15};
-  const ParameterSpec<int> ground_recover_min_inliers{"ground_recover_min_inliers", 100, 100};
-  const ParameterSpec<double> ground_recover_max_residual{"ground_recover_max_residual", 1.0, 1.0};
-  const ParameterSpec<double> ground_recover_sector_tol{"ground_recover_sector_tol", 0.25, 0.25};
-  const ParameterSpec<int> ground_recover_max_rows{"ground_recover_max_rows", 4000, 4000};
   const ParameterSpec<bool> nn_refresh_gate_en{"nn_refresh_gate_en", false, false};
   const ParameterSpec<double> nn_refresh_min_shift{"nn_refresh_min_shift", 0.0, 0.0};
   const ParameterSpec<double> nn_refresh_ref_range{"nn_refresh_ref_range", 20.0, 20.0};

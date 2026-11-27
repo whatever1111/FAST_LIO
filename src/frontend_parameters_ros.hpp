@@ -96,7 +96,6 @@ public:
                     RecoveryParams & recovery_params);
   void loadLostRecovery(const rclcpp::Node & node, double total_s, LostRecoveryParams & lost_recovery_params);
   void readRunaway(const rclcpp::Node & node, double zupt_wheel_max_age, double zupt_wheel_speed_thresh);
-  void readCanopyAndGround(const rclcpp::Node & node);
   void readDataPaths(const rclcpp::Node & node, std::string & map_file_path, std::string & root_dir);
   void readInputs(const rclcpp::Node & node,
                   FrontendStartup & startup,

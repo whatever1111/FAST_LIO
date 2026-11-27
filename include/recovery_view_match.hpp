@@ -12,8 +12,6 @@
 //   - with the correspondence gate on, its innovation and first-neighbour tests (correspondenceAdmitted)
 //     against the update's prior [pos, rot] covariance, floored as h_share_model floors it, and the scan's
 //     own robust residual scale.
-// h_share_model's ground recovery (ground_recover_en) re-admits rejected ground returns; it is not repeated
-// here, so with it on a scan counts fewer correspondences here than in the update.
 //
 // Pure C++ + Eigen. No ROS, no estimator types.
 

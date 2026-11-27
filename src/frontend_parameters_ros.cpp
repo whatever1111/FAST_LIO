@@ -189,7 +189,6 @@ void FrontendParameters::declareBack(rclcpp::Node & node)
 void FrontendParameters::declareRunawayToPreprocess(rclcpp::Node & node)
 {
   const RecoveryParameterSpecs recovery{};
-  const MeasurementParameterSpecs measurement{};
   const MapParameterSpecs map{};
   const DiagnosticsParameterSpecs diagnostics{};
   const InputParameterSpecs input{};
@@ -199,15 +198,6 @@ void FrontendParameters::declareRunawayToPreprocess(rclcpp::Node & node)
   declareOnly(node, recovery.runaway_hold_sec);
   declareOnly(node, recovery.runaway_on_trip);
   declareOnly(node, recovery.input_epoch_on_fault);
-  declareOnly(node, measurement.canopy_near_range);
-  declareOnly(node, measurement.canopy_ground_z);
-  declareOnly(node, measurement.canopy_ground_halfband);
-  declareOnly(node, measurement.ground_recover_en);
-  declareOnly(node, measurement.ground_recover_scan_band);
-  declareOnly(node, measurement.ground_recover_min_inliers);
-  declareOnly(node, measurement.ground_recover_max_residual);
-  declareOnly(node, measurement.ground_recover_sector_tol);
-  declareOnly(node, measurement.ground_recover_max_rows);
   declareOnly(node, map.map_file_path);
   declareOnly(node, diagnostics.data_dir);
   declareOnly(node, input.common_lid_topic);
@@ -597,20 +587,6 @@ void FrontendParameters::readRunaway(const rclcpp::Node & node,
   // 代理,拒止段整段读 0)否则会把正常行走判成跑飞。
   values_.runaway.wheel_moving_thresh = zupt_wheel_speed_thresh;
   readInto(node, recovery.divergence_guard_max_speed, values_.divergence_guard_max_speed);
-}
-
-void FrontendParameters::readCanopyAndGround(const rclcpp::Node & node)
-{
-  const MeasurementParameterSpecs measurement{};
-  readInto(node, measurement.canopy_near_range, values_.canopy_near_range);
-  readInto(node, measurement.canopy_ground_z, values_.canopy_ground_z);
-  readInto(node, measurement.canopy_ground_halfband, values_.canopy_ground_halfband);
-  readInto(node, measurement.ground_recover_en, values_.ground_recover_en);
-  readInto(node, measurement.ground_recover_scan_band, values_.ground_recover_scan_band);
-  readInto(node, measurement.ground_recover_min_inliers, values_.ground_recover_min_inliers);
-  readInto(node, measurement.ground_recover_max_residual, values_.ground_recover_max_residual);
-  readInto(node, measurement.ground_recover_sector_tol, values_.ground_recover_sector_tol);
-  readInto(node, measurement.ground_recover_max_rows, values_.ground_recover_max_rows);
 }
 
 void FrontendParameters::readDataPaths(const rclcpp::Node & node, std::string & map_file_path, std::string & root_dir)

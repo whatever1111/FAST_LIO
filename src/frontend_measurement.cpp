@@ -17,7 +17,6 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
-#include <limits>
 #include <omp.h>
 #include <so3_math.h>
 #include <vector>
@@ -57,7 +56,6 @@ static void reportHModelSelection(const fast_lio::MeasurementScratch & scratch,
   selection.residuals = scratch.res_last.data();
   selection.gate_rejected = telemetry.corr_gate_rejected.load(std::memory_order_relaxed);
   selection.gate_scan_sigma = telemetry.corr_gate_scan_sigma;
-  selection.ground_rows = telemetry.canopy_ground_recovered;
   selection.rows.resize(static_cast<std::size_t>(std::max(outputs.effective_rows, 0)));
   for (std::size_t i = 0; i < selection.rows.size(); ++i) {
     const PointType & point = scratch.laserCloudOri.points[i];
@@ -100,8 +98,6 @@ static HModelExit hModelExit(const fast_lio::MeasurementTelemetry & telemetry,
 
 namespace
 {
-// Sectors of the ground-recovery planes.
-constexpr int kGndSectors = fast_lio::MeasurementScratch::kGndSectors;
 // Upper body-range edges of the [RES] residual bins (m).
 constexpr int kResBins = fast_lio::MeasurementTelemetry::kResBins;
 constexpr double kResBinEdges[kResBins] = {2.0, 5.0, 10.0, 20.0, 40.0, 1e9};
@@ -222,7 +218,7 @@ void matchPoints(fast_lio::MeasurementScratch & scratch,
     }
 
     // Per-iteration selection is independent of the cached neighbours. A row
-    // rejected by residual/innovation/ground gates can recover at the new pose.
+    // rejected by the residual or innovation gate can recover at the new pose.
     scratch.point_selected_surf[i] = false;
     if (!cached_plane.valid())
       continue;
@@ -291,236 +287,6 @@ void applyGate(fast_lio::MeasurementScratch & scratch,
       scratch.point_selected_surf[i] = false;
       telemetry.corr_gate_rejected.fetch_add(1, std::memory_order_relaxed);
     }
-  }
-}
-
-// Shrinking-band iterative LS over one or more candidate sets.
-// Gates: enough support, near-horizontal (terrain + vehicle tilt stay
-// within a few degrees), sane height under the sensor. The height gate
-// is what makes always-on safe: the accepted surface must sit where
-// the vehicle's own ground sits.
-bool fitGround(fast_lio::MeasurementScratch & scratch,
-               const fast_lio::FrontendParams & params,
-               const std::vector<Eigen::Vector3d> * sets,
-               int nsets,
-               int min_in,
-               Eigen::Vector3d & n_out,
-               double & d_out)
-{
-  std::vector<float> & zs = scratch.zs;
-  zs.clear();
-  for (int k = 0; k < nsets; k++)
-    for (const auto & p : sets[k])
-      zs.push_back(static_cast<float>(p.z()));
-  if (static_cast<int>(zs.size()) < min_in)
-    return false;
-  // Init: horizontal plane at the pooled median candidate height.
-  std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
-  Eigen::Vector3d n(0, 0, 1);
-  double d = -static_cast<double>(zs[zs.size() / 2]);
-  int n_in = 0;
-  const double bands[3] = {0.4, 0.25, 0.15};
-  for (double band : bands) {
-    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-    n_in = 0;
-    for (int k = 0; k < nsets; k++)
-      for (const auto & p : sets[k])
-        if (std::fabs(n.dot(p) + d) <= band) {
-          mean += p;
-          ++n_in;
-        }
-    if (n_in < min_in)
-      break;
-    mean /= n_in;
-    for (int k = 0; k < nsets; k++)
-      for (const auto & p : sets[k])
-        if (std::fabs(n.dot(p) + d) <= band) {
-          const Eigen::Vector3d q = p - mean;
-          cov.noalias() += q * q.transpose();
-        }
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
-    n = es.eigenvectors().col(0);
-    if (n.z() < 0)
-      n = -n;
-    d = -n.dot(mean);
-  }
-  n_out = n;
-  d_out = d;
-  return n_in >= min_in && n.z() >= 0.95 &&
-         std::fabs(-d / std::max(n.z(), 1e-6) - params.canopy_ground_z) <= params.canopy_ground_halfband;
-}
-
-void fitGroundSectors(fast_lio::MeasurementScratch & scratch,
-                      const fast_lio::FrontendParams & params,
-                      const fast_lio::MeasurementInputs & inputs)
-{
-  auto & cand = scratch.cand;
-  for (int s = 0; s < kGndSectors; s++) {
-    cand[s].clear();
-    scratch.sec_ok[s] = false;
-  }
-  for (int i = 0; i < inputs.point_count; i++) {
-    const PointType & pb = inputs.body.points[i];
-    if (std::hypot(pb.x, pb.y) > params.canopy_near_range)
-      continue;
-    if (std::fabs(pb.z - params.canopy_ground_z) > params.canopy_ground_halfband)
-      continue;
-    const int s =
-      std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
-    cand[s].emplace_back(pb.x, pb.y, pb.z);
-  }
-  // Global whole-scan fit: pooled support is the hardest to bias — the
-  // prior every sector must agree with, and the fallback plane.
-  Eigen::Vector3d gn(0, 0, 1);
-  double gd = 0.0;
-  const bool glob_ok = fitGround(scratch, params, cand, kGndSectors, params.ground_recover_min_inliers, gn, gd);
-  for (int s = 0; s < kGndSectors; s++) {
-    Eigen::Vector3d n;
-    double d;
-    bool own_ok = fitGround(scratch, params, &cand[s], 1, params.ground_recover_min_inliers, n, d);
-    if (own_ok && glob_ok) {
-      // A sector plane may only REFINE the global one: normals must
-      // agree and the plane heights at the sector centroid must match
-      // within ground_recover_sector_tol; otherwise the sector fit
-      // latched onto something the pooled fit rejected.
-      Eigen::Vector3d c = Eigen::Vector3d::Zero();
-      for (const auto & p : cand[s])
-        c += p;
-      c /= static_cast<double>(cand[s].size());
-      const double z_sec = -(d + n.x() * c.x() + n.y() * c.y()) / std::max(n.z(), 1e-6);
-      const double z_glob = -(gd + gn.x() * c.x() + gn.y() * c.y()) / std::max(gn.z(), 1e-6);
-      constexpr double kSectorNormalDotMin = 0.985;  // ~10 deg relative tilt
-      own_ok = n.dot(gn) >= kSectorNormalDotMin && std::fabs(z_sec - z_glob) <= params.ground_recover_sector_tol;
-    }
-    if (own_ok) {
-      scratch.sec_ok[s] = true;
-      scratch.sec_n[s] = n;
-      scratch.sec_d[s] = d;
-    } else if (glob_ok) {
-      scratch.sec_ok[s] = true;
-      scratch.sec_n[s] = gn;
-      scratch.sec_d[s] = gd;
-    }
-  }
-}
-
-void recoverGroundRows(fast_lio::MeasurementScratch & scratch,
-                       fast_lio::MeasurementTelemetry & telemetry,
-                       const fast_lio::FrontendParams & params,
-                       const fast_lio::MeasurementInputs & inputs)
-{
-  for (int i = 0; i < inputs.point_count; i++) {
-    if (scratch.point_selected_surf[i])
-      continue;
-    if (telemetry.canopy_ground_recovered >= params.ground_recover_max_rows)
-      break;
-    const PointType & pb = inputs.body.points[i];
-    if (std::hypot(pb.x, pb.y) > params.canopy_near_range)
-      continue;
-    const int s =
-      std::min(kGndSectors - 1, static_cast<int>((std::atan2(pb.y, pb.x) + M_PI) * kGndSectors / (2.0 * M_PI)));
-    if (!scratch.sec_ok[s])
-      continue;
-    // Scan side: on this sector's ground plane (clutter trimmed by the fit band).
-    if (std::fabs(scratch.sec_n[s].dot(Eigen::Vector3d(pb.x, pb.y, pb.z)) + scratch.sec_d[s]) >
-        params.ground_recover_scan_band)
-      continue;
-    auto & pn = scratch.Nearest_Points[i];
-    if (static_cast<int>(pn.size()) < NUM_MATCH_POINTS)
-      continue;
-    const PointType & pw = inputs.world.points[i];
-    // Map neighborhood must actually be nearby (same criterion class as
-    // the normal path's 5th-neighbor sqdist gate).
-    const double dx0 = pn[0].x - pw.x, dy0 = pn[0].y - pw.y, dz0 = pn[0].z - pw.z;
-    if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 > 5.0)
-      continue;
-    // Residual reference: the map-neighbour lower envelope (mean of the two
-    // lowest z — robust to clutter fuzz in the map). It DRIFTS with the
-    // vehicle, so this channel slows the Z ratchet, it does not anchor it.
-    // An absolute reference was tried and closed: every level of authority
-    // strong enough to matter rerouted the error into another channel
-    // (attitude torque in degenerate clutter, or an inconsistent
-    // measurement model when the attitude columns were zeroed). Fix the
-    // constraint set instead of injecting absolute Z here.
-    const double w_row = 1.0;
-    float z1 = pn[0].z, z2 = std::numeric_limits<float>::max();
-    for (size_t k = 1; k < pn.size(); k++) {
-      const float z = pn[k].z;
-      if (z < z1) {
-        z2 = z1;
-        z1 = z;
-      } else if (z < z2) {
-        z2 = z;
-      }
-    }
-    const double z_ground_map = 0.5 * (z1 + (z2 == std::numeric_limits<float>::max() ? z1 : z2));
-    const double pd2 = pw.z - z_ground_map;
-    if (std::fabs(pd2) > params.ground_recover_max_residual)
-      continue;
-    scratch.point_selected_surf[i] = true;
-    scratch.normvec.points[i].x = 0.0f;
-    scratch.normvec.points[i].y = 0.0f;
-    // Row weight rides on the normal + residual scaling (information
-    // scales as w_row^2 in the point-to-plane H) — same mechanism as an
-    // ordinary row, no new plumbing.
-    scratch.normvec.points[i].z = static_cast<float>(w_row);
-    scratch.normvec.points[i].intensity = static_cast<float>(w_row * pd2);
-    scratch.res_last[i] = std::fabs(pd2);
-    ++telemetry.canopy_ground_recovered;
-  }
-}
-
-// P2 VoxelMap-lite anisotropic deweight (see the flag's block comment).
-// Runs on the ACCEPTED rows BEFORE ground recovery, so recovery rows (added
-// below with fabricated vertical normals — the load-bearing counterweight)
-// are never rescaled. esti_plane rewrites the organic normals every iEKF
-// iteration, so the scaling is applied fresh each call — no compounding.
-// The grid is only written from the main thread between scans; this pass
-// is read-only and safe under OMP.
-
-/*** Ground recovery (selection-layer repair, 2026-07-06 forensics): ANY
- *   ground-hugging clutter (grass, crops, debris — content-agnostic) pollutes
- *   the 5-NN esti_plane + s>0.9 gates: true-ground returns get REJECTED while
- *   clutter micro-patches get accepted, depleting the vertical-normal share of
- *   the effective set even though the raw scan-to-scan Z valley stays sharp
- *   (measured: raw ground 62-70 % → ~10 % effective on the giant 0702 bag).
- *   Repair at the same layer, SELF-GATED (no scene classifier): (1) fit robust
- *   ground planes HYBRID global+sector in the body frame (shrinking-band LS —
- *   anything above the dominant surface is trimmed regardless of what it is).
- *   The whole-scan GLOBAL fit pools every candidate: maximum support, hardest
- *   to bias (in deep clutter a per-sector fit can latch onto a locally
- *   consistent clutter shelf that the pooled fit rejects — measured: sector-
- *   only was ~2x weaker than whole-scan in the 0702 canopy). Per-SECTOR fits
- *   refine it for crowned/rutted/partially-occupied terrain, but a sector
- *   plane is used only where it AGREES with the global plane (normal dot +
- *   height at the sector centroid); a sector that fails its own gates or
- *   disagrees falls back to the global plane, and without a valid global fit
- *   the surviving sector fits stand alone. The height-sanity gate (plane at
- *   the known sensor mount height) guarantees the dominant surface IS what
- *   the vehicle stands on, without scene semantics.
- *   (2) re-admit rejected near-field returns lying on their sector's plane,
- *   with an imposed vertical world normal and the residual measured against
- *   the LOWER ENVELOPE of their map neighbors (mean of the two lowest z —
- *   robust to clutter fuzz in the map). Rows flow into the standard
- *   point-to-plane H. Only points the normal path rejected are touched.
- *   NOTE: distinct from the removed A'-3 boost, which amplified already-
- *   matched rows (NEGATIVE result); this restores SELECTION of discarded
- *   true ground. ***/
-void recoverGround(fast_lio::MeasurementScratch & scratch,
-                   fast_lio::MeasurementTelemetry & telemetry,
-                   const fast_lio::FrontendParams & params,
-                   const fast_lio::MeasurementInputs & inputs)
-{
-  telemetry.canopy_ground_recovered = 0;
-  if (params.ground_recover_en) {
-    // Per-sector ground planes, cached per scan (body cloud is fixed across
-    // iEKF iterations). n·p + d = 0 with unit n, n_z > 0.
-    if (inputs.scan_end_time != scratch.fit_time) {
-      scratch.fit_time = inputs.scan_end_time;
-      fitGroundSectors(scratch, params, inputs);
-    }
-    recoverGroundRows(scratch, telemetry, params, inputs);
   }
 }
 
@@ -809,7 +575,6 @@ void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state,
   prepareIdentities(scratch_, inputs);
   matchPoints(scratch_, params_, inputs, state, searching, gate_on, gate_P6);
   applyGate(scratch_, telemetry_, params_, inputs, gate_on);
-  recoverGround(scratch_, telemetry_, params_, inputs);
   compactRows(scratch_, telemetry_, inputs, outputs);
 
 #ifdef FASTLIO_TEST_HOOKS

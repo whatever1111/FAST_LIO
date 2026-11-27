@@ -838,9 +838,7 @@ std::vector<Point3> scenePoints(Cloud kind, std::int64_t seed, bool outliers)
     for (const auto & wall : kRoomWalls)
       appendPatch(out, wall, seed, outliers);
   } else if (kind == Cloud::kGround) {
-    // Rings 1-5 m out, a point every 0.25 m along each. The two angular sectors of the quadrant x < 0 <= y have too
-    // few ground candidates for a fit of their own and take the whole scan's ground plane; the other six fit their
-    // own.
+    // Rings 1-5 m out, a point every 0.25 m along each; in the quadrant x < 0 <= y only every third ring.
     for (int ring = 0; ring <= 16; ++ring) {
       const double radius = 1.0 + 0.25 * ring;
       const int count = static_cast<int>(std::lround(2.0 * kPi * radius / 0.25));
@@ -1280,18 +1278,16 @@ Scenario refreshScenario()
   return s;
 }
 
-// The ground recovery (ground_recover_en): the plane test refuses ground points whose neighbourhood holds clutter, and
-// the recovery adds them back as rows against the ground fitted in their sector (the whole scan's ground in the two
-// sparse sectors).
+// Near ground with clutter, with the keys of the removed ground recovery set as they ran it: the plane test refuses
+// ground points whose neighbourhood holds clutter, and nothing adds them back.
 Scenario groundScenario()
 {
-  Scenario s = measurementScenario("h_ground_recovery", Cloud::kGround);
+  Scenario s = measurementScenario("h_ground_scene", Cloud::kGround);
   setParam(s, rclcpp::Parameter("ground_recover_en", true));
   setParam(s, rclcpp::Parameter("canopy_ground_z", kGroundZ));
   setParam(s, rclcpp::Parameter("canopy_ground_halfband", 0.6));
   setParam(s, rclcpp::Parameter("ground_recover_min_inliers", 75));
   append(s, 8, sceneSlot(Cloud::kGround));
-  s.claims = {"h_ground_rows"};
   return s;
 }
 
@@ -1441,7 +1437,10 @@ constexpr Branch kBranches[] = {
   {"h_nn_reuse",
    "H-model calls that kept the cached planes because the filter asked for no search (an unconverged iteration)",
    "test_cached_plane CachedPlane.*"},
-  {"h_ground_rows", "H-model calls to which the ground recovery added rows (ground_recover_en)", ""},
+  {"h_vertical_rows",
+   "H-model rows whose world normal is exactly (0, 0, 1), the normal the removed ground recovery imposed; a plane "
+   "fitted to noisy points does not give it",
+   ""},
   {"h_rp_consider",
    "H-model calls with rows on scans whose update leaves roll/pitch to the gyro (lidar_consider_rp_en)",
    "test_rp_consider ConsiderPolicy.*; test_rp_consider ConsiderInformation.*; "
@@ -1790,8 +1789,9 @@ private:
         ++counts_["h_nn_skip"];
       if (!s.search_requested)
         ++counts_["h_nn_reuse"];
-      if (s.ground_rows > 0)
-        ++counts_["h_ground_rows"];
+      for (const auto & row : s.rows)
+        if (row.normal[0] == 0.0f && row.normal[1] == 0.0f && row.normal[2] == 1.0f)
+          ++counts_["h_vertical_rows"];
     };
     fast_lio_test::afterHModelIdentities =
       [this](double end,
@@ -3128,9 +3128,14 @@ TEST(FrontendPipelineContract, MeasurementNeighbourRefresh)
   checkScenario(refreshScenario());
 }
 
-TEST(FrontendPipelineContract, MeasurementGroundRecovery)
+// The ground recovery is gone: on the ground scene the H-model takes rows, and none of them carries the vertical world
+// normal the recovery imposed on the ground points it re-admitted.
+TEST(FrontendPipelineContract, GroundSceneRowsKeepTheirFittedNormals)
 {
-  checkScenario(groundScenario());
+  const ChildRun run = runScenario(groundScenario());
+  ASSERT_TRUE(run.ok()) << run.describe();
+  EXPECT_GT(run.count("h_matrix_values"), 0u);
+  EXPECT_EQ(run.count("h_vertical_rows"), 0u);
 }
 
 TEST(FrontendPipelineContract, MeasurementExtrinsicEstimationOn)

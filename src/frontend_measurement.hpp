@@ -80,26 +80,16 @@ struct MeasurementTelemetry
   // evaluation (only while the node's degeneracy_debug is on).
   int res_bin_n[kResBins] = {0};
   double res_bin_ss[kResBins] = {0.0};
-  int canopy_ground_recovered = 0;  // rows the ground recovery added on the last evaluation
   // Neighbour refresh (FrontendParams::nn_refresh_gate_en is the policy) over the scan: the largest would-be refresh
   // shift (m) and the searches the gate skipped.
   double nn_max_shift = 0.0;
   int nn_skips = 0;
 };
 
-/// What the evaluations keep for each other: the per-point correspondence storage, the neighbour cache and the
-/// ground-plane cache. Only the measurement model reads it.
+/// What the evaluations keep for each other: the per-point correspondence storage and the neighbour cache. Only the
+/// measurement model reads it.
 struct MeasurementScratch
 {
-  /// Sectors of the ground-recovery planes.
-  static constexpr int kGndSectors = 8;
-
-  MeasurementScratch()
-  {
-    for (Eigen::Vector3d & normal : sec_n)
-      normal.setZero();
-  }
-
   // Per point of the downsampled scan, sized before the parallel loops, which only index them.
   std::vector<float> res_last;
   std::vector<std::uint8_t> point_selected_surf;
@@ -119,14 +109,6 @@ struct MeasurementScratch
   PointCloudXYZI normvec{100000, 1};
   PointCloudXYZI laserCloudOri{100000, 1};
   PointCloudXYZI corr_normvect{100000, 1};
-  // Ground recovery: per-sector planes n·p + d = 0 (unit n, n_z > 0), fitted for the scan that ends at fit_time,
-  // with the candidates of each sector and the heights the fit pools.
-  double fit_time = -1.0;
-  bool sec_ok[kGndSectors] = {};
-  Eigen::Vector3d sec_n[kGndSectors];
-  double sec_d[kGndSectors] = {};
-  std::vector<Eigen::Vector3d> cand[kGndSectors];
-  std::vector<float> zs;
 };
 
 /// The lidar measurement model of the iterated update. The node holds one by value and binds it with

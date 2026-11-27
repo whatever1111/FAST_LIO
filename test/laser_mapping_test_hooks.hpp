@@ -101,7 +101,7 @@ struct HModelRow
 };
 
 /// One H-model call's correspondences right after compaction: the search decision, the selection in point order,
-/// what the gate and the ground recovery did, and the rows.
+/// what the gate did, and the rows.
 struct HModelSelection
 {
   double scan_end = 0.0;
@@ -115,7 +115,7 @@ struct HModelSelection
   const float * residuals = nullptr;        ///< `points` values, read where the point has a row: |residual|
   int gate_rejected = 0;                    ///< points the correspondence gate refused
   double gate_scan_sigma = 0.0;             ///< the scan's robust residual scale (0 when the gate does not use it)
-  int ground_rows = 0;                      ///< rows the ground recovery added
+  int ground_rows = 0;                      ///< always 0: nothing adds rows; the field keeps the h_select.v1 layout
   std::vector<HModelRow> rows;
 };
 

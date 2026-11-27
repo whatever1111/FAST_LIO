@@ -3796,7 +3796,6 @@ public:
     reanchor_healthy_eff =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(startup.reanchor_healthy_window), kReanchorHealthyMinScans);
     params_.readRunaway(*this, zupt_wheel_max_age, zupt_wheel_speed_thresh);
-    params_.readCanopyAndGround(*this);
     params_.readDataPaths(*this, map_file_path, root_dir);
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("read_policies");
@@ -4574,15 +4573,6 @@ private:
     record.value("lidar_consider_rp_min_info", params_.values().rp_consider.min_rp_info);
     record.value("lidar_consider_rp_z_weak_min", params_.values().rp_consider.z_weak_min);
     record.value("lidar_consider_rp_max_s", params_.values().rp_consider.max_consider_s);
-    record.value("canopy_near_range", params_.values().canopy_near_range);
-    record.value("canopy_ground_z", params_.values().canopy_ground_z);
-    record.value("canopy_ground_halfband", params_.values().canopy_ground_halfband);
-    record.value("ground_recover_en", params_.values().ground_recover_en);
-    record.value("ground_recover_scan_band", params_.values().ground_recover_scan_band);
-    record.value("ground_recover_min_inliers", params_.values().ground_recover_min_inliers);
-    record.value("ground_recover_max_residual", params_.values().ground_recover_max_residual);
-    record.value("ground_recover_sector_tol", params_.values().ground_recover_sector_tol);
-    record.value("ground_recover_max_rows", params_.values().ground_recover_max_rows);
     record.value("nn_refresh_gate_en", params_.values().nn_refresh_gate_en);
     record.value("nn_refresh_min_shift", params_.values().nn_refresh_min_shift);
     record.value("nn_refresh_ref_range", params_.values().nn_refresh_ref_range);
@@ -6908,8 +6898,7 @@ private:
             effct_feat_num < 200 || measured.pos_obs_z_weak > 0.7) {
           std::cerr << "[DEGEN] effct=" << effct_feat_num << " corr=" << lidar_correction << "m speed=" << body_speed
                     << " dvel=" << dvel << " dba=" << dba << " dbg=" << dbg << " z_weak=" << measured.pos_obs_z_weak
-                    << " posZ=" << state_point.pos[2] << "m"
-                    << " rec=" << measured.canopy_ground_recovered << std::endl;
+                    << " posZ=" << state_point.pos[2] << "m" << std::endl;
         }
       }
 

@@ -6,8 +6,8 @@ Inputs and goldens of the two contract fixtures of the legacy front-end node (la
   defaults, the platform profiles (this package's own files and the parent repository's merged profiles), type
   errors, vector lengths, NaN and Inf, prior-map settings, the read-only descriptor, typed outputs with their
   configuration ID, two invalid values at once, the entry checks of the wheel measurement model, the keys of the
-  normal-noise floor and the IMU initialisation's switches, which are not parameters, and the wheel update with its
-  variance topic. Per case it records the configuration
+  normal-noise floor, the IMU initialisation's switches and the ground recovery, which are not parameters, and the
+  wheel update with its variance topic. Per case it records the configuration
   (profile path and sha256, every override), whether construction returned or threw (type and text), what
   construction logged at INFO and above with the constructor's stage boundaries between those lines (`event.v1`),
   every declared parameter with type, value and descriptor as the node's parameter services report them, the
@@ -25,14 +25,15 @@ Inputs and goldens of the two contract fixtures of the legacy front-end node (la
   fixed repeat clock. The scenarios set `mapping.extrinsic_est_en` to true, which is off by default, so the recorded
   Jacobian keeps its extrinsic columns; `h_extrinsic_off` and `h_m20` set it false.
   The measurement scenarios (`h_*`, laserMapping S2) turn on the H-model branches the default configuration leaves
-  off, each on a synthetic scene that reaches it (three tilted walls, near ground with clutter, a corridor with a
-  patch across its end): the correspondence gate's innovation test (`h_gate_innov`) and nearest-neighbour bound
-  (`h_gate_nn0`), the neighbour refresh gate's skip and the reuse of the cached planes (`h_nn_refresh`), the ground
-  recovery with sector and whole-scan planes (`h_ground_recovery`), online extrinsic estimation on and off
+  off, each on a synthetic scene that reaches it (three tilted walls, a corridor with a patch across its end): the
+  correspondence gate's innovation test (`h_gate_innov`) and nearest-neighbour bound (`h_gate_nn0`), the neighbour
+  refresh gate's skip and the reuse of the cached planes (`h_nn_refresh`), online extrinsic estimation on and off
   (`h_extrinsic_on`, `h_extrinsic_off`), the correspondence dump (`h_dump`) and the H-model keys of the M20 profile
-  with roll/pitch considered (`h_m20`). Every scenario records each H-model call's correspondence selection (`h_select.v1`: the
-  search decision, the gate and ground recovery counts, and digests of the selection, the residuals and the rows,
-  whose weights are all 1) and its exit (`h_exit.v1`: position information, the removed attitude hold's four fields
+  with roll/pitch considered (`h_m20`). A scene of near ground with clutter has no golden:
+  `GroundSceneRowsKeepTheirFittedNormals` checks on it, with the removed ground recovery's keys set, that no row
+  takes the vertical normal that recovery imposed. Every scenario records each H-model call's correspondence
+  selection (`h_select.v1`: the search decision, the gate count, a ground-row count that stays 0, and digests of the
+  selection, the residuals and the rows, whose weights are all 1) and its exit (`h_exit.v1`: position information, the removed attitude hold's four fields
   (0), roll/pitch information and consideration, and the neutral `degeneracy_*` fields below); the dump scenario
   records its three files (`h_dump.v1`), which the test build writes to the scenario's result directory.
 

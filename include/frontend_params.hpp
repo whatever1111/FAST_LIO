@@ -233,27 +233,6 @@ struct FrontendParams
   // nearest map point is within corr_nn0_max). Both 0 = the legacy s > 0.9 test alone.
   fast_lio::CorrespondenceGateParams corr_gate;
 
-  // Near-field ground geometry, in the LiDAR/cloud BODY frame so it is immune to
-  // the Z drift it helps repair. Consumed by the ground recovery below; the
-  // canopy_ prefix is historical (these were shared with a canopy scene detector
-  // that measured as telemetry-only and was removed) and is kept so the giant
-  // profiles keep working.
-  double canopy_near_range = 20.0;      // near-field horizontal radius, cloud frame (m)
-  double canopy_ground_z = -0.47;       // ground height in the CLOUD frame (giant rig measured)
-  double canopy_ground_halfband = 0.8;  // ± band around canopy_ground_z counted as ground (m)
-
-  // Ground recovery (selection-layer repair): re-admit true-ground returns that
-  // the 5-NN plane gates reject under ground-hugging clutter (grass, crops,
-  // debris — content-agnostic) — see the block comment above the measurement
-  // model's recoverGround. SELF-GATED by per-sector fit quality + the
-  // sensor-height sanity gate; no scene classifier involved. Default OFF.
-  bool ground_recover_en = false;
-  double ground_recover_scan_band = 0.15;    // |dist to sector ground plane| accept band (m)
-  int ground_recover_min_inliers = 100;      // PER-SECTOR fit support gate (8 sectors)
-  double ground_recover_max_residual = 1.0;  // |z - map lower envelope| accept gate (m)
-  double ground_recover_sector_tol = 0.25;   // sector-vs-global plane height agreement (m)
-  int ground_recover_max_rows = 4000;        // per-scan cap on recovered rows
-
   // Neighbour refresh: the filter searches again once it declares itself converged, but if the
   // state barely moved since the last search the neighbour sets cannot have changed, and that
   // second 5-NN pass over the scan is the single most expensive item in the front end.

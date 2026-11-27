@@ -9,7 +9,9 @@
 // build whose points the map backend all skips. The static verdict is the
 // real one, computed from the IMU windows the fixture sends.
 // Wheel evidence comes from the newest causal sample: an expired or non-finite
-// sample, or only another epoch inside the freshness window, proves nothing.
+// sample, or only another epoch inside the freshness window, proves nothing,
+// and the IMU alone never proves the platform parked. So the fixture publishes
+// a fresh zero wheel sample before every scan unless the step says otherwise.
 //
 // The anchor and pre-event positions are the three frozen cases F1-F3.
 // Attitude, velocity and covariance are fixed fixture values (identity, a
@@ -193,9 +195,9 @@ struct Step
   bool late_imu = false;     // an IMU sample stamped 50 ms before the newest one follows the scan's samples
   bool clock_back = false;   // an IMU sample stamped 1.5 s before the newest one precedes the scan: an epoch fault
   bool expect_scan = true;   // false: the node is not expected to take this slot's scan at all
-  bool wheel = false;        // a wheel sample is published before the scan
+  bool wheel = true;         // a wheel sample is published before the scan; by default a fresh zero
   double wheel_speed = 0.0;  // m/s; NaN is the bridge saying it cannot measure
-  double wheel_age = 0.0;    // s between the wheel sample's stamp and the scan end
+  double wheel_age = 0.01;   // s between the wheel sample's stamp and the scan end
   int relocalization = -1;   // index into Scenario::relocalizations, published before the scan
   // Input-driven slots: the cloud is queued before any IMU sample of the slot; the slot sends no IMU sample (a
   // later slot sends them, in stamp order); one more IMU sample is stamped exactly at the slot's scan end.
@@ -228,6 +230,7 @@ struct Scenario
   std::vector<Relocalization> relocalizations;
   double scan_length = kScanLength;  // s, last point time within each scan; kScanPeriod: scans that abut
   bool warm_up = true;               // false: the steps are the process's first input, its start included
+  bool warm_up_wheel = true;         // false: the warm-up scans go out without a wheel sample
   bool capture_raw_state = false;    // startup-only: snapshot at scope exit or an unlocked empty-IMU drop
   bool capture_tf_graph = false;     // independent old-output and disabled-publisher evidence
   bool wait_for_reference_repeat = false;
@@ -418,6 +421,7 @@ Scenario baseParams(const std::string & name, bool trace)
         rclcpp::Parameter("mapping.extrinsic_R", std::vector<double>{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}),
         rclcpp::Parameter("common.lid_topic", kLidarTopic),
         rclcpp::Parameter("common.imu_topic", kImuTopic),
+        rclcpp::Parameter("wheel_topic", kWheelTopic),
         rclcpp::Parameter("preprocess.lidar_type", 3),
         rclcpp::Parameter("preprocess.timestamp_unit", 3),
         rclcpp::Parameter("point_filter_num", 1),
@@ -683,7 +687,10 @@ public:
     }
     executor_->add_node(subject_->get_node_base_interface());
     executor_->add_node(observer_);
-    if (!spinUntil([&] { return imu_->get_subscription_count() == 1 && lidar_->get_subscription_count() == 1; }))
+    if (!spinUntil([&] {
+          return imu_->get_subscription_count() == 1 && lidar_->get_subscription_count() == 1 &&
+                 wheel_->get_subscription_count() == 1;
+        }))
       return "front end subscriptions never matched";
     if (relocalization_ && !spinUntil([&] { return relocalization_->get_subscription_count() == 1; }))
       return "relocalization subscription never matched";
@@ -994,6 +1001,18 @@ private:
     executor_->spin_some();
   }
 
+  // The wheel sample step `s` publishes before scan number `scan`, if any.
+  void publishWheel(int scan, const Step & s)
+  {
+    if (!s.wheel)
+      return;
+    geometry_msgs::msg::TwistStamped message;
+    message.header.stamp = rclcpp::Time(static_cast<std::int64_t>(std::llround((scanEnd(scan) - s.wheel_age) * 1e9)));
+    message.twist.linear.x = s.wheel_speed;
+    wheel_->publish(message);
+    executor_->spin_some();
+  }
+
   // Every IMU sample stamped up to `end` that has not gone out yet: the fixture's grid, and the extra samples
   // slots asked for, in stamp order.
   void sendImuThrough(double end)
@@ -1091,6 +1110,9 @@ private:
     // the pattern of the step that runs next (a warm-up scan cannot know, and stays static).
     const bool has_next = index >= 0 && static_cast<std::size_t>(index) + 1 < scenario_.steps.size();
     step_by_scan_[scan + 1] = has_next ? index + 1 : -1;
+    Step warm_up;
+    warm_up.wheel = scenario_.warm_up_wheel;
+    publishWheel(scan, index >= 0 ? scenario_.steps[static_cast<std::size_t>(index)] : warm_up);
     if (scenario_.lidar_first) {
       // The cloud is queued before the IMU sample that passes its end: the scan, not that sample, is what the
       // front end processes next.
@@ -1430,13 +1452,7 @@ private:
       if (!error.empty())
         return error;
     }
-    if (s.wheel) {
-      geometry_msgs::msg::TwistStamped message;
-      message.header.stamp = rclcpp::Time(static_cast<std::int64_t>(std::llround((scanEnd(scan) - s.wheel_age) * 1e9)));
-      message.twist.linear.x = s.wheel_speed;
-      wheel_->publish(message);
-      executor_->spin_some();
-    }
+    publishWheel(scan, s);
     if (s.clock_back)
       publishImu(std::max<std::int64_t>(1, newest_imu_ns_ - 1500000000LL), 0.0);
     const std::uint64_t refused = fast_lio_test::inspectImuInput().rejectedLidar;
@@ -1960,7 +1976,6 @@ bool sameObservation(const Observation & a, const Observation & b, std::string *
   integer("ref_gen", static_cast<long long>(x.ref_gen), static_cast<long long>(y.ref_gen));
   integer("evidence", static_cast<int>(x.evidence), static_cast<int>(y.evidence));
   integer("evidence_reason", static_cast<int>(x.evidence_reason), static_cast<int>(y.evidence_reason));
-  integer("imu_only", x.imu_only, y.imu_only);
   integer("wheel_valid", x.wheel_valid, y.wheel_valid);
   integer("usable", x.usable, y.usable);
   integer("zero_only", x.zero_only, y.zero_only);
@@ -2764,22 +2779,60 @@ Step wheelSlot(Phase phase, double speed, double age)
   return s;
 }
 
-// A wheel sample is required. Stop publishing before the stale/other-epoch scans so the newest causal sample is
-// expired; the non-finite scan supplies its own newest causal sample.
+// The same step, its scan sent without a wheel sample before it.
+Step withoutWheel(Step s)
+{
+  s.wheel = false;
+  return s;
+}
+
+// The warm-up publishes no wheel sample, so the first scans have never received one. Stop publishing before the
+// stale/other-epoch scans so the newest causal sample is expired; the non-finite scan supplies its own newest causal
+// sample.
 Scenario wheelEvidence()
 {
   Scenario s = inputScenario("wheel_evidence");
-  setParam(s, rclcpp::Parameter("zupt_require_wheel", true));
-  setParam(s, rclcpp::Parameter("wheel_topic", kWheelTopic));
-  append(s, 4, slot(Phase::kBefore));
+  s.warm_up_wheel = false;
+  append(s, 4, withoutWheel(slot(Phase::kBefore)));
   append(s, kWheelFreshScans, wheelSlot(Phase::kAnchorStatic, 0.0, 0.01));
-  append(s, kWheelSilenceScans, slot(Phase::kWheelSilence));
+  append(s, kWheelSilenceScans, withoutWheel(slot(Phase::kWheelSilence)));
   s.steps.push_back(wheelSlot(Phase::kEvent, 0.0, 0.8));
   append(s, kWheelFreshScans, wheelSlot(Phase::kAnchorStatic, 0.0, 0.01));
   s.steps.push_back(wheelSlot(Phase::kEvent, std::numeric_limits<double>::quiet_NaN(), 0.01));
   append(s, kWheelFreshScans, wheelSlot(Phase::kAnchorStatic, 0.0, 0.01));
-  append(s, kWheelSilenceScans, slot(Phase::kWheelSilence));
+  append(s, kWheelSilenceScans, withoutWheel(slot(Phase::kWheelSilence)));
   s.steps.push_back(wheelSlot(Phase::kEvent, 0.0, -1000.0));
+  return s;
+}
+
+// Degraded parked scans, the branch that pins or zeroes whatever the velocity reads. The warm-up publishes no wheel
+// sample, so the first two have never received one. Then, each after fresh zeros: the newest causal sample has
+// expired (an older sample arriving late does not renew it), it says the bridge cannot measure (NaN), or only a
+// sample stamped after the scan, from another clock epoch, has arrived since.
+Scenario parkedWithoutWheelEvidence()
+{
+  Scenario s = inputScenario("parked_without_wheel_evidence");
+  s.warm_up_wheel = false;
+  const Step parked = slot(Phase::kEvent, Imu::kStatic, Guard::kDegraded);
+  Step fresh = parked;
+  fresh.phase = Phase::kBefore;
+  Step silent = withoutWheel(parked);
+  silent.phase = Phase::kWheelSilence;
+  Step expired = parked;
+  expired.wheel_age = 0.8;
+  Step not_a_number = parked;
+  not_a_number.wheel_speed = std::numeric_limits<double>::quiet_NaN();
+  Step future = parked;
+  future.wheel_age = -1000.0;
+  append(s, 2, withoutWheel(parked));
+  append(s, 2, fresh);
+  append(s, kWheelSilenceScans, silent);
+  s.steps.push_back(expired);
+  append(s, 2, fresh);
+  s.steps.push_back(not_a_number);
+  append(s, 2, fresh);
+  append(s, kWheelSilenceScans, silent);
+  s.steps.push_back(future);
   return s;
 }
 
@@ -3239,18 +3292,15 @@ Scenario consumedExits(const std::string & name, int exits, Imu first, const std
   return s;
 }
 
-// One parked exit with the wheel required: a fresh wheel sample before every scan, zero speed except before the
-// exit, where the bridge says it cannot measure (NaN).
+// One parked exit: the fixture's fresh zero wheel sample before every scan, except before the exit, where the bridge
+// says it cannot measure (NaN).
 Scenario consumedExitWithoutWheelEvidence()
 {
   Scenario s = consumedExits(
     "consumed_exit_no_wheel_evidence", 1, Imu::kStatic, movedOnFromTheAnchor(kFieldCases[0]), kExitAfterScans);
-  setParam(s, rclcpp::Parameter("zupt_require_wheel", true));
-  setParam(s, rclcpp::Parameter("wheel_topic", kWheelTopic));
   for (auto & st : s.steps) {
-    st.wheel = true;
-    st.wheel_speed = st.phase == Phase::kEvent ? std::numeric_limits<double>::quiet_NaN() : 0.0;
-    st.wheel_age = 0.01;
+    if (st.phase == Phase::kEvent)
+      st.wheel_speed = std::numeric_limits<double>::quiet_NaN();
   }
   return s;
 }
@@ -4866,19 +4916,23 @@ TEST(AnchorLifecycleInputs, AnInputClockFaultShutsTheNodeDownOnlyUnderFaultExit)
   }
 }
 
-// With a wheel sample required, missing evidence, an expired/non-finite newest causal sample, or only another
-// epoch inside the freshness window is "unknown": no candidate starts, and an anchor built on fresh samples ends.
+// Missing evidence, an expired/non-finite newest causal sample, or only another epoch inside the freshness window is
+// "unknown", however still the IMU reads: no candidate starts, an anchor built on fresh samples ends, and the healthy
+// scan does not zero its velocity.
 TEST(AnchorLifecycleInputs, WheelEvidenceThatIsMissingStaleOrNotANumberProvesNothing)
 {
   const Scenario scenario = wheelEvidence();
   const ChildResult r = runScenario(scenario);
   SCOPED_TRACE(describeRun(r));
   ASSERT_TRUE(r.ok());
+  ASSERT_EQ(r.phase(Phase::kBefore).size(), 4u);
   for (const auto * o : r.phase(Phase::kBefore)) {
     EXPECT_EQ(o->record.evidence, fast_lio::StaticEvidence::kUnknown) << "step " << o->step;
     EXPECT_EQ(o->record.evidence_reason, fast_lio::StaticEvidenceReason::kWheelMissing) << "step " << o->step;
     EXPECT_FALSE(o->record.wheel_valid) << "step " << o->step;
     EXPECT_EQ(o->record.anchor_id, 0u) << "step " << o->step << ": a candidate without wheel evidence";
+    EXPECT_EQ(o->record.action, fast_lio::AnchorTraceAction::kNone) << "step " << o->step;
+    EXPECT_FALSE(o->record.have_act) << "step " << o->step;
   }
   const auto fresh = r.phase(Phase::kAnchorStatic);
   const auto bad = r.phase(Phase::kEvent);
@@ -4904,6 +4958,8 @@ TEST(AnchorLifecycleInputs, WheelEvidenceThatIsMissingStaleOrNotANumberProvesNot
     EXPECT_EQ(b.evidence_reason, fast_lio::StaticEvidenceReason::kWheelMissing) << name;
     EXPECT_FALSE(b.wheel_valid) << name;
     EXPECT_EQ(b.anchor_state, fast_lio::AnchorState::kEmpty) << name;
+    EXPECT_EQ(b.action, fast_lio::AnchorTraceAction::kNone) << name;
+    EXPECT_FALSE(b.have_act) << name;
     expectInvalidatedOnce(r, id, "evidence_unknown", name);
   }
   const auto silence = r.phase(Phase::kWheelSilence);
@@ -4924,13 +4980,58 @@ TEST(AnchorLifecycleInputs, WheelEvidenceThatIsMissingStaleOrNotANumberProvesNot
   }
 }
 
+// The parked ZUPT needs the same proof. On degraded parked scans a fresh zero is stationary and the scan zeroes its
+// velocity, with no anchor to pin to; a wheel sample that is missing, expired, not a number or stamped after the
+// scan leaves the same scan unknown, not stationary, and the state alone: no zeroing, no hold, no pin. The per-scan
+// trace is on: only it records what the anchor step wrote.
+TEST(AnchorLifecycleInputs, ParkedScansWithoutUsableWheelEvidenceAreUnknownAndGetNoZupt)
+{
+  const Scenario scenario = traced(parkedWithoutWheelEvidence(), true);
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const auto bad = r.phase(Phase::kEvent);
+  ASSERT_EQ(bad.size(), 5u);
+  const char * const names[] = {"never received", "never received", "expired", "not a number", "stamped after"};
+  for (std::size_t i = 0; i < bad.size(); ++i) {
+    const auto & x = bad[i]->record;
+    const std::string at = std::string(names[i]) + ", step " + std::to_string(bad[i]->step);
+    EXPECT_TRUE(x.anchor_step) << at;
+    EXPECT_TRUE(x.degraded) << at;
+    EXPECT_EQ(x.evidence, fast_lio::StaticEvidence::kUnknown) << at;
+    EXPECT_EQ(x.evidence_reason, fast_lio::StaticEvidenceReason::kWheelMissing) << at;
+    EXPECT_FALSE(x.wheel_valid) << at;
+    EXPECT_EQ(x.anchor_state, fast_lio::AnchorState::kEmpty) << at;
+    EXPECT_EQ(x.action, fast_lio::AnchorTraceAction::kNone) << at << ": a parked ZUPT without wheel evidence";
+    EXPECT_FALSE(x.have_act) << at;
+    EXPECT_FALSE(x.zero_only) << at;
+    EXPECT_FALSE(x.zupt_active) << at;
+    EXPECT_FALSE(x.static_hold) << at;
+    EXPECT_FALSE(x.parked_applied) << at;
+  }
+  std::size_t controls = 0;
+  for (const Phase phase : {Phase::kBefore, Phase::kWheelSilence}) {
+    for (const auto * o : r.phase(phase)) {
+      const auto & x = o->record;
+      const std::string at = "fresh sample, step " + std::to_string(o->step);
+      EXPECT_TRUE(x.degraded) << at;
+      EXPECT_EQ(x.evidence, fast_lio::StaticEvidence::kStationary) << at;
+      EXPECT_EQ(x.evidence_reason, fast_lio::StaticEvidenceReason::kImuAndWheel) << at;
+      EXPECT_TRUE(x.wheel_valid) << at;
+      EXPECT_EQ(x.action, fast_lio::AnchorTraceAction::kZeroVelocity) << at;
+      EXPECT_TRUE(x.zero_only) << at;
+      EXPECT_TRUE(x.have_act && allZero(x.act_v)) << at;
+      ++controls;
+    }
+  }
+  EXPECT_EQ(controls, 3u * 2u + 2u * static_cast<std::size_t>(kWheelSilenceScans));
+}
+
 // An unrelated arrival cannot erase a fresh causal zero that still proves the platform is parked.
 TEST(AnchorLifecycleInputs, LateOrFutureWheelSamplesPreserveFreshCausalEvidence)
 {
   for (const double age : {0.8, -1000.0}) {
     Scenario scenario = inputScenario(age > 0.0 ? "wheel_late_preserves_causal" : "wheel_future_preserves_causal");
-    setParam(scenario, rclcpp::Parameter("zupt_require_wheel", true));
-    setParam(scenario, rclcpp::Parameter("wheel_topic", kWheelTopic));
     append(scenario, kWheelFreshScans, wheelSlot(Phase::kAnchorStatic, 0.0, 0.01));
     scenario.steps.push_back(wheelSlot(Phase::kEvent, 0.0, age));
     const ChildResult r = runScenario(scenario);
@@ -4950,7 +5051,7 @@ TEST(AnchorLifecycleInputs, LateOrFutureWheelSamplesPreserveFreshCausalEvidence)
   }
 }
 
-// The wheel is required. A valid anchor on fresh zero wheel samples, then a scan that took a parked IMU window while
+// A valid anchor on fresh zero wheel samples, then a scan that took a parked IMU window while
 // the bridge said it could not measure (a fresh NaN), and left before the anchor step. Nothing proves the platform
 // stayed put: the anchor ends as evidence_unknown on that exit, which writes nothing to the state itself. The
 // degraded parked scan after it, with a fresh zero again, zeroes its velocity alone.

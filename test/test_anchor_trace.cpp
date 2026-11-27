@@ -451,8 +451,8 @@ TEST(AnchorTrace, ScanRecordCarriesTheLifecycleAndTheTrust)
   r.episode = 4;
   r.ref_gen = 1;
   r.evidence = fast_lio::StaticEvidence::kStationary;
-  r.evidence_reason = fast_lio::StaticEvidenceReason::kImuOnly;
-  r.imu_only = true;
+  r.evidence_reason = fast_lio::StaticEvidenceReason::kImuAndWheel;
+  r.wheel_valid = true;
   r.zero_only = true;
   r.trust_pre = fast_lio::RecoveryTrust::kPending;
   r.trust_post = fast_lio::RecoveryTrust::kUnanchored;
@@ -465,9 +465,9 @@ TEST(AnchorTrace, ScanRecordCarriesTheLifecycleAndTheTrust)
   EXPECT_EQ(valueOf(line, "stationary_episode"), "4");
   EXPECT_EQ(valueOf(line, "reference_generation"), "1");
   EXPECT_EQ(valueOf(line, "evidence"), "stationary");
-  EXPECT_EQ(valueOf(line, "evidence_reason"), "imu_only");
-  EXPECT_EQ(valueOf(line, "imu_only"), "1");
-  EXPECT_EQ(valueOf(line, "wheel_valid"), "0");
+  EXPECT_EQ(valueOf(line, "evidence_reason"), "imu_and_wheel");
+  EXPECT_EQ(valueOf(line, "imu_only"), "0") << "the key keeps its place; the IMU alone never testifies";
+  EXPECT_EQ(valueOf(line, "wheel_valid"), "1");
   EXPECT_EQ(valueOf(line, "usable"), "0");
   EXPECT_EQ(valueOf(line, "zero_only"), "1");
   EXPECT_EQ(valueOf(line, "trust_pre"), "pending");

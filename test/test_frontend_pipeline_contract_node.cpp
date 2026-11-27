@@ -6,7 +6,8 @@
 // FASTLIO_TEST_HOOKS fix only what a synthetic stream cannot produce on demand (the divergence guard's verdict, the
 // registration state test_anchor_lifecycle_node injects before the anchor step, a runaway trip and a failing IMU
 // processing step) and report what the scan path did. The child writes one record, in the order things happened:
-//   slot      what the fixture sent for one scan period: the scan, its IMU window and what was done to them;
+//   slot      what the fixture sent for one scan period: the scan, its IMU window and what was done to them (every
+//             slot also opens with a zero wheel sample, the static evidence's wheel proof);
 //   scan_begin, imu_process, imu_batch, scan_prepared, initial_build, h_rows, guard, anchor_step_fixture,
 //   runaway_check, map_reset_join, map_reset_pending_cleared, map_reset, pose_publish
 //             every hook the scan path called, in call order: the stage order, with the IMU batch's settlement, the
@@ -74,6 +75,7 @@
 // The goldens apply to x86_64 only: on other architectures CMake registers the entries as skipped, and the
 // executable, run there in comparison mode, fails with that statement rather than pass.
 
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -139,6 +141,8 @@ constexpr const char * kLaserMappingFactory = "rclcpp_components::NodeFactoryTem
 constexpr const char * kFixture = "pipeline";
 constexpr const char * kImuTopic = "/test_frontend_pipeline/imu";
 constexpr const char * kLidarTopic = "/test_frontend_pipeline/points";
+constexpr const char * kWheelTopic = "/test_frontend_pipeline/twist";
+constexpr double kWheelAge = 0.01;    // s between each slot's zero wheel sample and its scan end
 constexpr double kFirstScan = 1.0;    // s, start of the first scan
 constexpr double kScanPeriod = 0.1;   // s
 constexpr double kScanLength = 0.05;  // s, last point time within a scan
@@ -397,9 +401,8 @@ void appendRecord(std::vector<std::string> & out, const fast_lio::AnchorScanReco
        << " p=" << vec(r.anchor_p, 3) << " q=" << vec(r.anchor_q, 4);
   flush();
   line << "record.evidence evidence=" << fast_lio::staticEvidenceName(r.evidence)
-       << " reason=" << fast_lio::staticEvidenceReasonName(r.evidence_reason) << " imu_only=" << r.imu_only
-       << " wheel_valid=" << r.wheel_valid << " usable=" << r.usable << " zero_only=" << r.zero_only
-       << " supported=" << r.supported;
+       << " reason=" << fast_lio::staticEvidenceReasonName(r.evidence_reason) << " wheel_valid=" << r.wheel_valid
+       << " usable=" << r.usable << " zero_only=" << r.zero_only << " supported=" << r.supported;
   flush();
   line << "record.recovery trust_pre=" << fast_lio::recoveryTrustName(r.trust_pre)
        << " trust_post=" << fast_lio::recoveryTrustName(r.trust_post) << " episode=" << r.recovery_episode
@@ -983,6 +986,7 @@ Scenario baseScenario(const std::string & name)
         rclcpp::Parameter("mapping.extrinsic_est_en", true),
         rclcpp::Parameter("common.lid_topic", kLidarTopic),
         rclcpp::Parameter("common.imu_topic", kImuTopic),
+        rclcpp::Parameter("wheel_topic", kWheelTopic),
         rclcpp::Parameter("preprocess.lidar_type", 3),
         rclcpp::Parameter("preprocess.timestamp_unit", 3),
         rclcpp::Parameter("point_filter_num", 1),
@@ -1505,6 +1509,8 @@ public:
         observer_->create_publisher<sensor_msgs::msg::Imu>(kImuTopic, rclcpp::QoS(rclcpp::KeepLast(1000)).reliable());
       lidar_ = observer_->create_publisher<sensor_msgs::msg::PointCloud2>(kLidarTopic,
                                                                           rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+      wheel_ = observer_->create_publisher<geometry_msgs::msg::TwistStamped>(
+        kWheelTopic, rclcpp::QoS(rclcpp::KeepLast(100)).reliable());
       odom_ = observer_->create_subscription<nav_msgs::msg::Odometry>(
         "/Odometry",
         rclcpp::QoS(rclcpp::KeepLast(50)).reliable(),
@@ -1528,6 +1534,7 @@ public:
       executor_->add_node(observer_);
       if (!spinUntil([&] {
             return imu_->get_subscription_count() == 1 && lidar_->get_subscription_count() == 1 &&
+                   wheel_->get_subscription_count() == 1 &&
                    (!scenario_.typed ||
                     (frontend_sub_->get_publisher_count() == 1 && reference_sub_->get_publisher_count() == 1));
           }))
@@ -2129,6 +2136,16 @@ private:
     return "";
   }
 
+  // The fixture's wheel bridge: before a slot's IMU samples, a zero speed stamped kWheelAge before its scan's end. The
+  // IMU alone never proves the platform parked; with this sample every scan has fresh wheel evidence.
+  void publishWheel(int scan)
+  {
+    geometry_msgs::msg::TwistStamped message;
+    message.header.stamp = rclcpp::Time(static_cast<std::int64_t>(std::llround((scanEnd(scan) - kWheelAge) * 1e9)));
+    wheel_->publish(message);
+    executor_->spin_some();
+  }
+
   // Publishes one IMU sample, lets the subscription take it and the scan path run on it.
   std::string publishImu(std::int64_t stamp_ns, double yaw_rate)
   {
@@ -2386,6 +2403,7 @@ private:
     if (s.bad_imu)
       bad_imu_scan_ = scan;
     stream_.push_back(describeSlot(index, scan, s));
+    publishWheel(scan);
     std::string error;
     if (s.clock_back)
       error = publishImu(std::max<std::int64_t>(1, newest_imu_ns_ - 1500000000LL), 0.0);
@@ -2512,6 +2530,7 @@ private:
   rclcpp::TimerBase::SharedPtr scan_path_timer_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr wheel_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_;
   rclcpp::Subscription<fast_lio_interfaces::msg::FrontendObservation>::SharedPtr frontend_sub_;
   rclcpp::Subscription<fast_lio_interfaces::msg::ReferenceHealth>::SharedPtr reference_sub_;
@@ -3181,8 +3200,9 @@ TEST(FrontendPipelineContract, KalmanChannelsLidarRowsEndWithThePosteriorVelocit
   EXPECT_EQ(actual, expected);
 }
 
-// The pipeline driver fixes its IMU grid/rates and has no wheel publishers. Exercise the pure MeasureGroup input
-// conversion used by updateWheelSpeed with real timestamped ROS messages, without adding a stand-in node hook.
+// The pipeline driver fixes its IMU grid/rates, and its wheel samples are zeros for the static evidence with the
+// wheel update off. Exercise the pure MeasureGroup input conversion used by updateWheelSpeed with real timestamped ROS
+// messages, without adding a stand-in node hook.
 TEST(WheelInput, NodeUsesTimestampedAngularEndpoint)
 {
   // numerical-design.txt:L26,L34,L41,L45,L49: zero innovation and the native endpoint/gyro covariance oracles.

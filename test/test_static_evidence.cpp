@@ -60,16 +60,17 @@ TEST(StaticEvidence, MovingWheelVetoesTheHoldEvenWithAQuietImu)
   EXPECT_FALSE(bodyIsStatic(parkedImu(), 0.05, 0.4, StaticEvidenceParams{}));
 }
 
-TEST(StaticEvidence, StaleOrAbsentWheelFallsBackToTheImuPolicy)
+TEST(StaticEvidence, AParkedImuWithoutAFreshWheelSampleIsNotStatic)
 {
-  StaticEvidenceParams permissive;  // require_wheel = false
-  EXPECT_TRUE(bodyIsStatic(parkedImu(), -1.0, 0.0, permissive));   // never received one
-  EXPECT_TRUE(bodyIsStatic(parkedImu(), 5.0, 0.0, permissive));    // 5 s old
-  StaticEvidenceParams strict;
-  strict.require_wheel = true;
-  EXPECT_FALSE(bodyIsStatic(parkedImu(), -1.0, 0.0, strict));
-  EXPECT_FALSE(bodyIsStatic(parkedImu(), 5.0, 0.0, strict));
-  EXPECT_TRUE(bodyIsStatic(parkedImu(), 0.1, 0.0, strict));
+  // A quiet IMU alone cannot tell parked from a slow, smooth motion: without a wheel sample that testifies,
+  // nothing is static, however still the IMU reads.
+  const StaticEvidenceParams params;
+  EXPECT_FALSE(bodyIsStatic(parkedImu(), -1.0, 0.0, params));  // never received one
+  EXPECT_FALSE(bodyIsStatic(parkedImu(), 5.0, 0.0, params));   // 5 s old
+  EXPECT_FALSE(bodyIsStatic(parkedImu(), 0.51, 0.0, params));  // just past wheel_max_age
+  EXPECT_FALSE(bodyIsStatic(parkedImu(), -0.2, 0.0, params));  // stamped after the scan: time runs backwards
+  EXPECT_TRUE(bodyIsStatic(parkedImu(), 0.5, 0.0, params));    // exactly wheel_max_age old still testifies
+  EXPECT_TRUE(bodyIsStatic(parkedImu(), 0.1, 0.0, params));
 }
 
 TEST(StaticEvidence, EmptyOrNonFiniteWindowIsNeverStatic)
@@ -88,28 +89,17 @@ TEST(StaticEvidence, NonFiniteWheelSampleIsTreatedAsNoEvidence)
 {
   // NaN is the wheelspeed bridge saying "cannot measure": while its legs work, and
   // permanently if its wheel signs never lock or a sign mismatch latches. It is the
-  // absence of a measurement, so it must land on the same policy as an absent or a
-  // stale sample — not on "not parked", which would silently disable the hold, the
-  // parked-velocity zeroing and the runaway watchdog for the whole run.
+  // absence of a measurement: not static, exactly like an absent or a stale sample.
   const double nan_speed = std::numeric_limits<double>::quiet_NaN();
-  StaticEvidenceParams permissive;  // require_wheel = false: the IMU alone may decide
-  EXPECT_TRUE(bodyIsStatic(parkedImu(), 0.05, nan_speed, permissive));
-  EXPECT_EQ(bodyIsStatic(parkedImu(), 0.05, nan_speed, permissive),
-            bodyIsStatic(parkedImu(), -1.0, 0.0, permissive));
+  const double inf = std::numeric_limits<double>::infinity();
+  const StaticEvidenceParams params;
+  EXPECT_FALSE(bodyIsStatic(parkedImu(), 0.05, nan_speed, params));
+  EXPECT_EQ(bodyIsStatic(parkedImu(), 0.05, nan_speed, params), bodyIsStatic(parkedImu(), -1.0, 0.0, params));
+  EXPECT_FALSE(bodyIsStatic(parkedImu(), 0.05, inf, params));
 
-  StaticEvidenceParams strict;
-  strict.require_wheel = true;  // no wheel evidence means "not proven"
-  EXPECT_FALSE(bodyIsStatic(parkedImu(), 0.05, nan_speed, strict));
-
-  // A moving IMU still vetoes it: dropping the wheel term never invents a hold.
-  ImuWindowStats turning = parkedImu();
-  turning.gyr_max = 0.2;
-  EXPECT_FALSE(bodyIsStatic(turning, 0.05, nan_speed, permissive));
-
-  // A non-finite AGE is the same story: we cannot tell how old the sample is, so
-  // there is no usable evidence and require_wheel decides.
-  EXPECT_TRUE(bodyIsStatic(parkedImu(), nan_speed, 0.0, permissive));
-  EXPECT_FALSE(bodyIsStatic(parkedImu(), nan_speed, 0.0, strict));
+  // A non-finite AGE is the same story: nobody can tell how old the sample is.
+  EXPECT_FALSE(bodyIsStatic(parkedImu(), nan_speed, 0.0, params));
+  EXPECT_FALSE(bodyIsStatic(parkedImu(), inf, 0.0, params));
 }
 
 TEST(StaticEvidence, WheelSampleIsEvidenceRejectsAnyNonFiniteComponent)

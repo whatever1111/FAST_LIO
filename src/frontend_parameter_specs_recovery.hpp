@@ -32,7 +32,6 @@ struct RecoveryParameterSpecs
   const ParameterSpec<double> zupt_acc_span_ratio{"zupt_acc_span_ratio", 0.02, 0.02};
   const ParameterSpec<double> zupt_wheel_speed_thresh{"zupt_wheel_speed_thresh", 0.05, 0.05};
   const ParameterSpec<double> zupt_wheel_max_age{"zupt_wheel_max_age", 0.5, 0.5};
-  const ParameterSpec<bool> zupt_require_wheel{"zupt_require_wheel", false, false};
   const ParameterSpec<bool> zupt_anchor_trace_en{"zupt_anchor_trace_en", false, false};
   const ParameterSpec<bool> zupt_parked_hold_en{"zupt_parked_hold_en", false, false};
   const ParameterSpec<int> zupt_parked_hold_scans{"zupt_parked_hold_scans", 3, 3};

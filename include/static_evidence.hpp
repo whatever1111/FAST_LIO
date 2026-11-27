@@ -11,17 +11,18 @@
 // wheel stream.
 //
 // The verdict is deliberately conservative: it may only ever be true when the
-// evidence positively says parked. A non-finite IMU window is never static.
+// evidence positively says parked, which takes both: an IMU window at rest and a
+// fresh, finite wheel sample at rest. A quiet IMU alone cannot tell parked from a
+// slow, smooth motion, so without a usable wheel sample nothing is static. A
+// non-finite IMU window is never static.
 //
-// A wheel sample that is ABSENT, STALE or NON-FINITE is the same thing: no wheel
-// evidence. The wheelspeed bridge says "cannot measure" in band, with NaN, and
-// it does so whenever it is gated — while the legs work, and permanently if its
-// wheel signs never lock or a sign mismatch latches. Reading that NaN as "not
-// parked" rather than as "no evidence" is what silently disabled the hold, the
-// parked-velocity zeroing and the runaway watchdog together, in exactly the
-// runs where the bridge was unhealthy and they were needed most. What happens
-// with no wheel evidence is `require_wheel`'s decision, and nothing else's;
-// runaway_watchdog.hpp already folds finiteness into its freshness test.
+// A wheel sample that is ABSENT, STALE, from the scan's FUTURE or NON-FINITE is
+// the same thing: no wheel evidence. The wheelspeed bridge says "cannot measure"
+// in band, with NaN, and it does so whenever it is gated — while the legs work,
+// and permanently if its wheel signs never lock or a sign mismatch latches. A
+// configured wheel topic that never publishes is no evidence either. Only a
+// sample the bridge measured testifies; runaway_watchdog.hpp folds the same
+// finiteness into its freshness test.
 //
 // Pure C++. No ROS, no Eigen.
 
@@ -38,7 +39,6 @@ struct StaticEvidenceParams
   double acc_span_ratio = 0.02;      ///< (max-min)|a| / mean|a| — free of the IMU's unit scale
   double wheel_speed_thresh = 0.05;  ///< m/s
   double wheel_max_age = 0.5;        ///< s; older wheel samples do not testify
-  bool require_wheel = false;        ///< true = no fresh wheel sample means "not proven"
 };
 
 /// Per-scan IMU window summary. `samples == 0` means no IMU covered the scan.
@@ -60,7 +60,7 @@ inline bool wheelSampleIsEvidence(double vx, double vy, double vz)
   return std::isfinite(vx) && std::isfinite(vy) && std::isfinite(vz);
 }
 
-/// `wheel_age` < 0 means "no wheel sample at all".
+/// `wheel_age` < 0 means "no wheel sample at all"; without a fresh, finite wheel sample nothing is static.
 inline bool bodyIsStatic(const ImuWindowStats & imu,
                          double wheel_age,
                          double wheel_speed,
@@ -84,10 +84,7 @@ inline bool bodyIsStatic(const ImuWindowStats & imu,
   }
   const bool wheel_usable = wheel_age >= 0.0 && std::isfinite(wheel_age) &&
                             wheel_age <= params.wheel_max_age && std::isfinite(wheel_speed);
-  if (!wheel_usable) {
-    return !params.require_wheel;
-  }
-  return wheel_speed <= params.wheel_speed_thresh;
+  return wheel_usable && wheel_speed <= params.wheel_speed_thresh;
 }
 
 }  // namespace fast_lio

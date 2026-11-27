@@ -245,7 +245,7 @@
 //     post_q=<w,x,y,z> post_v=<x,y,z> p_pose_pre=<hash> p_pose_post=<hash>
 //     p_finite=<0|1> p_sym=<real> p_min_eig=<real> published=<0|1>
 //     flags=<bits> anchor_state=<state> stationary_episode=<n>
-//     reference_generation=<n> evidence=<evidence> evidence_reason=<reason> imu_only=<0|1>
+//     reference_generation=<n> evidence=<evidence> evidence_reason=<reason> imu_only=0
 //     wheel_valid=<0|1> usable=<0|1> zero_only=<0|1> supported=<0|1>
 //     trust_pre=<trust> trust_post=<trust> recovery_episode=<n>
 //     recovery_start_ns=<ns> recovery_deadline_ns=<ns> eff_degraded=<0|1>
@@ -308,11 +308,11 @@
 //               -1 = nothing published.
 //   anchor_state  empty, qualifying or valid, after this scan.
 //   evidence    stationary, moving (the evidence measured motion) or unknown (it
-//               could prove neither). evidence_reason: imu_and_wheel, imu_only,
-//               gyro, acc_span, wheel, no_imu, imu_invalid, wheel_missing.
-//               imu_only = stationary on the IMU alone, no wheel sample
-//               testified; wheel_valid = a wheel sample was usable as evidence
-//               (present, fresh and finite).
+//               could prove neither). evidence_reason: imu_and_wheel, gyro,
+//               acc_span, wheel, no_imu, imu_invalid, wheel_missing.
+//               imu_only is always 0: stationary evidence needs a usable wheel
+//               sample, so the IMU alone never testifies; wheel_valid = a wheel
+//               sample was usable as evidence (present, fresh and finite).
 //   usable      the anchor step found a usable anchor of the current episode.
 //   zero_only   degraded, stationary, no usable anchor: the velocity alone was
 //               zeroed.
@@ -779,8 +779,6 @@ inline const char * staticEvidenceReasonName(StaticEvidenceReason reason)
   switch (reason) {
     case StaticEvidenceReason::kImuAndWheel:
       return "imu_and_wheel";
-    case StaticEvidenceReason::kImuOnly:
-      return "imu_only";
     case StaticEvidenceReason::kGyro:
       return "gyro";
     case StaticEvidenceReason::kAccSpan:
@@ -977,7 +975,6 @@ struct AnchorScanRecord
   std::uint64_t ref_gen = 0;
   StaticEvidence evidence = StaticEvidence::kUnknown;
   StaticEvidenceReason evidence_reason = StaticEvidenceReason::kNoImu;
-  bool imu_only = false;
   bool wheel_valid = false;
   bool usable = false;
   bool zero_only = false;
@@ -1269,7 +1266,7 @@ inline std::string formatAnchorScanRecord(const AnchorScanRecord & r)
   if (r.anchor_step) {
     line.text("evidence", staticEvidenceName(r.evidence));
     line.text("evidence_reason", staticEvidenceReasonName(r.evidence_reason));
-    line.boolean("imu_only", r.imu_only);
+    line.boolean("imu_only", false);  // the key keeps its place: the IMU alone never testifies
     line.boolean("wheel_valid", r.wheel_valid);
     line.boolean("usable", r.usable);
     line.boolean("zero_only", r.zero_only);

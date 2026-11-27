@@ -89,7 +89,6 @@ public:
                        double & zupt_acc_span_ratio,
                        double & zupt_wheel_speed_thresh,
                        double & zupt_wheel_max_age,
-                       bool & zupt_require_wheel,
                        bool & zupt_anchor_trace_en,
                        StationaryAnchorParams & stationary_anchor_params);
   void readReanchor(const rclcpp::Node & node,

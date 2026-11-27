@@ -290,7 +290,6 @@ double zupt_gyro_thresh = 0.05;         // rad/s; max |omega| over the scan's IM
 double zupt_acc_span_ratio = 0.02;      // (max-min)|a| / mean|a| — free of the IMU's unit scale
 double zupt_wheel_speed_thresh = 0.05;  // m/s; wheel speed below this reads as parked
 double zupt_wheel_max_age = 0.5;        // s; older wheel samples are not evidence
-bool zupt_require_wheel = false;        // true = hold only when a fresh wheel sample agrees
 V3D zupt_anchor_pos = V3D::Zero();      // pose of the current candidate or anchor (stationary_anchor.state says which)
 SO3 zupt_anchor_rot;
 bool zupt_active = false;
@@ -1305,7 +1304,6 @@ static_evidence_of(const MeasureGroup & meas, double now, fast_lio::AnchorScanRe
   params.acc_span_ratio = zupt_acc_span_ratio;
   params.wheel_speed_thresh = zupt_wheel_speed_thresh;
   params.wheel_max_age = zupt_wheel_max_age;
-  params.require_wheel = zupt_require_wheel;
   const fast_lio::StaticEvidenceVerdict verdict = fast_lio::classifyStaticEvidence(imu, wheel, params);
   if (trace != nullptr) {
     trace->body = verdict.stationary() ? fast_lio::AnchorTraceBody::kStatic : fast_lio::AnchorTraceBody::kMoving;
@@ -1317,7 +1315,6 @@ static_evidence_of(const MeasureGroup & meas, double now, fast_lio::AnchorScanRe
     trace->wheel_speed = wheel.speed;
     trace->evidence = verdict.evidence;
     trace->evidence_reason = verdict.reason;
-    trace->imu_only = verdict.imu_only;
     trace->wheel_valid = fast_lio::wheelEvidenceUsable(wheel, params);
   }
   return verdict;
@@ -3788,7 +3785,6 @@ public:
                             zupt_acc_span_ratio,
                             zupt_wheel_speed_thresh,
                             zupt_wheel_max_age,
-                            zupt_require_wheel,
                             zupt_anchor_trace_en,
                             stationary_anchor_params);
     params_.readReanchor(*this, startup, reanchor_params, recovery_params);
@@ -4668,7 +4664,6 @@ private:
     record.value("zupt_acc_span_ratio", zupt_acc_span_ratio);
     record.value("zupt_wheel_speed_thresh", zupt_wheel_speed_thresh);
     record.value("zupt_wheel_max_age", zupt_wheel_max_age);
-    record.value("zupt_require_wheel", zupt_require_wheel);
     record.value("zupt_anchor_trace_en", zupt_anchor_trace_en);
     record.value("zupt_parked_hold_en", params_.values().parked_hold.enabled);
     record.value("zupt_parked_hold_scans", params_.values().parked_hold.engage_scans);

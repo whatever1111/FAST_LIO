@@ -41,7 +41,6 @@ TEST(WheelEvidenceHistory, FutureStandstillCannotSupplyPastStaticEvidence)
   fast_lio::ImuWindowStats imu;
   imu.samples = 1;
   imu.acc_min = imu.acc_max = imu.acc_mean = 9.81;
-  params.require_wheel = true;
   EXPECT_EQ(fast_lio::classifyStaticEvidence(imu, earlier, params).evidence, fast_lio::StaticEvidence::kMoving);
   EXPECT_EQ(fast_lio::classifyStaticEvidence(imu, history.at(2.0), params).evidence,
             fast_lio::StaticEvidence::kUnknown);
@@ -1644,31 +1643,27 @@ TEST(StationaryAnchorPolicy, BeforeTheFirstReferenceAScanReportsItsOwnVerdict)
 
 TEST(StationaryAnchorPolicy, StationaryAgreesWithBodyIsStaticEverywhere)
 {
-  fast_lio::StaticEvidenceParams params;
+  const fast_lio::StaticEvidenceParams params;
   const double nan = std::numeric_limits<double>::quiet_NaN();
   const double inf = std::numeric_limits<double>::infinity();
   int cases = 0;
-  for (const bool require : {false, true}) {
-    params.require_wheel = require;
-    for (const int samples : {0, 1, 20}) {
-      for (const double gyr : {0.0, 0.05, 0.0500001, 0.3, nan}) {
-        for (const double span : {0.0, 0.19, 0.2, 0.25, inf}) {
-          for (const double mean : {9.81, 0.0, -1.0}) {
-            for (const double age : {-1.0, 0.0, 0.5, 0.51, 3.0, nan}) {
-              for (const double speed : {0.0, 0.05, 0.06, nan, inf}) {
-                fast_lio::ImuWindowStats imu;
-                imu.samples = samples;
-                imu.gyr_max = gyr;
-                imu.acc_min = mean;
-                imu.acc_max = mean + span;
-                imu.acc_mean = mean;
-                const bool legacy = fast_lio::bodyIsStatic(imu, age, speed, params);
-                const auto verdict = fast_lio::classifyStaticEvidence(imu, wheel(age >= 0.0, age, speed), params);
-                ASSERT_EQ(verdict.stationary(), legacy)
-                  << "require=" << require << " samples=" << samples << " gyr=" << gyr << " span=" << span
-                  << " mean=" << mean << " age=" << age << " speed=" << speed;
-                ++cases;
-              }
+  for (const int samples : {0, 1, 20}) {
+    for (const double gyr : {0.0, 0.05, 0.0500001, 0.3, nan}) {
+      for (const double span : {0.0, 0.19, 0.2, 0.25, inf}) {
+        for (const double mean : {9.81, 0.0, -1.0}) {
+          for (const double age : {-1.0, 0.0, 0.5, 0.51, 3.0, nan}) {
+            for (const double speed : {0.0, 0.05, 0.06, nan, inf}) {
+              fast_lio::ImuWindowStats imu;
+              imu.samples = samples;
+              imu.gyr_max = gyr;
+              imu.acc_min = mean;
+              imu.acc_max = mean + span;
+              imu.acc_mean = mean;
+              const bool legacy = fast_lio::bodyIsStatic(imu, age, speed, params);
+              const auto verdict = fast_lio::classifyStaticEvidence(imu, wheel(age >= 0.0, age, speed), params);
+              ASSERT_EQ(verdict.stationary(), legacy) << "samples=" << samples << " gyr=" << gyr << " span=" << span
+                                                      << " mean=" << mean << " age=" << age << " speed=" << speed;
+              ++cases;
             }
           }
         }
@@ -1680,16 +1675,16 @@ TEST(StationaryAnchorPolicy, StationaryAgreesWithBodyIsStaticEverywhere)
 
 TEST(StationaryAnchorPolicy, OnlyAValidFreshWheelZeroIsAMeasuredZero)
 {
-  fast_lio::StaticEvidenceParams params;
+  const fast_lio::StaticEvidenceParams params;
   const auto measured = fast_lio::classifyStaticEvidence(imuAtRest(), wheel(true, 0.1, 0.0), params);
   EXPECT_EQ(measured.evidence, StaticEvidence::kStationary);
   EXPECT_EQ(measured.reason, StaticEvidenceReason::kImuAndWheel);
-  EXPECT_FALSE(measured.imu_only);
 
   const double nan = std::numeric_limits<double>::quiet_NaN();
   const double inf = std::numeric_limits<double>::infinity();
   // Not measurements: an invalid 0.0, NaN, Inf, a missing sample, a stale one (including one from a clock far
-  // away), and ages that are negative or not finite.
+  // away), and ages that are negative (a sample from the scan's future) or not finite. With the IMU at rest each
+  // is unknown, never stationary: the IMU alone does not testify.
   const std::vector<fast_lio::WheelEvidence> not_measured = {wheel(false, 0.1, 0.0),
                                                              wheel(true, 0.1, nan),
                                                              wheel(true, 0.1, inf),
@@ -1699,19 +1694,11 @@ TEST(StationaryAnchorPolicy, OnlyAValidFreshWheelZeroIsAMeasuredZero)
                                                              wheel(true, -0.2, 0.0),
                                                              wheel(true, nan, 0.0),
                                                              wheel(true, inf, 0.0)};
-  for (const bool require : {false, true}) {
-    params.require_wheel = require;
-    for (const auto & w : not_measured) {
-      const auto verdict = fast_lio::classifyStaticEvidence(imuAtRest(), w, params);
-      if (require) {
-        EXPECT_EQ(verdict.evidence, StaticEvidence::kUnknown);
-        EXPECT_EQ(verdict.reason, StaticEvidenceReason::kWheelMissing);
-      } else {
-        EXPECT_EQ(verdict.evidence, StaticEvidence::kStationary);
-        EXPECT_EQ(verdict.reason, StaticEvidenceReason::kImuOnly);
-        EXPECT_TRUE(verdict.imu_only) << "the IMU alone testified, and the record says so";
-      }
-    }
+  for (const auto & w : not_measured) {
+    const auto verdict = fast_lio::classifyStaticEvidence(imuAtRest(), w, params);
+    EXPECT_EQ(verdict.evidence, StaticEvidence::kUnknown);
+    EXPECT_EQ(verdict.reason, StaticEvidenceReason::kWheelMissing);
+    EXPECT_FALSE(verdict.stationary());
   }
 }
 
@@ -1735,13 +1722,13 @@ TEST(StationaryAnchorPolicy, MotionAndMissingProofAreTold)
             StaticEvidenceReason::kImuInvalid);
 }
 
-TEST(StationaryAnchorPolicy, ImuOnlyEvidenceCannotBringBackADroppedAnchor)
+TEST(StationaryAnchorPolicy, StationaryEvidenceAfterAMissingWheelCannotBringBackTheDroppedAnchor)
 {
   Lifecycle life;
   const std::uint64_t old_id = life.commit();
-  life.scan(StaticEvidence::kUnknown, true);  // a required wheel went missing
+  life.scan(StaticEvidence::kUnknown, true);  // the wheel sample went missing
   for (int i = 0; i < 3; ++i)
-    life.stationary();  // IMU-only stationary, healthy: a NEW anchor
+    life.stationary();  // the wheel testifies again, healthy: a NEW anchor
   EXPECT_EQ(life.anchor.state, AnchorState::kValid);
   EXPECT_NE(life.anchor.id, old_id);
 }

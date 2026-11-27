@@ -84,13 +84,12 @@ enum class StaticEvidence : std::uint8_t
 enum class StaticEvidenceReason : std::uint8_t
 {
   kImuAndWheel,   ///< stationary: IMU at rest and a fresh wheel sample at rest
-  kImuOnly,       ///< stationary: IMU at rest, no usable wheel sample, and none is required
   kGyro,          ///< moving: angular rate above the threshold
   kAccSpan,       ///< moving: spread of |a| above the threshold
   kWheel,         ///< moving: a fresh wheel sample above the threshold
   kNoImu,         ///< unknown: no IMU sample in the scan's window
   kImuInvalid,    ///< unknown: non-finite IMU statistics, or no positive |a| to scale the spread by
-  kWheelMissing,  ///< unknown: a wheel sample is required and none is usable
+  kWheelMissing,  ///< unknown: IMU at rest, but no usable wheel sample (absent, stale, future or not finite)
 };
 
 /// The newest wheel sample as the static test sees it. `valid` says a sample exists; without one, `speed` is not
@@ -169,7 +168,6 @@ struct StaticEvidenceVerdict
 {
   StaticEvidence evidence = StaticEvidence::kUnknown;
   StaticEvidenceReason reason = StaticEvidenceReason::kNoImu;
-  bool imu_only = false;  ///< stationary on the IMU alone: no wheel sample testified
   bool stationary() const { return evidence == StaticEvidence::kStationary; }
 };
 
@@ -211,13 +209,7 @@ classifyStaticEvidence(const ImuWindowStats & imu, const WheelEvidence & wheel, 
     return verdict;
   }
   if (!wheelEvidenceUsable(wheel, params)) {
-    if (params.require_wheel) {
-      verdict.reason = StaticEvidenceReason::kWheelMissing;
-      return verdict;
-    }
-    verdict.evidence = StaticEvidence::kStationary;
-    verdict.reason = StaticEvidenceReason::kImuOnly;
-    verdict.imu_only = true;
+    verdict.reason = StaticEvidenceReason::kWheelMissing;
     return verdict;
   }
   if (wheel.speed <= params.wheel_speed_thresh) {

@@ -131,7 +131,6 @@ void FrontendParameters::declareHoleToLostRecovery(rclcpp::Node & node)
   declareOnly(node, recovery.zupt_acc_span_ratio);
   declareOnly(node, recovery.zupt_wheel_speed_thresh);
   declareOnly(node, recovery.zupt_wheel_max_age);
-  declareOnly(node, recovery.zupt_require_wheel);
   declareOnly(node, recovery.zupt_anchor_trace_en);
   declareOnly(node, recovery.zupt_parked_hold_en);
   declareOnly(node, recovery.zupt_parked_hold_scans);
@@ -503,7 +502,6 @@ void FrontendParameters::readHoleAndZupt(const rclcpp::Node & node,
                                          double & zupt_acc_span_ratio,
                                          double & zupt_wheel_speed_thresh,
                                          double & zupt_wheel_max_age,
-                                         bool & zupt_require_wheel,
                                          bool & zupt_anchor_trace_en,
                                          StationaryAnchorParams & stationary_anchor_params)
 {
@@ -516,7 +514,6 @@ void FrontendParameters::readHoleAndZupt(const rclcpp::Node & node,
   readInto(node, recovery.zupt_acc_span_ratio, zupt_acc_span_ratio);
   readInto(node, recovery.zupt_wheel_speed_thresh, zupt_wheel_speed_thresh);
   readInto(node, recovery.zupt_wheel_max_age, zupt_wheel_max_age);
-  readInto(node, recovery.zupt_require_wheel, zupt_require_wheel);
   readInto(node, recovery.zupt_anchor_trace_en, zupt_anchor_trace_en);
   readInto(node, recovery.zupt_parked_hold_en, values_.parked_hold.enabled);
   readInto(node, recovery.zupt_parked_hold_scans, values_.parked_hold.engage_scans);

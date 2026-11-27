@@ -1316,14 +1316,6 @@ TEST(FrontendParameterContract, LostRecoveryRequiresRecoveryBudget)
   checkCase(c);
 }
 
-TEST(FrontendParameterContract, LostRecoveryRequiresHealthPublication)
-{
-  ParameterCase c = overridesCase("lost_recovery_requires_health_publication", Expect::kRejected);
-  setOverride(c, rclcpp::Parameter("lost_recovery_en", true));
-  setOverride(c, rclcpp::Parameter("health_pub_en", false));
-  checkCase(c);
-}
-
 TEST(FrontendParameterContract, NanImuBacklog)
 {
   ParameterCase c = overridesCase("nan_imu_backlog", Expect::kRejected);
@@ -1341,7 +1333,6 @@ TEST(FrontendParameterContract, InfScanDuration)
 TEST(FrontendParameterContract, InfImuCoverageGap)
 {
   ParameterCase c = overridesCase("inf_imu_coverage_gap", Expect::kRejected);
-  setOverride(c, rclcpp::Parameter("reanchor_en", true));
   setOverride(c, rclcpp::Parameter("imu_coverage.max_gap_s", std::numeric_limits<double>::infinity()));
   checkCase(c);
 }
@@ -1451,7 +1442,7 @@ TEST(FrontendParameterContract, TwoInvalidLostRecoveryThenAnchor)
 {
   ParameterCase c = overridesCase("two_invalid_lost_recovery_then_anchor", Expect::kRejected);
   setOverride(c, rclcpp::Parameter("lost_recovery_en", true));
-  setOverride(c, rclcpp::Parameter("health_pub_en", false));
+  setOverride(c, rclcpp::Parameter("reanchor_total_timeout_sec", 0.0));
   setOverride(c, rclcpp::Parameter("zupt_anchor_confirm_scans", 0));
   checkCase(c);
 }

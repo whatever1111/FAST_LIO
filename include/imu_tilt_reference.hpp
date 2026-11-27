@@ -216,8 +216,7 @@ private:
     if ((measurement - down_).norm() > 0.5)
       return Rejection::kOutlier;
 
-    const double sigma = levellingSigma(
-      LevellingSigmaPolicy::kMeasurement, false, window_static_, 0.0, 0.0, params_.noise_static, params_.noise_moving);
+    const double sigma = levellingSigma(window_static_, params_.noise_static, params_.noise_moving);
     const double noise = sigma * sigma + sigma_lin * sigma_lin;
     const Eigen::Matrix3d pi = tiltProjector();
     const Eigen::Vector3d residual = pi * (measurement - down_);

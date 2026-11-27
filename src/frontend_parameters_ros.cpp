@@ -63,19 +63,13 @@ void FrontendParameters::declareOutputsAndMeasurement(rclcpp::Node & node)
   declareOnly(node, measurement.degeneracy_floor_model_scale);
   declareOnly(node, measurement.degeneracy_floor_rel_uncertainty);
   declareOnly(node, measurement.degeneracy_schur_ridge);
-  declareOnly(node, output.health_pub_en);
   declareOnly(node, constraints.planar_constraint_en);
   declareOnly(node, constraints.planar_constraint_noise);
   declareOnly(node, constraints.planar_constraint_z_weak_thresh);
   declareOnly(node, constraints.gravity_align_en);
-  declareOnly(node, constraints.gravity_align_noise);
-  declareOnly(node, constraints.gravity_align_z_weak_thresh);
   declareOnly(node, constraints.gravity_align_accel_tol);
   declareOnly(node, constraints.gravity_align_gyro_tol);
   declareOnly(node, constraints.gravity_align_window_s);
-  declareOnly(node, constraints.gravity_align_continuous);
-  declareOnly(node, constraints.gravity_align_hold_s);
-  declareOnly(node, constraints.gravity_align_noise_degraded);
   declareOnly(node, constraints.gravity_align_mag_ref);
   declareOnly(node, constraints.gravity_align_grav_leak);
   declareOnly(node, constraints.gravity_align_grav_cap_deg);
@@ -97,8 +91,6 @@ void FrontendParameters::declareGravityToConsider(rclcpp::Node & node)
   declareOnly(node, recovery.zupt_vel_reset_sigma);
   declareOnly(node, constraints.gravity_align_lin_accel_comp);
   declareOnly(node, constraints.gravity_align_vel_sigma_scale);
-  declareOnly(node, constraints.gravity_align_withhold_blind_moving);
-  declareOnly(node, constraints.gravity_align_sigma_policy);
   declareOnly(node, constraints.gravity_align_noise_static);
   declareOnly(node, constraints.gravity_align_noise_moving);
   declareOnly(node, constraints.gravity_align_leg_vel_sigma);
@@ -114,9 +106,7 @@ void FrontendParameters::declareGravityToConsider(rclcpp::Node & node)
   declareOnly(node, imu.imu_init_still_gravity_ref);
   declareOnly(node, imu.imu_init_still_gravity_tol);
   declareOnly(node, imu.imu_init_still_max_gap_s);
-  declareOnly(node, recovery.divergence_guard_en);
   declareOnly(node, recovery.divergence_guard_min_eff);
-  declareOnly(node, recovery.guard_engulf_en);
   declareOnly(node, recovery.guard_engulf_far_range);
   declareOnly(node, recovery.guard_engulf_far_frac_min);
   declareOnly(node, recovery.guard_engulf_streak);
@@ -142,7 +132,6 @@ void FrontendParameters::declareHoleToLostRecovery(rclcpp::Node & node)
   declareOnly(node, recovery.guard_hole_max_accel);
   declareOnly(node, recovery.divergence_guard_streak);
   declareOnly(node, recovery.divergence_guard_max_speed);
-  declareOnly(node, recovery.zupt_en);
   declareOnly(node, recovery.zupt_gyro_thresh);
   declareOnly(node, recovery.zupt_acc_span_ratio);
   declareOnly(node, recovery.zupt_wheel_speed_thresh);
@@ -157,7 +146,6 @@ void FrontendParameters::declareHoleToLostRecovery(rclcpp::Node & node)
   declareOnly(node, recovery.zupt_hold_deadband_sigma);
   declareOnly(node, recovery.zupt_anchor_confirm_scans);
   declareOnly(node, recovery.zupt_anchor_max_scan_gap_s);
-  declareOnly(node, recovery.reanchor_en);
   declareOnly(node, recovery.reanchor_min_eff);
   declareOnly(node, recovery.reanchor_max_res);
   declareOnly(node, recovery.reanchor_confirm_scans);
@@ -170,7 +158,6 @@ void FrontendParameters::declareHoleToLostRecovery(rclcpp::Node & node)
   declareOnly(node, recovery.reanchor_healthy_window);
   declareOnly(node, recovery.reanchor_total_timeout_sec);
   declareOnly(node, recovery.reanchor_recovery_stable_sec);
-  declareOnly(node, recovery.reanchor_recovery_entry_view);
   declareValue(node, recovery.lost_recovery_en);
   declareValue(node, recovery.lost_recovery_stable_sec);
 }
@@ -215,7 +202,6 @@ void FrontendParameters::declareRunawayToPreprocess(rclcpp::Node & node)
   const DiagnosticsParameterSpecs diagnostics{};
   const InputParameterSpecs input{};
   const ImuParameterSpecs imu{};
-  declareOnly(node, recovery.runaway_watchdog_en);
   declareOnly(node, recovery.runaway_parked_speed_thresh);
   declareOnly(node, recovery.runaway_wheel_speed_margin);
   declareOnly(node, recovery.runaway_hold_sec);
@@ -288,7 +274,6 @@ void FrontendParameters::declareImuGapToWheel(rclcpp::Node & node)
   declareOnly(node, imu.mapping_extrinsic_T);
   declareOnly(node, imu.mapping_extrinsic_R);
   declareOnly(node, map.prior_map_pcd);
-  declareOnly(node, map.prior_map_pinned);
   declareOnly(node, map.prior_map_align);
   declareOnly(node, map.prior_map_voxel);
   declareOnly(node, map.prior_map_freeze);
@@ -396,23 +381,16 @@ void FrontendParameters::readDegeneracy(const rclcpp::Node & node, bool & degene
 #endif
 }
 
-void FrontendParameters::readConstraints(const rclcpp::Node & node, bool & health_pub_en)
+void FrontendParameters::readConstraints(const rclcpp::Node & node)
 {
-  const OutputParameterSpecs output{};
   const ConstraintParameterSpecs constraints{};
-  readInto(node, output.health_pub_en, health_pub_en);
   readInto(node, constraints.planar_constraint_en, values_.planar_constraint_en);
   readInto(node, constraints.planar_constraint_noise, values_.planar_constraint_noise);
   readInto(node, constraints.planar_constraint_z_weak_thresh, values_.planar_constraint_z_weak_thresh);
   readInto(node, constraints.gravity_align_en, values_.gravity_align_en);
-  readInto(node, constraints.gravity_align_noise, values_.gravity_align_noise);
-  readInto(node, constraints.gravity_align_z_weak_thresh, values_.gravity_align_z_weak_thresh);
   readInto(node, constraints.gravity_align_accel_tol, values_.gravity_align_accel_tol);
   readInto(node, constraints.gravity_align_gyro_tol, values_.gravity_align_gyro_tol);
   readInto(node, constraints.gravity_align_window_s, values_.gravity_align_window_s);
-  readInto(node, constraints.gravity_align_continuous, values_.gravity_align_continuous);
-  readInto(node, constraints.gravity_align_hold_s, values_.gravity_align_hold_s);
-  readInto(node, constraints.gravity_align_noise_degraded, values_.gravity_align_noise_degraded);
   readInto(node, constraints.gravity_align_mag_ref, values_.gravity_align_mag_ref);
   readInto(node, constraints.gravity_align_grav_leak, values_.gravity_align_grav_leak);
   readInto(node, constraints.gravity_align_grav_cap_deg, values_.gravity_align_grav_cap_deg);
@@ -457,16 +435,8 @@ void FrontendParameters::readResetSigmasAndGravity(const rclcpp::Node & node, do
   readInto(node, recovery.zupt_vel_reset_sigma, zupt_vel_reset_sigma);
   readInto(node, constraints.gravity_align_lin_accel_comp, values_.gravity_align_lin_accel_comp);
   readInto(node, constraints.gravity_align_vel_sigma_scale, values_.gravity_align_vel_sigma_scale);
-  readInto(node, constraints.gravity_align_withhold_blind_moving, values_.gravity_align_withhold_blind_moving);
-  readInto(node, constraints.gravity_align_sigma_policy, values_.gravity_align_sigma_policy);
   readInto(node, constraints.gravity_align_noise_static, values_.gravity_align_noise_static);
   readInto(node, constraints.gravity_align_noise_moving, values_.gravity_align_noise_moving);
-  if (values_.gravity_align_sigma_policy != "scene" && values_.gravity_align_sigma_policy != "measurement") {
-    RCLCPP_FATAL(node.get_logger(),
-                 "gravity_align_sigma_policy must be 'scene' or 'measurement', got '%s'",
-                 values_.gravity_align_sigma_policy.c_str());
-    throw std::invalid_argument("gravity_align_sigma_policy");
-  }
   readInto(node, constraints.gravity_align_leg_vel_sigma, values_.gravity_align_leg_vel_sigma);
   readInto(node, constraints.gravity_align_leg_edge_window_s, values_.gravity_align_leg_edge_window_s);
   std::vector<double> gravity_align_leg_lever_arm_vec;
@@ -523,9 +493,7 @@ void FrontendParameters::readGuards(const rclcpp::Node & node, ReleaseVelocityPa
 {
   const RecoveryParameterSpecs recovery{};
   const MeasurementParameterSpecs measurement{};
-  readInto(node, recovery.divergence_guard_en, values_.divergence_guard_en);
   readInto(node, recovery.divergence_guard_min_eff, values_.divergence_guard_min_eff);
-  readInto(node, recovery.guard_engulf_en, values_.guard_engulf_en);
   readInto(node, recovery.guard_engulf_far_range, values_.guard_engulf_far_range);
   readInto(node, recovery.guard_engulf_far_frac_min, values_.guard_engulf_far_frac_min);
   readInto(node, recovery.guard_engulf_streak, values_.guard_engulf_streak);
@@ -580,7 +548,6 @@ void FrontendParameters::readHoleAndZupt(const rclcpp::Node & node,
   readInto(node, recovery.guard_hole_min_sec, values_.guard_hole_min_sec);
   readInto(node, recovery.guard_hole_max_accel, values_.guard_hole_max_accel);
   readInto(node, recovery.divergence_guard_streak, values_.divergence_guard_streak);
-  readInto(node, recovery.zupt_en, values_.zupt_en);
   readInto(node, recovery.zupt_gyro_thresh, zupt_gyro_thresh);
   readInto(node, recovery.zupt_acc_span_ratio, zupt_acc_span_ratio);
   readInto(node, recovery.zupt_wheel_speed_thresh, zupt_wheel_speed_thresh);
@@ -603,7 +570,6 @@ void FrontendParameters::readReanchor(const rclcpp::Node & node,
                                       RecoveryParams & recovery_params)
 {
   const RecoveryParameterSpecs recovery{};
-  readInto(node, recovery.reanchor_en, reanchor_params.enabled);
   readInto(node, recovery.reanchor_min_eff, reanchor_params.min_eff);
   readInto(node, recovery.reanchor_max_res, reanchor_params.max_res);
   readInto(node, recovery.reanchor_confirm_scans, reanchor_params.confirm_scans);
@@ -641,18 +607,12 @@ void FrontendParameters::readReanchor(const rclcpp::Node & node,
 }
 
 void FrontendParameters::loadLostRecovery(const rclcpp::Node & node,
-                                          bool health_pub_en,
                                           double total_s,
                                           LostRecoveryParams & lost_recovery_params)
 {
   const RecoveryParameterSpecs recovery{};
   const bool enabled = node.get_parameter(recovery.lost_recovery_en.name).as_bool();
   const double stable_s = node.get_parameter(recovery.lost_recovery_stable_sec.name).as_double();
-  if (enabled && !health_pub_en) {
-    throw std::invalid_argument(
-      "lost_recovery_en=true requires health_pub_en=true "
-      "(the coordinate epoch is published in the /Odometry health block)");
-  }
   if (!fast_lio::resolveLostRecoveryParams(enabled, stable_s, total_s, &lost_recovery_params)) {
     throw std::invalid_argument(
       "lost_recovery_stable_sec must be finite and positive (representable in ns); "
@@ -664,24 +624,11 @@ void FrontendParameters::loadLostRecovery(const rclcpp::Node & node,
 #endif
 }
 
-void FrontendParameters::loadRecoveryEntryView(const rclcpp::Node & node)
-{
-  const RecoveryParameterSpecs recovery{};
-  readInto(node, recovery.reanchor_recovery_entry_view, values_.reanchor_recovery_entry_view);
-#ifndef USE_IVOX
-  if (values_.reanchor_recovery_entry_view) {
-    RCLCPP_FATAL(node.get_logger(), "reanchor_recovery_entry_view needs the iVox map backend (USE_IVOX)");
-    throw std::invalid_argument("reanchor_recovery_entry_view needs the iVox map backend");
-  }
-#endif
-}
-
 void FrontendParameters::readRunaway(const rclcpp::Node & node,
                                      double zupt_wheel_max_age,
                                      double zupt_wheel_speed_thresh)
 {
   const RecoveryParameterSpecs recovery{};
-  readInto(node, recovery.runaway_watchdog_en, values_.runaway.enabled);
   readInto(node, recovery.runaway_parked_speed_thresh, values_.runaway.parked_speed_thresh);
   readInto(node, recovery.runaway_wheel_speed_margin, values_.runaway.wheel_speed_margin);
   readInto(node, recovery.runaway_hold_sec, values_.runaway.hold_sec);
@@ -818,8 +765,7 @@ void FrontendParameters::resolveAnchorGap(const rclcpp::Node & node,
 void FrontendParameters::readImuCoverage(const rclcpp::Node & node,
                                          double & max_scan_duration_s,
                                          ImuCoverageParams & coverage,
-                                         ImuGapPriorParams & gap,
-                                         bool reanchor_en)
+                                         ImuGapPriorParams & gap)
 {
   const InputParameterSpecs input{};
   const ImuParameterSpecs imu{};
@@ -829,8 +775,6 @@ void FrontendParameters::readImuCoverage(const rclcpp::Node & node,
   if (!std::isfinite(coverage.max_gap_s) || coverage.max_gap_s < 0.0 || !std::isfinite(coverage.max_extrapolation_s) ||
       coverage.max_extrapolation_s < 0.0)
     throw std::invalid_argument("imu_coverage limits must be finite and nonnegative");
-  if ((coverage.max_gap_s > 0.0 || coverage.max_extrapolation_s > 0.0) && !reanchor_en)
-    throw std::invalid_argument("imu_coverage requires reanchor_en for recovery against the frozen map");
   {
     readInto(node, imu.imu_gap_prior_en, gap.enabled);
     readInto(node, imu.imu_gap_min_s, gap.min_gap_s);
@@ -896,7 +840,6 @@ IvoxDeclaredValues FrontendParameters::declareIvox(rclcpp::Node & node)
 {
   const MapParameterSpecs map{};
   const double ivox_res = declareValue(node, map.ivox_grid_resolution);
-  const int ivox_nearby = declareValue(node, map.ivox_nearby_type);
   const int ivox_vcap = declareValue(node, map.ivox_voxel_capacity);
   const int ivox_maxvox = declareValue(node, map.ivox_max_voxels);
   if (ivox_maxvox < 0) {
@@ -905,11 +848,10 @@ IvoxDeclaredValues FrontendParameters::declareIvox(rclcpp::Node & node)
   }
 #ifdef FASTLIO_TEST_HOOKS
   locals_for_test_.value("ivox_grid_resolution", ivox_res);
-  locals_for_test_.value("ivox_nearby_type", ivox_nearby);
   locals_for_test_.value("ivox_voxel_capacity", ivox_vcap);
   locals_for_test_.value("ivox_max_voxels", ivox_maxvox);
 #endif
-  return IvoxDeclaredValues{ivox_res, ivox_nearby, ivox_vcap, ivox_maxvox};
+  return IvoxDeclaredValues{ivox_res, ivox_vcap, ivox_maxvox};
 }
 #endif
 
@@ -948,12 +890,19 @@ void FrontendParameters::readPriorMapPath(const rclcpp::Node & node, std::string
 {
   const MapParameterSpecs map{};
   readInto(node, map.prior_map_pcd, prior_map_pcd);
+#ifndef USE_IVOX
+  if (!prior_map_pcd.empty()) {
+    RCLCPP_FATAL(node.get_logger(),
+                 "prior_map_pcd needs the iVox map backend: ikd-Tree has no tier to keep a delivered map apart from "
+                 "the live one");
+    throw std::invalid_argument("prior_map_pcd needs the iVox map backend");
+  }
+#endif
 }
 
 void FrontendParameters::readPriorMapAndPose(const rclcpp::Node & node)
 {
   const MapParameterSpecs map{};
-  readInto(node, map.prior_map_pinned, values_.prior_map_pinned);
   readInto(node, map.prior_map_voxel, values_.prior_map_voxel);
   readInto(node, map.prior_map_freeze, values_.prior_map_freeze);
   {
@@ -967,10 +916,7 @@ void FrontendParameters::readPriorMapAndPose(const rclcpp::Node & node)
     }
     if (values_.prior_map_align == fast_lio::PriorMapAlign::kRelocalization) {
 #ifdef USE_IVOX
-      // The map has to be replaceable as a unit when a better alignment arrives, which is
-      // what the pinned tier is: forcing it here rather than asking the operator to set two
-      // parameters that only work together.
-      values_.prior_map_pinned = true;
+      // The map has to be replaceable as a unit when a better alignment arrives, which is what its tier is.
       RCLCPP_INFO(node.get_logger(),
                   "prior_map_align=relocalization: the map waits for /relocalization/result and is "
                   "installed transformed into this run's frame (pinned tier, replaced on realignment)");

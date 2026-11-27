@@ -53,9 +53,9 @@ enum class ImuStaticInitDecision
 };
 
 // Cell 5 is diagnostic only, independent of the pose-health flag bits.
-inline double imuInitDegradedCell(bool healthEnabled, bool gateActive, bool degraded)
+inline double imuInitDegradedCell(bool gateActive, bool degraded)
 {
-  return healthEnabled && gateActive && degraded ? 1.0 : 0.0;
+  return gateActive && degraded ? 1.0 : 0.0;
 }
 
 class ImuStaticInitGate

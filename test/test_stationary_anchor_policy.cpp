@@ -362,7 +362,6 @@ TEST(StationaryAnchorPolicy, OneMovingScanEndsTheEpisodeInAllFourAlternations)
         EXPECT_FALSE(parked.started) << "a degraded scan does not start a candidate";
         fast_lio::ZuptPolicyInputs zupt;
         zupt.scan_degraded = true;
-        zupt.zupt_enabled = true;
         zupt.anchor_valid = parked.usable;
         zupt.body_static = true;
         zupt.speed = 0.4;
@@ -597,7 +596,6 @@ TEST(StationaryAnchorPolicy, ACommittedWindowThatIsNotParkedEndsTheAnchor)
     EXPECT_FALSE(parked.usable || parked.started || parked.committed);
     fast_lio::ZuptPolicyInputs in;
     in.scan_degraded = true;
-    in.zupt_enabled = true;
     in.anchor_valid = parked.usable;
     in.body_static = true;
     in.speed = 0.4;
@@ -764,28 +762,25 @@ TEST(StationaryAnchorPolicy, AfterAWindowEndedTheAnchorZuptKeepsItsTable)
 {
   // The window check only ends the anchor; what a later scan writes is decideZupt's, from that scan's own
   // evidence and without the anchor. Evidence that still cannot tell is not "parked": nothing is pinned, and the
-  // velocity is zeroed only above the speed ceiling, as with ZUPT off.
+  // velocity is zeroed only above the speed ceiling.
   Lifecycle life;
   life.commit();
   ASSERT_EQ(life.exit(StaticEvidence::kUnknown), AnchorDrop::kEvidenceUnknown);
   const AnchorStep unknown = life.scan(StaticEvidence::kUnknown, true);
   EXPECT_FALSE(unknown.usable || unknown.started || unknown.dropped);
-  for (const bool enabled : {true, false}) {
-    for (const bool body_static : {false, true}) {
-      for (const double speed : {0.4, 31.0}) {
-        fast_lio::ZuptPolicyInputs in;
-        in.scan_degraded = true;
-        in.zupt_enabled = enabled;
-        in.anchor_valid = unknown.usable;
-        in.body_static = body_static;
-        in.speed = speed;
-        in.max_speed = 30.0;
-        const fast_lio::ZuptDecision decision = fast_lio::decideZupt(in);
-        const bool zero = (enabled && body_static) || speed > in.max_speed;
-        EXPECT_EQ(decision.action, zero ? fast_lio::ZuptAction::kZeroVelocity : fast_lio::ZuptAction::kNone)
-          << "zupt " << enabled << " static " << body_static << " speed " << speed;
-        EXPECT_FALSE(decision.hold);
-      }
+  for (const bool body_static : {false, true}) {
+    for (const double speed : {0.4, 31.0}) {
+      fast_lio::ZuptPolicyInputs in;
+      in.scan_degraded = true;
+      in.anchor_valid = unknown.usable;
+      in.body_static = body_static;
+      in.speed = speed;
+      in.max_speed = 30.0;
+      const fast_lio::ZuptDecision decision = fast_lio::decideZupt(in);
+      const bool zero = body_static || speed > in.max_speed;
+      EXPECT_EQ(decision.action, zero ? fast_lio::ZuptAction::kZeroVelocity : fast_lio::ZuptAction::kNone)
+        << "static " << body_static << " speed " << speed;
+      EXPECT_FALSE(decision.hold);
     }
   }
 }
@@ -1913,7 +1908,6 @@ TEST(StationaryAnchorPolicy, ZeroOnlyNeverPinsWhateverTheSpeed)
   for (const double speed : {0.0, 0.4, 2.9, 3.0, 45.0, nan}) {
     fast_lio::ZuptPolicyInputs in;
     in.scan_degraded = true;
-    in.zupt_enabled = true;
     in.anchor_valid = false;  // no usable anchor
     in.body_static = true;
     in.speed = speed;

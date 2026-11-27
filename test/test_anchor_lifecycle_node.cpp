@@ -393,6 +393,21 @@ void setParam(Scenario & scenario, const rclcpp::Parameter & param)
   scenario.params[param.get_name()] = param;
 }
 
+// The re-anchor gate as the products run it: three matching scans before the map grows again, a loss after five
+// seconds without them. The base scenario releases on the guard's verdict and never gives up.
+void productReanchorGate(Scenario & scenario)
+{
+  setParam(scenario, rclcpp::Parameter("reanchor_confirm_scans", 3));
+  setParam(scenario, rclcpp::Parameter("reanchor_timeout_sec", 5.0));
+}
+
+// The runaway watchdog's product patience: a contradiction that outlasts three seconds trips it. The base
+// scenario's watchdog trips only where a scan forces it.
+void productRunawayWatchdog(Scenario & scenario)
+{
+  setParam(scenario, rclcpp::Parameter("runaway_hold_sec", 3.0));
+}
+
 Scenario baseParams(const std::string & name, bool trace)
 {
   Scenario s;
@@ -412,11 +427,16 @@ Scenario baseParams(const std::string & name, bool trace)
         rclcpp::Parameter("publish.scan_publish_en", false),
         rclcpp::Parameter("publish.path_en", false),
         rclcpp::Parameter("runtime_pos_log_enable", false),
-        // The re-anchor gate would hold a recovered scan in verification against a map the
-        // fixture never matches; with it off the anchor logic sees the guard's verdict directly.
-        rclcpp::Parameter("reanchor_en", false),
-        rclcpp::Parameter("runaway_watchdog_en", false),
-        rclcpp::Parameter("zupt_en", true),
+        // The re-anchor gate releases a recovered scan on the guard's verdict, with no match against the frozen
+        // map required (the fixture moves the pose while the map is frozen), and never declares a loss itself, so
+        // the anchor logic sees the guard's verdict; the scan it releases carries the reanchored event. A loss
+        // tripped from outside the gate stands until a map rebuild or a degraded scan. The cases about the gate
+        // take its product settings (productReanchorGate).
+        rclcpp::Parameter("reanchor_confirm_scans", 0),
+        rclcpp::Parameter("reanchor_timeout_sec", 0.0),
+        // The watchdog trips only where a scan forces it, or where a case takes its product patience
+        // (productRunawayWatchdog).
+        rclcpp::Parameter("runaway_hold_sec", 1.0e9),
         rclcpp::Parameter("zupt_parked_hold_en", false),
         rclcpp::Parameter("zupt_anchor_trace_en", trace)}) {
     setParam(s, p);
@@ -449,7 +469,7 @@ Scenario parkedAgainDegraded(const FieldCase & c, bool trace = false)
 Scenario parkedAgainWithLateReset(const FieldCase & c, bool trace = false)
 {
   Scenario s = baseParams(std::string(c.name) + "_reset", trace);
-  setParam(s, rclcpp::Parameter("runaway_watchdog_en", true));
+  productRunawayWatchdog(s);
   setParam(s, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   appendAnchorThenMove(s, c);
   s.steps.push_back(step(Phase::kStatic, Imu::kStatic, Guard::kDegraded, c.pre_event, true));
@@ -475,7 +495,7 @@ Scenario parkedAgainHealthy(const FieldCase & c)
 Scenario coverageGapThenParked(const FieldCase & c)
 {
   Scenario s = baseParams(std::string(c.name) + "_coverage", false);
-  setParam(s, rclcpp::Parameter("reanchor_en", true));  // imu_coverage.max_gap_s requires it
+  productReanchorGate(s);
   setParam(s, rclcpp::Parameter("imu_coverage.max_gap_s", 0.02));
   s.steps.push_back(step(Phase::kAnchorMove, Imu::kMoving, Guard::kHealthy, c.old_anchor));
   for (int i = 0; i < 4; ++i)
@@ -501,7 +521,7 @@ Scenario pinThenLateReset(bool trace = false)
 {
   const FieldCase & c = kFieldCases[0];
   Scenario s = baseParams("pin_late_reset", trace);
-  setParam(s, rclcpp::Parameter("runaway_watchdog_en", true));
+  productRunawayWatchdog(s);
   setParam(s, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   s.steps.push_back(step(Phase::kAnchorMove, Imu::kMoving, Guard::kHealthy, c.old_anchor));
   for (int i = 0; i < 4; ++i)
@@ -521,7 +541,7 @@ Scenario resetWhileParkedHealthy(double total)
 {
   const FieldCase & c = kFieldCases[0];
   Scenario s = baseParams(total > 0.0 ? "parked_reset_policy_on" : "parked_reset_policy_off", false);
-  setParam(s, rclcpp::Parameter("runaway_watchdog_en", true));
+  productRunawayWatchdog(s);
   setParam(s, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   setParam(s, rclcpp::Parameter("reanchor_total_timeout_sec", total));
   setParam(s, rclcpp::Parameter("reanchor_recovery_stable_sec", 1.0));
@@ -2119,9 +2139,8 @@ void expectTransitionKeys(const std::vector<std::string> & transitions, const st
 // What only the per-scan trace observes (anchor_trace.hpp, "Since version 2"), on every scan of a run with the
 // trace on: which of the fields are present; that a candidate's stored pose is the pose its first scan had, stays
 // what it was, and is the target of every write that uses it; what a pin and a zero-only scan leave in the state;
-// that a Pending scan adds nothing to the map. With `entry_view` (reanchor_recovery_entry_view) only a degraded
-// Pending scan does not.
-void expectAnchorWriteFields(const ChildResult & r, const std::string & name, bool entry_view = false)
+// that a degraded Pending scan adds nothing to the map (a healthy one goes into it while the entry view serves).
+void expectAnchorWriteFields(const ChildResult & r, const std::string & name)
 {
   struct Pose
   {
@@ -2179,7 +2198,7 @@ void expectAnchorWriteFields(const ChildResult & r, const std::string & name, bo
       EXPECT_TRUE(std::isfinite(x.upd_dp) && x.upd_dp >= 0.0) << at;
       EXPECT_TRUE(std::isfinite(x.upd_dq) && x.upd_dq >= 0.0) << at;
     }
-    if (x.trust_post == fast_lio::RecoveryTrust::kPending && (x.degraded || !entry_view)) {
+    if (x.trust_post == fast_lio::RecoveryTrust::kPending && x.degraded) {
       EXPECT_FALSE(x.map_updated) << at << ": a Pending scan added its points to the map";
     }
   }
@@ -2195,10 +2214,7 @@ void expectAnchorWriteFields(const ChildResult & r, const std::string & name, bo
 }
 
 // K7 on the node: one scan record per scan taken, sequences without gaps or repeats, counters that reconcile.
-void expectTraceAccountsForEveryScan(const ChildResult & r,
-                                     bool trace_on,
-                                     const std::string & name,
-                                     bool entry_view = false)
+void expectTraceAccountsForEveryScan(const ChildResult & r, bool trace_on, const std::string & name)
 {
   const auto scans = linesTagged(r, "[ZUPT-ANCHOR-SCAN]");
   const auto transitions = transitionLines(r);
@@ -2223,7 +2239,7 @@ void expectTraceAccountsForEveryScan(const ChildResult & r,
     }
     return;
   }
-  expectAnchorWriteFields(r, name, entry_view);
+  expectAnchorWriteFields(r, name);
   ASSERT_EQ(scans.size(), r.observations.size()) << name;
   for (std::size_t i = 0; i < scans.size(); ++i) {
     const auto & o = r.observations[i];
@@ -2473,7 +2489,7 @@ Scenario imuBridge(double hole_s, double total, Guard event_guard = Guard::kHeal
   name << "imu_bridge_" << hole_s << (total > 0.0 ? "_policy_on" : "_policy_off")
        << (event_guard == Guard::kDegraded ? "_degraded" : "");
   Scenario s = inputScenario(name.str());
-  setParam(s, rclcpp::Parameter("reanchor_en", true));
+  productReanchorGate(s);
   setParam(s, rclcpp::Parameter("imu_gap_prior_en", true));
   // Below the fixture's scan period, so a scan without any IMU sample is bridged whichever way 0.1 s rounds.
   setParam(s, rclcpp::Parameter("imu_gap_min_s", 0.05));
@@ -2679,7 +2695,7 @@ Scenario lostImu(LostImu what)
   Step event = slot(Phase::kEvent);
   switch (what) {
     case LostImu::kTail:
-      setParam(s, rclcpp::Parameter("reanchor_en", true));
+      productReanchorGate(s);
       setParam(s, rclcpp::Parameter("imu_coverage.max_extrapolation_s", 0.02));
       event.hole_from = -0.035;
       event.hole_to = 0.0;
@@ -2698,7 +2714,7 @@ Scenario lostImu(LostImu what)
       s.steps.push_back(event);
       break;
     case LostImu::kBacklog:
-      setParam(s, rclcpp::Parameter("reanchor_en", true));
+      productReanchorGate(s);
       setParam(s, rclcpp::Parameter("imu_coverage.max_gap_s", 0.05));
       setParam(s, rclcpp::Parameter("max_imu_backlog_sec", 0.5));
       append(s, 12, slot(Phase::kEvent, Imu::kStatic, Guard::kHealthy, Cloud::kNone));
@@ -2776,7 +2792,7 @@ Scenario verificationTimesOut(double total)
 {
   Scenario s = inputScenario(total > 0.0 ? "gate_lost_policy_on" : "gate_lost_policy_off");
   s.typed = true;
-  setParam(s, rclcpp::Parameter("reanchor_en", true));
+  productReanchorGate(s);
   setParam(s, rclcpp::Parameter("reanchor_on_fail", "reset_map"));
   setParam(s, rclcpp::Parameter("reanchor_min_eff", 100000000));
   setParam(s, rclcpp::Parameter("publish.frontend_observation", true));
@@ -2808,7 +2824,7 @@ Scenario nearFieldDuringVerification(bool require_guard_clear)
 {
   Scenario s = baseParams(require_guard_clear ? "near_field_rule_on" : "near_field_rule_off", true);
   s.flexible = true;
-  setParam(s, rclcpp::Parameter("reanchor_en", true));
+  productReanchorGate(s);
   if (require_guard_clear)
     setParam(s, rclcpp::Parameter("reanchor_require_guard_clear", true));
   append(s, 5, slot(Phase::kBefore, Imu::kStatic, Guard::kNatural));
@@ -2847,14 +2863,13 @@ Scenario nearFieldThenFarTail(bool require_guard_clear)
 
 // ---- F05: the parked prior and a reset later in the same scan --------------------------------------------------
 
-Scenario parkedPriorThenLateReset(bool zupt)
+Scenario parkedPriorThenLateReset()
 {
   const FieldCase & c = kFieldCases[0];
-  Scenario s = baseParams(zupt ? "prior_late_reset_zupt_on" : "prior_late_reset_zupt_off", false);
-  setParam(s, rclcpp::Parameter("zupt_en", zupt));
+  Scenario s = baseParams("prior_late_reset", false);
   setParam(s, rclcpp::Parameter("zupt_parked_hold_en", true));
   setParam(s, rclcpp::Parameter("zupt_parked_hold_scans", 3));
-  setParam(s, rclcpp::Parameter("runaway_watchdog_en", true));
+  productRunawayWatchdog(s);
   setParam(s, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   s.steps.push_back(step(Phase::kAnchorMove, Imu::kMoving, Guard::kHealthy, c.old_anchor));
   for (int i = 0; i < 4; ++i)
@@ -2911,7 +2926,7 @@ Scenario referenceChanges(std::vector<ReferenceEvent> * events)
   s.relocalizations = {{{0.0, 0.0, 0.0}}, {{1.0e12, 0.0, 0.0}}, {{0.5, 0.0, 0.0}}};
   setParam(s, rclcpp::Parameter("prior_map_pcd", priorMapPath()));
   setParam(s, rclcpp::Parameter("prior_map_align", "relocalization"));
-  setParam(s, rclcpp::Parameter("runaway_watchdog_en", true));
+  productRunawayWatchdog(s);
   setParam(s, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   append(s, 5, slot(Phase::kBefore));
   const auto event = [&](const char * name, int relocalization, bool trip, bool changes, const char * reason) {
@@ -3023,7 +3038,7 @@ Scenario resetRebuildsNoMap(bool prior, bool policy)
   Scenario s = traced(inputScenario(std::string(prior ? "rebuild_kept_prior" : "rebuild_no_prior") +
                                     (policy ? "_policy_on" : "_policy_off")),
                       true);
-  setParam(s, rclcpp::Parameter("runaway_watchdog_en", true));
+  productRunawayWatchdog(s);
   setParam(s, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   setPolicy(s, policy ? 10.0 : 0.0, 1.0);
   append(s, kRebuildBefore, slot(Phase::kBefore));
@@ -3048,25 +3063,24 @@ Scenario resetRebuildsNoMap(bool prior, bool policy)
 
 // ---- The runaway watchdog's hold action ------------------------------------------------------------------------
 
-// A late trip with the watchdog's hold action in place of the map reset, ZUPT on or off.
-Scenario withHold(Scenario s, const std::string & name, bool zupt)
+// A late trip with the watchdog's hold action in place of the map reset.
+Scenario withHold(Scenario s, const std::string & name)
 {
   s.name = name;
   setParam(s, rclcpp::Parameter("runaway_on_trip", "hold"));
-  setParam(s, rclcpp::Parameter("zupt_en", zupt));
   return s;
 }
 
-// Degraded parked scans held on the anchor, then the trip on the next one (with ZUPT off nothing is pinned).
-Scenario pinThenLateHold(bool zupt)
+// Degraded parked scans held on the anchor, then the trip on the next one.
+Scenario pinThenLateHold()
 {
-  return withHold(pinThenLateReset(), zupt ? "pin_late_hold_zupt_on" : "pin_late_hold_zupt_off", zupt);
+  return withHold(pinThenLateReset(), "pin_late_hold");
 }
 
 // Healthy parked scans the parked prior pulls toward the anchor, then the trip on the next one.
-Scenario parkedPriorThenLateHold(bool zupt)
+Scenario parkedPriorThenLateHold()
 {
-  return withHold(parkedPriorThenLateReset(zupt), zupt ? "prior_late_hold_zupt_on" : "prior_late_hold_zupt_off", zupt);
+  return withHold(parkedPriorThenLateReset(), "prior_late_hold");
 }
 
 // The pose covariance the fixture gives a scan before its anchor step, as /Odometry encodes it.
@@ -4023,7 +4037,7 @@ TEST(AnchorLifecycleTraceSwitch, TraceOnAndOffPublishBitIdenticalStatesAndFlags)
     {recoveryRunsOut(true), recoveryRunsOut(false)},
     // The parked prior, and a reset that takes it back; a scan that leaves before the measurement update; a
     // deadline that passes on the IMU clock.
-    {traced(parkedPriorThenLateReset(true), true), traced(parkedPriorThenLateReset(true), false)},
+    {traced(parkedPriorThenLateReset(), true), traced(parkedPriorThenLateReset(), false)},
     {traced(earlyExitBetweenCandidateScans(Cloud::kSparse), true),
      traced(earlyExitBetweenCandidateScans(Cloud::kSparse), false)},
     {traced(idleWithImu(), true), traced(idleWithImu(), false)},
@@ -5277,65 +5291,62 @@ TEST(AnchorLifecycleGate, TheFarScansAfterTheNearFieldScanReRegisterOnceAndNothi
 // Parked on healthy scans with the parked prior pulling toward the anchor, when a runaway map reset runs after the
 // anchor step. The reset ends the anchor within that scan, so the scan gives the prior's pull back: the map is
 // rebuilt around, and /Odometry carries, the scan's own pose. What remains of the anchor step is what it would
-// have written without an anchor: the zeroed velocity where the static verdict zeroes it, nothing otherwise.
+// have written without an anchor: the zeroed velocity the static verdict calls for.
 TEST(AnchorLifecycleGate, ALateResetTakesBackTheParkedPriorOfItsScan)
 {
   const FieldCase & c = kFieldCases[0];
   const std::array<double, 3> nudged = nudgedAnchor(c);
-  for (const bool zupt : {true, false}) {
-    const Scenario scenario = parkedPriorThenLateReset(zupt);
-    const ChildResult r = runScenario(scenario);
-    SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
-    ASSERT_TRUE(r.ok());
-    const std::uint64_t old_id = oldAnchorId(r);
-    ASSERT_NE(old_id, 0u);
-    ASSERT_TRUE(anchorWasValidAtTheOldPose(r, c));
-    const auto written = zupt ? fast_lio::AnchorTraceAction::kZeroVelocity : fast_lio::AnchorTraceAction::kNone;
-    const auto held = r.phase(Phase::kHold);
-    ASSERT_EQ(held.size(), 2u);
-    for (const auto * o : held) {
-      EXPECT_TRUE(o->record.parked_applied) << "step " << o->step;
-      EXPECT_EQ(o->record.anchor_used, old_id) << "step " << o->step;
-      EXPECT_EQ(o->record.action, written) << "step " << o->step;
-      ASSERT_TRUE(o->odom_seen);
-      EXPECT_LT(distance(o->odom_p, c.old_anchor), distance(nudged, c.old_anchor)) << formatPosition(o->odom_p);
-      EXPECT_GT(distance(o->odom_p, c.old_anchor), 0.0) << formatPosition(o->odom_p);
-      EXPECT_EQ(odomFlags(*o), kFlagStaticHold) << "step " << o->step;
-    }
-    const auto reset = r.phase(Phase::kHoldReset);
-    ASSERT_EQ(reset.size(), 1u);
-    const auto & rr = reset.front()->record;
-    const std::uint32_t reset_events = fast_lio::kAnchorEventRunawayTrip | fast_lio::kAnchorEventMapReset;
-    EXPECT_EQ(rr.events & reset_events, reset_events);
-    EXPECT_TRUE(rr.usable) << "the anchor step ran, and applied the prior, before the reset";
-    EXPECT_FALSE(rr.parked_applied);
-    EXPECT_EQ(rr.anchor_used, 0u);
-    EXPECT_EQ(rr.action, written);
-    EXPECT_FALSE(rr.zero_only);
-    EXPECT_TRUE(samePosition(rr.pre_p, nudged) && samePosition(rr.post_p, nudged))
-      << "pre " << formatPosition(rr.pre_p) << " post " << formatPosition(rr.post_p);
-    EXPECT_TRUE(reset.front()->odom_seen && samePosition(reset.front()->odom_p, nudged))
-      << formatPosition(reset.front()->odom_p);
-    for (int i = 0; i < 4; ++i)
-      EXPECT_TRUE(sameBits(rr.pre_q[i], rr.post_q[i])) << "attitude component " << i;
-    for (int i = 0; i < 3; ++i)
-      EXPECT_TRUE(sameBits(rr.post_v[i], zupt ? 0.0 : kFixtureVelocity[static_cast<std::size_t>(i)]))
-        << "velocity component " << i << " is " << rr.post_v[i];
-    EXPECT_TRUE(rr.have_cov && samePoseCovariance(rr)) << "the prior's covariance update outlived its anchor";
-    EXPECT_EQ(rr.anchor_state, fast_lio::AnchorState::kEmpty);
-    EXPECT_FALSE(rr.static_hold);
-    EXPECT_EQ(odomFlags(*reset.front()), 0u);
-    EXPECT_EQ(counterValue(r, "parked_prior_applied"), "2") << "only the two scans whose published pose carries it";
-    EXPECT_EQ(counterValue(r, "zero_only_unanchored"), "0") << "a healthy scan is no zero-only scan";
-    expectInvalidatedOnce(r, old_id, "map_reset", scenario.name);
-    const auto after = r.phase(Phase::kAfterReset);
-    ASSERT_EQ(after.size(), 2u);
-    for (const auto * o : after) {
-      EXPECT_FALSE(o->record.parked_applied) << "step " << o->step;
-      EXPECT_EQ(o->record.anchor_used, 0u) << "step " << o->step;
-      EXPECT_EQ(o->record.anchor_id, old_id + 1) << "step " << o->step;
-      EXPECT_TRUE(o->odom_seen && samePosition(o->odom_p, nudged)) << formatPosition(o->odom_p);
-    }
+  const Scenario scenario = parkedPriorThenLateReset();
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const std::uint64_t old_id = oldAnchorId(r);
+  ASSERT_NE(old_id, 0u);
+  ASSERT_TRUE(anchorWasValidAtTheOldPose(r, c));
+  const auto written = fast_lio::AnchorTraceAction::kZeroVelocity;
+  const auto held = r.phase(Phase::kHold);
+  ASSERT_EQ(held.size(), 2u);
+  for (const auto * o : held) {
+    EXPECT_TRUE(o->record.parked_applied) << "step " << o->step;
+    EXPECT_EQ(o->record.anchor_used, old_id) << "step " << o->step;
+    EXPECT_EQ(o->record.action, written) << "step " << o->step;
+    ASSERT_TRUE(o->odom_seen);
+    EXPECT_LT(distance(o->odom_p, c.old_anchor), distance(nudged, c.old_anchor)) << formatPosition(o->odom_p);
+    EXPECT_GT(distance(o->odom_p, c.old_anchor), 0.0) << formatPosition(o->odom_p);
+    EXPECT_EQ(odomFlags(*o), kFlagStaticHold) << "step " << o->step;
+  }
+  const auto reset = r.phase(Phase::kHoldReset);
+  ASSERT_EQ(reset.size(), 1u);
+  const auto & rr = reset.front()->record;
+  const std::uint32_t reset_events = fast_lio::kAnchorEventRunawayTrip | fast_lio::kAnchorEventMapReset;
+  EXPECT_EQ(rr.events & reset_events, reset_events);
+  EXPECT_TRUE(rr.usable) << "the anchor step ran, and applied the prior, before the reset";
+  EXPECT_FALSE(rr.parked_applied);
+  EXPECT_EQ(rr.anchor_used, 0u);
+  EXPECT_EQ(rr.action, written);
+  EXPECT_FALSE(rr.zero_only);
+  EXPECT_TRUE(samePosition(rr.pre_p, nudged) && samePosition(rr.post_p, nudged))
+    << "pre " << formatPosition(rr.pre_p) << " post " << formatPosition(rr.post_p);
+  EXPECT_TRUE(reset.front()->odom_seen && samePosition(reset.front()->odom_p, nudged))
+    << formatPosition(reset.front()->odom_p);
+  for (int i = 0; i < 4; ++i)
+    EXPECT_TRUE(sameBits(rr.pre_q[i], rr.post_q[i])) << "attitude component " << i;
+  for (int i = 0; i < 3; ++i)
+    EXPECT_TRUE(sameBits(rr.post_v[i], 0.0)) << "velocity component " << i << " is " << rr.post_v[i];
+  EXPECT_TRUE(rr.have_cov && samePoseCovariance(rr)) << "the prior's covariance update outlived its anchor";
+  EXPECT_EQ(rr.anchor_state, fast_lio::AnchorState::kEmpty);
+  EXPECT_FALSE(rr.static_hold);
+  EXPECT_EQ(odomFlags(*reset.front()), 0u);
+  EXPECT_EQ(counterValue(r, "parked_prior_applied"), "2") << "only the two scans whose published pose carries it";
+  EXPECT_EQ(counterValue(r, "zero_only_unanchored"), "0") << "a healthy scan is no zero-only scan";
+  expectInvalidatedOnce(r, old_id, "map_reset", scenario.name);
+  const auto after = r.phase(Phase::kAfterReset);
+  ASSERT_EQ(after.size(), 2u);
+  for (const auto * o : after) {
+    EXPECT_FALSE(o->record.parked_applied) << "step " << o->step;
+    EXPECT_EQ(o->record.anchor_used, 0u) << "step " << o->step;
+    EXPECT_EQ(o->record.anchor_id, old_id + 1) << "step " << o->step;
+    EXPECT_TRUE(o->odom_seen && samePosition(o->odom_p, nudged)) << formatPosition(o->odom_p);
   }
 }
 
@@ -5530,129 +5541,113 @@ TEST(AnchorLifecycleRebuild, AResetWhoseRebuildTakesNoPointEndsTheAnchorOnce)
 // A trip with the hold action on a degraded parked scan held on its anchor. The pin of that scan is taken back
 // before the front end declares itself lost: the scan publishes its own pose, attitude and pose covariance with the
 // velocity alone zeroed, as a zero-only scan, and its outputs carry Lost without StaticHold. The anchor ends for
-// that reason. With ZUPT off nothing was pinned and nothing is taken back: the scan publishes the state it brought.
-// The loss is that scan's: the degraded parked scans after it report Degraded alone.
+// that reason. The loss is that scan's: the degraded parked scans after it report Degraded alone.
 TEST(AnchorLifecycleHold, AHoldTakesBackThePinOfItsScanAndReportsLost)
 {
   const FieldCase & c = kFieldCases[0];
   const std::array<double, 3> nudged = nudgedAnchor(c);
   const std::array<double, 3> zero = {0.0, 0.0, 0.0};
-  for (const bool zupt : {true, false}) {
-    const Scenario scenario = pinThenLateHold(zupt);
-    const ChildResult r = runScenario(scenario);
-    SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
-    ASSERT_TRUE(r.ok());
-    const std::uint64_t old_id = oldAnchorId(r);
-    ASSERT_NE(old_id, 0u);
-    ASSERT_TRUE(anchorWasValidAtTheOldPose(r, c));
-    const auto held = r.phase(Phase::kHold);
-    ASSERT_EQ(held.size(), 2u);
-    for (const auto * o : held) {
-      EXPECT_EQ(o->record.action, zupt ? fast_lio::AnchorTraceAction::kPin : fast_lio::AnchorTraceAction::kNone)
-        << "step " << o->step;
-      EXPECT_EQ(o->record.anchor_used, zupt ? old_id : 0u) << "step " << o->step;
-      EXPECT_EQ(odomFlags(*o), zupt ? kFlagDegraded | kFlagStaticHold : kFlagDegraded) << "step " << o->step;
-    }
-    const auto trip = r.phase(Phase::kHoldReset);
-    ASSERT_EQ(trip.size(), 1u);
-    const Observation & t = *trip.front();
-    const auto & tr = t.record;
-    EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventRunawayTrip));
-    EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventLost));
-    EXPECT_FALSE(hasEvent(t, fast_lio::kAnchorEventMapReset));
-    EXPECT_EQ(tr.anchor_used, 0u);
-    EXPECT_FALSE(tr.parked_applied);
-    if (zupt) {
-      EXPECT_TRUE(tr.usable) << "the anchor step ran, and pinned, before the trip";
-      EXPECT_EQ(tr.action, fast_lio::AnchorTraceAction::kZeroVelocity);
-      EXPECT_TRUE(tr.zero_only);
-    } else {
-      EXPECT_EQ(tr.action, fast_lio::AnchorTraceAction::kNone);
-      EXPECT_FALSE(tr.zero_only);
-    }
-    expectTheScanOwnState(t, nudged, zupt ? zero : kFixtureVelocity, zupt, true);
-    EXPECT_EQ(tr.anchor_state, fast_lio::AnchorState::kEmpty);
-    EXPECT_FALSE(tr.static_hold);
-    EXPECT_EQ(odomFlags(t), kFlagDegraded | kFlagLost);
-    EXPECT_EQ(tr.flags, static_cast<int>(kFlagDegraded | kFlagLost));
-    expectInvalidatedOnce(r, old_id, "lost", scenario.name);
-    EXPECT_EQ(counterValue(r, "lost"), "1");
-    EXPECT_EQ(counterValue(r, "map_reset"), "0");
-    EXPECT_EQ(counterValue(r, "pin_applied"), zupt ? "2" : "0")
-      << "only the scans whose published pose is the anchor's";
-    EXPECT_EQ(counterValue(r, "zero_only_unanchored"), zupt ? "3" : "0") << "the trip scan and the two after it";
-    const auto after = r.phase(Phase::kAfterReset);
-    ASSERT_EQ(after.size(), 2u);
-    for (const auto * o : after) {
-      if (zupt) {
-        std::string why;
-        EXPECT_TRUE(zeroedVelocityOnly(*o, nudged, &why)) << "step " << o->step << ": " << why;
-      } else {
-        EXPECT_EQ(o->record.action, fast_lio::AnchorTraceAction::kNone) << "step " << o->step;
-        EXPECT_EQ(o->record.anchor_used, 0u) << "step " << o->step;
-        EXPECT_TRUE(o->odom_seen && samePosition(o->odom_p, nudged)) << formatPosition(o->odom_p);
-        EXPECT_EQ(odomFlags(*o), kFlagDegraded) << "step " << o->step;
-      }
-    }
+  const Scenario scenario = pinThenLateHold();
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const std::uint64_t old_id = oldAnchorId(r);
+  ASSERT_NE(old_id, 0u);
+  ASSERT_TRUE(anchorWasValidAtTheOldPose(r, c));
+  const auto held = r.phase(Phase::kHold);
+  ASSERT_EQ(held.size(), 2u);
+  for (const auto * o : held) {
+    EXPECT_EQ(o->record.action, fast_lio::AnchorTraceAction::kPin) << "step " << o->step;
+    EXPECT_EQ(o->record.anchor_used, old_id) << "step " << o->step;
+    EXPECT_EQ(odomFlags(*o), kFlagDegraded | kFlagStaticHold) << "step " << o->step;
+  }
+  const auto trip = r.phase(Phase::kHoldReset);
+  ASSERT_EQ(trip.size(), 1u);
+  const Observation & t = *trip.front();
+  const auto & tr = t.record;
+  EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventRunawayTrip));
+  EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventLost));
+  EXPECT_FALSE(hasEvent(t, fast_lio::kAnchorEventMapReset));
+  EXPECT_EQ(tr.anchor_used, 0u);
+  EXPECT_FALSE(tr.parked_applied);
+  EXPECT_TRUE(tr.usable) << "the anchor step ran, and pinned, before the trip";
+  EXPECT_EQ(tr.action, fast_lio::AnchorTraceAction::kZeroVelocity);
+  EXPECT_TRUE(tr.zero_only);
+  expectTheScanOwnState(t, nudged, zero, true, true);
+  EXPECT_EQ(tr.anchor_state, fast_lio::AnchorState::kEmpty);
+  EXPECT_FALSE(tr.static_hold);
+  EXPECT_EQ(odomFlags(t), kFlagDegraded | kFlagLost);
+  EXPECT_EQ(tr.flags, static_cast<int>(kFlagDegraded | kFlagLost));
+  expectInvalidatedOnce(r, old_id, "lost", scenario.name);
+  EXPECT_EQ(counterValue(r, "lost"), "1");
+  EXPECT_EQ(counterValue(r, "map_reset"), "0");
+  EXPECT_EQ(counterValue(r, "pin_applied"), "2") << "only the scans whose published pose is the anchor's";
+  EXPECT_EQ(counterValue(r, "zero_only_unanchored"), "3") << "the trip scan and the two after it";
+  const auto after = r.phase(Phase::kAfterReset);
+  ASSERT_EQ(after.size(), 2u);
+  for (const auto * o : after) {
+    std::string why;
+    EXPECT_TRUE(zeroedVelocityOnly(*o, nudged, &why)) << "step " << o->step << ": " << why;
   }
 }
 
 // A trip with the hold action on a healthy parked scan the parked prior pulled toward its anchor. The pull is taken
 // back before the front end declares itself lost: the scan publishes its own pose, attitude and pose covariance,
-// with the velocity zeroed where ZUPT zeroes it, and its outputs carry Lost without StaticHold. The anchor ends for
-// that reason; the parked scans after it start a new candidate and report nothing.
+// with the velocity zeroed, and its outputs carry Lost without StaticHold. The anchor ends for that reason, and the
+// loss stands on the healthy parked scans after it: the re-anchor gate keeps a loss tripped from outside it until a
+// map rebuild or a degraded scan, so they report Lost and Degraded, zero the velocity alone and start no candidate.
 TEST(AnchorLifecycleHold, AHoldTakesBackTheParkedPriorOfItsScanAndReportsLost)
 {
   const FieldCase & c = kFieldCases[0];
   const std::array<double, 3> nudged = nudgedAnchor(c);
   const std::array<double, 3> zero = {0.0, 0.0, 0.0};
-  for (const bool zupt : {true, false}) {
-    const Scenario scenario = parkedPriorThenLateHold(zupt);
-    const ChildResult r = runScenario(scenario);
-    SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
-    ASSERT_TRUE(r.ok());
-    const std::uint64_t old_id = oldAnchorId(r);
-    ASSERT_NE(old_id, 0u);
-    ASSERT_TRUE(anchorWasValidAtTheOldPose(r, c));
-    const auto written = zupt ? fast_lio::AnchorTraceAction::kZeroVelocity : fast_lio::AnchorTraceAction::kNone;
-    const auto held = r.phase(Phase::kHold);
-    ASSERT_EQ(held.size(), 2u);
-    for (const auto * o : held) {
-      EXPECT_TRUE(o->record.parked_applied) << "step " << o->step;
-      EXPECT_EQ(o->record.anchor_used, old_id) << "step " << o->step;
-      EXPECT_EQ(odomFlags(*o), kFlagStaticHold) << "step " << o->step;
-    }
-    const auto trip = r.phase(Phase::kHoldReset);
-    ASSERT_EQ(trip.size(), 1u);
-    const Observation & t = *trip.front();
-    const auto & tr = t.record;
-    EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventRunawayTrip));
-    EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventLost));
-    EXPECT_FALSE(hasEvent(t, fast_lio::kAnchorEventMapReset));
-    EXPECT_TRUE(tr.usable) << "the anchor step ran, and applied the prior, before the trip";
-    EXPECT_FALSE(tr.parked_applied);
-    EXPECT_EQ(tr.anchor_used, 0u);
-    EXPECT_EQ(tr.action, written);
-    EXPECT_FALSE(tr.zero_only);
-    expectTheScanOwnState(t, nudged, zupt ? zero : kFixtureVelocity, true, false);
-    EXPECT_EQ(tr.anchor_state, fast_lio::AnchorState::kEmpty);
-    EXPECT_FALSE(tr.static_hold);
-    EXPECT_EQ(odomFlags(t), kFlagLost);
-    EXPECT_EQ(tr.flags, static_cast<int>(kFlagLost));
-    expectInvalidatedOnce(r, old_id, "lost", scenario.name);
-    EXPECT_EQ(counterValue(r, "lost"), "1");
-    EXPECT_EQ(counterValue(r, "map_reset"), "0");
-    EXPECT_EQ(counterValue(r, "parked_prior_applied"), "2") << "only the two scans whose published pose carries it";
-    EXPECT_EQ(counterValue(r, "zero_only_unanchored"), "0") << "a healthy scan is no zero-only scan";
-    const auto after = r.phase(Phase::kAfterReset);
-    ASSERT_EQ(after.size(), 2u);
-    for (const auto * o : after) {
-      EXPECT_FALSE(o->record.parked_applied) << "step " << o->step;
-      EXPECT_EQ(o->record.anchor_used, 0u) << "step " << o->step;
-      EXPECT_EQ(o->record.anchor_id, old_id + 1) << "step " << o->step;
-      EXPECT_TRUE(o->odom_seen && samePosition(o->odom_p, nudged)) << formatPosition(o->odom_p);
-      EXPECT_EQ(odomFlags(*o), 0u) << "step " << o->step;
-    }
+  const Scenario scenario = parkedPriorThenLateHold();
+  const ChildResult r = runScenario(scenario);
+  SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+  ASSERT_TRUE(r.ok());
+  const std::uint64_t old_id = oldAnchorId(r);
+  ASSERT_NE(old_id, 0u);
+  ASSERT_TRUE(anchorWasValidAtTheOldPose(r, c));
+  const auto written = fast_lio::AnchorTraceAction::kZeroVelocity;
+  const auto held = r.phase(Phase::kHold);
+  ASSERT_EQ(held.size(), 2u);
+  for (const auto * o : held) {
+    EXPECT_TRUE(o->record.parked_applied) << "step " << o->step;
+    EXPECT_EQ(o->record.anchor_used, old_id) << "step " << o->step;
+    EXPECT_EQ(odomFlags(*o), kFlagStaticHold) << "step " << o->step;
+  }
+  const auto trip = r.phase(Phase::kHoldReset);
+  ASSERT_EQ(trip.size(), 1u);
+  const Observation & t = *trip.front();
+  const auto & tr = t.record;
+  EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventRunawayTrip));
+  EXPECT_TRUE(hasEvent(t, fast_lio::kAnchorEventLost));
+  EXPECT_FALSE(hasEvent(t, fast_lio::kAnchorEventMapReset));
+  EXPECT_TRUE(tr.usable) << "the anchor step ran, and applied the prior, before the trip";
+  EXPECT_FALSE(tr.parked_applied);
+  EXPECT_EQ(tr.anchor_used, 0u);
+  EXPECT_EQ(tr.action, written);
+  EXPECT_FALSE(tr.zero_only);
+  expectTheScanOwnState(t, nudged, zero, true, false);
+  EXPECT_EQ(tr.anchor_state, fast_lio::AnchorState::kEmpty);
+  EXPECT_FALSE(tr.static_hold);
+  EXPECT_EQ(odomFlags(t), kFlagLost);
+  EXPECT_EQ(tr.flags, static_cast<int>(kFlagLost));
+  expectInvalidatedOnce(r, old_id, "lost", scenario.name);
+  EXPECT_EQ(counterValue(r, "lost"), "1");
+  EXPECT_EQ(counterValue(r, "map_reset"), "0");
+  EXPECT_EQ(counterValue(r, "parked_prior_applied"), "2") << "only the two scans whose published pose carries it";
+  EXPECT_EQ(counterValue(r, "zero_only_unanchored"), "2") << "the two parked scans after the trip, not the trip scan";
+  const auto after = r.phase(Phase::kAfterReset);
+  ASSERT_EQ(after.size(), 2u);
+  for (const auto * o : after) {
+    EXPECT_FALSE(o->record.parked_applied) << "step " << o->step;
+    EXPECT_EQ(o->record.anchor_used, 0u) << "step " << o->step;
+    EXPECT_TRUE(o->record.zero_only) << "step " << o->step;
+    EXPECT_EQ(o->record.anchor_id, old_id) << "step " << o->step << ": a candidate started while lost";
+    EXPECT_EQ(o->record.anchor_state, fast_lio::AnchorState::kEmpty) << "step " << o->step;
+    EXPECT_TRUE(o->odom_seen && samePosition(o->odom_p, nudged)) << formatPosition(o->odom_p);
+    EXPECT_EQ(odomFlags(*o), kFlagDegraded | kFlagLost) << "step " << o->step;
   }
 }
 
@@ -5796,7 +5791,7 @@ TEST(AnchorLifecycleExport, ABridgedScanReportsItsOwnVerdict)
 }
 
 // ---------------------------------------------------------------------------
-// The entry view (reanchor_recovery_entry_view, #369): the scans of a pending recovery go into the map, and its
+// The entry view (iVox, #369): the scans of a pending recovery go into the map, and its
 // re-anchor match counts only the points the map held when the recovery began
 // ---------------------------------------------------------------------------
 
@@ -5808,12 +5803,11 @@ constexpr int kViewLiftedScans = 20;  // its healthy Pending scans: the budget r
 // One healthy moving scan, the last supported one; three degraded scans, which start Pending; `matching` healthy
 // scans; three healthy scans after them. Moving: every scan a step further along x, the IMU turning. Lifted: from
 // the event on, parked kViewLift above the pose the map was built at.
-Scenario entryViewRun(const std::string & name, bool entry_view, bool lifted, int matching, double total)
+Scenario entryViewRun(const std::string & name, bool lifted, int matching, double total)
 {
   Scenario s = baseParams(name, true);
   s.view_probe = true;
   setPolicy(s, total, 1.0);
-  setParam(s, rclcpp::Parameter("reanchor_recovery_entry_view", entry_view));
   const Imu imu = lifted ? Imu::kStatic : Imu::kMoving;
   int k = 0;
   const auto next = [&k, lifted]() {
@@ -5839,17 +5833,17 @@ const Observation * scanEndingAt(const ChildResult & r, std::int64_t end_ms)
   return nullptr;
 }
 
-// Moving on through a recovery with the entry view on. The degraded scans that start it stay out of the map; every
+// Moving on through a recovery. The degraded scans that start it stay out of the map; every
 // healthy Pending scan goes into it, and is matched against the entry view, which counts one more of them each
 // time; the view qualifies the recovery after the stable time on the map it began with. The view is open at a map
 // insertion exactly when the recovery is still pending: not on the scan that qualified it, nor after.
 TEST(AnchorLifecycleEntryView, AMovingRecoveryMapsItsHealthyScansAndQualifiesOnTheMapItBeganWith)
 {
-  const Scenario scenario = entryViewRun("entry_view_moving", true, false, kExportRun + 1, kExportBudget);
+  const Scenario scenario = entryViewRun("entry_view_moving", false, kExportRun + 1, kExportBudget);
   const ChildResult r = runScenario(scenario);
   SCOPED_TRACE(describeRun(r));
   ASSERT_TRUE(r.ok());
-  expectTraceAccountsForEveryScan(r, true, scenario.name, true);
+  expectTraceAccountsForEveryScan(r, true, scenario.name);
   const auto event = r.phase(Phase::kEvent);
   const auto after = r.phase(Phase::kAfter);
   ASSERT_EQ(event.size(), 3u);
@@ -5897,11 +5891,11 @@ TEST(AnchorLifecycleEntryView, AMovingRecoveryMapsItsHealthyScansAndQualifiesOnT
 // does not show those points: the recovery is not qualified on them and runs out.
 TEST(AnchorLifecycleEntryView, ARecoveryIsNotQualifiedOnPointsItsOwnScansPutIntoTheMap)
 {
-  const Scenario scenario = entryViewRun("entry_view_own_points", true, true, kViewLiftedScans, kViewBudget);
+  const Scenario scenario = entryViewRun("entry_view_own_points", true, kViewLiftedScans, kViewBudget);
   const ChildResult r = runScenario(scenario);
   SCOPED_TRACE(describeRun(r));
   ASSERT_TRUE(r.ok());
-  expectTraceAccountsForEveryScan(r, true, scenario.name, true);
+  expectTraceAccountsForEveryScan(r, true, scenario.name);
   EXPECT_TRUE(recoveryLines(r, "qualified").empty());
   const auto latched = recoveryLines(r, "unanchored");
   ASSERT_EQ(latched.size(), 1u);
@@ -5928,35 +5922,11 @@ TEST(AnchorLifecycleEntryView, ARecoveryIsNotQualifiedOnPointsItsOwnScansPutInto
   }
 }
 
-// The moving run with the entry view off, as the front end ran before it: no scan is matched against a view, none
-// is open at any map insertion, and no Pending scan goes into the map.
-TEST(AnchorLifecycleEntryView, WithTheEntryViewOffAPendingRecoveryLeavesTheMapAlone)
-{
-  const Scenario scenario = entryViewRun("entry_view_off", false, false, kExportRun + 1, kExportBudget);
-  const ChildResult r = runScenario(scenario);
-  SCOPED_TRACE(describeRun(r));
-  ASSERT_TRUE(r.ok());
-  expectTraceAccountsForEveryScan(r, true, scenario.name);
-  EXPECT_TRUE(linesWhere(r, "[VIEW-PROBE]", "event", "match").empty());
-  int healthy_pending = 0;
-  for (const auto * o : fromPhase(r, Phase::kEvent)) {
-    if (o->record.trust_post != fast_lio::RecoveryTrust::kPending)
-      continue;
-    healthy_pending += o->record.degraded ? 0 : 1;
-    EXPECT_FALSE(o->record.map_updated) << "step " << o->step;
-  }
-  EXPECT_GT(healthy_pending, 0);
-  const auto inserts = linesWhere(r, "[VIEW-PROBE]", "event", "insert");
-  EXPECT_FALSE(inserts.empty());
-  for (const auto & line : inserts)
-    EXPECT_EQ(valueOf(line, "view_open"), "0") << line;
-}
-
 // The moving run, and a second recovery after it. A run has as many recoveries as the platform meets, and each gets
 // a view of its own: the second one's starts with no scan inserted and qualifies it just as the first one did.
 TEST(AnchorLifecycleEntryView, EveryRecoveryOfARunQualifiesOnAViewOfItsOwn)
 {
-  Scenario scenario = entryViewRun("entry_view_second", true, false, kExportRun + 1, kExportBudget);
+  Scenario scenario = entryViewRun("entry_view_second", false, kExportRun + 1, kExportBudget);
   double x = scenario.steps.back().pos[0];
   const auto next = [&x]() {
     x += kViewStep;
@@ -6026,14 +5996,14 @@ void expectQualifiedOnItsView(const ChildResult & r,
 TEST(AnchorLifecycleEntryView, AMapResetLatchesTheRecoveryAndClosesItsView)
 {
   constexpr int matching = 4;  // healthy Pending scans before the reset, well short of the stable time
-  Scenario scenario = entryViewRun("entry_view_map_reset", true, false, matching, kExportBudget);
-  setParam(scenario, rclcpp::Parameter("runaway_watchdog_en", true));
+  Scenario scenario = entryViewRun("entry_view_map_reset", false, matching, kExportBudget);
+  productRunawayWatchdog(scenario);
   setParam(scenario, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   scenario.steps[scenario.steps.size() - 3].trip = true;  // the first of the three scans after them
   const ChildResult r = runScenario(scenario);
   SCOPED_TRACE(describeRun(r));
   ASSERT_TRUE(r.ok());
-  expectTraceAccountsForEveryScan(r, true, scenario.name, true);
+  expectTraceAccountsForEveryScan(r, true, scenario.name);
   const auto after = r.phase(Phase::kAfter);
   const auto later = r.phase(Phase::kLater);
   ASSERT_EQ(after.size(), static_cast<std::size_t>(matching));
@@ -6065,7 +6035,6 @@ Scenario entryViewPriorInstall()
   s.view_probe = true;
   s.prior_map = true;
   s.relocalizations = {{{0.0, 0.0, 0.0}}};
-  setParam(s, rclcpp::Parameter("reanchor_recovery_entry_view", true));
   setParam(s, rclcpp::Parameter("prior_map_pcd", priorMapPath()));
   setParam(s, rclcpp::Parameter("prior_map_align", "relocalization"));
   append(s, kViewInstallAfter, slot(Phase::kAfter));
@@ -6118,7 +6087,6 @@ TEST(AnchorLifecycleEntryView, AScanHoleRecoveryOpensItsViewOnTheFirstScanBack)
     Scenario scenario = traced(scanHole(missing, Imu::kStatic), true);
     scenario.name = "entry_view_scan_hole_" + std::to_string(missing);
     scenario.view_probe = true;
-    setParam(scenario, rclcpp::Parameter("reanchor_recovery_entry_view", true));
     const ChildResult r = runScenario(scenario);
     SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
     ASSERT_TRUE(r.ok());
@@ -6140,7 +6108,6 @@ TEST(AnchorLifecycleEntryView, AnImuBridgeRecoveryOpensItsViewOnTheBridgedScan)
   Scenario scenario = traced(imuBridge(0.2, 10.0), true);
   scenario.name = "entry_view_imu_bridge";
   scenario.view_probe = true;
-  setParam(scenario, rclcpp::Parameter("reanchor_recovery_entry_view", true));
   const ChildResult r = runScenario(scenario);
   SCOPED_TRACE(describeRun(r));
   ASSERT_TRUE(r.ok());
@@ -6164,7 +6131,6 @@ TEST(AnchorLifecycleEntryView, ACoverageGapRecoveryOpensItsViewOnTheNextScan)
   Scenario scenario = traced(lostImu(LostImu::kTail), true);
   scenario.name = "entry_view_coverage_gap";
   scenario.view_probe = true;
-  setParam(scenario, rclcpp::Parameter("reanchor_recovery_entry_view", true));
   scenario.steps.resize(scenario.steps.size() - 3);  // lostImu()'s degraded scans
   append(scenario, 14, slot(Phase::kAfter));
   const ChildResult r = runScenario(scenario);
@@ -6297,7 +6263,7 @@ TEST(AnchorLifecycleStartup, AColdStartStillBlindsTheRawGateAndFreezesTheMap)
   Scenario on = coldStart(kMovingScans, true);
   on.name = "cold_start_reanchor_policy_on";
   on.capture_raw_state = true;
-  setParam(on, rclcpp::Parameter("reanchor_en", true));
+  productReanchorGate(on);
   setParam(on, rclcpp::Parameter("reanchor_min_eff", 100000000));
   Scenario off = on;
   off.name = "cold_start_reanchor_policy_off";
@@ -6834,14 +6800,11 @@ TEST(AnchorLifecycleReference, FaultExitEndsTheScanWithAnIndependentDdsObserver)
     Scenario scenario = withReference(baseParams("fault_exit_dds_" + policy, true));
     scenario.external_pose_ack = ack[0];
     scenario.typed = true;
-    setParam(scenario, rclcpp::Parameter("runaway_watchdog_en", true));
     setParam(scenario, rclcpp::Parameter("runaway_on_trip", policy));
-    setParam(scenario, rclcpp::Parameter("runaway_hold_sec", 0.25));
-    setParam(scenario, rclcpp::Parameter("zupt_en", false));
-    // The real watchdog sees the fixture velocity against real stationary IMU windows for 0.3 seconds.
-    // No forced trip: the fourth scan crosses hold_sec.
+    // The fourth scan trips the watchdog. The static hold zeroes a parked body's phantom speed before the watchdog
+    // reads it, so the scan forces the trip.
     for (int i = 0; i < 4; ++i)
-      scenario.steps.push_back(step(Phase::kEvent, Imu::kStatic, Guard::kHealthy, {0.0, 0.0, 0.0}));
+      scenario.steps.push_back(step(Phase::kEvent, Imu::kStatic, Guard::kHealthy, {0.0, 0.0, 0.0}, i == 3));
     const ChildResult result = runScenario(scenario);
     const bool stopped = ::write(stop[1], "D", 1) == 1;
     ::close(stop[1]);
@@ -6899,21 +6862,21 @@ TEST(AnchorLifecycleReference, FaultExitEndsTheScanWithAnIndependentDdsObserver)
   }
 }
 
-TEST(AnchorLifecycleReference, LostRequiredPriorStopsLocalizationButRetainedAndOptionalPriorsDoNot)
+// A delivered prior map is a tier of its own, so a reset keeps it: on both real callers, the gate's loss and the
+// runaway map reset, with the recovery policy off and on, and without the freeze request. The front end goes on
+// publishing after the reset, and grows the map again where the freeze is not requested.
+TEST(AnchorLifecycleReference, AResetKeepsThePriorMapTier)
 {
   ASSERT_TRUE(writePriorMap(priorMapPath()));
-  // Two real callers, with policy disabled/enabled for the required unpinned prior; retained and optional controls.
-  for (int variant = 0; variant < 6; ++variant) {
+  for (int variant = 0; variant < 5; ++variant) {
     const bool late = variant >= 2;
-    const bool pinned = variant == 4;
-    const bool freeze = variant != 5;
+    const bool freeze = variant != 4;
     const bool policy = variant == 1 || variant == 3;
     Scenario scenario = late ? resetRebuildsNoMap(false, policy) : verificationTimesOut(policy ? 10.0 : 0.0);
     scenario = withReference(std::move(scenario));
     scenario.capture_raw_state = scenario.capture_tf_graph = true;
     setParam(scenario, rclcpp::Parameter("prior_map_pcd", priorMapPath()));
     setParam(scenario, rclcpp::Parameter("prior_map_align", "as_delivered"));
-    setParam(scenario, rclcpp::Parameter("prior_map_pinned", pinned));
     setParam(scenario, rclcpp::Parameter("prior_map_freeze", freeze));
     if (late) {
       for (auto & step : scenario.steps)
@@ -6936,11 +6899,10 @@ TEST(AnchorLifecycleReference, LostRequiredPriorStopsLocalizationButRetainedAndO
     ASSERT_TRUE(published_before);
     ASSERT_NE(reset, nullptr);
     ASSERT_TRUE(reset->prior_reset_seen && reset->prior_installed_before);
-    EXPECT_EQ(reset->prior_installed_after, pinned);
-    EXPECT_EQ(reset->retained_prior_voxels > 0, pinned);
-    const bool lost = freeze && !pinned;
-    EXPECT_EQ(reset->required_prior_lost, lost);
-    EXPECT_EQ(reset->record.published, !lost);
+    EXPECT_TRUE(reset->prior_installed_after);
+    EXPECT_GT(reset->retained_prior_voxels, 0u);
+    EXPECT_FALSE(reset->required_prior_lost);
+    EXPECT_TRUE(reset->record.published);
     for (const auto & observation : result.observations) {
       if (observation.record.scan_seq < reset->record.scan_seq)
         continue;
@@ -6950,24 +6912,10 @@ TEST(AnchorLifecycleReference, LostRequiredPriorStopsLocalizationButRetainedAndO
       // The reset records MapReset hard once; only the Unanchored latch (policy on) carries it to later scans.
       if (&observation == reset || policy)
         EXPECT_NE(health->hard_mask & 4u, 0u);
-      if (lost) {
-        EXPECT_FALSE(observation.record.published || observation.odom_seen || observation.typed_seen);
-        EXPECT_FALSE(health->has_pose_binding);
-        EXPECT_EQ(health->local, 0);
-        EXPECT_NE(health->legacy_flags & kFlagLost, 0u);
-        EXPECT_TRUE(observation.map_frozen && observation.raw_degraded);
-        EXPECT_EQ(observation.imu_batch, 1);
-        if (&observation != reset)
-          EXPECT_FALSE(observation.record.map_updated || observation.record.anchor_step);
-        for (const auto & transform : result.transforms)
-          EXPECT_NE(msKey(rclcpp::Time(transform.header.stamp).seconds()), msKey(observation.record.end_ns * 1e-9));
-      }
     }
-    if (!lost) {
-      EXPECT_TRUE(result.observations.back().record.published);
-      if (!freeze)
-        EXPECT_TRUE(result.observations.back().record.map_updated);
-    }
+    EXPECT_TRUE(result.observations.back().record.published);
+    if (!freeze)
+      EXPECT_TRUE(result.observations.back().record.map_updated);
   }
 }
 
@@ -7244,7 +7192,7 @@ TEST(AnchorLifecycleReference, PostBuildRawVerifyingStaysEstablishedWithoutWitne
 {
   auto scenario = withReference(coldStart(kMovingScans, true));
   scenario.capture_raw_state = true;
-  setParam(scenario, rclcpp::Parameter("reanchor_en", true));
+  productReanchorGate(scenario);
   setParam(scenario, rclcpp::Parameter("reanchor_min_eff", 100000000));
   auto control = scenario;
   control.reference = false;
@@ -7326,7 +7274,7 @@ TEST(AnchorLifecycleReference, PreReferenceMapResetExcludesStartupWithoutQualifi
 
 TEST(AnchorLifecycleReference, LateLostSuppressesWitnessInFinalSnapshot)
 {
-  for (auto scenario : {verificationTimesOut(10.0), pinThenLateHold(true)}) {
+  for (auto scenario : {verificationTimesOut(10.0), pinThenLateHold()}) {
     const auto result = runScenario(withReference(std::move(scenario)));
     ASSERT_TRUE(result.ok()) << result.describe();
     std::size_t lost = 0, earlier_witnesses = 0;
@@ -7457,7 +7405,7 @@ Scenario lostEpochScenario(bool reset, bool enabled = true)
   scenario.name = reset ? "lost_epoch_reset" : "lost_epoch_deadline";
   setParam(scenario, rclcpp::Parameter("lost_recovery_en", enabled));
   setParam(scenario, rclcpp::Parameter("lost_recovery_stable_sec", 0.25));
-  setParam(scenario, rclcpp::Parameter("runaway_watchdog_en", true));
+  productRunawayWatchdog(scenario);
   setParam(scenario, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   scenario.steps.clear();
   append(scenario, 5, slot(Phase::kBefore, Imu::kMoving));
@@ -7563,27 +7511,21 @@ TEST(AnchorLifecycleLostRecovery, LostRecoveryRepeatedResetAdvancesToEpochThree)
   expectEpochCommit(result, 3);
 }
 
+// A run interrupted by a degraded scan, or by a trip that resets the map, must earn a new stable run.
 TEST(AnchorLifecycleLostRecovery, LostRecoveryInterruptedCandidateMustEarnANewStableRun)
 {
-  for (int interruption = 0; interruption < 3; ++interruption) {
+  for (const bool trip : {false, true}) {
     auto scenario = lostEpochScenario(true);
     scenario.steps.resize(8);  // reset, then two healthy scans: less than the 0.25 s stable interval
     auto event = slot(Phase::kHoldReset, Imu::kMoving, Guard::kDegraded);
-    if (interruption != 0) {
+    if (trip) {
       event.guard = Guard::kHealthy;
-      event.trip = true;
-      setParam(scenario, rclcpp::Parameter("runaway_on_trip", interruption == 1 ? "hold" : "reset_map"));
-      // The initial reset must still occur: use the deadline latch for the hold variant instead.
-      if (interruption == 1) {
-        scenario = lostEpochScenario(false);
-        scenario.steps.resize(22);
-        setParam(scenario, rclcpp::Parameter("runaway_on_trip", "hold"));
-      }
+      event.trip = true;  // runaway_on_trip is reset_map
     }
     append(scenario, 1, event);
     append(scenario, 20, slot(Phase::kAfterReset));
     const auto result = runScenario(scenario);
-    SCOPED_TRACE(std::to_string(interruption) + " " + describeRun(result));
+    SCOPED_TRACE(std::string(trip ? "trip" : "degraded") + " " + describeRun(result));
     ASSERT_TRUE(result.ok());
     for (const auto * observation : result.phase(Phase::kHoldReset))
       EXPECT_EQ(observation->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
@@ -7594,6 +7536,36 @@ TEST(AnchorLifecycleLostRecovery, LostRecoveryInterruptedCandidateMustEarnANewSt
     EXPECT_EQ(after[1]->record.trust_post, fast_lio::RecoveryTrust::kUnanchored);
     expectEpochCommit(result, 2);
   }
+}
+
+// A hold trips the front end lost while a run is under way, and the loss stands on the healthy scans after it: the
+// re-anchor gate keeps a loss tripped from outside it until a map rebuild or a degraded scan, and the lost recovery
+// gives up on every scan the gate calls lost, so no epoch commits.
+TEST(AnchorLifecycleLostRecovery, LostRecoveryAHoldLeavesTheFrontEndLost)
+{
+  auto scenario = lostEpochScenario(false);
+  scenario.name = "lost_epoch_hold";
+  scenario.steps.resize(22);  // the deadline latch, then two healthy scans: less than the 0.25 s stable interval
+  setParam(scenario, rclcpp::Parameter("runaway_on_trip", "hold"));
+  auto trip = slot(Phase::kHoldReset, Imu::kMoving);
+  trip.trip = true;
+  append(scenario, 1, trip);
+  append(scenario, 20, slot(Phase::kAfterReset));
+  const auto result = runScenario(scenario);
+  SCOPED_TRACE(describeRun(result));
+  ASSERT_TRUE(result.ok());
+  ASSERT_FALSE(recoveryLines(result, "unanchored").empty());
+  const auto held = result.phase(Phase::kHoldReset);
+  ASSERT_EQ(held.size(), 1u);
+  EXPECT_TRUE(hasEvent(*held.front(), fast_lio::kAnchorEventRunawayTrip));
+  EXPECT_TRUE(hasEvent(*held.front(), fast_lio::kAnchorEventLost));
+  const auto after = result.phase(Phase::kAfterReset);
+  ASSERT_EQ(after.size(), 20u);
+  for (const auto * observation : after) {
+    EXPECT_EQ(observation->record.trust_post, fast_lio::RecoveryTrust::kUnanchored) << "step " << observation->step;
+    EXPECT_EQ(odomFlags(*observation), kFlagDegraded | kFlagLost) << "step " << observation->step;
+  }
+  EXPECT_TRUE(recoveryLines(result, "epoch_committed").empty());
 }
 
 TEST(AnchorLifecycleLostRecovery, LostRecoveryDroppedScanMustEarnANewStableRun)

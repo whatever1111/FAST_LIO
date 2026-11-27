@@ -184,13 +184,11 @@ TEST(ImuStaticInitGate, T12InvalidParametersAreRejected)
   EXPECT_FALSE(fast_lio::validImuStaticInitParams(valid));
 }
 
-TEST(ImuStaticInitGate, T16DiagnosticCellRequiresHealthActiveGateAndDegradedLatch)
+TEST(ImuStaticInitGate, T16DiagnosticCellRequiresActiveGateAndDegradedLatch)
 {
-  for (bool health : {false, true})
-    for (bool active : {false, true})
-      for (bool degraded : {false, true})
-        EXPECT_DOUBLE_EQ(fast_lio::imuInitDegradedCell(health, active, degraded),
-                         health && active && degraded ? 1.0 : 0.0);
+  for (bool active : {false, true})
+    for (bool degraded : {false, true})
+      EXPECT_DOUBLE_EQ(fast_lio::imuInitDegradedCell(active, degraded), active && degraded ? 1.0 : 0.0);
 }
 
 TEST(ImuStaticInitGate, T19LateReadyWindowTakesPriorityOverStrictTimeout)

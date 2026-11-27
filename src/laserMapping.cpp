@@ -232,15 +232,10 @@ bool degeneracy_debug = false;  // verbose per-frame [DEGEN] diagnostics
 // and the travel direction (1 = every plane faces the motion, 0 = all planes
 // parallel to it → along-track unobservable). -1 below the speed gate (direction
 // undefined), 0 when a moving scan has no effective points (worst case).
-bool health_pub_en = true;
 constexpr double kHealthSpeedGate = 0.2;  // m/s, same gate as the [SCAN] trace obs_along
 double scan_obs_along = -1.0;
 double scan_body_speed = 0.0;
 
-// [v5] Whether the last scan's levelling update ran at the degraded/held strength;
-// published in the health flags so a pose-graph consumer can leave those
-// keyframes' roll/pitch unpinned.
-bool gravity_align_degraded_active = false;
 // [v6] What the levelling compensation (FrontendParams::gravity_align_lin_accel_comp) keeps between scans: the
 // previous scan's end edge, measured by the legs.
 double gravity_align_prev_t = -1.0;           // previous scan's lidar_end_time (-1 = none yet)
@@ -262,7 +257,6 @@ struct GravWinAgg
   fast_lio::LevellingWindowScan edge;  // [v6] body velocity at both ends of this scan's IMU span
 };
 std::deque<GravWinAgg> grav_win;  // scan-thread only
-double gravity_align_last_trig = -1e18;
 // The correspondence dump (FrontendParams::corr_dump_en describes it): its files and its per-scan state.
 std::ofstream fout_corr, fout_corr_iter, fout_corr_scan;
 bool corr_dump_scan_active = false;  // this scan lies inside a dump window (set before the update)
@@ -292,7 +286,6 @@ V3D hole_vel_pre = V3D::Zero();
 // there is nothing to dead-reckon: hold the last map-confirmed pose until
 // correspondences return. Evidence is deliberately independent of the pose
 // estimate, which is the thing under suspicion.
-// The hold is switched by FrontendParams::zupt_en.
 double zupt_gyro_thresh = 0.05;         // rad/s; max |omega| over the scan's IMU window
 double zupt_acc_span_ratio = 0.02;      // (max-min)|a| / mean|a| — free of the IMU's unit scale
 double zupt_wheel_speed_thresh = 0.05;  // m/s; wheel speed below this reads as parked
@@ -1513,7 +1506,9 @@ FinalFrontendSnapshot captureFinalFrontend(bool completed, bool scanEvent, doubl
   facts.degraded = final.health.effective_degraded;
   facts.staticHold = final.health.reported_static_hold;
   facts.runaway = frontend_runaway;
-  facts.levelling = gravity_align_degraded_active;
+  // The levelling update has one strength, its measurement's own sigma, so no scan runs it at a
+  // degraded one; the health bit stays in the published contract and reads clear.
+  facts.levelling = false;
   facts.blocked = input_epoch_guard.faulted();
   facts.contextKnown = frontend_has_instance && !odom_frame_id.empty() && !body_frame_id.empty() &&
                        !frontend_clock_domain.empty() && !facts.blocked;
@@ -2119,8 +2114,8 @@ void changeStationaryReference(fast_lio::AnchorDrop drop, double stamp)
   fast_lio::revokeRecoveryStartup(&recovery_state);
 }
 
-// What the human-readable end of a recovery adds while its entry view is open (reanchor_recovery_entry_view): the
-// scans the map took in meanwhile. Empty otherwise, so those lines read as before; the structured trace line
+// What the human-readable end of a recovery adds while its entry view is open (iVox): the scans the map took in
+// meanwhile. Empty otherwise, so those lines read as before; the structured trace line
 // never carries it.
 std::string entryViewNote()
 {
@@ -3531,31 +3526,29 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   // same-scan. The twist covariance was always zero here and has no other
   // consumer. Layout contract:
   // LIO-SLAM core pgo_factor_kernels.hpp kFeHealth*Cell.
-  if (health_pub_en) {
-    odomAftMapped.twist.covariance[5] =
-      fast_lio::imuInitDegradedCell(health_pub_en, p_imu->sustainedInitActive(), p_imu->initializationDegraded());
-    odomAftMapped.twist.covariance[0] = 1.0;  // sentinel/version
-    exportLostRecoveryEpoch(final);
-    // Flags say what the front end did about this scan, which is what a
-    // consumer must act on: a degraded pose is fresh and self-consistent, so
-    // staleness gates downstream pass it through unchanged (dog 2, 2026-09-04).
-    const unsigned health_flags = final.reference.legacyFlags;
-    odomAftMapped.twist.covariance[1] = static_cast<double>(health_flags);
-    if (anchor_scan_record_open)
-      anchor_scan_record.flags = static_cast<int>(health_flags);
-    odomAftMapped.twist.covariance[7] = scan_obs_along;
-    odomAftMapped.twist.covariance[14] = static_cast<double>(effct_feat_num);
-    odomAftMapped.twist.covariance[21] = scan_far_frac;
-    odomAftMapped.twist.covariance[28] = res_mean_last;
-    odomAftMapped.twist.covariance[35] = scan_body_speed;
-    // Gravity side-channel (LIO-SLAM core fe_health.hpp kFeGravity*Cell): the S2
-    // gravity state, world frame, m/s^2. The world frame was levelled from the
-    // start-up accelerometer mean; this is where the filter now puts "down", and
-    // downstream attitude references are levelled by it.
-    odomAftMapped.twist.covariance[2] = state_point.grav[0];
-    odomAftMapped.twist.covariance[3] = state_point.grav[1];
-    odomAftMapped.twist.covariance[4] = state_point.grav[2];
-  }
+  odomAftMapped.twist.covariance[5] =
+    fast_lio::imuInitDegradedCell(p_imu->sustainedInitActive(), p_imu->initializationDegraded());
+  odomAftMapped.twist.covariance[0] = 1.0;  // sentinel/version
+  exportLostRecoveryEpoch(final);
+  // Flags say what the front end did about this scan, which is what a
+  // consumer must act on: a degraded pose is fresh and self-consistent, so
+  // staleness gates downstream pass it through unchanged (dog 2, 2026-09-04).
+  const unsigned health_flags = final.reference.legacyFlags;
+  odomAftMapped.twist.covariance[1] = static_cast<double>(health_flags);
+  if (anchor_scan_record_open)
+    anchor_scan_record.flags = static_cast<int>(health_flags);
+  odomAftMapped.twist.covariance[7] = scan_obs_along;
+  odomAftMapped.twist.covariance[14] = static_cast<double>(effct_feat_num);
+  odomAftMapped.twist.covariance[21] = scan_far_frac;
+  odomAftMapped.twist.covariance[28] = res_mean_last;
+  odomAftMapped.twist.covariance[35] = scan_body_speed;
+  // Gravity side-channel (LIO-SLAM core fe_health.hpp kFeGravity*Cell): the S2
+  // gravity state, world frame, m/s^2. The world frame was levelled from the
+  // start-up accelerometer mean; this is where the filter now puts "down", and
+  // downstream attitude references are levelled by it.
+  odomAftMapped.twist.covariance[2] = state_point.grav[0];
+  odomAftMapped.twist.covariance[3] = state_point.grav[1];
+  odomAftMapped.twist.covariance[4] = state_point.grav[2];
   pubOdomAftMapped->publish(odomAftMapped);
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterPosePublish)
@@ -3807,7 +3800,7 @@ public:
     params_.readOutputs(*this, startup, scan_pub_en, dense_pub_en, odom_frame_id, body_frame_id);
     params_.readBacklog(*this, max_buffered_scans, max_scan_backlog_sec, max_imu_backlog_sec);
     params_.readDegeneracy(*this, degeneracy_debug);
-    params_.readConstraints(*this, health_pub_en);
+    params_.readConstraints(*this);
     params_.readCorrespondence(*this);
     params_.readCorrespondenceDump(*this);
     if (params_.values().corr_dump_en)
@@ -3827,11 +3820,10 @@ public:
     params_.readReanchor(*this, startup, reanchor_params, recovery_params);
     reanchor_healthy_res =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(startup.reanchor_healthy_window), kReanchorHealthyMinScans);
-    params_.loadLostRecovery(*this, health_pub_en, startup.reanchor_total_timeout_sec, lost_recovery_params);
+    params_.loadLostRecovery(*this, startup.reanchor_total_timeout_sec, lost_recovery_params);
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("lost_recovery_loaded");
 #endif
-    params_.loadRecoveryEntryView(*this);
     reanchor_healthy_eff =
       fast_lio::HealthyScanWindow(static_cast<std::size_t>(startup.reanchor_healthy_window), kReanchorHealthyMinScans);
     params_.readRunaway(*this, zupt_wheel_max_age, zupt_wheel_speed_thresh);
@@ -3847,8 +3839,7 @@ public:
 #ifdef FASTLIO_TEST_HOOKS
     constructionStageForTest("anchor_gap_resolved");
 #endif
-    params_.readImuCoverage(
-      *this, max_scan_duration_s, p_imu->coverage_params, p_imu->gap_params, reanchor_params.enabled);
+    params_.readImuCoverage(*this, max_scan_duration_s, p_imu->coverage_params, p_imu->gap_params);
     params_.readFeatureInputs(*this, p_pre->point_filter_num, runtime_pos_log);
     p_imu->runtime_log_en = runtime_pos_log;                // mirror to ImuProcess so Log/imu.txt is written
     ikd_profile = (getenv("FLIO_IKD_PROFILE") != nullptr);  // [ikd-profile] opt-in via env
@@ -3856,14 +3847,16 @@ public:
 #ifdef USE_IVOX
     {  // option B: iVox map backend (its parameters and their notes: frontend_parameter_specs_map.hpp)
       const fast_lio::IvoxDeclaredValues ivox = params_.declareIvox(*this);
+      // The nearest point can lie in any of the 26 voxels around a point's own: across a face, an edge or a corner.
+      constexpr int kIvoxNearbyVoxels = 26;
       ikdtree.Init(static_cast<float>(ivox.grid_resolution),
-                   ivox.nearby_type,
+                   kIvoxNearbyVoxels,
                    ivox.voxel_capacity,
                    static_cast<std::size_t>(ivox.max_voxels));
       RCLCPP_INFO(this->get_logger(),
                   "[IVOX] map backend = iVox (res=%.2f nearby=%d voxel_cap=%d max_voxels=%d)",
                   ivox.grid_resolution,
-                  ivox.nearby_type,
+                  kIvoxNearbyVoxels,
                   ivox.voxel_capacity,
                   ivox.max_voxels);
     }
@@ -4498,17 +4491,16 @@ private:
         });
       RCLCPP_INFO(this->get_logger(), "Standard IMU mode: topic=%s", startup.imu_topic.c_str());
     }
-    if (params_.values().wheel_odom_en || params_.values().zupt_en || params_.values().parked_hold.enabled) {
-      attachWheelSpeedInput(startup);
-      sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(startup.wheel_topic, reliableKeepLastQos(kWheelInputDepth), twist_cbk);
-      RCLCPP_INFO(this->get_logger(),
-                  "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, static hold %s, parked hold %s)",
-                  startup.wheel_topic.c_str(),
-                  params_.values().wheel_speed_scale,
-                  params_.values().wheel_odom_en ? "on" : "off",
-                  params_.values().zupt_en ? "on" : "off",
-                  params_.values().parked_hold.enabled ? "on" : "off");
-    }
+    // The static hold reads the wheel speed as parked evidence, so the twist is always subscribed.
+    attachWheelSpeedInput(startup);
+    sub_twist_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(
+      startup.wheel_topic, reliableKeepLastQos(kWheelInputDepth), twist_cbk);
+    RCLCPP_INFO(this->get_logger(),
+                "Wheel twist subscribed: topic=%s scale=%.3f (fusion %s, parked hold %s)",
+                startup.wheel_topic.c_str(),
+                params_.values().wheel_speed_scale,
+                params_.values().wheel_odom_en ? "on" : "off",
+                params_.values().parked_hold.enabled ? "on" : "off");
   }
 
   // The wheel update's input (wheel_speed_input.hpp): where its variances come from, the pointer the wheel callbacks
@@ -4621,7 +4613,6 @@ private:
     record.value("publish.scan_bodyframe_pub_en", params_.values().scan_body_pub_en);
     record.value("publish.odom_frame_id", odom_frame_id);
     record.value("publish.body_frame_id", body_frame_id);
-    record.value("health_pub_en", health_pub_en);
     record.value("publish.frontend_observation", frontend_observation_en);
     record.value("publish.reference_health", reference_health_en);
     record.value("publish.frontend_clock_domain", frontend_clock_domain);
@@ -4678,21 +4669,14 @@ private:
     record.value("planar_constraint_noise", params_.values().planar_constraint_noise);
     record.value("planar_constraint_z_weak_thresh", params_.values().planar_constraint_z_weak_thresh);
     record.value("gravity_align_en", params_.values().gravity_align_en);
-    record.value("gravity_align_noise", params_.values().gravity_align_noise);
-    record.value("gravity_align_z_weak_thresh", params_.values().gravity_align_z_weak_thresh);
     record.value("gravity_align_accel_tol", params_.values().gravity_align_accel_tol);
     record.value("gravity_align_gyro_tol", params_.values().gravity_align_gyro_tol);
     record.value("gravity_align_window_s", params_.values().gravity_align_window_s);
-    record.value("gravity_align_continuous", params_.values().gravity_align_continuous);
-    record.value("gravity_align_hold_s", params_.values().gravity_align_hold_s);
-    record.value("gravity_align_noise_degraded", params_.values().gravity_align_noise_degraded);
     record.value("gravity_align_mag_ref", params_.values().gravity_align_mag_ref);
     record.value("gravity_align_grav_leak", params_.values().gravity_align_grav_leak);
     record.value("gravity_align_grav_cap_deg", params_.values().gravity_align_grav_cap_deg);
     record.value("gravity_align_lin_accel_comp", params_.values().gravity_align_lin_accel_comp);
     record.value("gravity_align_vel_sigma_scale", params_.values().gravity_align_vel_sigma_scale);
-    record.value("gravity_align_withhold_blind_moving", params_.values().gravity_align_withhold_blind_moving);
-    record.value("gravity_align_sigma_policy", params_.values().gravity_align_sigma_policy);
     record.value("gravity_align_noise_static", params_.values().gravity_align_noise_static);
     record.value("gravity_align_noise_moving", params_.values().gravity_align_noise_moving);
     record.value("gravity_align_leg_vel_sigma", params_.values().gravity_align_leg_vel_sigma);
@@ -4721,9 +4705,7 @@ private:
   {
     record.value("guard_vel_reset_sigma", params_.values().guard_vel_reset_sigma);
     record.value("zupt_vel_reset_sigma", zupt_vel_reset_sigma);
-    record.value("divergence_guard_en", params_.values().divergence_guard_en);
     record.value("divergence_guard_min_eff", params_.values().divergence_guard_min_eff);
-    record.value("guard_engulf_en", params_.values().guard_engulf_en);
     record.value("guard_engulf_far_range", params_.values().guard_engulf_far_range);
     record.value("guard_engulf_far_frac_min", params_.values().guard_engulf_far_frac_min);
     record.value("guard_engulf_streak", params_.values().guard_engulf_streak);
@@ -4737,7 +4719,6 @@ private:
     record.value("guard_hole_max_accel", params_.values().guard_hole_max_accel);
     record.value("divergence_guard_streak", params_.values().divergence_guard_streak);
     record.value("divergence_guard_max_speed", params_.values().divergence_guard_max_speed);
-    record.value("zupt_en", params_.values().zupt_en);
     record.value("zupt_gyro_thresh", zupt_gyro_thresh);
     record.value("zupt_acc_span_ratio", zupt_acc_span_ratio);
     record.value("zupt_wheel_speed_thresh", zupt_wheel_speed_thresh);
@@ -4751,7 +4732,6 @@ private:
     record.value("zupt_hold_vel_noise", params_.values().parked_hold.vel_noise);
     record.value("zupt_hold_deadband_sigma", params_.values().parked_hold.deadband_sigma);
     record.value("zupt_anchor_confirm_scans", stationary_anchor_params.confirm_scans);
-    record.value("reanchor_en", reanchor_params.enabled);
     record.value("reanchor_min_eff", reanchor_params.min_eff);
     record.value("reanchor_max_res", reanchor_params.max_res);
     record.value("reanchor_confirm_scans", reanchor_params.confirm_scans);
@@ -4761,8 +4741,6 @@ private:
     record.value("reanchor_res_floor", reanchor_params.res_floor);
     record.value("reanchor_min_eff_ratio", reanchor_params.min_eff_ratio);
     record.value("reanchor_require_guard_clear", params_.values().reanchor_require_guard_clear);
-    record.value("reanchor_recovery_entry_view", params_.values().reanchor_recovery_entry_view);
-    record.value("runaway_watchdog_en", params_.values().runaway.enabled);
     record.value("runaway_parked_speed_thresh", params_.values().runaway.parked_speed_thresh);
     record.value("runaway_wheel_speed_margin", params_.values().runaway.wheel_speed_margin);
     record.value("runaway_hold_sec", params_.values().runaway.hold_sec);
@@ -4792,7 +4770,6 @@ private:
     record.value("pcd_save.pcd_save_en", pcd_save_en);
     record.value("pcd_save.interval", pcd_save_interval);
     record.value("prior_map_pcd", prior_map_pcd_);
-    record.value("prior_map_pinned", params_.values().prior_map_pinned);
     record.value("prior_map_voxel", params_.values().prior_map_voxel);
     record.value("prior_map_freeze", params_.values().prior_map_freeze);
     record.value("initial_pose", params_.values().initial_pose_vec);
@@ -4861,7 +4838,6 @@ private:
     record.value("derived:prior_startup:recovery_state.reference_initialized_once",
                  recovery_state.reference_initialized_once);
     record.value("derived:prior_alignment:prior_map_align_", params_.values().prior_map_align);
-    record.value("derived:prior_alignment:prior_map_pinned_", params_.values().prior_map_pinned);
     record.matrix("derived:wheel_extrinsic:R_robot_to_imu", params_.values().R_robot_to_imu);
     record.matrix("derived:lever_arm:wheel_lever_arm", params_.values().wheel_lever_arm);
     record.value("derived:filter_setters:downSizeFilterSurf.leaf", downSizeFilterSurf.leaf());
@@ -4969,7 +4945,7 @@ private:
     const bool pending = recovery_state.trust == fast_lio::RecoveryTrust::kPending;
     if (!pending && ikdtree.entryViewActive())
       ikdtree.EndEntryView();
-    if (params_.values().reanchor_recovery_entry_view && pending && entry_view_round_ != recovery_state.episode) {
+    if (pending && entry_view_round_ != recovery_state.episode) {
       entry_view_round_ = recovery_state.episode;
       ikdtree.BeginEntryView();
     }
@@ -4979,8 +4955,7 @@ private:
   bool recoveryEntryViewServes() const
   {
 #ifdef USE_IVOX
-    return params_.values().reanchor_recovery_entry_view && recovery_state.trust == fast_lio::RecoveryTrust::kPending &&
-           ikdtree.entryViewActive();
+    return recovery_state.trust == fast_lio::RecoveryTrust::kPending && ikdtree.entryViewActive();
 #else
     return false;
 #endif
@@ -5863,11 +5838,10 @@ private:
               ikdtree.set_downsample_param(filter_size_map_min);
               transformMapSeed(true);
 
-              // 5. Prior map + current scan → map backend. Pinned, the prior map goes into a
-              //    tier of its own; unpinned, it is merged in and lives or dies with the rest.
+              // 5. Prior map + current scan → map backend. The prior map goes into a tier of
+              //    its own (an ikd-Tree build refused it at load: it has no tier to keep it in).
               //    On the relocalization path nothing goes in yet: the map is held in its own
               //    frame until an alignment says where to put it (installPriorMap below).
-              size_t map_points = 0;
               if (p.prior_map_align == fast_lio::PriorMapAlign::kRelocalization) {
                 prior_map_ds_ = prior_ds;
                 observeMapOperation(
@@ -5895,42 +5869,23 @@ private:
                 rclcpp::shutdown();
                 return;
               }
-              if (p.prior_map_pinned) {
-                observeMapOperation(
-                  observer,
-                  fast_lio::AdmissionMapKind::kPriorAdd,
-                  [&] { return std::array<std::uint64_t, 3>{0, prior_ds->size(), 0}; },
-                  [&] { return ikdtree.AddPinnedPoints(prior_ds->points); });
-                observeMapOperation(
-                  observer,
-                  fast_lio::AdmissionMapKind::kPriorAdd,
-                  [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
-                  [] { return fast_lio::addScanSeed(ikdtree, feats_down_world->points, lifecycle_scan_seq); });
-                map_points = static_cast<size_t>(ikdtree.size());
-                RCLCPP_INFO(this->get_logger(),
-                            "map built from prior map (PINNED, %zu voxels) + current scan (%zu + %d = %zu points)",
-                            ikdtree.pinnedVoxels(),
-                            prior_ds->size(),
-                            feats_down_size,
-                            map_points);
-              } else
+              observeMapOperation(
+                observer,
+                fast_lio::AdmissionMapKind::kPriorAdd,
+                [&] { return std::array<std::uint64_t, 3>{0, prior_ds->size(), 0}; },
+                [&] { return ikdtree.AddPinnedPoints(prior_ds->points); });
+              observeMapOperation(
+                observer,
+                fast_lio::AdmissionMapKind::kPriorAdd,
+                [] { return std::array<std::uint64_t, 3>{feats_down_world->size(), 0, 0}; },
+                [] { return fast_lio::addScanSeed(ikdtree, feats_down_world->points, lifecycle_scan_seq); });
+              RCLCPP_INFO(this->get_logger(),
+                          "map built from prior map (PINNED, %zu voxels) + current scan (%zu + %d = %zu points)",
+                          ikdtree.pinnedVoxels(),
+                          prior_ds->size(),
+                          feats_down_size,
+                          static_cast<size_t>(ikdtree.size()));
 #endif
-              {
-                PointCloudXYZI::Ptr combined(new PointCloudXYZI());
-                *combined = *prior_ds;
-                *combined += *feats_down_world;
-                observeMapOperation(
-                  observer,
-                  fast_lio::AdmissionMapKind::kPriorBuild,
-                  [&] { return std::array<std::uint64_t, 3>{feats_down_world->size(), prior_ds->size(), 0}; },
-                  [&] { fast_lio::buildScanMap(ikdtree, combined->points, lifecycle_scan_seq, prior_ds->size()); });
-                map_points = combined->size();
-                RCLCPP_INFO(this->get_logger(),
-                            "ikd-tree built from prior map + current scan (%zu + %d = %zu points)",
-                            prior_ds->size(),
-                            feats_down_size,
-                            map_points);
-              }
               anchorTraceMapUpdated();
               Localmap_Initialized = false;
               prior_map_installed_ = true;
@@ -6076,9 +6031,8 @@ private:
         }
       }
       EkfUpdateDiagnostics lidarDiagnostics;
-      Eigen::Matrix<double, 23, 23> lidarCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
-      if (p.kalman_channel_diag_en || corr_dump_scan_active || p.reanchor_recovery_entry_view)
-        lidarCovarianceBefore = kf.get_P();
+      // The update's prior covariance: the diagnostics write it, and a recovery's entry-view match takes it.
+      const Eigen::Matrix<double, 23, 23> lidarCovarianceBefore = kf.get_P();
       {
         // Consider roll/pitch on this scan? Decided from what the previous scan left (its roll/pitch information
         // and z_weak), the guard's latch and the time since the last release (rp_consider.hpp).
@@ -6200,96 +6154,85 @@ private:
        *   operation, so the guard is accuracy-neutral when undisturbed. ***/
       flio_map_frozen = false;
       flio_degraded_odom = false;
-      bool flio_vel_runaway = false;
-      bool flio_engulfed = false;
-      if (p.divergence_guard_en) {
-        if (effct_feat_num < p.divergence_guard_min_eff)
-          ++consec_low_eff;
+      if (effct_feat_num < p.divergence_guard_min_eff)
+        ++consec_low_eff;
+      else
+        consec_low_eff = 0;
+      const bool flio_vel_runaway = (state_point.vel.norm() > p.divergence_guard_max_speed);
+      if (reference_health_en && flio_vel_runaway)
+        reference_progress.negative(1u << 10, 1u << 4);  // the actual pre-clamp fact
+      if (reference_health_en && consec_low_eff >= p.divergence_guard_streak)
+        reference_progress.negative(1u << 11, 1u << 7);
+      // (3) engulfment: far field collapsed in the raw scan — leading indicator
+      //     (fires before effct starves; see the guard_engulf_* comment in frontend_params.hpp).
+      if (scan_far_frac < p.guard_engulf_far_frac_min)
+        ++consec_engulf;
+      else
+        consec_engulf = 0;
+      if (!engulf_latched) {
+        if (consec_engulf >= p.guard_engulf_streak) {
+          engulf_latched = true;
+          consec_engulf_clear = 0;
+          engulf_latch_time = lidar_end_time;
+        }
+      } else {
+        // Latched: release only on a SUSTAINED healthy far field (hysteresis).
+        if (scan_far_frac >= p.guard_engulf_far_frac_release)
+          ++consec_engulf_clear;
         else
-          consec_low_eff = 0;
-        flio_vel_runaway = (state_point.vel.norm() > p.divergence_guard_max_speed);
-        if (reference_health_en && flio_vel_runaway)
-          reference_progress.negative(1u << 10, 1u << 4);  // the actual pre-clamp fact
-        if (reference_health_en && consec_low_eff >= p.divergence_guard_streak)
-          reference_progress.negative(1u << 11, 1u << 7);
-        // (3) engulfment: far field collapsed in the raw scan — leading indicator
-        //     (fires before effct starves; see guard_engulf_en block comment).
-        if (p.guard_engulf_en) {
-          if (scan_far_frac < p.guard_engulf_far_frac_min)
-            ++consec_engulf;
-          else
-            consec_engulf = 0;
-          if (!engulf_latched) {
-            if (consec_engulf >= p.guard_engulf_streak) {
-              engulf_latched = true;
-              consec_engulf_clear = 0;
-              engulf_latch_time = lidar_end_time;
-            }
-          } else {
-            // Latched: release only on a SUSTAINED healthy far field (hysteresis).
-            if (scan_far_frac >= p.guard_engulf_far_frac_release)
-              ++consec_engulf_clear;
-            else
-              consec_engulf_clear = 0;
-            if (consec_engulf_clear >= p.guard_engulf_release_scans) {
-              engulf_latched = false;
-              consec_engulf = 0;
-              // The blind stretch's velocity: the legacy policy discards it (see block comment); the release
-              // policy (engulf_release.hpp) can take the legs or keep the estimate, each with the 1-σ the
-              // assignment deserves, so the next innovations are not forced through stale cross terms.
-              state_ikfom st = kf.get_x();
-              const auto wheel = wheelEvidenceAt(lidar_end_time);
-              const V3D leg_v(wheel.body_velocity[0], wheel.body_velocity[1], wheel.body_velocity[2]);
-              release_vel_params.zero_sigma = p.guard_vel_reset_sigma;
-              release_vel_params.max_speed = p.divergence_guard_max_speed;
-              const auto rel = fast_lio::releaseVelocity(
-                st.vel, st.rot.toRotationMatrix(), leg_v, wheel.valid ? wheel.age : -1.0, release_vel_params);
-              st.vel = rel.velocity;
-              kf.change_x(st);
-              resetVelocityCovariance(rel.sigma);
-              const double blind_s = engulf_latch_time > 0.0 ? lidar_end_time - engulf_latch_time : 0.0;
-              engulf_release_time = lidar_end_time;
-              state_point = kf.get_x();
-              RCLCPP_WARN(this->get_logger(),
-                          "[DIVERGENCE-GUARD] engulfment released (far_frac=%.2f for %d scans, blind %.1fs): "
-                          "map unfrozen, velocity %s (%.2f m/s, sigma %.2f)",
-                          scan_far_frac,
-                          p.guard_engulf_release_scans,
-                          blind_s,
-                          rel.used == fast_lio::ReleaseVelocitySource::kLeg    ? "from legs"
-                          : rel.used == fast_lio::ReleaseVelocitySource::kKeep ? "kept"
-                                                                               : "reset",
-                          state_point.vel.norm(),
-                          rel.sigma);
-            }
-          }
-          flio_engulfed = engulf_latched;
+          consec_engulf_clear = 0;
+        if (consec_engulf_clear >= p.guard_engulf_release_scans) {
+          engulf_latched = false;
+          consec_engulf = 0;
+          // The blind stretch's velocity: the legacy policy discards it (see block comment); the release
+          // policy (engulf_release.hpp) can take the legs or keep the estimate, each with the 1-σ the
+          // assignment deserves, so the next innovations are not forced through stale cross terms.
+          state_ikfom st = kf.get_x();
+          const auto wheel = wheelEvidenceAt(lidar_end_time);
+          const V3D leg_v(wheel.body_velocity[0], wheel.body_velocity[1], wheel.body_velocity[2]);
+          release_vel_params.zero_sigma = p.guard_vel_reset_sigma;
+          release_vel_params.max_speed = p.divergence_guard_max_speed;
+          const auto rel = fast_lio::releaseVelocity(
+            st.vel, st.rot.toRotationMatrix(), leg_v, wheel.valid ? wheel.age : -1.0, release_vel_params);
+          st.vel = rel.velocity;
+          kf.change_x(st);
+          resetVelocityCovariance(rel.sigma);
+          const double blind_s = engulf_latch_time > 0.0 ? lidar_end_time - engulf_latch_time : 0.0;
+          engulf_release_time = lidar_end_time;
+          state_point = kf.get_x();
+          RCLCPP_WARN(this->get_logger(),
+                      "[DIVERGENCE-GUARD] engulfment released (far_frac=%.2f for %d scans, blind %.1fs): "
+                      "map unfrozen, velocity %s (%.2f m/s, sigma %.2f)",
+                      scan_far_frac,
+                      p.guard_engulf_release_scans,
+                      blind_s,
+                      rel.used == fast_lio::ReleaseVelocitySource::kLeg    ? "from legs"
+                      : rel.used == fast_lio::ReleaseVelocitySource::kKeep ? "kept"
+                                                                           : "reset",
+                      state_point.vel.norm(),
+                      rel.sigma);
         }
       }
-      const bool flio_in_degraded = guardVerdictForTest(
-        p.divergence_guard_en && (consec_low_eff >= p.divergence_guard_streak || flio_vel_runaway || flio_engulfed));
+      const bool flio_in_degraded =
+        guardVerdictForTest(consec_low_eff >= p.divergence_guard_streak || flio_vel_runaway || engulf_latched);
 
       /*** A1 gravity-alignment leveling prior — the ROOT-CAUSE fix for the
        *   iVox pitch-coupled world-Z drift. Supplies the ABSOLUTE pitch/roll
        *   reference the body-vz planar constraint below structurally lacks.
-       *   2026-08-31 upgrade (m20_0831 doorway pitch anatomy: dZ_rate =
-       *   −v·sin(pitch_err), r=0.94; the per-sample standstill gate engaged
-       *   7/2569 scans, all inside guard windows — the phase where no error
-       *   integrates). Three additions, parameter-gated, defaults = legacy:
-       *   [L2] gravity_align_window_s > 0: the measurement becomes the
+       *   Every scan that passes the gates below takes the update; the
+       *   doorway pitch twist integrates into Z on the walk after a guard
+       *   window as well as inside it (m20_0831 doorway pitch anatomy:
+       *   dZ_rate = −v·sin(pitch_err), r=0.94).
+       *   [L2] gravity_align_window_s > 0: the measurement is the
        *        WINDOW-MEAN compensated specific force — gait linear
        *        acceleration is near zero-mean over a stride, so the mean is a
        *        clean gravity direction even while walking (measured on
        *        m20_0831 /IMU: 0.13-0.56° median at 1.2 m/s vs 1.2-2.5°
-       *        per-sample). gravity_align_continuous engages every scan.
-       *   [L1] gravity_align_hold_s: a z_weak/degraded trigger keeps the
-       *        stronger gravity_align_noise_degraded sigma for this long
-       *        after clearing — the doorway pitch twist integrates into Z on
-       *        the walk AFTER the guard window, not inside it.
-       *        error-state variance BEFORE this update. A confidently-wrong
-       *        iEKF (measured 0.09-0.67°/scan authority against a 6-7° error)
-       *        beats any honestly-weighted witness; softening P is what lets
-       *        the measurement act (Schmidt/consider-state practice).
+       *        per-sample).
+       *   The sigma is the measurement's own error (levellingSigma); the
+       *   Kalman gain, through the attitude covariance, decides how much of
+       *   it to take where the LiDAR is weak. A blind stretch with the body
+       *   moving withholds it: the acceleration is unobservable there.
        *   Constrains roll/pitch ONLY: yaw lies in the measurement null space
        *   (skew(g_body) sends a yaw-axis δθ to 0), so the LiDAR-excellent
        *   heading is untouched. h(x)=Rᵀ·u_world, right-perturbation
@@ -6307,7 +6250,6 @@ private:
         M3D Rw = st.rot.toRotationMatrix();
         const V3D bg_now(st.bg[0], st.bg[1], st.bg[2]);
         const V3D v_body_now = Rw.transpose() * st.vel;  // velocity in IMU frame
-        const bool sigma_by_measurement = p.gravity_align_sigma_policy == "measurement";
         // [L2] per-scan aggregate of kinematically-compensated specific force
         // (centripetal ω×v_body subtracted per sample — transport theorem; the
         // scan-end velocity serves every sample, walking-speed error << gates).
@@ -6351,167 +6293,147 @@ private:
             grav_win.pop_front();
           }
         }
-        // Engagement: legacy trigger, [L1] hold hysteresis, [L2] continuous.
-        const bool ga_trig = measured.pos_obs_z_weak > p.gravity_align_z_weak_thresh || flio_in_degraded;
-        if (ga_trig) {
-          gravity_align_last_trig = lidar_end_time;
+        // Measurement vector: window mean ([L2]) or legacy last-sample.
+        V3D f_meas = V3D::Zero();
+        double win_span = 0.0;
+        int win_n = 0;
+        fast_lio::LinearAccelerationTerm lin_term;  // [v6] invalid unless the option is on and the window is clean
+        if (p.gravity_align_window_s > 0.0) {
+          double t_old = lidar_end_time;
+          for (const auto & a : grav_win) {
+            if (a.n == 0) {
+              continue;
+            }  // scan fully rejected by the per-sample gyro filter
+            f_meas += a.sum;
+            win_n += a.n;
+            t_old = std::min(t_old, a.t);
+          }
+          if (win_n > 0) {
+            f_meas /= double(win_n);
+          }
+          win_span = lidar_end_time - t_old + 0.1;
+          // [v6] window-mean linear acceleration from the leg-velocity edges: (v_b(end) − v_b(start))/span,
+          // raw accelerometer units like the ω×v term. An edge without a leg velocity has no derivative —
+          // the term is invalid and the prior is withheld below.
+          if (p.gravity_align_lin_accel_comp && !grav_win.empty()) {
+            lin_term = fast_lio::linearAccelerationTerm(
+              grav_win.front().edge, grav_win.back().edge, fast_lio::G_m_s2, p.gravity_align_vel_sigma_scale);
+            if (lin_term.valid) {
+              f_meas -= lin_term.accel * (g_raw / fast_lio::G_m_s2);
+            }
+          }
+        } else {
+          const auto & imu_last = Measures.imu.back();
+          V3D a_raw(imu_last->linear_acceleration.x, imu_last->linear_acceleration.y, imu_last->linear_acceleration.z);
+          V3D w_raw(imu_last->angular_velocity.x, imu_last->angular_velocity.y, imu_last->angular_velocity.z);
+          if (w_raw.norm() <= p.gravity_align_gyro_tol) {
+            f_meas = a_raw - (w_raw - bg_now).cross(v_body_now) * (g_raw / fast_lio::G_m_s2);
+            win_n = 1;
+            win_span = 1.0;
+          }
         }
-        const bool ga_held = p.gravity_align_hold_s > 0.0 && !ga_trig &&
-                             lidar_end_time - gravity_align_last_trig <= p.gravity_align_hold_s;
-        gravity_align_degraded_active =
-          !sigma_by_measurement && (ga_trig || ga_held) && p.gravity_align_noise_degraded > 0.0;
-        if (ga_trig || ga_held || p.gravity_align_continuous) {
-          // Measurement vector: window mean ([L2]) or legacy last-sample.
-          V3D f_meas = V3D::Zero();
-          double win_span = 0.0;
-          int win_n = 0;
-          fast_lio::LinearAccelerationTerm lin_term;  // [v6] invalid unless the option is on and the window is clean
-          if (p.gravity_align_window_s > 0.0) {
-            double t_old = lidar_end_time;
-            for (const auto & a : grav_win) {
-              if (a.n == 0) {
-                continue;
-              }  // scan fully rejected by the per-sample gyro filter
-              f_meas += a.sum;
-              win_n += a.n;
-              t_old = std::min(t_old, a.t);
-            }
-            if (win_n > 0) {
-              f_meas /= double(win_n);
-            }
-            win_span = lidar_end_time - t_old + 0.1;
-            // [v6] window-mean linear acceleration from the leg-velocity edges: (v_b(end) − v_b(start))/span,
-            // raw accelerometer units like the ω×v term. An edge without a leg velocity has no derivative —
-            // the term is invalid and the prior is withheld below.
-            if (p.gravity_align_lin_accel_comp && !grav_win.empty()) {
-              lin_term = fast_lio::linearAccelerationTerm(
-                grav_win.front().edge, grav_win.back().edge, fast_lio::G_m_s2, p.gravity_align_vel_sigma_scale);
-              if (lin_term.valid) {
-                f_meas -= lin_term.accel * (g_raw / fast_lio::G_m_s2);
+        const double a_norm = f_meas.norm();
+        // Validity gates: enough window coverage (windowed mode), compensated
+        // magnitude ≈ gravity (rejects residual tangential accel). The anchor
+        // is gravity_align_mag_ref when set: the IMU-init g estimate is biased
+        // when the bag/robot starts IN MOTION (m20_0831: init while walking →
+        // the 5 % gate rejected nearly every honest window, 9/2569 engaged).
+        const double g_ref = p.gravity_align_mag_ref > 1e-3 ? p.gravity_align_mag_ref : g_raw;
+        const bool span_ok =
+          p.gravity_align_window_s <= 0.0 || (win_span >= 0.7 * p.gravity_align_window_s && win_n >= 20);
+        // [v6] with the compensation on, a window with no leg velocity at an edge cannot be levelled to.
+        // A platform with no leg stream at all keeps the legacy measurement (the stream, not an edge, is absent).
+        const bool leg_stream_alive = leg_edge.stream_alive;
+        const bool lin_ok =
+          !p.gravity_align_lin_accel_comp || p.gravity_align_window_s <= 0.0 || lin_term.valid || !leg_stream_alive;
+        // [v6] blind stretch with the body moving: the acceleration is unobservable, so is the vertical
+        const bool blind_moving = flio_in_degraded && !body_static_now;
+        if (degeneracy_debug && blind_moving) {
+          std::cerr << "[GALIGN] withheld: blind stretch, body moving" << std::endl;
+        }
+        if (degeneracy_debug && !lin_ok) {
+          std::cerr << "[GALIGN] withheld: no leg velocity at a window edge" << std::endl;
+        }
+        if (g_ref > 1e-3 && win_n > 0 && a_norm > 1e-6 && span_ok && lin_ok && !blind_moving &&
+            std::abs(a_norm - g_ref) <= p.gravity_align_accel_tol * g_ref) {
+          V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
+          V3D u_world = -grav_w.normalized();              // world up (unit)
+          V3D g_body = Rw.transpose() * u_world;           // up in body (unit)
+          V3D m_body = f_meas / a_norm;                    // measured up in body (unit)
+          const V3D h_body = fast_lio::levellingPrediction(g_body, st.ba, fast_lio::G_m_s2);
+          V3D residual = m_body - h_body;  // z − h(x)
+          if (residual.norm() <= 0.5) {    // ~30° outlier gate (never inject a wild window)
+            Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
+            H.block<3, 3>(0, 3) = skew_sym_mat(g_body);  // ∂h/∂(rot); yaw in null space
+            H.block<3, 3>(0, 18) = fast_lio::levellingBiasJacobian(g_body, fast_lio::G_m_s2);
+            // [v4] An init window in motion can bias the S2 gravity state (m20_0831).
+            // These columns let the Kalman gain split the residual among attitude,
+            // accelerometer bias and gravity according to the covariance.
+            // ∂h/∂δg = −(1/‖g‖)·Rᵀ·M(g), M = S2_Mx (same helper df_dx uses).
+            {
+              Eigen::Matrix<state_ikfom::scalar, 2, 1> dz0 = Eigen::Matrix<state_ikfom::scalar, 2, 1>::Zero();
+              Eigen::Matrix<state_ikfom::scalar, 3, 2> Mg;
+              st.S2_Mx(Mg, dz0, 21);
+              const double gnorm = grav_w.norm();
+              if (gnorm > 1e-6) {
+                H.block<3, 2>(0, 21) = -(1.0 / gnorm) * Rw.transpose() * Mg;
               }
             }
-          } else {
-            const auto & imu_last = Measures.imu.back();
-            V3D a_raw(
-              imu_last->linear_acceleration.x, imu_last->linear_acceleration.y, imu_last->linear_acceleration.z);
-            V3D w_raw(imu_last->angular_velocity.x, imu_last->angular_velocity.y, imu_last->angular_velocity.z);
-            if (w_raw.norm() <= p.gravity_align_gyro_tol) {
-              f_meas = a_raw - (w_raw - bg_now).cross(v_body_now) * (g_raw / fast_lio::G_m_s2);
-              win_n = 1;
-              win_span = 1.0;
-            }
-          }
-          const double a_norm = f_meas.norm();
-          // Validity gates: enough window coverage (windowed mode), compensated
-          // magnitude ≈ gravity (rejects residual tangential accel). The anchor
-          // is gravity_align_mag_ref when set: the IMU-init g estimate is biased
-          // when the bag/robot starts IN MOTION (m20_0831: init while walking →
-          // the 5 % gate rejected nearly every honest window, 9/2569 engaged).
-          const double g_ref = p.gravity_align_mag_ref > 1e-3 ? p.gravity_align_mag_ref : g_raw;
-          const bool span_ok =
-            p.gravity_align_window_s <= 0.0 || (win_span >= 0.7 * p.gravity_align_window_s && win_n >= 20);
-          // [v6] with the compensation on, a window with no leg velocity at an edge cannot be levelled to.
-          // A platform with no leg stream at all keeps the legacy measurement (the stream, not an edge, is absent).
-          const bool leg_stream_alive = leg_edge.stream_alive;
-          const bool lin_ok =
-            !p.gravity_align_lin_accel_comp || p.gravity_align_window_s <= 0.0 || lin_term.valid || !leg_stream_alive;
-          // [v6] blind stretch with the body moving: the acceleration is unobservable, so is the vertical
-          const bool blind_moving =
-            (p.gravity_align_withhold_blind_moving || sigma_by_measurement) && flio_in_degraded && !body_static_now;
-          if (degeneracy_debug && blind_moving) {
-            std::cerr << "[GALIGN] withheld: blind stretch, body moving" << std::endl;
-          }
-          if (degeneracy_debug && !lin_ok) {
-            std::cerr << "[GALIGN] withheld: no leg velocity at a window edge" << std::endl;
-          }
-          if (g_ref > 1e-3 && win_n > 0 && a_norm > 1e-6 && span_ok && lin_ok && !blind_moving &&
-              std::abs(a_norm - g_ref) <= p.gravity_align_accel_tol * g_ref) {
-            V3D grav_w(st.grav[0], st.grav[1], st.grav[2]);  // ≈ [0,0,-g], points DOWN
-            V3D u_world = -grav_w.normalized();              // world up (unit)
-            V3D g_body = Rw.transpose() * u_world;           // up in body (unit)
-            V3D m_body = f_meas / a_norm;                    // measured up in body (unit)
-            const V3D h_body = fast_lio::levellingPrediction(g_body, st.ba, fast_lio::G_m_s2);
-            V3D residual = m_body - h_body;                  // z − h(x)
-            if (residual.norm() <= 0.5) {                    // ~30° outlier gate (never inject a wild window)
-              Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
-              H.block<3, 3>(0, 3) = skew_sym_mat(g_body);  // ∂h/∂(rot); yaw in null space
-              H.block<3, 3>(0, 18) = fast_lio::levellingBiasJacobian(g_body, fast_lio::G_m_s2);
-              // [v4] An init window in motion can bias the S2 gravity state (m20_0831).
-              // These columns let the Kalman gain split the residual among attitude,
-              // accelerometer bias and gravity according to the covariance.
-              // ∂h/∂δg = −(1/‖g‖)·Rᵀ·M(g), M = S2_Mx (same helper df_dx uses).
-              {
-                Eigen::Matrix<state_ikfom::scalar, 2, 1> dz0 = Eigen::Matrix<state_ikfom::scalar, 2, 1>::Zero();
-                Eigen::Matrix<state_ikfom::scalar, 3, 2> Mg;
-                st.S2_Mx(Mg, dz0, 21);
-                const double gnorm = grav_w.norm();
-                if (gnorm > 1e-6) {
-                  H.block<3, 2>(0, 21) = -(1.0 / gnorm) * Rw.transpose() * Mg;
+            // [v4] fading memory on the gravity block: with no process noise the
+            // grav variance collapses and even a correct H routes nothing into it.
+            // Gentle multiplicative leak (congruence row/col scaling — correlations
+            // and PSD preserved, no covariance shock) capped at the configured gravity sigma squared.
+            // 重力切空间方差上限为配置的重力 σ 的平方。
+            if (p.gravity_align_grav_leak > 1.0) {
+              const double kGravVarCap = std::pow(p.gravity_align_grav_cap_deg * M_PI / 180.0, 2);
+              auto Pg = kf.get_P();
+              const double lam = std::sqrt(p.gravity_align_grav_leak);
+              bool leaked = false;
+              for (int i = 21; i <= 22; i++) {
+                if (Pg(i, i) < kGravVarCap) {
+                  Pg.row(i) *= lam;
+                  Pg.col(i) *= lam;
+                  leaked = true;
                 }
               }
-              // [v4] fading memory on the gravity block: with no process noise the
-              // grav variance collapses and even a correct H routes nothing into it.
-              // Gentle multiplicative leak (congruence row/col scaling — correlations
-              // and PSD preserved, no covariance shock) capped at the configured gravity sigma squared.
-              // 重力切空间方差上限为配置的重力 σ 的平方。
-              if (p.gravity_align_grav_leak > 1.0) {
-                const double kGravVarCap = std::pow(p.gravity_align_grav_cap_deg * M_PI / 180.0, 2);
-                auto Pg = kf.get_P();
-                const double lam = std::sqrt(p.gravity_align_grav_leak);
-                bool leaked = false;
-                for (int i = 21; i <= 22; i++) {
-                  if (Pg(i, i) < kGravVarCap) {
-                    Pg.row(i) *= lam;
-                    Pg.col(i) *= lam;
-                    leaked = true;
-                  }
-                }
-                if (leaked) {
-                  kf.change_P(Pg);
-                }
+              if (leaked) {
+                kf.change_P(Pg);
               }
-              const double sigma =
-                fast_lio::levellingSigma(sigma_by_measurement ? fast_lio::LevellingSigmaPolicy::kMeasurement
-                                                              : fast_lio::LevellingSigmaPolicy::kScene,
-                                         ga_trig || ga_held,
-                                         body_static_now,
-                                         p.gravity_align_noise,
-                                         p.gravity_align_noise_degraded,
-                                         p.gravity_align_noise_static,
-                                         p.gravity_align_noise_moving);
-              // [v6] the compensation's own uncertainty widens the measurement (quadrature)
-              const double n2 = sigma * sigma + (lin_term.valid ? lin_term.sigma * lin_term.sigma : 0.0);
-              Eigen::Vector3d R_diag(n2, n2, n2);
-              EkfUpdateDiagnostics gravityDiagnostics;
-              Eigen::Matrix<double, 23, 23> gravityCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
-              if (p.kalman_channel_diag_en)
-                gravityCovarianceBefore = kf.get_P();
-              if (degeneracy_debug) {
-                V3D tilt = g_body.cross(m_body);  // axis*sin(angle), body frame
-                const double ang_deg = std::asin(std::min(1.0, tilt.norm())) * 57.2958;
-                V3D eul_before = SO3ToEuler(st.rot);  // degrees
-                kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
-                state_point = kf.get_x();
-                V3D eul_after = SO3ToEuler(state_point.rot);
-                V3D deul = eul_after - eul_before;
-                std::cerr << "[GALIGN] z_weak=" << measured.pos_obs_z_weak << " degr=" << flio_in_degraded
-                          << " trig=" << ga_trig << " held=" << ga_held << " win_n=" << win_n << " span=" << win_span
-                          << " sigma=" << sigma << " sig_eff=" << std::sqrt(n2) << " gvar=" << kf.get_P()(21, 21)
-                          << " tilt_deg=" << ang_deg << " alin=" << (lin_term.valid ? lin_term.accel.norm() : 0.0)
-                          << " alin_deg="
-                          << (lin_term.valid ? fast_lio::leanOfAcceleration(lin_term.accel, fast_lio::G_m_s2) * 57.2958 : 0.0)
-                          << " dRPY_deg=[" << deul.x() << "," << deul.y() << "," << deul.z() << "]"
-                          << " posZ=" << state_point.pos[2] << "m" << std::endl;
-              } else {
-                kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
-                state_point = kf.get_x();
-              }
-              if (p.kalman_channel_diag_en) {
-                writeKalmanChannel(
-                  "gravity", st, state_point, gravityCovarianceBefore, gravityDiagnostics, m_body, h_body);
-              }
-            }  // outlier gate
-          }
+            }
+            const double sigma =
+              fast_lio::levellingSigma(body_static_now, p.gravity_align_noise_static, p.gravity_align_noise_moving);
+            // [v6] the compensation's own uncertainty widens the measurement (quadrature)
+            const double n2 = sigma * sigma + (lin_term.valid ? lin_term.sigma * lin_term.sigma : 0.0);
+            Eigen::Vector3d R_diag(n2, n2, n2);
+            EkfUpdateDiagnostics gravityDiagnostics;
+            Eigen::Matrix<double, 23, 23> gravityCovarianceBefore = Eigen::Matrix<double, 23, 23>::Zero();
+            if (p.kalman_channel_diag_en)
+              gravityCovarianceBefore = kf.get_P();
+            if (degeneracy_debug) {
+              V3D tilt = g_body.cross(m_body);  // axis*sin(angle), body frame
+              const double ang_deg = std::asin(std::min(1.0, tilt.norm())) * 57.2958;
+              V3D eul_before = SO3ToEuler(st.rot);  // degrees
+              kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
+              state_point = kf.get_x();
+              V3D eul_after = SO3ToEuler(state_point.rot);
+              V3D deul = eul_after - eul_before;
+              std::cerr << "[GALIGN] z_weak=" << measured.pos_obs_z_weak << " degr=" << flio_in_degraded
+                        << " win_n=" << win_n << " span=" << win_span << " sigma=" << sigma
+                        << " sig_eff=" << std::sqrt(n2) << " gvar=" << kf.get_P()(21, 21) << " tilt_deg=" << ang_deg
+                        << " alin=" << (lin_term.valid ? lin_term.accel.norm() : 0.0) << " alin_deg="
+                        << (lin_term.valid ? fast_lio::leanOfAcceleration(lin_term.accel, fast_lio::G_m_s2) * 57.2958
+                                           : 0.0)
+                        << " dRPY_deg=[" << deul.x() << "," << deul.y() << "," << deul.z() << "]"
+                        << " posZ=" << state_point.pos[2] << "m" << std::endl;
+            } else {
+              kf.update_simple(H, residual, R_diag, p.kalman_channel_diag_en ? &gravityDiagnostics : nullptr);
+              state_point = kf.get_x();
+            }
+            if (p.kalman_channel_diag_en) {
+              writeKalmanChannel(
+                "gravity", st, state_point, gravityCovarianceBefore, gravityDiagnostics, m_body, h_body);
+            }
+          }  // outlier gate
         }
       }
 
@@ -6706,7 +6628,6 @@ private:
         anchor_scan_record.usable = anchor_step.usable;
       fast_lio::ZuptPolicyInputs zupt_in;
       zupt_in.scan_degraded = reanchor.degraded;
-      zupt_in.zupt_enabled = p.zupt_en;
       zupt_in.anchor_valid = anchor_step.usable;
       zupt_in.body_static = body_static;
       zupt_in.speed = kf.get_x().vel.norm();
@@ -6758,7 +6679,7 @@ private:
           release_static_hold("no hold on a degraded scan", fast_lio::AnchorTraceReason::kNone);
           if (zupt_verdict.action == fast_lio::ZuptAction::kZeroVelocity) {
             anchorTraceAction(fast_lio::AnchorTraceAction::kZeroVelocity, 0);
-            if (zupt_in.zupt_enabled && zupt_in.body_static)
+            if (zupt_in.body_static)
               noteZeroOnlyScan();
             // A body speed above the platform's physical maximum is a
             // GUARANTEED-WRONG state, not a bound to enforce. Clamping it to
@@ -6886,66 +6807,64 @@ private:
        *   Compare the estimate against the only sources outside it — the wheels
        *   and the IMU's static verdict — and act when they contradict it for
        *   long enough that noise cannot explain it. ***/
-      if (p.runaway.enabled) {
-        const auto wheel = wheelEvidenceAt(lidar_end_time);
-        const double wheel_age = wheel.valid ? wheel.age : -1.0;
-        const auto runaway = runawayVerdictForTest(fast_lio::updateRunawayWatchdog(
-          &runaway_state, lidar_end_time, state_point.vel.norm(), body_static, wheel_age, wheel.speed, p.runaway));
-        if (runaway.tripped) {
-          frontend_runaway = true;
-          if (anchor_scan_record_open)
-            anchor_scan_record.events |= fast_lio::kAnchorEventRunawayTrip;
-          RCLCPP_ERROR(this->get_logger(),
-                       "[RUNAWAY] estimate contradicted for %.1fs (%s): speed=%.2fm/s wheel=%.2fm/s effct=%d "
-                       "res=%.3fm — trip #%u, policy=%s",
-                       runaway.bad_for,
-                       fast_lio::runawayReasonName(runaway.reason),
-                       state_point.vel.norm(),
-                       wheel_age >= 0.0 ? wheel.speed : -1.0,
-                       effct_feat_num,
-                       res_mean_last,
-                       runaway_state.trips,
-                       p.runaway_on_trip.c_str());
-          // A reset and a hold both end the anchor below, within the scan whose anchor step may just have pinned
-          // to it or pulled toward it. That write goes first: what is cleared, rebuilt around and published is
-          // the state the scan has without the anchor. The verdict stands as it was reached.
-          if (p.runaway_on_trip != "fault_exit")
-            takeBackAnchorWrite();
-          // Clear what tripped it. A kParked trip says the velocity is phantom,
-          // and rebuilding the map around a state that still carries it re-arms
-          // the identical contradiction: dog 2 (2026-09-05) tripped 91 times, 54
-          // of the 90 intervals landing on hold_sec exactly. The IMU and the
-          // wheels both say zero — the map is not the part that is wrong.
-          if (runaway.reason == fast_lio::RunawayReason::kParked) {
-            state_ikfom st = kf.get_x();
-            st.vel.setZero();
-            kf.change_x(st);
-            resetVelocityCovariance(p.guard_vel_reset_sigma);
-            state_point = kf.get_x();
-          }
-          if (p.runaway_on_trip == "reset_map") {
-            if (!rebuildLocalMap("RUNAWAY")) {
-              accounting.finish(fast_lio::AdmissionExit::kRecoveryFailed);
-              return;
-            }
-          } else if (p.runaway_on_trip == "fault_exit") {
-            accounting.finish(fast_lio::AdmissionExit::kFaultExit);
-            RCLCPP_FATAL(this->get_logger(),
-                         "[RUNAWAY] exiting so the supervisor can restart the pipeline (runaway_on_trip=fault_exit)");
-            rclcpp::shutdown();
+      const auto wheel = wheelEvidenceAt(lidar_end_time);
+      const double wheel_age = wheel.valid ? wheel.age : -1.0;
+      const auto runaway = runawayVerdictForTest(fast_lio::updateRunawayWatchdog(
+        &runaway_state, lidar_end_time, state_point.vel.norm(), body_static, wheel_age, wheel.speed, p.runaway));
+      if (runaway.tripped) {
+        frontend_runaway = true;
+        if (anchor_scan_record_open)
+          anchor_scan_record.events |= fast_lio::kAnchorEventRunawayTrip;
+        RCLCPP_ERROR(this->get_logger(),
+                     "[RUNAWAY] estimate contradicted for %.1fs (%s): speed=%.2fm/s wheel=%.2fm/s effct=%d "
+                     "res=%.3fm — trip #%u, policy=%s",
+                     runaway.bad_for,
+                     fast_lio::runawayReasonName(runaway.reason),
+                     state_point.vel.norm(),
+                     wheel_age >= 0.0 ? wheel.speed : -1.0,
+                     effct_feat_num,
+                     res_mean_last,
+                     runaway_state.trips,
+                     p.runaway_on_trip.c_str());
+        // A reset and a hold both end the anchor below, within the scan whose anchor step may just have pinned
+        // to it or pulled toward it. That write goes first: what is cleared, rebuilt around and published is
+        // the state the scan has without the anchor. The verdict stands as it was reached.
+        if (p.runaway_on_trip != "fault_exit")
+          takeBackAnchorWrite();
+        // Clear what tripped it. A kParked trip says the velocity is phantom,
+        // and rebuilding the map around a state that still carries it re-arms
+        // the identical contradiction: dog 2 (2026-09-05) tripped 91 times, 54
+        // of the 90 intervals landing on hold_sec exactly. The IMU and the
+        // wheels both say zero — the map is not the part that is wrong.
+        if (runaway.reason == fast_lio::RunawayReason::kParked) {
+          state_ikfom st = kf.get_x();
+          st.vel.setZero();
+          kf.change_x(st);
+          resetVelocityCovariance(p.guard_vel_reset_sigma);
+          state_point = kf.get_x();
+        }
+        if (p.runaway_on_trip == "reset_map") {
+          if (!rebuildLocalMap("RUNAWAY")) {
+            accounting.finish(fast_lio::AdmissionExit::kRecoveryFailed);
             return;
-          } else {
-            // hold: freeze the map and let the health flags stop downstream from
-            // consuming a pose we no longer believe.
-            fast_lio::tripReanchorLost(&reanchor_gate);
-            anchorEvidence(fast_lio::AnchorTraceReason::kLost,
-                           fast_lio::kAnchorEventLost,
-                           &anchor_trace_counters.lost,
-                           lidar_end_time,
-                           true);
-            dropStationaryAnchor(fast_lio::AnchorDrop::kLost, lidar_end_time);
-            fast_lio::breakRecoveryRun(&recovery_state);
           }
+        } else if (p.runaway_on_trip == "fault_exit") {
+          accounting.finish(fast_lio::AdmissionExit::kFaultExit);
+          RCLCPP_FATAL(this->get_logger(),
+                       "[RUNAWAY] exiting so the supervisor can restart the pipeline (runaway_on_trip=fault_exit)");
+          rclcpp::shutdown();
+          return;
+        } else {
+          // hold: freeze the map and let the health flags stop downstream from
+          // consuming a pose we no longer believe.
+          fast_lio::tripReanchorLost(&reanchor_gate);
+          anchorEvidence(fast_lio::AnchorTraceReason::kLost,
+                         fast_lio::kAnchorEventLost,
+                         &anchor_trace_counters.lost,
+                         lidar_end_time,
+                         true);
+          dropStationaryAnchor(fast_lio::AnchorDrop::kLost, lidar_end_time);
+          fast_lio::breakRecoveryRun(&recovery_state);
         }
       }
       countAnchorWrite();
@@ -6958,11 +6877,11 @@ private:
        *   observe. While it runs, the only way back is the re-anchor
        *   gate's own match test, passed by consecutive scans of one reference
        *   for the stable time, and the scans must not vouch for themselves with
-       *   points they added: by default the map stays frozen meanwhile. With
-       *   reanchor_recovery_entry_view the scans the guard did not call
+       *   points they added. On iVox the scans the guard did not call
        *   degraded keep going into the map and the test counts only the points
-       *   it held when the episode began (iVox's entry view); a pinned tier
-       *   brings the freeze back. ***/
+       *   it held when the episode began (its entry view); a pinned tier
+       *   brings the freeze back. A map backend without an entry view keeps
+       *   the map frozen meanwhile. ***/
       const bool scan_held = anchor_write.writer == AnchorWrite::Writer::kPin;  // a pin that was not taken back
       const bool scan_supported = (!reanchor.degraded || scan_held) &&
                                   reanchor_gate.state != fast_lio::ReanchorState::kLost &&

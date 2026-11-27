@@ -140,18 +140,6 @@ TEST(ReanchorGate, BackwardsClockDoesNotExpireTheWindow)
   EXPECT_EQ(g.state, ReanchorState::kVerifying);
 }
 
-TEST(ReanchorGate, DisabledGateReproducesThePreGateRelease)
-{
-  ReanchorGate g;
-  ReanchorParams p;
-  p.enabled = false;
-  EXPECT_TRUE(updateReanchorGate(&g, true, kBlindEff, kBlindRes, 0.0, p).map_frozen);
-  const auto d = updateReanchorGate(&g, false, 10, 0.9, 0.1, p);  // still a bad match
-  EXPECT_FALSE(d.map_frozen);                                     // ...released anyway, as before
-  EXPECT_FALSE(d.degraded);
-  EXPECT_EQ(g.state, ReanchorState::kHealthy);
-}
-
 // ---- the guard's own count: a scan it has already called bad is no evidence ----
 
 namespace

@@ -50,7 +50,6 @@ enum class ZuptAction : std::uint8_t
 struct ZuptPolicyInputs
 {
   bool scan_degraded = false;  ///< the divergence guard says this scan cannot confirm the pose
-  bool zupt_enabled = false;   ///< zupt_en
   bool anchor_valid = false;   ///< the current stationary episode's anchor is usable on this scan
   bool body_static = false;    ///< bodyIsStatic() for this scan (static_evidence.hpp)
   double speed = 0.0;          ///< |v| of the current state (m/s)
@@ -73,7 +72,7 @@ inline ZuptDecision decideZupt(const ZuptPolicyInputs & in)
 {
   ZuptDecision decision;
   if (in.scan_degraded) {
-    if (in.zupt_enabled && in.body_static) {
+    if (in.body_static) {
       if (in.anchor_valid) {
         decision.action = ZuptAction::kPinToAnchor;
         decision.hold = true;
@@ -99,7 +98,7 @@ inline ZuptDecision decideZupt(const ZuptPolicyInputs & in)
     return decision;
   }
 
-  if (in.zupt_enabled && in.body_static && in.speed > 0.0) {
+  if (in.body_static && in.speed > 0.0) {
     decision.action = ZuptAction::kZeroVelocity;
     decision.report = in.speed > kZuptPhantomReportSpeed;
   }

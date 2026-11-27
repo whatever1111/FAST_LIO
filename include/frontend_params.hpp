@@ -45,24 +45,19 @@ struct FrontendParams
   // relation the iEKF already satisfies, so it carries no absolute-pitch information and
   // cannot catch a biased pitch (world-Z drift = forward_distance × sin(pitch_err)) —
   // proven by zero effect from 4× strengthening it. This supplies the missing ABSOLUTE
-  // reference: when LiDAR Z is degenerate AND the IMU is in low-linear-accel motion
-  // (|‖a‖−g| small), the accelerometer's specific-force direction IS world-up expressed
-  // in the body frame. A soft pseudo-measurement pulls the grav-state up-axis onto it,
-  // constraining roll/pitch only — yaw lies in the measurement null space (gravity is
-  // yaw-invariant), so the LiDAR-excellent heading is never touched.
+  // reference: while the IMU is in low-linear-accel motion (|‖a‖−g| small), the
+  // accelerometer's specific-force direction IS world-up expressed in the body frame.
+  // Every scan that passes the gates below takes a soft pseudo-measurement pulling the
+  // grav-state up-axis onto it, constraining roll/pitch only — yaw lies in the measurement
+  // null space (gravity is yaw-invariant), so the LiDAR-excellent heading is never touched.
   bool gravity_align_en = false;
-  double gravity_align_noise = 0.05;         // unit-vector (≈rad) std of the leveling prior
-  double gravity_align_z_weak_thresh = 0.3;  // engage only when pos_obs_z_weak exceeds this
-  double gravity_align_accel_tol = 0.05;     // |‖a‖−g|/g must be below this (low-linear-accel gate)
-  double gravity_align_gyro_tol = 0.35;      // rad/s; skip during fast turns (lever-arm safety)
-  // 2026-08-31 additions (m20_0831 doorway pitch anatomy) — all default-off:
-  double gravity_align_window_s = 0.0;        // [L2] >0: measurement = window-mean specific force
-  bool gravity_align_continuous = false;      // [L2] engage every scan (gates still apply)
-  double gravity_align_hold_s = 0.0;          // [L1] hold the degraded-strength prior after a trigger
-  double gravity_align_noise_degraded = 0.0;  // [L1] tighter sigma while triggered/held (0 = use base)
-  double gravity_align_mag_ref = 0.0;         // magnitude-gate anchor; 0 = IMU-init g (biased if init in motion)
-  double gravity_align_grav_leak = 1.0;       // [v4] per-engaged-scan multiplicative variance leak on the S2
-                                              // gravity block (fading memory); 1.0 = off
+  double gravity_align_accel_tol = 0.05;  // |‖a‖−g|/g must be below this (low-linear-accel gate)
+  double gravity_align_gyro_tol = 0.35;   // rad/s; skip during fast turns (lever-arm safety)
+  // 2026-08-31 additions (m20_0831 doorway pitch anatomy):
+  double gravity_align_window_s = 0.0;   // [L2] >0: measurement = window-mean specific force
+  double gravity_align_mag_ref = 0.0;    // magnitude-gate anchor; 0 = IMU-init g (biased if init in motion)
+  double gravity_align_grav_leak = 1.0;  // [v4] per-engaged-scan multiplicative variance leak on the S2
+                                         // gravity block (fading memory); 1.0 = off
   // [v6] Kinematic compensation of the levelling measurement (gravity_align_kinematics.hpp):
   // f = dv_b/dt + ω×v_b − Rᵀg + b_a, and only the ω×v_b term was subtracted. The window mean
   // of dv_b/dt is (v_b(end) − v_b(start))/span — 4-7° of lean at a doorway stop/start on the
@@ -83,14 +78,10 @@ struct FrontendParams
   // [v6] While the map is frozen (blind stretch) and the body moves, nothing observes the body's
   // acceleration: not the frozen-map near-field registration, not the legs at a threshold, not the
   // FP. The 1 s specific-force mean then leans 5-12° with the stop/start and no compensation can
-  // remove it (docs/PGO_LOOP_TUNING.md §7.3-7.4). With this on the prior is withheld there; the
-  // attitude rides on the gyro (0.1-1° over such a window) instead of being levelled onto acceleration.
-  bool gravity_align_withhold_blind_moving = false;
-  // [v7] What sigma describes (gravity_align_kinematics.hpp LevellingSigmaPolicy): "scene" is the legacy
-  // rule above; "measurement" makes sigma the measurement's own error — noise_static at rest,
-  // noise_moving while moving — and withholds the prior where the acceleration is unobservable
-  // (map frozen and body moving); the attitude covariance decides the rest.
-  std::string gravity_align_sigma_policy = "scene";
+  // remove it (docs/PGO_LOOP_TUNING.md §7.3-7.4). The prior is withheld there; the attitude rides on
+  // the gyro (0.1-1° over such a window) instead of being levelled onto acceleration.
+  // [v7] The sigma is the measurement's own error (gravity_align_kinematics.hpp levellingSigma) —
+  // noise_static at rest, noise_moving while moving; the attitude covariance decides the rest.
   double gravity_align_noise_static =
     0.008;  // rad-equivalent; the specific-force mean is exact at rest (0.06° measured)
   double gravity_align_noise_moving = 0.045;  // ≈2.6°: the gait floor of a compensated 1 s mean while walking
@@ -120,7 +111,6 @@ struct FrontendParams
   // effective-point count falls below divergence_guard_min_eff). Recovery is
   // automatic: once correspondences return, the streak resets and the front end
   // re-locks against the (uncorrupted) map.
-  bool divergence_guard_en = true;
   int divergence_guard_min_eff = 50;         // effct_feat_num below this = degenerate scan
   int divergence_guard_streak = 5;           // consecutive degenerate scans → enter degraded
   double divergence_guard_max_speed = 30.0;  // m/s; body-speed clamp while degraded (headroom over any platform speed)
@@ -135,7 +125,6 @@ struct FrontendParams
   // (identical runs: clean vs km-runaway). Freezing the map on the SCAN-level
   // signal makes the guard leading instead of lagging. Computed on the raw
   // downsampled scan (a scene property, independent of matching outcome).
-  bool guard_engulf_en = true;              // arm the far-field-collapse trigger
   double guard_engulf_far_range = 2.0;      // m; horizontal radius separating near/far
   double guard_engulf_far_frac_min = 0.15;  // enter when far-field fraction < this
   int guard_engulf_streak = 2;              // consecutive engulfed scans → degraded
@@ -166,9 +155,8 @@ struct FrontendParams
   bool guard_hole_en = false;
   double guard_hole_min_sec = 0.3;    // s; scan gap that counts as a hole (nominal 0.1)
   double guard_hole_max_accel = 1.0;  // m/s^2; |vel - vel_pre_hole| is capped at this * gap
-  // Static hold (ZUPT) on parked evidence; its evidence thresholds (zupt_*) stay beside the anchor state in
-  // laserMapping.cpp, which documents the hold.
-  bool zupt_en = true;
+  // The static hold (ZUPT) on parked evidence always runs; its evidence thresholds (zupt_*) stay beside the
+  // anchor state in laserMapping.cpp, which documents the hold.
   // Parked hold (parked_hold.hpp): the same evidence, applied while the scan is
   // HEALTHY.
   fast_lio::ParkedHoldParams parked_hold;
@@ -180,9 +168,6 @@ struct FrontendParams
   // A verification scan the divergence guard has already counted against, before its streak declared the scene
   // degraded, is no re-registration evidence (reanchor_gate.hpp, ReanchorScan); off, the match alone decides.
   bool reanchor_require_guard_clear = false;
-  // A pending recovery is qualified against the map it began with, iVox's entry view, and its scans keep going into
-  // the map; off, the map stays frozen until the recovery ends.
-  bool reanchor_recovery_entry_view = false;
   // Runaway watchdog: the guard and the re-anchor gate both key off the scan, and
   // the worst drift keeps the scan looking healthy — the map is rebuilt around
   // the wrong pose every frame, so correspondences and residuals stay good while
@@ -230,7 +215,6 @@ struct FrontendParams
   Eigen::Vector3d wheel_lever_arm = Eigen::Vector3d::Zero();
   double wheel_lever_sigma = 0.0;
 
-  bool prior_map_pinned = false;  // prior map goes into its own non-evictable tier
   double prior_map_voxel = 0.0;   // leaf the prior map is downsampled to (0 = filter_size_map)
   bool prior_map_freeze = false;  // stop growing the map once a prior map is installed
   fast_lio::PriorMapAlign prior_map_align = fast_lio::PriorMapAlign::kAsDelivered;

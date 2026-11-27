@@ -20,20 +20,16 @@ struct MapParameterSpecs
   const ParameterSpec<int> mapping_map_insert_delay_scans{"mapping.map_insert_delay_scans", 0, 0};
   const ParameterSpec<bool> pcd_save_pcd_save_en{"pcd_save.pcd_save_en", false, false};
   const ParameterSpec<int> pcd_save_interval{"pcd_save.interval", -1, -1};
+  // A delivered prior map goes into a map-backend tier of its own: it is not something this run
+  // learned, so nothing this run does — LRU eviction as the map fills, or the guard dropping a
+  // local map it can no longer register against — may take it away. On the 0831 lobby bag,
+  // forcing the guard to lose its re-registration ends the run 11.1 m from truth with the prior
+  // merged into the live map (the map goes 70023 -> 532 points, so there is nothing left to
+  // re-register against) versus 1.5 m with its own tier. Keeping a map to re-register against is
+  // not the same as knowing where in it you are, which is what relocalization decides, and the
+  // tier cannot heal: the delivered map owns its cells for the whole run. iVox backend only; an
+  // ikd-Tree build, which has no tier to keep it in, refuses a prior map.
   const ParameterSpec<std::string> prior_map_pcd{"prior_map_pcd", "", std::string("")};
-  // Pin the prior map into its own map-backend tier: it is not something this run learned,
-  // so nothing this run does — LRU eviction as the map fills, or the guard dropping a local
-  // map it can no longer register against — may take it away. Inert without prior_map_pcd,
-  // and bit-identical to the unpinned path until one of those two events happens.
-  //
-  // Off by default, and opt in per scene. On the 0831 lobby bag, forcing the guard to lose
-  // its re-registration ends the run 11.1 m from truth unpinned (the map goes 70023 -> 532
-  // points, so there is nothing left to re-register against) versus 1.5 m pinned, but the
-  // pinned run's worst mid-run excursion is larger (16.5 m vs 11.1 m): keeping a map to
-  // re-register against is not the same as knowing where in it you are, which is what
-  // relocalization decides. The pinned tier also cannot heal — the delivered map owns its
-  // cells for the whole run. iVox backend only (the ikd-Tree build has no tier to pin into).
-  const ParameterSpec<bool> prior_map_pinned{"prior_map_pinned", false, false};
   // prior_map_align — where the transform that puts the map into THIS run's frame
   // comes from. The map is delivered in the frame of the run that built it, and that
   // frame is not a property of the site: a different front-end binary, or the same one
@@ -59,11 +55,10 @@ struct MapParameterSpecs
   // [x, y, z, roll°, pitch°, yaw°]: the position and yaw are injected, roll and pitch stay with the IMU's gravity
   // alignment (prior_map_load.hpp resolveInitialPose).
   const ParameterSpec<std::vector<double>> initial_pose{"initial_pose", std::vector<double>(), std::vector<double>()};
-  // iVox map backend (option B; declared only by USE_IVOX builds). nearby_type MUST be >=18 (Phase-0: NEARBY6
-  // inadequate). res=0.5 NN voxels give the best probe NN-agreement (99.9%, tightest normals); a GLOBAL fine-grid
-  // dedup (= filter_size_map) keeps the map at ikd-Tree's 542k.
+  // iVox map backend (option B; declared only by USE_IVOX builds). Its neighbour search covers all 26 voxels around
+  // a point's own (laserMapping.cpp). res=0.5 NN voxels give the best probe NN-agreement (99.9%, tightest normals);
+  // a GLOBAL fine-grid dedup (= filter_size_map) keeps the map at ikd-Tree's 542k.
   const DeclaredValueSpec<double> ivox_grid_resolution{"ivox_grid_resolution", 0.5, false};
-  const DeclaredValueSpec<int> ivox_nearby_type{"ivox_nearby_type", 26, false};
   const DeclaredValueSpec<int> ivox_voxel_capacity{"ivox_voxel_capacity", 50, false};
   const DeclaredValueSpec<int> ivox_max_voxels{"ivox_max_voxels", 5000000, false};
 };

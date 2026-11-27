@@ -16,22 +16,14 @@ struct ConstraintParameterSpecs
   const ParameterSpec<double> planar_constraint_noise{"planar_constraint_noise", 0.1, 0.1};
   const ParameterSpec<double> planar_constraint_z_weak_thresh{"planar_constraint_z_weak_thresh", 0.5, 0.5};
   const ParameterSpec<bool> gravity_align_en{"gravity_align_en", false, false};
-  const ParameterSpec<double> gravity_align_noise{"gravity_align_noise", 0.05, 0.05};
-  const ParameterSpec<double> gravity_align_z_weak_thresh{"gravity_align_z_weak_thresh", 0.3, 0.3};
   const ParameterSpec<double> gravity_align_accel_tol{"gravity_align_accel_tol", 0.05, 0.05};
   const ParameterSpec<double> gravity_align_gyro_tol{"gravity_align_gyro_tol", 0.35, 0.35};
   const ParameterSpec<double> gravity_align_window_s{"gravity_align_window_s", 0.0, 0.0};
-  const ParameterSpec<bool> gravity_align_continuous{"gravity_align_continuous", false, false};
-  const ParameterSpec<double> gravity_align_hold_s{"gravity_align_hold_s", 0.0, 0.0};
-  const ParameterSpec<double> gravity_align_noise_degraded{"gravity_align_noise_degraded", 0.0, 0.0};
   const ParameterSpec<double> gravity_align_mag_ref{"gravity_align_mag_ref", 0.0, 0.0};
   const ParameterSpec<double> gravity_align_grav_leak{"gravity_align_grav_leak", 1.0, 1.0};
   const ParameterSpec<double> gravity_align_grav_cap_deg{"gravity_align_grav_cap_deg", 3.0, 3.0};
   const ParameterSpec<bool> gravity_align_lin_accel_comp{"gravity_align_lin_accel_comp", false, false};
   const ParameterSpec<double> gravity_align_vel_sigma_scale{"gravity_align_vel_sigma_scale", 0.0, 0.0};
-  const ParameterSpec<bool> gravity_align_withhold_blind_moving{"gravity_align_withhold_blind_moving", false, false};
-  const ParameterSpec<std::string> gravity_align_sigma_policy{
-    "gravity_align_sigma_policy", "scene", std::string("scene")};
   const ParameterSpec<double> gravity_align_noise_static{"gravity_align_noise_static", 0.008, 0.008};
   const ParameterSpec<double> gravity_align_noise_moving{"gravity_align_noise_moving", 0.045, 0.045};
   const ParameterSpec<double> gravity_align_leg_vel_sigma{"gravity_align_leg_vel_sigma", 0.15, 0.15};

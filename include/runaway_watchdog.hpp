@@ -24,7 +24,6 @@ namespace fast_lio
 
 struct RunawayParams
 {
-  bool enabled = true;
   double parked_speed_thresh = 0.3;  ///< m/s of estimated speed that contradicts "parked"
   double wheel_speed_margin = 1.0;   ///< m/s the estimate may exceed the wheels by
   double hold_sec = 3.0;             ///< the contradiction must persist this long
@@ -64,7 +63,7 @@ inline RunawayVerdict updateRunawayWatchdog(RunawayState * state,
                                             const RunawayParams & params)
 {
   RunawayVerdict verdict;
-  if (state == nullptr || !params.enabled || !std::isfinite(now) || !std::isfinite(state_speed)) {
+  if (state == nullptr || !std::isfinite(now) || !std::isfinite(state_speed)) {
     return verdict;
   }
 

@@ -55,7 +55,6 @@ enum class ReanchorState : std::uint8_t
 
 struct ReanchorParams
 {
-  bool enabled = true;
   int min_eff = 200;         ///< effective correspondences that count as re-registered
   double max_res = 0.10;     ///< m; mean point-to-plane residual of a trustworthy match
   int confirm_scans = 3;     ///< consecutive good scans before the map may grow again
@@ -196,15 +195,6 @@ inline ReanchorDecision updateReanchorGate(ReanchorGate * gate,
 {
   ReanchorDecision decision;
   if (gate == nullptr) {
-    return decision;
-  }
-  if (!params.enabled) {
-    // Pre-gate behaviour: the guard's verdict is the whole story.
-    gate->state = guard_degraded ? ReanchorState::kBlind : ReanchorState::kHealthy;
-    gate->ok_streak = 0;
-    gate->verify_start = -1.0;
-    decision.map_frozen = guard_degraded;
-    decision.degraded = guard_degraded;
     return decision;
   }
 

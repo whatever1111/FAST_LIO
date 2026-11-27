@@ -13,12 +13,11 @@ using fast_lio::ZuptPolicyInputs;
 
 namespace
 {
-// The deployed configuration: ZUPT on, an anchor already laid down by an earlier
-// healthy scan, and the divergence guard's speed ceiling at its default.
+// The deployed configuration: an anchor already laid down by an earlier healthy
+// scan, and the divergence guard's speed ceiling at its default.
 ZuptPolicyInputs deployed()
 {
   ZuptPolicyInputs in;
-  in.zupt_enabled = true;
   in.anchor_valid = true;
   in.max_speed = 30.0;
   return in;
@@ -96,16 +95,6 @@ TEST(ZuptPolicy, AlreadyStoppedIsLeftAlone)
   EXPECT_FALSE(d.report);
 }
 
-TEST(ZuptPolicy, DisabledZuptTouchesNothingOnAHealthyScan)
-{
-  ZuptPolicyInputs in = deployed();
-  in.zupt_enabled = false;
-  in.body_static = true;
-  in.speed = 2.6;
-
-  EXPECT_EQ(decideZupt(in).action, ZuptAction::kNone);
-}
-
 // ── The blind branch ─────────────────────────────────────────────────────────
 // Parked with a scan that cannot confirm the pose: pin pose AND attitude. Zeroing
 // only the velocity left propagation free to walk the state (dog 2, 2026-09-04:
@@ -175,27 +164,19 @@ TEST(ZuptPolicy, BlindAndParkedWithoutAnAnchorZeroesWhateverTheSpeed)
   }
 }
 
-// Zero-only answers "parked, no anchor"; without ZUPT or without the static
-// verdict the blind branch is what it was: only impossible speeds are zeroed.
-TEST(ZuptPolicy, ZeroOnlyNeedsZuptAndTheStaticVerdict)
+// Zero-only answers "parked, no anchor"; without the static verdict the blind
+// branch is what it was: only impossible speeds are zeroed.
+TEST(ZuptPolicy, ZeroOnlyNeedsTheStaticVerdict)
 {
-  for (const bool zupt : {false, true}) {
-    for (const bool parked : {false, true}) {
-      if (zupt && parked) {
-        continue;
-      }
-      ZuptPolicyInputs in = deployed();
-      in.anchor_valid = false;
-      in.scan_degraded = true;
-      in.zupt_enabled = zupt;
-      in.body_static = parked;
-      in.speed = 1.4;
-      EXPECT_EQ(decideZupt(in).action, ZuptAction::kNone) << "zupt " << zupt << " parked " << parked;
-      in.speed = in.max_speed + 1.0;
-      EXPECT_EQ(decideZupt(in).action, ZuptAction::kZeroVelocity) << "zupt " << zupt << " parked " << parked;
-      EXPECT_FALSE(decideZupt(in).hold);
-    }
-  }
+  ZuptPolicyInputs in = deployed();
+  in.anchor_valid = false;
+  in.scan_degraded = true;
+  in.body_static = false;
+  in.speed = 1.4;
+  EXPECT_EQ(decideZupt(in).action, ZuptAction::kNone);
+  in.speed = in.max_speed + 1.0;
+  EXPECT_EQ(decideZupt(in).action, ZuptAction::kZeroVelocity);
+  EXPECT_FALSE(decideZupt(in).hold);
 }
 
 // Moving while blind: the hold must not survive into this, and a speed above the
@@ -216,19 +197,6 @@ TEST(ZuptPolicy, BlindAndMovingZeroesOnlyImpossibleSpeeds)
   d = decideZupt(in);
   EXPECT_EQ(d.action, ZuptAction::kZeroVelocity);
   EXPECT_FALSE(d.hold);
-}
-
-TEST(ZuptPolicy, DisabledZuptStillGuardsImpossibleSpeedsWhileBlind)
-{
-  ZuptPolicyInputs in = deployed();
-  in.zupt_enabled = false;
-  in.scan_degraded = true;
-  in.body_static = true;  // ignored: the hold needs zupt_en
-  in.speed = 45.0;
-
-  const ZuptDecision d = decideZupt(in);
-  EXPECT_FALSE(d.hold);
-  EXPECT_EQ(d.action, ZuptAction::kZeroVelocity);
 }
 
 // ── Degenerate inputs ────────────────────────────────────────────────────────

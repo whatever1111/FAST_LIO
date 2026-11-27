@@ -39,11 +39,10 @@ struct FrontendStartup
   std::string wheel_topic = "/lio/twist";
 };
 
-/// The four iVox parameters as declared; the node validates nothing more and initialises its map backend with them.
+/// The three iVox parameters as declared; the node validates nothing more and initialises its map backend with them.
 struct IvoxDeclaredValues
 {
   double grid_resolution = 0.0;
-  int nearby_type = 0;
   int voxel_capacity = 0;
   int max_voxels = 0;
 };
@@ -78,7 +77,7 @@ public:
                    double & max_scan_backlog_sec,
                    double & max_imu_backlog_sec);
   void readDegeneracy(const rclcpp::Node & node, bool & degeneracy_debug);
-  void readConstraints(const rclcpp::Node & node, bool & health_pub_en);
+  void readConstraints(const rclcpp::Node & node);
   void readCorrespondence(const rclcpp::Node & node);
   void readCorrespondenceDump(const rclcpp::Node & node);
   void readResetSigmasAndGravity(const rclcpp::Node & node, double & zupt_vel_reset_sigma);
@@ -97,11 +96,7 @@ public:
                     FrontendStartup & startup,
                     ReanchorParams & reanchor_params,
                     RecoveryParams & recovery_params);
-  void loadLostRecovery(const rclcpp::Node & node,
-                        bool health_pub_en,
-                        double total_s,
-                        LostRecoveryParams & lost_recovery_params);
-  void loadRecoveryEntryView(const rclcpp::Node & node);
+  void loadLostRecovery(const rclcpp::Node & node, double total_s, LostRecoveryParams & lost_recovery_params);
   void readRunaway(const rclcpp::Node & node, double zupt_wheel_max_age, double zupt_wheel_speed_thresh);
   void readCanopyAndGround(const rclcpp::Node & node);
   void readDataPaths(const rclcpp::Node & node, std::string & map_file_path, std::string & root_dir);
@@ -124,8 +119,7 @@ public:
   void readImuCoverage(const rclcpp::Node & node,
                        double & max_scan_duration_s,
                        ImuCoverageParams & coverage,
-                       ImuGapPriorParams & gap,
-                       bool reanchor_en);
+                       ImuGapPriorParams & gap);
   void readFeatureInputs(const rclcpp::Node & node, int & point_filter_num, bool & runtime_pos_log);
 #ifdef USE_IVOX
   IvoxDeclaredValues declareIvox(rclcpp::Node & node);

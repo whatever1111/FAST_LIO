@@ -22,7 +22,6 @@ struct OutputParameterSpecs
   const ParameterSpec<std::string> publish_odom_frame_id{
     "publish.odom_frame_id", "lidar_odom", std::string("lidar_odom")};
   const ParameterSpec<std::string> publish_body_frame_id{"publish.body_frame_id", "body", std::string("body")};
-  const ParameterSpec<bool> health_pub_en{"health_pub_en", true, true};
   const DeclaredValueSpec<bool> publish_frontend_observation{"publish.frontend_observation", false, false};
   const DeclaredValueSpec<bool> publish_reference_health{"publish.reference_health", false, true};
   const DeclaredValueSpec<std::string> publish_frontend_clock_domain{"publish.frontend_clock_domain", "", false};

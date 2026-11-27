@@ -967,6 +967,18 @@ void setPolicy(Scenario & scenario, double total, double stable)
   setParam(scenario, rclcpp::Parameter("reanchor_recovery_stable_sec", stable));
 }
 
+// test_anchor_lifecycle_node's productReanchorGate and productRunawayWatchdog.
+void productReanchorGate(Scenario & scenario)
+{
+  setParam(scenario, rclcpp::Parameter("reanchor_confirm_scans", 3));
+  setParam(scenario, rclcpp::Parameter("reanchor_timeout_sec", 5.0));
+}
+
+void productRunawayWatchdog(Scenario & scenario)
+{
+  setParam(scenario, rclcpp::Parameter("runaway_hold_sec", 3.0));
+}
+
 // test_anchor_lifecycle_node's base configuration, with the anchor trace on, and online extrinsic estimation on: the
 // node defaults to off, and h_matrix.v1 and filter_update.v1 are to cover the extrinsic columns of H.
 Scenario baseScenario(const std::string & name)
@@ -988,9 +1000,9 @@ Scenario baseScenario(const std::string & name)
         rclcpp::Parameter("publish.scan_publish_en", false),
         rclcpp::Parameter("publish.path_en", false),
         rclcpp::Parameter("runtime_pos_log_enable", false),
-        rclcpp::Parameter("reanchor_en", false),
-        rclcpp::Parameter("runaway_watchdog_en", false),
-        rclcpp::Parameter("zupt_en", true),
+        rclcpp::Parameter("reanchor_confirm_scans", 1),
+        rclcpp::Parameter("reanchor_timeout_sec", 0.0),
+        rclcpp::Parameter("runaway_hold_sec", 1.0e9),
         rclcpp::Parameter("zupt_parked_hold_en", false),
         rclcpp::Parameter("zupt_anchor_trace_en", true)}) {
     setParam(s, p);
@@ -1035,14 +1047,14 @@ Scenario typedMatchScenario()
   return s;
 }
 
-// test_anchor_lifecycle_node's prior_late_reset_zupt_on: an anchor from injected registration states, two parked
+// test_anchor_lifecycle_node's prior_late_reset: an anchor from injected registration states, two parked
 // scans 0.36 m from it that take the parked prior, and a runaway map reset after the anchor step of a parked scan.
 Scenario parkedPriorScenario()
 {
   Scenario s = baseScenario("parked_prior_reset");
   setParam(s, rclcpp::Parameter("zupt_parked_hold_en", true));
   setParam(s, rclcpp::Parameter("zupt_parked_hold_scans", 3));
-  setParam(s, rclcpp::Parameter("runaway_watchdog_en", true));
+  productRunawayWatchdog(s);
   setParam(s, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   s.slots.push_back(injected("anchor_move", true, kGuardHealthy, kAnchorPosition));
   append(s, 4, injected("anchor_static", false, kGuardHealthy, kAnchorPosition));
@@ -1058,7 +1070,7 @@ Scenario parkedPriorScenario()
 Scenario pinScenario()
 {
   Scenario s = baseScenario("pin_reset");
-  setParam(s, rclcpp::Parameter("runaway_watchdog_en", true));
+  productRunawayWatchdog(s);
   setParam(s, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   s.slots.push_back(injected("anchor_move", true, kGuardHealthy, kAnchorPosition));
   append(s, 4, injected("anchor_static", false, kGuardHealthy, kAnchorPosition));
@@ -1099,7 +1111,7 @@ Scenario imuCoverageScenario()
 {
   Scenario s = baseScenario("imu_coverage_gap");
   setPolicy(s, 10.0, 1.0);
-  setParam(s, rclcpp::Parameter("reanchor_en", true));
+  productReanchorGate(s);
   setParam(s, rclcpp::Parameter("imu_coverage.max_extrapolation_s", 0.02));
   append(s, 5, slot("static"));
   Slot gap = slot("imu_tail_gap");
@@ -1169,7 +1181,7 @@ Scenario workerScenario()
   Scenario s = baseScenario("worker_delay_reset");
   s.async_map = true;
   setParam(s, rclcpp::Parameter("mapping.map_insert_delay_scans", 2));
-  setParam(s, rclcpp::Parameter("runaway_watchdog_en", true));
+  productRunawayWatchdog(s);
   setParam(s, rclcpp::Parameter("runaway_on_trip", "reset_map"));
   append(s, 4, slot("moving", true, kGuardNatural));
   append(s, 4, slot("static", false, kGuardNatural));
@@ -1183,7 +1195,7 @@ Scenario workerScenario()
 
 constexpr double kEntryViewStep = 0.04;  // m along x per scan: the fixture's 0.4 m/s
 
-// reanchor_recovery_entry_view on (#369), test_anchor_lifecycle_node's entry_view_moving: the platform moves on along
+// The recovery's entry view (#369), test_anchor_lifecycle_node's entry_view_moving: the platform moves on along
 // x through a recovery, its registration states injected. One healthy scan, the last supported one; three degraded
 // scans, which start Pending and stay out of the map; healthy scans, which go into the map while Pending and are
 // matched against the entry view until it qualifies the recovery after the stable time, and go on after it.
@@ -1191,7 +1203,6 @@ Scenario entryViewScenario()
 {
   Scenario s = baseScenario("entry_view_moving");
   setPolicy(s, 10.0, 1.0);
-  setParam(s, rclcpp::Parameter("reanchor_recovery_entry_view", true));
   int k = 0;
   const auto along = [&k]() {
     return std::array<double, 3>{kEntryViewStep * k++, 0.0, 0.0};
@@ -1440,7 +1451,7 @@ constexpr Branch kBranches[] = {
    "test_async_map_reset AsyncMapReset.EveryBatchOfAMultiScanDelayIsDiscarded"},
   {"pending_map_update",
    "records of scans still Pending after the recovery step whose points went into the map "
-   "(reanchor_recovery_entry_view)",
+   "(the entry view)",
    "test_anchor_lifecycle_node AnchorLifecycleEntryView.*"},
   {"h_gate_rejected",
    "H-model calls whose correspondence gate refused at least one match (h_select.v1 gate_rejected > 0)",

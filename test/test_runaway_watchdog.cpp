@@ -152,15 +152,11 @@ TEST(RunawayWatchdog, BackwardsClockRestartsTheWindow)
   EXPECT_DOUBLE_EQ(s.bad_since, 0.5);
 }
 
-TEST(RunawayWatchdog, NonFiniteInputsAndDisabledAreInert)
+TEST(RunawayWatchdog, NonFiniteInputsAreInert)
 {
   RunawayState s;
   RunawayParams p;
   EXPECT_FALSE(updateRunawayWatchdog(&s, std::nan(""), kDriftSpeed, true, 0.05, 0.0, p).tripped);
   EXPECT_FALSE(updateRunawayWatchdog(&s, 1.0, std::nan(""), true, 0.05, 0.0, p).tripped);
   EXPECT_FALSE(updateRunawayWatchdog(nullptr, 1.0, kDriftSpeed, true, 0.05, 0.0, p).tripped);
-  RunawayParams off;
-  off.enabled = false;
-  RunawayState s2;
-  EXPECT_EQ(runScans(s2, off, 200, kDriftSpeed, true), 0);
 }

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "frontend_gravity.hpp"
 #include "gravity_align_kinematics.hpp"
 
 namespace fast_lio
@@ -21,7 +22,7 @@ struct ImuTiltReferenceParams
   double motion_init_sigma = 0.0;
   double accel_tol = 0.05;
   double gravity_raw = 0.0;
-  double gravity_m_s2 = 9.81;
+  double gravity_m_s2 = G_m_s2;
   double mag_ref = 0.0;
   double vel_sigma_scale = 0.0;
 };

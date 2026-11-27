@@ -537,7 +537,7 @@ TEST(FloorResidualShift, NonFiniteInputsRefuseTheWholeUpdate)
   EXPECT_THROW(project(rows), std::invalid_argument);
 }
 
-// --- the lidar update's modes (degeneracy_floor_mode), the scan's record and its [FLOOR] line ---------------------
+// --- the lidar update's modes, the scan's record and its [FLOOR] line -----------------------------------------------
 
 TEST(FloorMode, ParsesTheThreeNamesAndRefusesAnyOther)
 {

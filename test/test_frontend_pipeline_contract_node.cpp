@@ -4,10 +4,8 @@
 // NodeFactory) in a forked child of its own, fed through the node's real IMU and point-cloud subscriptions: every scan
 // takes the production scan path, off the node's own 100 Hz timer, to the /Odometry publisher. The existing
 // FASTLIO_TEST_HOOKS fix only what a synthetic stream cannot produce on demand (the divergence guard's verdict, the
-// registration state test_anchor_lifecycle_node injects before the anchor step, a runaway trip, a failing IMU
-// processing step, and the wheel speed an applying floor needs, which the driver does not publish: a wheel stream
-// would also feed the static hold and the wheel update) and report what the scan path did. The child writes one
-// record, in the order things happened:
+// registration state test_anchor_lifecycle_node injects before the anchor step, a runaway trip and a failing IMU
+// processing step) and report what the scan path did. The child writes one record, in the order things happened:
 //   slot      what the fixture sent for one scan period: the scan, its IMU window and what was done to them;
 //   scan_begin, imu_process, imu_batch, scan_prepared, initial_build, h_rows, guard, anchor_step_fixture,
 //   runaway_check, map_reset_join, map_reset_pending_cleared, map_reset, pose_publish
@@ -115,7 +113,6 @@
 #include <rcl/error_handling.h>
 #include <rcl/timer.h>
 #include <rcl/wait.h>
-#include <rcl_interfaces/msg/log.hpp>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -696,7 +693,7 @@ std::string formatSelection(const fast_lio_test::HModelSelection & s)
 }
 
 // The h_exit.v1 line of one H-model exit.
-std::string formatExit(const fast_lio_test::HModelExit & e, bool floor_enabled)
+std::string formatExit(const fast_lio_test::HModelExit & e)
 {
   std::ostringstream out;
   out << "h_exit.v1 end=" << bits(e.scan_end) << " call=" << e.call << " valid=" << (e.valid ? 1 : 0)
@@ -711,9 +708,6 @@ std::string formatExit(const fast_lio_test::HModelExit & e, bool floor_enabled)
       << " degeneracy_weights=" << bitsList(e.degeneracy_weights, 3)
       << " degeneracy_weighted_points=" << e.degeneracy_weighted_points
       << " degeneracy_weight_sum=" << bits(e.degeneracy_weight_sum) << " dump_written=" << (e.dump_written ? 1 : 0);
-  if (floor_enabled) {
-    out << " schema=2 rule=joint_row_v1 gain_order=tau_ascending lambda_gain_pairing=independent";
-  }
   return out.str();
 }
 
@@ -922,8 +916,6 @@ struct Scenario
   // kalman_channels.csv goes to the scenario's result directory; lidar_p_vel.v1 records the velocity block of the
   // covariance each lidar update left
   bool kalman = false;
-  bool floor_log_binding = false;  // assert schema-2 u/stamp against the actual /Odometry, without a new golden
-  bool wheel_fit = false;  // overrideScanWheelFit: every scan's wheel update finds a speed, as an applying floor needs
   bool accounting_capture = false;
   bool accounting_queue_probe = false;
   std::map<std::string, rclcpp::Parameter> params;
@@ -1297,22 +1289,6 @@ Scenario groundScenario()
   return s;
 }
 
-// The normal-noise floor applied (degeneracy_floor_mode apply) on the corridor, with the residual histogram and the
-// spectrum trace on: nothing faces up, so the vertical information of the walls' rows is what their noisy normals
-// fake, and the floor projects it out of the position columns with the matching residual shift. Apply projects only
-// on a scan whose wheel update finds a speed: the scan path is told every scan has one.
-Scenario degeneracyScenario()
-{
-  Scenario s = measurementScenario("h_degeneracy", Cloud::kCorridor);
-  setParam(s, rclcpp::Parameter("degeneracy_floor_mode", std::string("apply")));
-  setParam(s, rclcpp::Parameter("degeneracy_debug", true));
-  setParam(s, rclcpp::Parameter("degeneracy_spectrum_trace", true));
-  s.wheel_fit = true;
-  append(s, 8, sceneSlot(Cloud::kCorridor));
-  s.claims = {"h_floor_projected"};
-  return s;
-}
-
 // Online extrinsic estimation on and off (mapping.extrinsic_est_en): the rows' extrinsic columns filled or zero.
 Scenario extrinsicScenario(const std::string & name, bool estimate)
 {
@@ -1336,9 +1312,9 @@ Scenario dumpScenario()
   return s;
 }
 
-// The H-model keys of config/profiles/m20 (three iterations, the refresh gate, the correspondence gate, the
-// normal-noise floor off, roll/pitch considered after a scan with little roll/pitch information, extrinsic estimation
-// off) on parked and turning room scans; the fixture's plane, matched once it is in the map, leaves too little
+// The H-model keys of config/profiles/m20 (three iterations, the refresh gate, the correspondence gate, roll/pitch
+// considered after a scan with little roll/pitch information, extrinsic estimation off) on parked and turning room
+// scans; the fixture's plane, matched once it is in the map, leaves too little
 // roll/pitch information for the next scan.
 Scenario m20Scenario()
 {
@@ -1347,7 +1323,6 @@ Scenario m20Scenario()
                          rclcpp::Parameter("nn_refresh_gate_en", true),
                          rclcpp::Parameter("nn_refresh_min_shift", 0.05),
                          rclcpp::Parameter("degeneracy_schur_ridge", 1.0e-6),
-                         rclcpp::Parameter("degeneracy_floor_mode", std::string("off")),
                          rclcpp::Parameter("corr_innov_gate_k", 2.5),
                          rclcpp::Parameter("corr_gate_mad_scale", 1.0),
                          rclcpp::Parameter("corr_gate_rot_sigma_floor_deg", 0.3),
@@ -1461,15 +1436,6 @@ constexpr Branch kBranches[] = {
    "H-model calls that kept the cached planes because the filter asked for no search (an unconverged iteration)",
    "test_cached_plane CachedPlane.*"},
   {"h_ground_rows", "H-model calls to which the ground recovery added rows (ground_recover_en)", ""},
-  {"h_floor_projected",
-   "H-model calls with rows the normal-noise floor projected: apply, a valid decision, a keep gain below one "
-   "(degeneracy_floor_mode)",
-   "test_normal_noise_floor; test_degeneracy_policy SchurComplement.*; "
-   "test_rp_consider_filter FloorProjection*"},
-  {"h_floor_no_wheel",
-   "H-model calls with rows on scans an applying floor observed because the wheel update found no speed "
-   "(fast_lio::scanFloorMode)",
-   "test_normal_noise_floor ScanFloorMode.*; test_wheel_measurement WheelSpeedInput.HasFit*"},
   {"h_rp_consider",
    "H-model calls with rows on scans whose update leaves roll/pitch to the gyro (lidar_consider_rp_en)",
    "test_rp_consider ConsiderPolicy.*; test_rp_consider ConsiderInformation.*; "
@@ -1545,18 +1511,6 @@ public:
         [this](nav_msgs::msg::Odometry::ConstSharedPtr message) {
           odom_by_ms_[msKey(rclcpp::Time(message->header.stamp).seconds())] = *message;
         });
-      if (scenario_.floor_log_binding) {
-        floor_log_ = observer_->create_subscription<rcl_interfaces::msg::Log>(
-          "/rosout",
-          rclcpp::QoS(rclcpp::KeepLast(1000)).reliable(),
-          [this](rcl_interfaces::msg::Log::ConstSharedPtr message) {
-            if (message->msg.rfind("[FLOOR] schema=2 ", 0) == 0) {
-              const std::string stamp = valueOf(message->msg, "stamp_ns");
-              if (!stamp.empty())
-                floor_by_stamp_[std::stoll(stamp)] = message->msg;
-            }
-          });
-      }
       if (scenario_.typed) {
         const auto typed_qos = rclcpp::QoS(rclcpp::KeepLast(1000)).best_effort();
         frontend_sub_ = observer_->create_subscription<fast_lio_interfaces::msg::FrontendObservation>(
@@ -1574,8 +1528,6 @@ public:
       executor_->add_node(observer_);
       if (!spinUntil([&] {
             return imu_->get_subscription_count() == 1 && lidar_->get_subscription_count() == 1 &&
-                   // The subject and observer each advertise /rosout. Wait for both before sending scans.
-                   (!scenario_.floor_log_binding || floor_log_->get_publisher_count() >= 2) &&
                    (!scenario_.typed ||
                     (frontend_sub_->get_publisher_count() == 1 && reference_sub_->get_publisher_count() == 1));
           }))
@@ -1602,8 +1554,6 @@ public:
       error = appendTyped();
     if (error.empty() && scenario_.typed && (typed_frontend_total_ == 0 || typed_reference_total_ == 0))
       error = "the typed scenario received no FrontendObservation or no ReferenceHealth";
-    if (error.empty() && scenario_.floor_log_binding)
-      error = validateFloorBindings();
     teardown();
     finish();
     return error;
@@ -1660,34 +1610,6 @@ private:
     sendLidar(scanStart(5) - 1.5, Cloud::kDense, false);  // epoch fault clears the actual protected queue
     executor_->spin_some();
     return runScanPath("accounting epoch clear");
-  }
-
-  std::string validateFloorBindings()
-  {
-    if (odom_by_ms_.empty())
-      return "no odometry for the floor binding check";
-    if (!spinUntil([&] { return floor_by_stamp_.size() >= odom_by_ms_.size(); }))
-      return "missing FLOOR records for published odometry";
-    for (const auto & entry : odom_by_ms_) {
-      const auto stamp = rclcpp::Time(entry.second.header.stamp).nanoseconds();
-      const auto found = floor_by_stamp_.find(stamp);
-      if (found == floor_by_stamp_.end())
-        return "FLOOR stamp differs from /Odometry";
-      const auto & line = found->second;
-      const auto start = line.find(" u=[");
-      Eigen::Vector3d actual;
-      if (start == std::string::npos ||
-          std::sscanf(line.c_str() + start, " u=[%lf %lf %lf]", &actual.x(), &actual.y(), &actual.z()) != 3)
-        return "FLOOR u is missing";
-      const auto & q = entry.second.pose.pose.orientation;
-      const Eigen::Vector3d expected =
-        Eigen::Quaterniond(q.w, q.x, q.y, q.z).toRotationMatrix() * Eigen::Vector3d::UnitX();
-      if (!actual.allFinite() || (actual - expected).norm() > 1e-12)
-        return "FLOOR u differs from the published frame-end quaternion";
-      if (valueOf(line, "u_valid") != "1")
-        return "FLOOR u is invalid in an unchanged world frame";
-    }
-    return "";
   }
 
   struct PendingScan
@@ -1889,16 +1811,8 @@ private:
         note("afterHModelIdentities", out.str());
       };
     fast_lio_test::afterHModelExit = [this](const fast_lio_test::HModelExit & e) {
-      // These immutable overrides are the same map supplied to the node constructor.
-      const auto floor = scenario_.params.find("degeneracy_floor_mode");
-      const bool floor_enabled = floor != scenario_.params.end() && floor->second.as_string() != "off";
-      if (!note("afterHModelExit", formatExit(e, floor_enabled)))
+      if (!note("afterHModelExit", formatExit(e)))
         return;
-      // The floor's decision of the call itself: every call with rows runs the floor while it is on.
-      if (e.valid && e.degeneracy_engaged)
-        ++counts_["h_floor_projected"];
-      if (e.valid && e.degeneracy_no_wheel)
-        ++counts_["h_floor_no_wheel"];
       if (e.valid && e.rp_consider)
         ++counts_["h_rp_consider"];
       if (e.dump_written)
@@ -1966,12 +1880,6 @@ private:
         ++counts_["runaway_trip"];
       return trip;
     };
-    // Installed only where the scenario says: it records nothing, so the record is the one the scan path leaves.
-    if (scenario_.wheel_fit) {
-      fast_lio_test::overrideScanWheelFit = [](double) {
-        return true;
-      };
-    }
     // Installed only where a slot injects: an installed hook makes the scan path re-read its state after it.
     if (std::any_of(scenario_.slots.begin(), scenario_.slots.end(), [](const Slot & s) { return s.inject; })) {
       fast_lio_test::beforeAnchorStep = [this](double end, fast_lio_test::AnchorFixtureState & fixture) {
@@ -2056,7 +1964,6 @@ private:
     fast_lio_test::afterConstruction = {};
     fast_lio_test::overrideGuardDegraded = {};
     fast_lio_test::forceRunawayTrip = {};
-    fast_lio_test::overrideScanWheelFit = {};
     fast_lio_test::beforeAnchorStep = {};
     fast_lio_test::initialBuildTakesNoPoint = {};
     fast_lio_test::beforeResetJoin = {};
@@ -2538,7 +2445,6 @@ private:
     reference_sub_.reset();
     frontend_sub_.reset();
     odom_.reset();
-    floor_log_.reset();
     imu_.reset();
     lidar_.reset();
     observer_.reset();
@@ -2607,8 +2513,6 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_;
-  rclcpp::Subscription<rcl_interfaces::msg::Log>::SharedPtr floor_log_;
-  std::map<std::int64_t, std::string> floor_by_stamp_;
   rclcpp::Subscription<fast_lio_interfaces::msg::FrontendObservation>::SharedPtr frontend_sub_;
   rclcpp::Subscription<fast_lio_interfaces::msg::ReferenceHealth>::SharedPtr reference_sub_;
   std::chrono::steady_clock::time_point repeat_clock_{kRepeatClockStart};
@@ -3206,243 +3110,6 @@ TEST(FrontendPipelineContract, MeasurementNeighbourRefresh)
 TEST(FrontendPipelineContract, MeasurementGroundRecovery)
 {
   checkScenario(groundScenario());
-}
-
-TEST(FrontendPipelineContract, JointRowFloorMeasurementFixture)
-{
-  // Independent r2 numerical-d1.txt:L8. Exercise the actual measurement-stage entry and dose telemetry.
-  // This assertion fixture does not record or generate a golden.
-  fast_lio::FrontendParams params;
-  params.degeneracy_floor_mode = fast_lio::FloorMode::kApply;
-  params.degeneracy_floor.rel_uncertainty = 0.0;
-  fast_lio::FrontendMeasurement measurement(params);
-  esekfom::dyn_share_datastruct<double> data;
-  data.h_x = Eigen::MatrixXd::Zero(6, 12);
-  data.h_x.leftCols(6).setIdentity();
-  data.h_x(3, 0) = data.h_x(3, 1) = 1.0;
-  data.h_x.rightCols(6) = data.h_x.leftCols(6);
-  data.h = data.h_x.col(0);
-  Eigen::MatrixXd expected = data.h_x;
-  expected.row(0).setZero();
-  Eigen::VectorXd expected_h = Eigen::VectorXd::Zero(6);
-  expected_h(3) = 1.0;
-  const Eigen::Matrix3d S0 = Eigen::Vector3d(1, 0, 0).asDiagonal();
-  const std::vector<double> weights(6, 1.0);
-  std::vector<std::optional<Eigen::Matrix3d>> covariances(6, Eigen::Matrix3d::Zero());
-  covariances.front() = S0;
-  measurement.beginScan(true);  // the scan's wheel update finds a speed
-  measurement.applyFloorRows(data, weights, covariances, 7);
-  EXPECT_LT((data.h_x - expected).norm(), 1e-12);
-  EXPECT_LT((data.h - expected_h).norm(), 1e-12);
-  const auto & telemetry = measurement.telemetry();
-  EXPECT_TRUE(telemetry.floor.projected);
-  EXPECT_EQ(telemetry.floor.evaluation_iter, 7);
-  EXPECT_EQ(telemetry.floor_rows_projected, 6);
-  EXPECT_NEAR(telemetry.floor_kept_sum, 2.0 + std::sqrt(2.0), 1e-12);
-}
-
-// The scan's wheel fit decides only whether apply projects (fast_lio::scanFloorMode). With it the rows are what
-// floorStep's apply makes of them; without it they stay as built, bit for bit, the decision is the one observe
-// computes, and the scan is counted once however many evaluations run the floor. Observe and off never read it.
-// This assertion fixture does not record or generate a golden.
-TEST(FrontendPipelineContract, FloorAppliesOnlyOnAScanWhoseWheelUpdateFindsASpeed)
-{
-  // JointRowFloorMeasurementFixture's rows: the floor projects one direction out of them.
-  esekfom::dyn_share_datastruct<double> built;
-  built.h_x = Eigen::MatrixXd::Zero(6, 12);
-  built.h_x.leftCols(6).setIdentity();
-  built.h_x(3, 0) = built.h_x(3, 1) = 1.0;
-  built.h_x.rightCols(6) = built.h_x.leftCols(6);
-  built.h = built.h_x.col(0);
-  const std::vector<double> weights(6, 1.0);
-  std::vector<std::optional<Eigen::Matrix3d>> covariances(6, Eigen::Matrix3d::Zero());
-  covariances.front() = Eigen::Matrix3d(Eigen::Vector3d(1, 0, 0).asDiagonal());
-  const auto decision = [](const fast_lio::FloorProjectionResult & r) {
-    std::ostringstream out;
-    out << r.valid << ' ' << r.reason << ' ' << r.spectral_count << ' ' << r.rank_m << ' ' << r.rank_r << ' '
-        << r.points << ' ' << r.points_without_covariance << ' ' << bitsList(r.lambda.data(), 3) << ' '
-        << bitsList(r.gains.data(), 3) << ' ' << bitsList(r.tau.data(), 3) << ' ' << matrixDigest(r.M0) << ' '
-        << matrixDigest(r.S0) << ' ' << matrixDigest(r.K) << ' ' << matrixDigest(r.A_keep) << ' '
-        << matrixDigest(r.B_keep) << ' ' << matrixDigest(r.C_keep) << ' ' << r.shift_coords_valid << ' '
-        << bitsList(r.d_t.data(), 3) << ' ' << bitsList(r.d_r.data(), 3) << ' ' << bits(r.dh_norm);
-    return out.str();
-  };
-  using fast_lio::FloorMode;
-  for (const FloorMode configured : {FloorMode::kApply, FloorMode::kObserve, FloorMode::kOff}) {
-    for (const bool wheel_fit : {true, false}) {
-      SCOPED_TRACE(std::string(fast_lio::floorModeName(configured)) + (wheel_fit ? ", wheel fit" : ", none"));
-      fast_lio::FrontendParams params;
-      params.degeneracy_floor_mode = configured;
-      params.degeneracy_floor.rel_uncertainty = 0.0;
-      const bool applies = configured == FloorMode::kApply && wheel_fit;
-      const bool no_wheel = configured == FloorMode::kApply && !wheel_fit;
-      const FloorMode runs = no_wheel ? FloorMode::kObserve : configured;
-      // The reference: floorStep in the mode the scan runs, on the same rows.
-      Eigen::MatrixXd reference_h_x = built.h_x;
-      Eigen::VectorXd reference_h = built.h;
-      fast_lio::FloorScanRecord reference;
-      fast_lio::floorStep(runs,
-                          reference_h_x,
-                          reference_h,
-                          weights,
-                          covariances,
-                          params.degeneracy_floor,
-                          params.degeneracy_params.schur_ridge,
-                          reference);
-      EXPECT_EQ(reference.projected, applies);
-      EXPECT_EQ(matrixDigest(reference_h_x) == matrixDigest(built.h_x), !applies);
-      EXPECT_EQ(matrixDigest(reference_h) == matrixDigest(built.h), !applies);
-      fast_lio::FrontendMeasurement measurement(params);
-      for (int scan = 0; scan < 2; ++scan) {
-        measurement.beginScan(wheel_fit);
-        for (int evaluation = 1; evaluation <= 2; ++evaluation) {
-          esekfom::dyn_share_datastruct<double> data;
-          data.h_x = built.h_x;
-          data.h = built.h;
-          measurement.applyFloorRows(data, weights, covariances, evaluation);
-          EXPECT_EQ(matrixDigest(data.h_x), matrixDigest(reference_h_x));
-          EXPECT_EQ(matrixDigest(data.h), matrixDigest(reference_h));
-          const fast_lio::FloorScanRecord & floor = measurement.telemetry().floor;
-          EXPECT_EQ(decision(floor.last), decision(reference.last));
-          EXPECT_EQ(floor.projected, applies);
-          EXPECT_EQ(floor.scan.mode, runs);
-          EXPECT_EQ(floor.scan.reason,
-                    no_wheel ? fast_lio::FloorModeReason::kNoWheel : fast_lio::FloorModeReason::kConfigured);
-        }
-      }
-      const fast_lio::MeasurementTelemetry & telemetry = measurement.telemetry();
-      EXPECT_EQ(telemetry.floor_no_wheel_scans, no_wheel ? 2 : 0);
-      EXPECT_EQ(telemetry.floor_rows_projected, applies ? 2 * 2 * 6 : 0);
-    }
-  }
-}
-
-// The node's own answer to the floor's wheel question, without the forced fit: with wheel_odom_en off, and on with no
-// wheel sample in the ring, an applying floor observes every scan. The record is the one observe records, bit for
-// bit: no row is projected and nothing downstream of the rows changes.
-TEST(FrontendPipelineContract, MeasurementNoiseFloorApplyWithoutAWheelSpeedObserves)
-{
-  Scenario observe = degeneracyScenario();
-  observe.wheel_fit = false;
-  setParam(observe, rclcpp::Parameter("degeneracy_floor_mode", std::string("observe")));
-  const ChildRun observed = runScenario(observe);
-  ASSERT_TRUE(observed.ok()) << observed.describe();
-  EXPECT_EQ(observed.count("h_floor_projected"), 0u);
-  EXPECT_EQ(observed.count("h_floor_no_wheel"), 0u);
-  for (const bool wheel_odom : {false, true}) {
-    SCOPED_TRACE(wheel_odom ? "wheel_odom_en true, no wheel sample" : "wheel_odom_en false");
-    Scenario apply = degeneracyScenario();
-    apply.wheel_fit = false;
-    setParam(apply, rclcpp::Parameter("wheel_odom_en", wheel_odom));
-    const ChildRun run = runScenario(apply);
-    ASSERT_TRUE(run.ok()) << run.describe();
-    EXPECT_GT(run.count("h_floor_no_wheel"), 0u);
-    EXPECT_EQ(run.count("h_floor_projected"), 0u);
-    const Comparison comparison = compareLines(observed.record, run.record);
-    EXPECT_EQ(comparison.result, "equal")
-      << "line " << comparison.line << "\n  observe: " << comparison.expected << "\n  apply:   " << comparison.actual;
-  }
-}
-
-TEST(FrontendPipelineContract, FloorExitRecordVersionsEnabledMode)
-{
-  // R39-2: the serialized record alone identifies the ordering and preserves its legacy payload.
-  fast_lio_test::HModelExit exit;
-  exit.degeneracy_lambdas[0] = 4.0;
-  exit.degeneracy_weights[0] = 0.5;
-  const std::string legacy = formatExit(exit, false);
-  const std::string enabled = formatExit(exit, true);
-  EXPECT_EQ(enabled, legacy + " schema=2 rule=joint_row_v1 gain_order=tau_ascending lambda_gain_pairing=independent");
-  EXPECT_TRUE(valueOf(legacy, "schema").empty());
-  EXPECT_TRUE(valueOf(legacy, "rule").empty());
-  EXPECT_EQ(valueOf(enabled, "schema"), "2");
-  EXPECT_EQ(valueOf(enabled, "rule"), "joint_row_v1");
-  EXPECT_EQ(valueOf(enabled, "gain_order"), "tau_ascending");
-  EXPECT_EQ(valueOf(enabled, "lambda_gain_pairing"), "independent");
-  EXPECT_EQ(valueOf(enabled, "degeneracy_lambdas"), valueOf(legacy, "degeneracy_lambdas"));
-  EXPECT_EQ(valueOf(enabled, "degeneracy_weights"), valueOf(legacy, "degeneracy_weights"));
-}
-
-TEST(FrontendPipelineContract, VersionedFloorDumpMapsOnlyProjectedRows)
-{
-  // R39-2: consume actual node exits and the per-(t,iter) mapping, without recording another golden.
-  for (const std::string mode : {"apply", "observe"}) {
-    SCOPED_TRACE(mode);
-    Scenario scenario = degeneracyScenario();
-    scenario.name = "floor_dump_schema2_" + mode;
-    scenario.dump = true;
-    setParam(scenario, rclcpp::Parameter("degeneracy_floor_mode", mode));
-    setParam(scenario, rclcpp::Parameter("corr_dump_en", true));
-    setParam(scenario, rclcpp::Parameter("corr_dump_windows", "0:10"));
-    const ChildRun run = runScenario(scenario);
-    ASSERT_TRUE(run.ok()) << run.describe();
-    std::istringstream records(run.record);
-    std::string line;
-    std::size_t exits = 0;
-    while (std::getline(records, line)) {
-      if (line.rfind("h_exit.v1 ", 0) != 0)
-        continue;
-      EXPECT_EQ(valueOf(line, "schema"), "2");
-      EXPECT_EQ(valueOf(line, "rule"), "joint_row_v1");
-      EXPECT_EQ(valueOf(line, "gain_order"), "tau_ascending");
-      EXPECT_EQ(valueOf(line, "lambda_gain_pairing"), "independent");
-      ++exits;
-    }
-    EXPECT_GT(exits, 0u);
-    std::string text;
-    ASSERT_TRUE(readFile(std::string(FASTLIO_CONTRACT_RESULTS) + "/frontend_contract/" + kFixture + "/" +
-                           scenario.name + ".dump/corr_dump.csv",
-                         &text));
-    std::istringstream csv(text);
-    std::getline(csv, line);  // the existing CSV column header
-    ASSERT_NE(line.find(",w,"), std::string::npos);
-    std::map<std::string, std::string> meanings;
-    std::size_t mapped_rows = 0;
-    while (std::getline(csv, line)) {
-      if (line.rfind("# ", 0) == 0) {
-        ASSERT_EQ(valueOf(line, "schema"), "2");
-        ASSERT_EQ(valueOf(line, "rule"), "joint_row_v1");
-        const std::string key = valueOf(line, "t") + "," + valueOf(line, "iter");
-        meanings[key] = valueOf(line, "column_w");
-        continue;
-      }
-      std::istringstream row(line);
-      std::vector<std::string> fields;
-      std::string field;
-      while (std::getline(row, field, ','))
-        fields.push_back(field);
-      ASSERT_EQ(fields.size(), 29u);
-      const double w = std::stod(fields[25]);
-      const auto mapping = meanings.find(fields[0] + "," + fields[1]);
-      if (mapping == meanings.end()) {
-        EXPECT_DOUBLE_EQ(w, 1.0);
-      } else {
-        EXPECT_EQ(mapping->second, "floor_row_pos_norm");
-        EXPECT_TRUE(std::isfinite(w) && (w >= 0.0 || w == -1.0));
-        ++mapped_rows;
-      }
-    }
-    if (mode == "apply") {
-      EXPECT_GT(mapped_rows, 0u);
-    } else {
-      EXPECT_EQ(mapped_rows, 0u);
-    }
-  }
-}
-
-TEST(FrontendPipelineContract, FloorSchema2UsesThePublishedFrameEndQuaternionAndStamp)
-{
-  Scenario scenario = degeneracyScenario();
-  scenario.name = "floor_schema2_binding";
-  scenario.floor_log_binding = true;
-  const ChildRun run = runScenario(scenario);
-  ASSERT_TRUE(run.ok()) << run.describe();
-  EXPECT_GT(run.count("odometry"), 0u);
-}
-
-TEST(FrontendPipelineContract, MeasurementNoiseFloorApplied)
-{
-  checkScenario(degeneracyScenario());
 }
 
 TEST(FrontendPipelineContract, MeasurementExtrinsicEstimationOn)

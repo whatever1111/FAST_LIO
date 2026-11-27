@@ -6,7 +6,7 @@
 
 namespace fast_lio
 {
-/// The lidar measurement update: iterations, the normal-noise floor, correspondence gating, the roll/pitch consider
+/// The lidar measurement update: iterations, the degeneracy traces, correspondence gating, the roll/pitch consider
 /// rule, canopy and ground recovery, nearest-neighbour refresh. One spec per parameter, in declaration order, named
 /// after the parameter with '.' written '_'. FrontendParameters declares and reads them in the constructor's original
 /// order, not domain by domain.
@@ -15,14 +15,7 @@ struct MeasurementParameterSpecs
   const ParameterSpec<int> max_iteration{"max_iteration", 4, 4};
   const ParameterSpec<bool> degeneracy_debug{"degeneracy_debug", false, false};
   const ParameterSpec<bool> degeneracy_spectrum_trace{"degeneracy_spectrum_trace", false, false};
-  // The normal-noise floor of the LiDAR position update (normal_noise_floor.hpp): off | observe | apply.
-  const ParameterSpec<std::string> degeneracy_floor_mode{"degeneracy_floor_mode", "off", std::string("off")};
-  // alpha: the rate at which a direction made only of floor is kept anyway, per direction and frame; in (0, 0.5).
-  const ParameterSpec<double> degeneracy_false_keep_rate{"degeneracy_false_keep_rate", 1e-3, 1e-3};
-  // kappa, the scale of the floor model (> 0), and sigma_rel, its relative uncertainty (>= 0).
-  const ParameterSpec<double> degeneracy_floor_model_scale{"degeneracy_floor_model_scale", 1.0, 1.0};
-  const ParameterSpec<double> degeneracy_floor_rel_uncertainty{"degeneracy_floor_rel_uncertainty", 0.3, 0.3};
-  // Regularisation of the Schur complement the floor judges, relative to trace(H_rr)/3.
+  // Regularisation of the Schur complement the spectrum trace reports, relative to trace(H_rr)/3.
   const ParameterSpec<double> degeneracy_schur_ridge{"degeneracy_schur_ridge", 1e-6, 1e-6};
   const ParameterSpec<double> corr_innov_gate_k{"corr_innov_gate_k", 0.0, 0.0};
   const ParameterSpec<double> corr_nn0_max{"corr_nn0_max", 0.0, 0.0};

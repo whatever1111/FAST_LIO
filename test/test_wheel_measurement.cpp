@@ -1192,9 +1192,9 @@ TEST(WheelSpeedInput, AScanWithoutAPairedSampleInItsSpanMakesNoUpdate)
   EXPECT_EQ(input.counts().updates, 0u);
 }
 
-// What an applying normal-noise floor asks before the lidar update: hasFit is the scan's own read, so it is true
-// exactly when the wheel update after the lidar update has a fitted speed, and false for every way of having none.
-TEST(WheelSpeedInput, HasFitIsWhetherTheScansWheelUpdateFindsASpeed)
+// The scan's own read of the ring fits a speed exactly when the wheel update after the lidar update has one, and for
+// no way of having none.
+TEST(WheelSpeedInput, TheScansReadFitsASpeedExactlyWhenItsWheelUpdateHasOne)
 {
   struct Half
   {
@@ -1242,7 +1242,7 @@ TEST(WheelSpeedInput, HasFitIsWhetherTheScansWheelUpdateFindsASpeed)
       addTwistAt(input, kEpochNs + twist.offset_ns, twist.value);
     for (const Half & variance : c.variances)
       addVariancesAt(input, kEpochNs + variance.offset_ns, variance.value, kUnobserved);
-    EXPECT_EQ(input.hasFit(kScanBegin, kScanEnd), c.fit);
+    EXPECT_EQ(input.read(kScanBegin, kScanEnd).fit.has_value(), c.fit);
     const fast_lio::WheelStep step = stepOf(input, WheelModelParams{});
     EXPECT_EQ(step.ring.fit.has_value(), c.fit);
     EXPECT_EQ(step.outcome, c.outcome);
@@ -1252,9 +1252,9 @@ TEST(WheelSpeedInput, HasFitIsWhetherTheScansWheelUpdateFindsASpeed)
   WheelSpeedInput input;
   input.configure(true, 0.075, 0.05);
   addTwistAt(input, kEpochNs + 100000000, 0.70);
-  EXPECT_FALSE(input.hasFit(kScanBegin, kScanEnd));
+  EXPECT_FALSE(input.read(kScanBegin, kScanEnd).fit.has_value());
   addVariancesAt(input, kEpochNs + 100000000, 0.003, kUnobserved);
-  EXPECT_TRUE(input.hasFit(kScanBegin, kScanEnd));
+  EXPECT_TRUE(input.read(kScanBegin, kScanEnd).fit.has_value());
   EXPECT_EQ(stepOf(input, WheelModelParams{}).outcome, WheelOutcome::kUpdate);
 }
 

@@ -37,7 +37,7 @@ protected:
   // points lie on the patch, or (rows = false) far from every map point. The floor is off: no wheel fit is asked.
   void prepare(std::size_t count, bool rows)
   {
-    measurement_.beginScan(false);
+    measurement_.beginScan();
     ASSERT_TRUE(measurement_.prepareScan(count, point_count_));
     ASSERT_EQ(point_count_, static_cast<int>(count));
     body_.resize(count);

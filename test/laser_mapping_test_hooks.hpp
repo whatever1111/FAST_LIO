@@ -64,9 +64,6 @@ extern std::function<int(double)> overrideGuardDegraded;
 extern std::function<void(double, AnchorFixtureState &)> beforeAnchorStep;
 /// Scan end time -> true to trip the runaway watchdog this scan (reason: wheel).
 extern std::function<bool(double)> forceRunawayTrip;
-/// Scan end time -> whether the scan's wheel update finds a speed, in place of the ring's answer: what an applying
-/// normal-noise floor asks before the lidar update (fast_lio::scanFloorMode).
-extern std::function<bool(double)> overrideScanWheelFit;
 /// Scan end time -> true to hand the normal initial map build of that scan only points the map backend skips
 /// (non-finite coordinates): the build runs and leaves the backend empty.
 extern std::function<bool(double)> initialBuildTakesNoPoint;
@@ -141,16 +138,16 @@ struct HModelExit
   bool hold_info = false;
   double rp_info_min = 0.0;         ///< roll/pitch information of the rows
   bool rp_consider = false;         ///< the scan's update leaves roll/pitch to the gyro (lidar_consider_rp_en)
-  // The normal-noise floor's decision of the scan's last evaluation that ran it; neutral (1, 0, 1, 0, 0) while the
-  // floor is off.
-  bool degeneracy_engaged = false;                 ///< the floor's projection changed this call's rows
-  bool degeneracy_no_wheel = false;                ///< apply, observing on this scan: its wheel update finds no speed
-  double degeneracy_shares[3] = {0.0, 0.0, 0.0};   ///< M_eff's eigenvalues over the rows, ascending (1 undecided)
-  double degeneracy_lambdas[3] = {0.0, 0.0, 0.0};  ///< M_eff's eigenvalues
-  double degeneracy_weights[3] = {0.0, 0.0, 0.0};  ///< the keep gain per direction
-  long degeneracy_weighted_points = 0;             ///< rows the floor projected since construction
-  double degeneracy_weight_sum = 0.0;              ///< the sum of what each of them kept, |G n|
-  bool dump_written = false;                       ///< this call appended to the correspondence dump
+  // No floor conditions the rows; these seven fields keep the h_exit.v1 layout at their neutral values: nothing
+  // engaged, unit shares and keep gains, zero eigenvalues and dose.
+  bool degeneracy_engaged = false;
+  bool degeneracy_no_wheel = false;
+  double degeneracy_shares[3] = {1.0, 1.0, 1.0};
+  double degeneracy_lambdas[3] = {0.0, 0.0, 0.0};
+  double degeneracy_weights[3] = {1.0, 1.0, 1.0};
+  long degeneracy_weighted_points = 0;
+  double degeneracy_weight_sum = 0.0;
+  bool dump_written = false;  ///< this call appended to the correspondence dump
 };
 /// Every H-model call right after afterHModelRows.
 extern std::function<void(const HModelSelection &)> afterHModelSelection;

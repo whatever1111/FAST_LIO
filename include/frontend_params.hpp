@@ -8,7 +8,6 @@
 
 #include "correspondence_gate.hpp"
 #include "degeneracy_policy.hpp"
-#include "normal_noise_floor.hpp"
 #include "parked_hold.hpp"
 #include "prior_map_load.hpp"
 #include "rp_consider.hpp"
@@ -227,16 +226,7 @@ struct FrontendParams
   // The spectrum trace alone, without the per-scan cerr traffic degeneracy_debug carries:
   // throttled, so it costs nothing and can run on a scoring replay.
   bool degeneracy_spectrum_trace = false;
-  // The normal-noise floor (normal_noise_floor.hpp): every evaluation judges the position information its rows leave
-  // once rotation is solved for (the Schur complement, regularised by degeneracy_params.schur_ridge) against what the
-  // plane normals' own noise can fake, and keeps of each direction only what is left above that floor. off computes
-  // nothing; observe computes the decision and logs it ([FLOOR]) without touching the rows; apply also projects the
-  // rows' position columns and shifts their residuals to match. The released directions fall to IMU propagation
-  // until another measurement (wheel speed, ZUPT, planar-Z) fills them, so apply projects only on a scan whose wheel
-  // update finds a speed (wheel_odom_en and a fit over the scan's span) and observes on every other scan
-  // (fast_lio::scanFloorMode).
-  fast_lio::FloorMode degeneracy_floor_mode = fast_lio::FloorMode::kOff;
-  fast_lio::FloorParams degeneracy_floor;
+  // The Schur complement's regularisation, for the position information the spectrum trace reports.
   fast_lio::DegeneracyParams degeneracy_params;
   // [v11] correspondence gate (correspondence_gate.hpp): a match is admitted only when its residual lies
   // within corr_innov_gate_k sigma of its own predicted variance H P Hᵀ + R (and, separately, when its

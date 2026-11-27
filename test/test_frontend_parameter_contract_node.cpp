@@ -714,7 +714,8 @@ ChildRun runInChild(const std::function<std::string()> & body)
 }
 
 // A record split around its parameter table: the lines before it (up to "parameters N"), the table by name, the
-// lines after it, and the effective configuration by name.
+// lines after it, and the effective configuration by name. A stored case whose table equals the reference has no
+// table line; its lines after the table begin with a set or the effective count.
 struct SplitRecord
 {
   std::vector<std::string> before;
@@ -748,7 +749,8 @@ SplitRecord splitRecord(const std::string & text)
     } else if (line.rfind("param_absent ", 0) == 0) {
       split.absent.push_back(line.substr(std::string("param_absent ").size()));
       seen_table = true;
-    } else if (seen_table || line.rfind("set ", 0) == 0 || line.rfind("after_set ", 0) == 0) {
+    } else if (seen_table || line.rfind("set ", 0) == 0 || line.rfind("after_set ", 0) == 0 ||
+               line.rfind("effective.v1.count ", 0) == 0) {
       seen_table = true;
       split.after.push_back(line);
     } else {
@@ -1473,13 +1475,6 @@ void checkRefused(const std::string & name, const std::string & key, const std::
   expectRefused(record, key);
 }
 
-TEST(FrontendParameterContract, FloorModeUnknown)
-{
-  checkRefused("floor_mode_unknown",
-               "degeneracy_floor_mode",
-               {rclcpp::Parameter("degeneracy_floor_mode", std::string("weighting"))});
-}
-
 TEST(FrontendParameterContract, InputEpochOnFaultUnknown)
 {
   // reset_map is a runaway action, not an input-epoch one: a typo must not fall back to hold.
@@ -1497,26 +1492,6 @@ TEST(FrontendParameterContract, InputEpochOnFaultExit)
   EXPECT_NE(record.find("\neffective.v1 input_epoch_on_fault string[10] \"fault_exit\""), std::string::npos) << record;
 }
 
-TEST(FrontendParameterContract, FloorFalseKeepRateOutOfRange)
-{
-  checkRefused("floor_false_keep_rate_out_of_range",
-               "degeneracy_false_keep_rate",
-               {rclcpp::Parameter("degeneracy_false_keep_rate", 0.5)});
-}
-
-TEST(FrontendParameterContract, FloorModelScaleZero)
-{
-  checkRefused(
-    "floor_model_scale_zero", "degeneracy_floor_model_scale", {rclcpp::Parameter("degeneracy_floor_model_scale", 0.0)});
-}
-
-TEST(FrontendParameterContract, NanFloorRelUncertainty)
-{
-  checkRefused("nan_floor_rel_uncertainty",
-               "degeneracy_floor_rel_uncertainty",
-               {rclcpp::Parameter("degeneracy_floor_rel_uncertainty", std::numeric_limits<double>::quiet_NaN())});
-}
-
 TEST(FrontendParameterContract, InfSchurRidge)
 {
   checkRefused("inf_schur_ridge",
@@ -1524,14 +1499,26 @@ TEST(FrontendParameterContract, InfSchurRidge)
                {rclcpp::Parameter("degeneracy_schur_ridge", std::numeric_limits<double>::infinity())});
 }
 
-TEST(FrontendParameterContract, FloorModeObserve)
+// The normal-noise floor is no part of the front end: none of its keys is a parameter, so overrides that would have
+// run it, or that its checks refused, construct the node without a parameter, an effective value or a [FLOOR] line
+// of the floor's. The floor stays as the comparison of test_normal_noise_floor and test_rp_consider_filter.
+TEST(FrontendParameterContract, NormalNoiseFloorKeysAreNotParameters)
 {
-  ParameterCase c = overridesCase("floor_mode_observe", Expect::kConstructed);
-  setOverride(c, rclcpp::Parameter("degeneracy_floor_mode", std::string("observe")));
+  const std::vector<rclcpp::Parameter> retired = {
+    rclcpp::Parameter("degeneracy_floor_mode", std::string("apply")),
+    rclcpp::Parameter("degeneracy_false_keep_rate", 0.5),
+    rclcpp::Parameter("degeneracy_floor_model_scale", 0.0),
+    rclcpp::Parameter("degeneracy_floor_rel_uncertainty", std::numeric_limits<double>::quiet_NaN())};
+  ParameterCase c = overridesCase("floor_keys_not_parameters", Expect::kConstructed);
+  for (const auto & parameter : retired)
+    setOverride(c, parameter);
   std::string record;
   checkCase(c, &record);
-  EXPECT_NE(record.find("\nlog INFO laser_mapping \"[FLOOR] normal-noise floor observe: "), std::string::npos)
-    << record;
+  for (const auto & parameter : retired) {
+    EXPECT_EQ(record.find("\nparam " + parameter.get_name() + " "), std::string::npos) << parameter.get_name();
+    EXPECT_TRUE(effectiveValue(record, parameter.get_name()).empty()) << parameter.get_name();
+  }
+  EXPECT_EQ(record.find("[FLOOR]"), std::string::npos) << record;
 }
 
 TEST(FrontendParameterContract, WheelLeverArmLength)

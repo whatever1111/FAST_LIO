@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
-#include <optional>
 #include <vector>
 
 #include "cached_plane.hpp"
@@ -18,8 +17,6 @@
 #include "frontend_point_types.hpp"
 #include "ikfom_types.hpp"
 #include "map_backend_reference.hpp"
-#include "normal_noise_floor.hpp"
-#include "plane_fit.hpp"
 
 namespace fast_lio
 {
@@ -73,15 +70,6 @@ struct MeasurementTelemetry
   double pos_obs_eig_max = 0.0;
   double pos_obs_z_weak = 0.0;
   Eigen::Matrix3d pos_obs_M = Eigen::Matrix3d::Zero();  // M itself (world frame), for the [SCAN] trace
-  // The normal-noise floor (FrontendParams::degeneracy_floor_mode is the policy): on the current scan, the mode it
-  // runs in, the last evaluation's decision and how many evaluations ran it and were refused, for the [FLOOR] line;
-  // over the node's life, the rows of the evaluations whose projection changed them and the sum of the position
-  // information each of those rows kept (the actual transformed position-row norm), so the dose stays measurable, and
-  // the scans whose floor observed because apply found no wheel speed (fast_lio::scanFloorMode).
-  fast_lio::FloorScanRecord floor;
-  long floor_rows_projected = 0;
-  double floor_kept_sum = 0.0;
-  long floor_no_wheel_scans = 0;
   // The correspondence gate (FrontendParams::corr_gate is the policy) on the last evaluation: the matches it refused,
   // and the scan's robust residual scale (1.4826 MAD).
   std::atomic<int> corr_gate_rejected{0};
@@ -123,14 +111,6 @@ struct MeasurementScratch
   // The neighbour set only moves on the iterations that search, so the 5x3 plane fit and the body-range scale in the
   // residual gate are invariant in between and are kept per point.
   std::vector<fast_lio::CachedPlane, Eigen::aligned_allocator<fast_lio::CachedPlane>> plane_cache;
-  // Per point, the scatter of the plane its row was accepted against (plane_cache's own eigen data, written with the
-  // selection; null for a ground-recovery row, whose normal is imposed rather than fitted). Per effective row, the
-  // same pointer, compacted with the rows while the floor is on, and the floor's inputs: the row's weight and its
-  // normal's covariance.
-  std::vector<const fast_lio::PlaneFitEigen *> point_plane;
-  std::vector<const fast_lio::PlaneFitEigen *> corr_plane;
-  std::vector<double> floor_weights;
-  std::vector<std::optional<Eigen::Matrix3d>> floor_cov;
   // Neighbour refresh: the pose of the last search.
   V3D nn_last_search_pos = V3D::Zero();
   M3D nn_last_search_rot = M3D::Identity();
@@ -164,10 +144,9 @@ public:
   FrontendMeasurement(FrontendMeasurement &&) = delete;
   FrontendMeasurement & operator=(FrontendMeasurement &&) = delete;
 
-  /// A new scan: clears the scan's timings, search count, neighbour-refresh telemetry and floor record, drops every
-  /// cached neighbour plane and the pose of the last search, and sets the mode the scan runs the floor in. wheel_fit:
-  /// the scan's wheel update finds a speed, which an applying floor needs (fast_lio::scanFloorMode).
-  void beginScan(bool wheel_fit);
+  /// A new scan: clears the scan's timings, search count and neighbour-refresh telemetry, and drops every cached
+  /// neighbour plane and the pose of the last search.
+  void beginScan();
   /// Sizes the per-point storage for a downsampled scan of count points and sets point_count to count. A count the
   /// evaluation's int-indexed loops cannot hold returns false and changes neither.
   bool prepareScan(std::size_t count, int & point_count);
@@ -180,12 +159,6 @@ public:
                 esekfom::dyn_share_datastruct<double> & data,
                 const MeasurementInputs & inputs,
                 const MeasurementOutputs & outputs);
-
-  /// Condition the built rows and record their actual dose. evaluate() calls this after row construction.
-  void applyFloorRows(esekfom::dyn_share_datastruct<double> & data,
-                      const std::vector<double> & weights,
-                      const std::vector<std::optional<Eigen::Matrix3d>> & covariances,
-                      int evaluation_iteration);
 
   const MeasurementTelemetry & telemetry() const { return telemetry_; }
   /// Each point's neighbours from its last search, for the map update.

@@ -19,7 +19,6 @@
 #include <iterator>
 #include <limits>
 #include <omp.h>
-#include <optional>
 #include <so3_math.h>
 #include <vector>
 
@@ -27,8 +26,6 @@
 #include "correspondence_compaction.hpp"
 #include "correspondence_gate.hpp"
 #include "degeneracy_policy.hpp"
-#include "normal_noise_floor.hpp"
-#include "plane_fit.hpp"
 #include "rp_consider.hpp"
 
 #ifdef FASTLIO_TEST_HOOKS
@@ -95,20 +92,6 @@ static HModelExit hModelExit(const fast_lio::MeasurementTelemetry & telemetry,
   out.pos_z_weak = telemetry.pos_obs_z_weak;
   out.rp_info_min = telemetry.lidar_rot_obs_rp_min;
   out.rp_consider = rp_consider_active;
-  // The floor's decision (the last evaluation that ran it on this scan): neutral while the floor is off or has not
-  // decided, which is the inert record of the former subspace weighting field for field.
-  const fast_lio::FloorProjectionResult & decision = telemetry.floor.last;
-  out.degeneracy_engaged = telemetry.floor.projected;
-  out.degeneracy_no_wheel = telemetry.floor.scan.reason == fast_lio::FloorModeReason::kNoWheel;
-  for (int i = 0; i < 3; ++i) {
-    out.degeneracy_shares[i] = decision.valid && outputs.effective_rows > 0
-                                 ? decision.lambda(i) / static_cast<double>(outputs.effective_rows)
-                                 : 1.0;
-    out.degeneracy_lambdas[i] = decision.lambda(i);
-    out.degeneracy_weights[i] = decision.gains(i);
-  }
-  out.degeneracy_weighted_points = telemetry.floor_rows_projected;
-  out.degeneracy_weight_sum = telemetry.floor_kept_sum;
   out.dump_written = valid && outputs.dump_scan_active && outputs.dump_rows.is_open();
   return out;
 }
@@ -263,7 +246,6 @@ void matchPoints(fast_lio::MeasurementScratch & scratch,
       }
       if (residual.accepted) {
         scratch.point_selected_surf[i] = true;
-        scratch.point_plane[i] = cached_plane.eigen();
         scratch.normvec.points[i].x = pabcd(0);
         scratch.normvec.points[i].y = pabcd(1);
         scratch.normvec.points[i].z = pabcd(2);
@@ -477,7 +459,6 @@ void recoverGroundRows(fast_lio::MeasurementScratch & scratch,
     if (std::fabs(pd2) > params.ground_recover_max_residual)
       continue;
     scratch.point_selected_surf[i] = true;
-    scratch.point_plane[i] = nullptr;  // the normal is imposed, not fitted: no plane covariance
     scratch.normvec.points[i].x = 0.0f;
     scratch.normvec.points[i].y = 0.0f;
     // Row weight rides on the normal + residual scaling (information
@@ -545,7 +526,6 @@ void recoverGround(fast_lio::MeasurementScratch & scratch,
 
 void compactRows(fast_lio::MeasurementScratch & scratch,
                  fast_lio::MeasurementTelemetry & telemetry,
-                 const fast_lio::FrontendParams & params,
                  const fast_lio::MeasurementInputs & inputs,
                  const fast_lio::MeasurementOutputs & outputs)
 {
@@ -554,12 +534,8 @@ void compactRows(fast_lio::MeasurementScratch & scratch,
     std::fill(std::begin(telemetry.res_bin_n), std::end(telemetry.res_bin_n), 0);
     std::fill(std::begin(telemetry.res_bin_ss), std::end(telemetry.res_bin_ss), 0.0);
   }
-  // The floor needs each row's plane: carried in row order, parallel to corr_normvect.
-  const bool floor_on = params.degeneracy_floor_mode != fast_lio::FloorMode::kOff;
-  scratch.corr_plane.clear();
-
-  // res_last, point_selected_surf and point_plane have the same extent; the compactor checks
-  // that extent and the point/normal bounds before invoking this observer.
+  // res_last and point_selected_surf have the same extent; the compactor checks that extent and the point/normal
+  // bounds before invoking this observer.
   outputs.effective_rows = static_cast<int>(fast_lio::compactSelectedCorrespondences(
     static_cast<std::size_t>(inputs.point_count),
     inputs.body,
@@ -569,9 +545,6 @@ void compactRows(fast_lio::MeasurementScratch & scratch,
     scratch.corr_normvect,
     [&](std::size_t i) {
       scratch.total_residual += scratch.res_last[i];
-      if (floor_on) {
-        scratch.corr_plane.push_back(scratch.point_plane[i]);
-      }
       if (inputs.degeneracy_debug) {
         const PointType & pb = inputs.body.points[i];
         const double rng = std::sqrt(double(pb.x) * pb.x + double(pb.y) * pb.y + double(pb.z) * pb.z);
@@ -667,9 +640,9 @@ void buildRows(const fast_lio::MeasurementScratch & scratch,
   }
 }
 
-// [DEGEN-SPECTRUM]: the position information of the rows as built, before the floor touches them. The Schur
-// complement over the rotation columns (what the floor judges, raw and as shares of the rows) beside the raw
-// translation block: the gap between them is what rotation explains away.
+// [DEGEN-SPECTRUM]: the position information of the rows as built. The Schur complement over the rotation columns
+// (raw and as shares of the rows) beside the raw translation block: the gap between them is what rotation explains
+// away.
 void traceSpectrum(const fast_lio::FrontendParams & params,
                    rclcpp::Clock & spectrum_clock,
                    const fast_lio::MeasurementInputs & inputs,
@@ -706,47 +679,22 @@ void traceSpectrum(const fast_lio::FrontendParams & params,
                        inputs.far_fraction);
 }
 
-// The normal-noise floor (FrontendParams::degeneracy_floor_mode is the policy, normal_noise_floor.hpp the decision)
-// on every evaluation that built rows. Each row brings its weight (1: the rows are unweighted) and its normal's
-// covariance: a fitted plane's from its scatter, none for a ground-recovery row, whose imposed normal the floor counts
-// apart and adds nothing for.
-void prepareFloor(fast_lio::MeasurementScratch & scratch, const fast_lio::MeasurementOutputs & outputs)
-{
-  const std::size_t rows = static_cast<std::size_t>(outputs.effective_rows);
-  scratch.floor_weights.resize(rows);
-  scratch.floor_cov.resize(rows);
-  for (std::size_t i = 0; i < rows; ++i) {
-    scratch.floor_weights[i] = 1.0;
-    scratch.floor_cov[i].reset();
-    if (scratch.corr_plane[i] != nullptr) {
-      scratch.floor_cov[i] = fast_lio::planeNormalCovariance(*scratch.corr_plane[i]);
-    }
-  }
-}
-
 void writeDump(const fast_lio::MeasurementScratch & scratch,
                const fast_lio::MeasurementTelemetry & telemetry,
                const fast_lio::MeasurementInputs & inputs,
                const fast_lio::MeasurementOutputs & outputs,
                state_ikfom & s,
                bool searching,
-               const V3D & up_body,
-               const esekfom::dyn_share_datastruct<double> & data)
+               const V3D & up_body)
 {
   const int iter = outputs.dump_iteration++;
-  if (telemetry.floor.projected) {
-    // This per-iteration mapping versions w without changing legacy, unprojected CSV records.
-    outputs.dump_rows << "# schema=2 rule=joint_row_v1 column_w=floor_row_pos_norm t=" << std::setprecision(15)
-                      << inputs.scan_end_time << " iter=" << iter << '\n';
-  }
   const V3D sensor_w = s.rot * s.offset_T_L_I + s.pos;
-  // The held column stays in the layout and reads 0: the attitude hold was removed.
+  // The held and the projected columns stay in the layout and read 0: nothing holds the attitude or projects the
+  // rows.
   outputs.dump_iterations << std::setprecision(15) << inputs.scan_end_time << ',' << iter << ','
                           << outputs.effective_rows << ",0," << std::setprecision(6) << telemetry.lidar_rot_obs_rp_min
-                          << ',' << up_body(0) << ',' << up_body(1) << ',' << up_body(2) << ',' << int(searching) << ','
-                          << int(telemetry.floor.projected) << '\n';
-  // Compaction preserves selected point order. Row mixing makes a per-point retained fraction undefined.
-  int effective_row = 0;
+                          << ',' << up_body(0) << ',' << up_body(1) << ',' << up_body(2) << ',' << int(searching)
+                          << ",0\n";
   for (int i = 0; i < inputs.point_count; i++) {
     const bool eff = scratch.point_selected_surf[i];
     if (!eff && iter > 0) {
@@ -794,10 +742,7 @@ void writeDump(const fast_lio::MeasurementScratch & scratch,
         plane_rms = std::sqrt(ss / double(n_near));
       }
     }
-    double pd2 = 0.0, nx = 0.0, ny = 0.0, nz = 0.0, ax = 0.0, ay = 0.0, az = 0.0, cosv = 0.0, w = 1.0;
-    if (telemetry.floor.projected) {
-      w = -1.0;  // an unmatched point has no transformed row
-    }
+    double pd2 = 0.0, nx = 0.0, ny = 0.0, nz = 0.0, ax = 0.0, ay = 0.0, az = 0.0, cosv = 0.0;
     if (eff) {
       const auto & np = scratch.normvec.points[i];
       nx = np.x;
@@ -812,48 +757,19 @@ void writeDump(const fast_lio::MeasurementScratch & scratch,
       az = A(2);
       const V3D dv = pw - sensor_w;
       cosv = dv.norm() > 1e-6 ? std::abs(n.dot(dv)) / dv.norm() : 0.0;
-      if (telemetry.floor.projected) {
-        w = data.h_x.row(effective_row).head<3>().norm();
-      }
-      ++effective_row;
     }
+    // The w column stays in the layout and reads 1: every row keeps its whole weight.
     outputs.dump_rows << std::setprecision(15) << inputs.scan_end_time << ',' << iter << ',' << i << ',' << int(eff)
                       << std::setprecision(5) << ',' << p_body.norm() << ',' << point_this(0) << ',' << point_this(1)
                       << ',' << point_this(2) << ',' << nx << ',' << ny << ',' << nz << ',' << pd2 << ',' << ax << ','
                       << ay << ',' << az << ',' << nn0 << ',' << nn4 << ',' << n_near << ','
                       << int(scratch.plane_cache[i].valid()) << ',' << plane_rms << ',' << lam0 << ',' << lam1 << ','
-                      << lam2 << ',' << d_in << ',' << cosv << ',' << w << ',' << pw(2) << ',' << pw(0) << ',' << pw(1)
-                      << '\n';
+                      << lam2 << ',' << d_in << ',' << cosv << ",1," << pw(2) << ',' << pw(0) << ',' << pw(1) << '\n';
   }
 }
 }  // namespace
 
-void fast_lio::FrontendMeasurement::applyFloorRows(esekfom::dyn_share_datastruct<double> & data,
-                                                   const std::vector<double> & weights,
-                                                   const std::vector<std::optional<Eigen::Matrix3d>> & covariances,
-                                                   int evaluation_iteration)
-{
-  fast_lio::floorStep(telemetry_.floor.scan.mode,
-                      data.h_x,
-                      data.h,
-                      weights,
-                      covariances,
-                      params_.degeneracy_floor,
-                      params_.degeneracy_params.schur_ridge,
-                      telemetry_.floor);
-  if (params_.degeneracy_floor_mode != fast_lio::FloorMode::kOff) {
-    telemetry_.floor.evaluation_iter = evaluation_iteration;
-  }
-  if (telemetry_.floor.evaluations == 1 && telemetry_.floor.scan.reason == fast_lio::FloorModeReason::kNoWheel) {
-    ++telemetry_.floor_no_wheel_scans;
-  }
-  if (telemetry_.floor.projected) {
-    telemetry_.floor_kept_sum += data.h_x.leftCols(3).rowwise().norm().sum();
-    telemetry_.floor_rows_projected += static_cast<long>(data.h_x.rows());
-  }
-}
-
-void fast_lio::FrontendMeasurement::beginScan(bool wheel_fit)
+void fast_lio::FrontendMeasurement::beginScan()
 {
   telemetry_.match_time = 0;
   telemetry_.match_search_time = 0;
@@ -865,8 +781,6 @@ void fast_lio::FrontendMeasurement::beginScan(bool wheel_fit)
   telemetry_.nn_max_shift = 0.0;
   telemetry_.nn_skips = 0;
   telemetry_.solve_time = 0;
-  telemetry_.floor = fast_lio::FloorScanRecord{};
-  telemetry_.floor.scan = fast_lio::scanFloorMode(params_.degeneracy_floor_mode, wheel_fit);
 }
 
 // Called once at the real downsampled-scan boundary, before any int-indexed
@@ -877,7 +791,6 @@ bool fast_lio::FrontendMeasurement::prepareScan(std::size_t count, int & point_c
     return false;
   if (scratch_.plane_cache.size() < count) {
     scratch_.plane_cache.resize(count);
-    scratch_.point_plane.resize(count, nullptr);
     scratch_.gate_var.resize(count);
     scratch_.gate_nn0.resize(count);
   }
@@ -897,7 +810,7 @@ void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state,
   matchPoints(scratch_, params_, inputs, state, searching, gate_on, gate_P6);
   applyGate(scratch_, telemetry_, params_, inputs, gate_on);
   recoverGround(scratch_, telemetry_, params_, inputs);
-  compactRows(scratch_, telemetry_, params_, inputs, outputs);
+  compactRows(scratch_, telemetry_, inputs, outputs);
 
 #ifdef FASTLIO_TEST_HOOKS
   if (fast_lio_test::afterHModelRows)
@@ -945,12 +858,8 @@ void fast_lio::FrontendMeasurement::evaluate(state_ikfom & state,
   if (params_.degeneracy_spectrum_trace) {
     traceSpectrum(params_, spectrum_clock_, inputs, outputs, data);
   }
-  if (params_.degeneracy_floor_mode != fast_lio::FloorMode::kOff) {
-    prepareFloor(scratch_, outputs);
-    applyFloorRows(data, scratch_.floor_weights, scratch_.floor_cov, outputs.iterations);
-  }
   if (outputs.dump_scan_active && outputs.dump_rows.is_open()) {
-    writeDump(scratch_, telemetry_, inputs, outputs, state, searching, up_body, data);
+    writeDump(scratch_, telemetry_, inputs, outputs, state, searching, up_body);
   }
 
 #ifdef FASTLIO_TEST_HOOKS

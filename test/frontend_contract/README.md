@@ -5,9 +5,8 @@ Inputs and goldens of the two contract fixtures of the legacy front-end node (la
 - `test/test_frontend_parameter_contract_node.cpp`: what the node does with its parameters: the declared
   defaults, the platform profiles (this package's own files and the parent repository's merged profiles), type
   errors, vector lengths, NaN and Inf, prior-map settings, the read-only descriptor, typed outputs with their
-  configuration ID, two invalid values at once, the entry checks of the normal-noise floor and of the wheel
-  measurement model, the floor in
-  observe mode, and the wheel update with its variance topic. Per case it records the configuration
+  configuration ID, two invalid values at once, the entry checks of the wheel measurement model, the normal-noise
+  floor's keys, which are not parameters, and the wheel update with its variance topic. Per case it records the configuration
   (profile path and sha256, every override), whether construction returned or threw (type and text), what
   construction logged at INFO and above with the constructor's stage boundaries between those lines (`event.v1`),
   every declared parameter with type, value and descriptor as the node's parameter services report them, the
@@ -28,84 +27,21 @@ Inputs and goldens of the two contract fixtures of the legacy front-end node (la
   off, each on a synthetic scene that reaches it (three tilted walls, near ground with clutter, a corridor with a
   patch across its end): the correspondence gate's innovation test (`h_gate_innov`) and nearest-neighbour bound
   (`h_gate_nn0`), the neighbour refresh gate's skip and the reuse of the cached planes (`h_nn_refresh`), the ground
-  recovery with sector and whole-scan planes (`h_ground_recovery`), the normal-noise floor applied to the Schur
-  complement with its diagnostics (`h_degeneracy`), online extrinsic estimation on and off (`h_extrinsic_on`,
-  `h_extrinsic_off`), the correspondence dump (`h_dump`) and the H-model keys of the M20 profile with roll/pitch
-  considered (`h_m20`). Every scenario records each H-model call's correspondence selection (`h_select.v1`: the
+  recovery with sector and whole-scan planes (`h_ground_recovery`), online extrinsic estimation on and off
+  (`h_extrinsic_on`, `h_extrinsic_off`), the correspondence dump (`h_dump`) and the H-model keys of the M20 profile
+  with roll/pitch considered (`h_m20`). Every scenario records each H-model call's correspondence selection (`h_select.v1`: the
   search decision, the gate and ground recovery counts, and digests of the selection, the residuals and the rows,
   whose weights are all 1) and its exit (`h_exit.v1`: position information, the removed attitude hold's four fields
-  (0), roll/pitch information and consideration, and in its `degeneracy_*` fields the normal-noise
-  floor's decision with the schema-2 meanings below, and since construction the transformed rows and their actual
-  position-row norms); the dump scenario records
-  its three files (`h_dump.v1`), which the test build writes to the scenario's result directory.
+  (0), roll/pitch information and consideration, and the neutral `degeneracy_*` fields below); the dump scenario
+  records its three files (`h_dump.v1`), which the test build writes to the scenario's result directory.
 
 Lines whose first word is a `.v1` name (`event.v1`, `effective.v1`, `h_matrix.v1`, ...) were added to records
 that existed before them; removing them gives each earlier record unchanged.
 
-## Joint-row floor telemetry
-
-The floor uses `schema=2 rule=joint_row_v1`. Its row contraction acts on all 12 Jacobian columns and the residual
-with the same L. D1 uses the exact rotation Schur M0. `M_ridge` remains a diagnostic of the former definition.
-R36 withdraws the former pure-position deletion guarantee and replaces it with deletion of the joint
-position-rotation mode. R37 accepts jumps at M0 and rotation-support rank boundaries. A nonzero floor with
-rank_m below three is invalid and leaves the rows unchanged. A zero floor is an exact byte-preserving no-op.
-R39 measures position rank against epsilon times the row count times lambda_max(Ht-transpose Ht), before rotation
-elimination. The complement is orthogonalized twice and its rank is bounded by the rows minus the rotation rank.
-
-`h_exit.v1` keeps its existing field names and order. With the mechanism off its values keep their original meanings
-and bytes. With observe or apply enabled, each serialized exit appends `schema=2 rule=joint_row_v1`,
-`gain_order=tau_ascending` and `lambda_gain_pairing=independent`. The floor fields then have these definitions.
-
-| Field | Schema-2 meaning |
-| --- | --- |
-| `degeneracy_engaged` | True only when apply actually commits the row contraction |
-| `degeneracy_lambdas` | Ascending eigenvalues of M0 |
-| `degeneracy_weights` | Generalized gains g_gen, ordered by ascending tau |
-| `degeneracy_shares` | Each M0 eigenvalue divided by the effective row count, or the existing invalid sentinel |
-| `degeneracy_weighted_points` | Cumulative count of rows in committed contractions |
-| `degeneracy_weight_sum` | Cumulative sum of actual transformed position-row norms |
-
-The lambda and gain arrays have independent ordering and their same-index entries are not paired. Each exit record
-carries the identity needed to interpret its compatibility fields. Invalid attempted evaluations
-carry nan gains and empty generalized spectra in the log. The floor-off neutral record retains zero lambdas and
-unit gains. The correspondence dump keeps its columns and ordering. On a projected evaluation its existing `w`
-column contains `floor_row_pos_norm`, the norm of the actual transformed position row. Each projected iteration is
-preceded by `# schema=2 rule=joint_row_v1 column_w=floor_row_pos_norm t=... iter=...`. This versioned mapping applies
-only to rows with the same `(t,iter)` CSV key. Readers map their `w` column to `floor_row_pos_norm`; rows without a
-mapping retain the legacy `w` meaning. An unmatched point has `w=-1`. Row mixing allows an individual row norm to
-grow. Observe and off retain the existing dump values and CSV bytes.
-
-Each enabled frame emits one `[FLOOR]` line after the final snapshot is fixed. All real values use `%.17g` and
-`stamp_ns` uses the same ROS conversion as `/Odometry`. Symmetric matrices use xx,xy,xz,yy,yz,zz and B is row-major
-with position rows and rotation columns. The row units are `normal_equivalent`. S0 excludes kappa and the margin.
-
-| Fields | Meaning |
-| --- | --- |
-| `schema rule mode t stamp_ns evaluation_iter` | Identity, scan end and last H-model iteration that evaluated the floor |
-| `valid reason projected` | Decision validity, failure reason and actual application |
-| `effective_mode mode_reason no_wheel_scans` | The scan's own mode and why, and the scans since start that observed for want of a wheel speed |
-| `points points_without_covariance iterations invalid_iterations` | Row and per-scan evaluation counts |
-| `rank_m rank_r kappa sigma_rel z a m_definition units` | Supports, model constants and exact Schur identity |
-| `M M_ridge S0 lambda tau g_gen K F_sym transform_kind` | Full decision, with F_sym in the symmetric M0-root basis |
-| `u u_source u_valid` | R_world_imu times UnitX from the published frame-end quaternion |
-| `rD_num rD_den rD rD_valid rD_zero_denominator rD_reason` | u-transpose M0 u, u-transpose S0 u and their ratio |
-| `A B C A_keep B_keep C_keep` | Original and candidate-contracted six-state Gram blocks |
-| `shift_kind shift_coords_valid d_t d_r dh_norm` | Apply-only joint-shift diagnostics and actual removed residual norm |
-
-Observe computes the same candidate decision and keep blocks while preserving H and h byte for byte. It omits
-all shift fields. Apply projects only on a scan whose wheel update finds a speed (`fast_lio::scanFloorMode`); any
-other scan observes, `effective_mode=observe mode_reason=no_wheel`, and keeps the shift fields of `mode=apply` with
-`shift_coords_valid=0`, nan d arrays and `dh_norm=0`. The pipeline fixture has no wheel stream: its apply scenario
-tells the scan path every scan has a speed (`overrideScanWheelFit`). Off emits no FLOOR line. Invalid numerical
-fields are nan and invalid tau/g_gen arrays are empty. Successfully computed M0 and S0 remain available when apply
-is invalid, so rD_valid is independent of valid.
-The zero-floor fast path has K=M0, zero tau and unit gains, with spectrum length rank_m. Coordinate overflow marks
-both d arrays nan without rejecting a finite row update. Other invalid applies keep dh_norm zero and commit no rows.
-
-A coordinate-epoch mismatch emits `rD_reason=frame_mismatch`, invalid u and invalid rD. A zero denominator emits a
-per-frame `rD_zero_denominator=1`, which the reader sums separately. All other unavailable ratios retain their
-reason. Calibration readers include every computable ratio, including rank_m-invalid evaluations, and keep M0
-and historical ridge-Schur datasets separate.
+No floor conditions the rows. `h_exit.v1` keeps its `degeneracy_*` fields in their place at neutral values:
+`degeneracy_engaged=0`, unit shares and weights, zero lambdas, `degeneracy_weighted_points=0` and
+`degeneracy_weight_sum=0`. The correspondence dump keeps its columns: the last column of `corr_iter.csv` reads 0
+and the `w` column of `corr_dump.csv` reads 1.
 
 Each case is compared with its golden line for line, character for character. Doubles are written with 17
 significant digits and NaN with its bit pattern; nothing is compared with a tolerance. Masked: the package's

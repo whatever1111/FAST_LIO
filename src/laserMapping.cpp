@@ -7184,7 +7184,7 @@ private:
           if (effct_feat_num > 0) {
             const double n = static_cast<double>(effct_feat_num);
             const Eigen::Vector3d vw(state_point.vel[0], state_point.vel[1], state_point.vel[2]);
-            if (vw.norm() > 0.2) {
+            if (vw.norm() > kHealthSpeedGate) {
               const Eigen::Vector3d d = vw.normalized();
               obs_along = d.dot(measured.pos_obs_M * d) / n;
             }
@@ -7641,7 +7641,7 @@ private:
   int effect_feat_num = 0, frame_num = 0;
   double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0,
                          aver_time_solve = 0, aver_time_const_H_time = 0;
-  double epsi[23] = {0.001};
+  double epsi[23] = {};  // the iEKF's per-component convergence limits; the constructor fills them before use
 
   FileHandle positionLog_;
   ofstream fout_pre, fout_out, fout_dbg, fout_jump, fout_kalman;

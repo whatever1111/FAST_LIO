@@ -5,8 +5,9 @@
 // into the map as usual and still cannot vouch for themselves with points they put there. The evidence is
 // what reanchorMatchOk judges, the effective correspondences and their mean absolute residual, counted by
 // h_share_model's own rules at one state, the scan's final one:
-//   - Count nearest neighbours, the farthest within sqrt(5) m (h_share_model: NUM_MATCH_POINTS, <= 5);
-//   - a plane through them (CachedPlane::fit: threshold 0.1, the square root of the body range);
+//   - Count nearest neighbours, the farthest within sqrt(kMaxNeighbourSquaredDistance) m (h_share_model:
+//     NUM_MATCH_POINTS);
+//   - a plane through them (CachedPlane::fit: kPlaneFitThreshold, the square root of the body range);
 //   - the plane's distance/range test (CachedPlane::evaluate);
 //   - with the correspondence gate on, its innovation and first-neighbour tests (correspondenceAdmitted)
 //     against the update's prior [pos, rot] covariance, floored as h_share_model floors it, and the scan's
@@ -94,10 +95,10 @@ RecoveryViewMatch matchRecoveryView(const BodyPoints & body,
     world.y = static_cast<float>(p_global(1));
     world.z = static_cast<float>(p_global(2));
     search(world, Count, row.near, row.sqdist);
-    if (static_cast<int>(row.near.size()) < Count || !(row.sqdist[Count - 1] <= 5))
+    if (static_cast<int>(row.near.size()) < Count || !(row.sqdist[Count - 1] <= kMaxNeighbourSquaredDistance))
       continue;
     CachedPlane plane;
-    if (!plane.fit<Count>(row.near, 0.1f, static_cast<float>(std::sqrt(p_body.norm()))))
+    if (!plane.fit<Count>(row.near, kPlaneFitThreshold, static_cast<float>(std::sqrt(p_body.norm()))))
       continue;
     const PlaneResidual residual = plane.evaluate(world.x, world.y, world.z);
     if (!residual.accepted)

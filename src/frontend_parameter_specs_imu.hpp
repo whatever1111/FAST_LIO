@@ -1,30 +1,36 @@
 #pragma once
 
-#include "frontend_gravity.hpp"
-
 #include <string>
 #include <vector>
 
 #include "frontend_parameter_spec.hpp"
+#include "imu_static_init_gate.hpp"
 
 namespace fast_lio
 {
 /// IMU initialisation, noise, coverage and gap priors, and the lidar-IMU extrinsics.
 /// One spec per parameter, in declaration order, named after the parameter with '.' written '_'. FrontendParameters
-/// declares and reads them in the constructor's original order, not domain by domain.
+/// declares and reads them in the constructor's original order, not domain by domain. The sustained still-window
+/// gate's parameters default to its own ImuStaticInitParams.
 struct ImuParameterSpecs
 {
   const ParameterSpec<bool> imu_init_require_still{"imu_init_require_still", false, false};
   const ParameterSpec<double> imu_init_still_tol{"imu_init_still_tol", 0.03, 0.03};
   const ParameterSpec<double> imu_init_still_timeout_s{"imu_init_still_timeout_s", 20.0, 20.0};
-  const ParameterSpec<bool> imu_init_still_sustained_en{"imu_init_still_sustained_en", false, false};
-  const ParameterSpec<double> imu_init_still_min_duration_s{"imu_init_still_min_duration_s", 1.0, 1.0};
-  const ParameterSpec<int> imu_init_still_min_samples{"imu_init_still_min_samples", 100, 100};
-  const ParameterSpec<double> imu_init_still_gyro_rms_max{"imu_init_still_gyro_rms_max", 0.1, 0.1};
+  const ParameterSpec<bool> imu_init_still_sustained_en{
+    "imu_init_still_sustained_en", ImuStaticInitParams{}.enabled, ImuStaticInitParams{}.enabled};
+  const ParameterSpec<double> imu_init_still_min_duration_s{
+    "imu_init_still_min_duration_s", ImuStaticInitParams{}.minDurationS, ImuStaticInitParams{}.minDurationS};
+  const ParameterSpec<int> imu_init_still_min_samples{
+    "imu_init_still_min_samples", ImuStaticInitParams{}.minSamples, ImuStaticInitParams{}.minSamples};
+  const ParameterSpec<double> imu_init_still_gyro_rms_max{
+    "imu_init_still_gyro_rms_max", ImuStaticInitParams{}.gyroRmsMax, ImuStaticInitParams{}.gyroRmsMax};
   const ParameterSpec<double> imu_init_still_gravity_ref{
-    "imu_init_still_gravity_ref", kDefaultRawImuStillGravity, kDefaultRawImuStillGravity};
-  const ParameterSpec<double> imu_init_still_gravity_tol{"imu_init_still_gravity_tol", 0.05, 0.05};
-  const ParameterSpec<double> imu_init_still_max_gap_s{"imu_init_still_max_gap_s", 0.1, 0.1};
+    "imu_init_still_gravity_ref", ImuStaticInitParams{}.gravityRef, ImuStaticInitParams{}.gravityRef};
+  const ParameterSpec<double> imu_init_still_gravity_tol{
+    "imu_init_still_gravity_tol", ImuStaticInitParams{}.gravityTol, ImuStaticInitParams{}.gravityTol};
+  const ParameterSpec<double> imu_init_still_max_gap_s{
+    "imu_init_still_max_gap_s", ImuStaticInitParams{}.maxGapS, ImuStaticInitParams{}.maxGapS};
   const ParameterSpec<double> mapping_gyr_cov{"mapping.gyr_cov", 0.1, 0.1};
   const ParameterSpec<double> mapping_acc_cov{"mapping.acc_cov", 0.1, 0.1};
   const ParameterSpec<double> mapping_b_gyr_cov{"mapping.b_gyr_cov", 0.0001, 0.0001};

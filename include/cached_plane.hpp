@@ -5,6 +5,12 @@
 namespace fast_lio
 {
 
+// The correspondence rule of the lidar update (h_share_model), which the recovery view repeats
+// (recovery_view_match.hpp): the farthest of the nearest map points lies within sqrt(kMaxNeighbourSquaredDistance) m
+// of the point, and the plane through them passes within kPlaneFitThreshold m of each of them (CachedPlane::fit).
+inline constexpr float kMaxNeighbourSquaredDistance = 5.0f;  // m²
+inline constexpr float kPlaneFitThreshold = 0.1f;            // m
+
 struct PlaneResidual
 {
   float distance = 0.0f;

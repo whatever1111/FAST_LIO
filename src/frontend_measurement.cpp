@@ -237,8 +237,9 @@ void matchPoints(fast_lio::MeasurementScratch & scratch,
           inputs.map, point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis, scratch.Nearest_Identities[i]);
       else
         inputs.map.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
-      if (points_near.size() >= NUM_MATCH_POINTS && pointSearchSqDis[NUM_MATCH_POINTS - 1] <= 5) {
-        cached_plane.fit<NUM_MATCH_POINTS>(points_near, 0.1f, std::sqrt(p_body.norm()));
+      if (points_near.size() >= NUM_MATCH_POINTS &&
+          pointSearchSqDis[NUM_MATCH_POINTS - 1] <= fast_lio::kMaxNeighbourSquaredDistance) {
+        cached_plane.fit<NUM_MATCH_POINTS>(points_near, fast_lio::kPlaneFitThreshold, std::sqrt(p_body.norm()));
       }
     }
 

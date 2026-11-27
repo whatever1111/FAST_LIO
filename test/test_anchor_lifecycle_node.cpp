@@ -6883,9 +6883,17 @@ TEST(AnchorLifecycleReference, FaultExitEndsTheScanWithAnIndependentDdsObserver)
         stamps.begin(), stamps.end(), [&](auto ns) { return msKey(ns * 1e-9) == msKey(trip.end_ns * 1e-9); });
     };
     EXPECT_EQ(trip.published, policy == "hold");
+    // /Odometry is reliable: the observer receives the trip scan exactly when it was published.
     EXPECT_EQ(containsTrip(legacy), policy == "hold");
-    EXPECT_EQ(containsTrip(typed), policy == "hold");
+    // FrontendObservation is best effort with depth 1, the product's inter-node QoS, so a busy host may
+    // drop any one frame. Whether the trip scan went out in it is read from the producer's own receipt.
+    const bool typed_trip_sent =
+      std::any_of(result.pose_publications.begin(), result.pose_publications.end(), [&](const auto & publication) {
+        return publication.encoding == 1 && msKey(publication.stamp_ns * 1e-9) == msKey(trip.end_ns * 1e-9);
+      });
+    EXPECT_EQ(typed_trip_sent, policy == "hold");
     if (policy == "fault_exit") {
+      EXPECT_FALSE(containsTrip(typed));
       for (const auto & publication : result.pose_publications)
         EXPECT_NE(msKey(publication.stamp_ns * 1e-9), msKey(trip.end_ns * 1e-9));
     }

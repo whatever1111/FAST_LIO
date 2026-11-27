@@ -25,7 +25,7 @@ Inputs and goldens of the two contract fixtures of the legacy front-end node (la
   fixed repeat clock. The scenarios set `mapping.extrinsic_est_en` to true, which is off by default, so the recorded
   Jacobian keeps its extrinsic columns; `h_extrinsic_off` and `h_m20` set it false.
   The measurement scenarios (`h_*`, laserMapping S2) turn on the H-model branches the default configuration leaves
-  off, each on a synthetic scene that reaches it (three tilted walls, a corridor with a patch across its end): the
+  off, each on a synthetic scene that reaches it (three tilted walls): the
   correspondence gate's innovation test (`h_gate_innov`) and nearest-neighbour bound (`h_gate_nn0`), the neighbour
   refresh gate's skip and the reuse of the cached planes (`h_nn_refresh`), online extrinsic estimation on and off
   (`h_extrinsic_on`, `h_extrinsic_off`), the correspondence dump (`h_dump`) and the H-model keys of the M20 profile

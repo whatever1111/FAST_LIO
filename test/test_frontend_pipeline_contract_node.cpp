@@ -49,9 +49,9 @@
 // each. A record is compared with its golden line for line, character for character, with no tolerance anywhere.
 //
 // The measurement scenarios (h_*, laserMapping S2) turn on the H-model branches the default configuration leaves off,
-// each on a synthetic scene built to reach it: three tilted walls 4-6 m away, near ground with clutter below walls, a
-// corridor with a patch across its end. A scene's points sit on a fixed grid and move along their surface normals by
-// noise drawn from the scan's start time, new in every scan and the same in every run.
+// each on a synthetic scene built to reach it: three tilted walls 4-6 m away, or near ground with clutter below walls.
+// A scene's points sit on a fixed grid and move along their surface normals by noise drawn from the scan's start time,
+// new in every scan and the same in every run.
 //
 // What makes a record reproducible: the map worker is off (FLIO_ASYNC_MAP=0) except in the worker suite, OpenMP runs
 // one thread, and the scan path runs (the fixture waits for its timer to come due and lets the executor run it) after
@@ -727,7 +727,6 @@ enum class Cloud : std::uint8_t
   kNone,      // no scan this period
   kRoom,      // three steep, tilted, non-parallel walls 4-6 m away: every position and attitude direction observed
   kGround,    // the ground 0.8 m below, a third of it clutter 0.2-0.5 m high, and the room's walls above it
-  kCorridor,  // two parallel walls 3.2 m apart and a small patch across its end: nothing vertical, little along it
   kLongSpan,  // the dense scene with a declared 300 ms span, beyond the scenario's configured 200 ms sync guard
 };
 
@@ -748,8 +747,6 @@ const char * cloudName(Cloud cloud)
       return "room";
     case Cloud::kGround:
       return "ground";
-    case Cloud::kCorridor:
-      return "corridor";
     case Cloud::kLongSpan:
       return "long_span";
   }
@@ -858,26 +855,6 @@ std::vector<Point3> scenePoints(Cloud kind, std::int64_t seed, bool outliers)
     }
     for (const auto & wall : kGroundWalls)
       appendPatch(out, wall, seed, false);
-  } else if (kind == Cloud::kCorridor) {
-    // The walls 12 m long and 2.4 m high; the patch, 4 x 3 points 0.15 m apart, 0.5 m past the walls' end.
-    for (const double side : {1.6, -1.6}) {
-      for (int r = 0; r < 20; ++r) {
-        for (int c = 0; c < 50; ++c) {
-          const std::size_t index = out.size();
-          out.push_back({static_cast<float>(-6.0 + 12.0 * c / 49),
-                         static_cast<float>(side + surfaceNoise(seed, index)),
-                         static_cast<float>(-0.8 + 2.4 * r / 19)});
-        }
-      }
-    }
-    for (int r = 0; r < 3; ++r) {
-      for (int c = 0; c < 4; ++c) {
-        const std::size_t index = out.size();
-        out.push_back({static_cast<float>(6.5 + surfaceNoise(seed, index)),
-                       static_cast<float>(-0.225 + 0.15 * c),
-                       static_cast<float>(0.25 + 0.15 * r)});
-      }
-    }
   }
   return out;
 }
@@ -2186,7 +2163,7 @@ private:
   // start, so a repeated scan carries the same points.
   void sendLidar(double start, Cloud kind, bool outliers)
   {
-    const bool scene = kind == Cloud::kRoom || kind == Cloud::kGround || kind == Cloud::kCorridor;
+    const bool scene = kind == Cloud::kRoom || kind == Cloud::kGround;
     const std::vector<Point3> scene_points = scene ? scenePoints(kind, msKey(start), outliers) : std::vector<Point3>();
     const std::size_t points = scene ? scene_points.size()
                                : kind == Cloud::kDense || kind == Cloud::kFar || kind == Cloud::kLongSpan ? kScanPoints

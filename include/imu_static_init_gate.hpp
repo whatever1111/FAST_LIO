@@ -11,9 +11,11 @@
 namespace fast_lio
 {
 
+// The IMU initialisation waits for a window that shows the platform still: long enough, with enough samples, without
+// gaps, at rest in gyro and in accelerometer scatter, and with the raw gravity magnitude. Every product takes it;
+// past the attempt's timeout the caller initialises from the window it has and latches the initialisation degraded.
 struct ImuStaticInitParams
 {
-  bool enabled = false;
   double minDurationS = 1.0;
   int minSamples = 100;
   double gyroRmsMax = 0.1;   // rad/s
@@ -31,11 +33,6 @@ inline bool validImuStaticInitParams(const ImuStaticInitParams & params)
          positive(params.gravityRef) && positive(params.gravityTol) && positive(params.maxGapS);
 }
 
-inline bool imuStaticInitActive(bool requireStill, const ImuStaticInitParams & params)
-{
-  return requireStill && params.enabled;
-}
-
 struct ImuStaticInitSample
 {
   double stamp = 0.0;
@@ -45,7 +42,6 @@ struct ImuStaticInitSample
 
 enum class ImuStaticInitDecision
 {
-  kDisabled,
   kAccumulating,
   kRestart,
   kReady,
@@ -53,9 +49,9 @@ enum class ImuStaticInitDecision
 };
 
 // Cell 5 is diagnostic only, independent of the pose-health flag bits.
-inline double imuInitDegradedCell(bool gateActive, bool degraded)
+inline double imuInitDegradedCell(bool degraded)
 {
-  return gateActive && degraded ? 1.0 : 0.0;
+  return degraded ? 1.0 : 0.0;
 }
 
 class ImuStaticInitGate
@@ -75,15 +71,11 @@ public:
   template<class Range, class SampleOf>
   ImuStaticInitDecision observe(const Range & batch,
                                 SampleOf sampleOf,
-                                bool requireStill,
                                 const ImuStaticInitParams & params,
                                 double scatterTol,
                                 double elapsedS,
                                 double timeoutS)
   {
-    if (!imuStaticInitActive(requireStill, params)) {
-      return ImuStaticInitDecision::kDisabled;
-    }
     Moments batchMoments;
     bool continuous = true;
     for (const auto & entry : batch) {

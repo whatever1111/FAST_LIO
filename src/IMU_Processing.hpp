@@ -122,14 +122,14 @@ class ImuProcess
   // Quasi-static init gate (2026-08-31, m20_0831): initializing gravity from a
   // WALKING accel mean tilted the world frame 6.5-7 deg for the entire run —
   // every later observation is frame-relative, nothing can re-level the map
-  // post hoc (measured: plane-fit tilt 6.5 deg, residual Z RMS 4 cm). When
-  // enabled, the init accumulator restarts until the accel-norm scatter says
-  // the platform is still; after init_still_timeout_s it proceeds with a WARN.
-  bool   init_require_still = false;
+  // post hoc (measured: plane-fit tilt 6.5 deg, residual Z RMS 4 cm). So the
+  // init accumulator restarts until the sustained still window
+  // (imu_static_init_gate.hpp) says the platform is still; after
+  // init_still_timeout_s it initialises from the window it has, latches
+  // initializationDegraded() and warns.
   double init_still_tol = 0.03;        // sqrt(tr(cov_acc))/|mean_acc| threshold
-  double init_still_timeout_s = 20.0;  // fall back to legacy init after this
+  double init_still_timeout_s = 20.0;  // initialise degraded after this
   fast_lio::ImuStaticInitParams init_static_params;
-  bool sustainedInitActive() const { return fast_lio::imuStaticInitActive(init_require_still, init_static_params); }
   bool initializationDegraded() const { return initialization_degraded_; }
   V3D cov_acc;
   V3D cov_gyr;
@@ -191,8 +191,7 @@ class ImuProcess
    // consumed-scan guard and the initialization attempt clock.
    void discardInitializationWindow()
    {
-     if (sustainedInitActive())
-       init_static_gate_.reset();
+     init_static_gate_.reset();
      b_first_frame_ = true;
      init_iter_num = 0;
      mean_acc.setZero();
@@ -294,8 +293,7 @@ void ImuProcess::Reset()
   stale_output_reuse_count_ = 0;
   frame_tail_counts_ = {};
   b_first_frame_ = true;
-  if (sustainedInitActive())
-    init_static_gate_.reset();
+  init_static_gate_.reset();
   acc_s_last = Zero3d;
 }
 
@@ -893,7 +891,7 @@ bool ImuProcess::Process(const MeasureGroup & meas,
 
   for (const auto & imu : meas.imu) {
     if (!validImuForConsumption(imu)) {
-      if (imu_need_init_ && sustainedInitActive())
+      if (imu_need_init_)
         discardInitializationWindow();
       return finish(fast_lio::ImuDisposition::kInvalid, fast_lio::ImuProcessReason::kInvalidImu);
     }
@@ -920,48 +918,35 @@ bool ImuProcess::Process(const MeasureGroup & meas,
       return finish(initialization.disposition, initialization.reason);
     }
 
-    fast_lio::ImuStaticInitDecision sustained = fast_lio::ImuStaticInitDecision::kDisabled;
-    if (sustainedInitActive()) {
-      sustained = init_static_gate_.observe(
-        meas.imu,
-        [](const auto & imu) {
-          return fast_lio::ImuStaticInitSample{
-            rclcpp::Time(imu->header.stamp).seconds(),
-            V3D(imu->linear_acceleration.x, imu->linear_acceleration.y, imu->linear_acceleration.z),
-            V3D(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z)};
-        },
-        init_require_still,
-        init_static_params,
-        init_still_tol,
-        meas.lidar_beg_time - initialization_attempt_start_,
-        init_still_timeout_s);
-      if (sustained == fast_lio::ImuStaticInitDecision::kRestart) {
-        std::cerr << "[IMU-INIT] motion detected during init (sustained still-window gate) — restarting init window"
-                  << std::endl;
-        b_first_frame_ = true;
-        init_iter_num = 0;
-        return finish(fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationMotion);
-      }
-      if (sustained == fast_lio::ImuStaticInitDecision::kAccumulating)
-        return finish(fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationAccumulated);
+    const fast_lio::ImuStaticInitDecision sustained = init_static_gate_.observe(
+      meas.imu,
+      [](const auto & imu) {
+        return fast_lio::ImuStaticInitSample{
+          rclcpp::Time(imu->header.stamp).seconds(),
+          V3D(imu->linear_acceleration.x, imu->linear_acceleration.y, imu->linear_acceleration.z),
+          V3D(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z)};
+      },
+      init_static_params,
+      init_still_tol,
+      meas.lidar_beg_time - initialization_attempt_start_,
+      init_still_timeout_s);
+    if (sustained == fast_lio::ImuStaticInitDecision::kRestart) {
+      std::cerr << "[IMU-INIT] motion detected during init (sustained still-window gate) — restarting init window"
+                << std::endl;
+      b_first_frame_ = true;
+      init_iter_num = 0;
+      return finish(fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationMotion);
     }
+    if (sustained == fast_lio::ImuStaticInitDecision::kAccumulating)
+      return finish(fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationAccumulated);
 
     state_ikfom imu_state = kf_state.get_x();
     if (init_iter_num >= MAX_INI_COUNT || sustained == fast_lio::ImuStaticInitDecision::kReady) {
       const double still_ratio = mean_acc.norm() > 1e-6 ? std::sqrt(cov_acc.sum()) / mean_acc.norm() : 1e9;
       const bool timed_out = (meas.lidar_beg_time - initialization_attempt_start_) > init_still_timeout_s;
-      if (!sustainedInitActive() && init_require_still && still_ratio > init_still_tol && !timed_out) {
-        // platform is moving: restart the accumulation window and keep waiting
-        std::cerr << "[IMU-INIT] motion detected during init (scatter " << still_ratio
-                  << " > " << init_still_tol << ") — restarting init window" << std::endl;
-        b_first_frame_ = true;   // next IMU_init call re-seeds mean/cov from fresh samples
-        init_iter_num = 0;
-        return finish(fast_lio::ImuDisposition::kCommitted, fast_lio::ImuProcessReason::kInitializationMotion);
-      }
       if (sustained == fast_lio::ImuStaticInitDecision::kDegraded)
         initialization_degraded_ = true;
-      if ((init_require_still && timed_out && still_ratio > init_still_tol) ||
-          sustained == fast_lio::ImuStaticInitDecision::kDegraded)
+      if ((timed_out && still_ratio > init_still_tol) || sustained == fast_lio::ImuStaticInitDecision::kDegraded)
         std::cerr << "[IMU-INIT] WARN still-gate timeout after " << init_still_timeout_s
                   << " s — initializing from a MOVING mean (gravity may be tilted; scatter "
                   << still_ratio << ")" << std::endl;

@@ -427,7 +427,10 @@ Scenario baseParams(const std::string & name, bool trace)
         rclcpp::Parameter("point_filter_num", 1),
         rclcpp::Parameter("filter_size_surf", 0.001),
         rclcpp::Parameter("filter_size_map", 0.05),
-        rclcpp::Parameter("imu_init_require_still", false),
+        // The IMU still window's shortest form: the first scan's ten still samples initialise. The cases about the
+        // window take the product's (coldStart).
+        rclcpp::Parameter("imu_init_still_min_samples", 10),
+        rclcpp::Parameter("imu_init_still_min_duration_s", 0.001),
         rclcpp::Parameter("publish.scan_publish_en", false),
         rclcpp::Parameter("publish.path_en", false),
         rclcpp::Parameter("runtime_pos_log_enable", false),
@@ -3550,8 +3553,8 @@ Scenario coldStart(int moving, bool parks, bool trace = true)
     trace);
   s.warm_up = false;
   setPolicy(s, kStartupBudget, 1.0);
-  setParam(s, rclcpp::Parameter("imu_init_require_still", true));
-  setParam(s, rclcpp::Parameter("imu_init_still_sustained_en", true));
+  setParam(s, rclcpp::Parameter("imu_init_still_min_samples", 100));
+  setParam(s, rclcpp::Parameter("imu_init_still_min_duration_s", 1.0));
   setParam(s, rclcpp::Parameter("imu_init_still_tol", 0.03));
   setParam(s, rclcpp::Parameter("imu_init_still_timeout_s", kStillTimeout));
   appendStartupGap(s);

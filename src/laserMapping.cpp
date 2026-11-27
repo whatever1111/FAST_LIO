@@ -3497,8 +3497,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   // same-scan. The twist covariance was always zero here and has no other
   // consumer. Layout contract:
   // LIO-SLAM core pgo_factor_kernels.hpp kFeHealth*Cell.
-  odomAftMapped.twist.covariance[5] =
-    fast_lio::imuInitDegradedCell(p_imu->sustainedInitActive(), p_imu->initializationDegraded());
+  odomAftMapped.twist.covariance[5] = fast_lio::imuInitDegradedCell(p_imu->initializationDegraded());
   odomAftMapped.twist.covariance[0] = 1.0;  // sentinel/version
   exportLostRecoveryEpoch(final);
   // Flags say what the front end did about this scan, which is what a
@@ -3865,7 +3864,6 @@ public:
     M3D Lidar_R_wrt_IMU(Eye3d);
     Lidar_T_wrt_IMU << VEC_FROM_ARRAY(startup.extrinT);
     Lidar_R_wrt_IMU << MAT_FROM_ARRAY(startup.extrinR);
-    p_imu->init_require_still = startup.imu_init_require_still;
     p_imu->init_still_tol = startup.imu_init_still_tol;
     p_imu->init_still_timeout_s = startup.imu_init_still_timeout_s;
     p_imu->init_static_params = startup.imu_init_static_params;
@@ -4726,11 +4724,9 @@ private:
     record.bytes("derived:config_id:reference_config_id", reference_config_id);
     record.windows("derived:corr_dump:corr_dump_windows", params_.values().corr_dump_windows);
     record.matrix("derived:lever_arm:gravity_align_leg_lever_arm", params_.values().gravity_align_leg_lever_arm);
-    record.value("derived:imu_static_limits:p_imu->init_require_still", p_imu->init_require_still);
     record.value("derived:imu_static_limits:p_imu->init_still_tol", p_imu->init_still_tol);
     record.value("derived:imu_static_limits:p_imu->init_still_timeout_s", p_imu->init_still_timeout_s);
     const fast_lio::ImuStaticInitParams & init_static = p_imu->init_static_params;
-    record.value("derived:imu_static_limits:p_imu->init_static_params.enabled", init_static.enabled);
     record.value("derived:imu_static_limits:p_imu->init_static_params.minDurationS", init_static.minDurationS);
     record.value("derived:imu_static_limits:p_imu->init_static_params.minSamples", init_static.minSamples);
     record.value("derived:imu_static_limits:p_imu->init_static_params.gyroRmsMax", init_static.gyroRmsMax);

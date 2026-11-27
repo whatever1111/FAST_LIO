@@ -130,7 +130,9 @@ protected:
        rclcpp::Parameter("point_filter_num", 1),
        rclcpp::Parameter("filter_size_surf", 0.001),
        rclcpp::Parameter("filter_size_map", 0.05),
-       rclcpp::Parameter("imu_init_require_still", false),
+       // The IMU still window's shortest form: the first scan's ten still samples initialise.
+       rclcpp::Parameter("imu_init_still_min_samples", 10),
+       rclcpp::Parameter("imu_init_still_min_duration_s", 0.001),
 #ifdef FASTLIO_INPUT_FAULT_TEST
        rclcpp::Parameter("max_imu_backlog_sec", 1.0),
 #endif

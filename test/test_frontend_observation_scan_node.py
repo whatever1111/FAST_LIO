@@ -138,7 +138,9 @@ def test_real_scans_idle_duplicate_rollback_restart():
             "point_filter_num": "1",
             "filter_size_surf": "0.001",
             "filter_size_map": "0.05",
-            "imu_init_require_still": "false",
+            # The IMU still window's shortest form: the first scan's ten still samples initialise.
+            "imu_init_still_min_samples": "10",
+            "imu_init_still_min_duration_s": "0.001",
             "publish.scan_publish_en": "false",
             "publish.path_en": "false",
             "runtime_pos_log_enable": "false",

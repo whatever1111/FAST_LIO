@@ -23,10 +23,9 @@ struct GateFixture
 {
   fast_lio::ImuStaticInitGate gate;
   fast_lio::ImuStaticInitParams params;
-  GateFixture() { params.enabled = true; }
-  Decision observe(const std::vector<Sample> & batch, double elapsed = 0.0, bool require = true)
+  Decision observe(const std::vector<Sample> & batch, double elapsed = 0.0)
   {
-    return gate.observe(batch, [](const Sample & sample) { return sample; }, require, params, 0.03, elapsed, 20.0);
+    return gate.observe(batch, [](const Sample & sample) { return sample; }, params, 0.03, elapsed, 20.0);
   }
 };
 }  // namespace
@@ -132,26 +131,18 @@ TEST(ImuStaticInitGate, T09TimeoutUsesStrictlyGreaterAndDegradesFirstLateBatch)
   EXPECT_EQ(f.observe(stillBatch(2.0, 1.0, 100, 0.11), 20.01), Decision::kDegraded);
 }
 
-TEST(ImuStaticInitGate, T10DisabledGateDoesNotReadSamplesOrParticipate)
+TEST(ImuStaticInitGate, T10DefaultParametersReadEverySampleIntoTheWindow)
 {
-  GateFixture f;
+  fast_lio::ImuStaticInitGate gate;
   const auto batch = stillBatch(0.0, 1.0, 201);
   std::size_t sampleCalls = 0;
   const auto sampleOf = [&sampleCalls](const Sample & sample) {
     ++sampleCalls;
     return sample;
   };
-  f.params.enabled = false;
-  EXPECT_EQ(f.gate.observe(batch, sampleOf, true, f.params, 0.03, 100.0, 20.0), Decision::kDisabled);
-  EXPECT_EQ(sampleCalls, 0u);
-  EXPECT_EQ(f.gate.samples(), 0u);
-  f.params.enabled = true;
-  EXPECT_EQ(f.gate.observe(batch, sampleOf, false, f.params, 0.03, 100.0, 20.0), Decision::kDisabled);
-  EXPECT_EQ(sampleCalls, 0u);
-  EXPECT_EQ(f.gate.samples(), 0u);
-  EXPECT_EQ(f.gate.observe(batch, sampleOf, true, f.params, 0.03, 1.0, 20.0), Decision::kReady);
+  EXPECT_EQ(gate.observe(batch, sampleOf, fast_lio::ImuStaticInitParams{}, 0.03, 1.0, 20.0), Decision::kReady);
   EXPECT_EQ(sampleCalls, batch.size());
-  EXPECT_EQ(f.gate.samples(), batch.size());
+  EXPECT_EQ(gate.samples(), batch.size());
 }
 
 TEST(ImuStaticInitGate, T11MovingThenStillBeforeTimeoutIsNormal)
@@ -184,11 +175,10 @@ TEST(ImuStaticInitGate, T12InvalidParametersAreRejected)
   EXPECT_FALSE(fast_lio::validImuStaticInitParams(valid));
 }
 
-TEST(ImuStaticInitGate, T16DiagnosticCellRequiresActiveGateAndDegradedLatch)
+TEST(ImuStaticInitGate, T16DiagnosticCellFollowsTheDegradedLatch)
 {
-  for (bool active : {false, true})
-    for (bool degraded : {false, true})
-      EXPECT_DOUBLE_EQ(fast_lio::imuInitDegradedCell(active, degraded), active && degraded ? 1.0 : 0.0);
+  EXPECT_DOUBLE_EQ(fast_lio::imuInitDegradedCell(false), 0.0);
+  EXPECT_DOUBLE_EQ(fast_lio::imuInitDegradedCell(true), 1.0);
 }
 
 TEST(ImuStaticInitGate, T19LateReadyWindowTakesPriorityOverStrictTimeout)

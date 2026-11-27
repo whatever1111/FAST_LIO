@@ -1521,6 +1521,27 @@ TEST(FrontendParameterContract, NormalNoiseFloorKeysAreNotParameters)
   EXPECT_EQ(record.find("[FLOOR]"), std::string::npos) << record;
 }
 
+// The IMU initialisation always waits for the still window: neither key that turned it off is a parameter, so
+// overrides that would have construct the node without a parameter or an effective value of theirs, and the IMU
+// processing takes the window's defaults.
+TEST(FrontendParameterContract, ImuInitStillSwitchKeysAreNotParameters)
+{
+  const std::vector<rclcpp::Parameter> retired = {rclcpp::Parameter("imu_init_require_still", false),
+                                                  rclcpp::Parameter("imu_init_still_sustained_en", false)};
+  ParameterCase c = overridesCase("imu_init_switch_keys_not_parameters", Expect::kConstructed);
+  for (const auto & parameter : retired)
+    setOverride(c, parameter);
+  std::string record;
+  checkCase(c, &record);
+  for (const auto & parameter : retired) {
+    EXPECT_EQ(record.find("\nparam " + parameter.get_name() + " "), std::string::npos) << parameter.get_name();
+    EXPECT_TRUE(effectiveValue(record, parameter.get_name()).empty()) << parameter.get_name();
+  }
+  EXPECT_EQ(effectiveValue(record, "derived:imu_static_limits:p_imu->init_static_params.minSamples"), "100");
+  EXPECT_EQ(effectiveValue(record, "derived:imu_static_limits:p_imu->init_static_params.minDurationS"),
+            "0x3ff0000000000000");  // 1.0 s
+}
+
 TEST(FrontendParameterContract, WheelLeverArmLength)
 {
   checkRefused(

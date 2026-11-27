@@ -91,10 +91,8 @@ void FrontendParameters::declareGravityToConsider(rclcpp::Node & node)
   declareOnly(node, constraints.gravity_align_leg_vel_sigma);
   declareOnly(node, constraints.gravity_align_leg_edge_window_s);
   declareOnly(node, constraints.gravity_align_leg_lever_arm);
-  declareOnly(node, imu.imu_init_require_still);
   declareOnly(node, imu.imu_init_still_tol);
   declareOnly(node, imu.imu_init_still_timeout_s);
-  declareOnly(node, imu.imu_init_still_sustained_en);
   declareOnly(node, imu.imu_init_still_min_duration_s);
   declareOnly(node, imu.imu_init_still_min_samples);
   declareOnly(node, imu.imu_init_still_gyro_rms_max);
@@ -420,10 +418,8 @@ void FrontendParameters::readResetSigmasAndGravity(const rclcpp::Node & node, do
 void FrontendParameters::readImuInit(const rclcpp::Node & node, FrontendStartup & startup)
 {
   const ImuParameterSpecs imu{};
-  readInto(node, imu.imu_init_require_still, startup.imu_init_require_still);
   readInto(node, imu.imu_init_still_tol, startup.imu_init_still_tol);
   readInto(node, imu.imu_init_still_timeout_s, startup.imu_init_still_timeout_s);
-  readInto(node, imu.imu_init_still_sustained_en, startup.imu_init_static_params.enabled);
   readInto(node, imu.imu_init_still_min_duration_s, startup.imu_init_static_params.minDurationS);
   readInto(node, imu.imu_init_still_min_samples, startup.imu_init_static_params.minSamples);
   readInto(node, imu.imu_init_still_gyro_rms_max, startup.imu_init_static_params.gyroRmsMax);
@@ -432,17 +428,12 @@ void FrontendParameters::readImuInit(const rclcpp::Node & node, FrontendStartup 
   readInto(node, imu.imu_init_still_max_gap_s, startup.imu_init_static_params.maxGapS);
   if (!fast_lio::validImuStaticInitParams(startup.imu_init_static_params))
     throw std::invalid_argument("imu_init_still sustained-window limits must be finite and positive");
-  if (fast_lio::imuStaticInitActive(startup.imu_init_require_still, startup.imu_init_static_params) &&
-      (!std::isfinite(startup.imu_init_still_tol) || startup.imu_init_still_tol <= 0.0 ||
-       !std::isfinite(startup.imu_init_still_timeout_s) || startup.imu_init_still_timeout_s <= 0.0))
+  if (!std::isfinite(startup.imu_init_still_tol) || startup.imu_init_still_tol <= 0.0 ||
+      !std::isfinite(startup.imu_init_still_timeout_s) || startup.imu_init_still_timeout_s <= 0.0)
     throw std::invalid_argument("imu_init_still_tol and imu_init_still_timeout_s must be finite and positive");
-  if (startup.imu_init_static_params.enabled && !startup.imu_init_require_still)
-    RCLCPP_WARN(node.get_logger(), "imu_init_still_sustained_en requires imu_init_require_still; gate is inactive");
 #ifdef FASTLIO_TEST_HOOKS
-  locals_for_test_.value("imu_init_require_still", startup.imu_init_require_still);
   locals_for_test_.value("imu_init_still_tol", startup.imu_init_still_tol);
   locals_for_test_.value("imu_init_still_timeout_s", startup.imu_init_still_timeout_s);
-  locals_for_test_.value("imu_init_still_sustained_en", startup.imu_init_static_params.enabled);
   locals_for_test_.value("imu_init_still_min_duration_s", startup.imu_init_static_params.minDurationS);
   locals_for_test_.value("imu_init_still_min_samples", startup.imu_init_static_params.minSamples);
   locals_for_test_.value("imu_init_still_gyro_rms_max", startup.imu_init_static_params.gyroRmsMax);

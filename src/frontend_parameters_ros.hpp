@@ -25,8 +25,7 @@ namespace fast_lio
 struct FrontendStartup
 {
   int num_max_iterations = 0;
-  bool imu_init_require_still = false;  // quasi-static IMU-init gate (see IMU_Processing.hpp)
-  double imu_init_still_tol = 0.03;
+  double imu_init_still_tol = 0.03;  // the quasi-static IMU-init gate (see IMU_Processing.hpp)
   double imu_init_still_timeout_s = 20.0;
   fast_lio::ImuStaticInitParams imu_init_static_params;
   double zupt_anchor_max_scan_gap_s = 0.0;

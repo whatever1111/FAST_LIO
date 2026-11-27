@@ -654,6 +654,9 @@ DeskewResult actualDeskew(const Vector23 & perturbation)
   using Filter = esekfom::esekf<state_ikfom, kProcessNoiseDof, input_ikfom>;
   ImuProcess process;
   Filter filter;
+  // The still window's shortest form: the first scan's still samples initialise.
+  process.init_static_params.minSamples = MAX_INI_COUNT;
+  process.init_static_params.minDurationS = 1e-3;
   process.coverage_params = {2.0, kInputVariance};
   process.set_acc_cov(V3D::Constant(kInputVariance));
   process.set_gyr_cov(V3D::Constant(kInputVariance));

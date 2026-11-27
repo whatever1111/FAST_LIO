@@ -11,14 +11,11 @@ namespace fast_lio
 /// IMU initialisation, noise, coverage and gap priors, and the lidar-IMU extrinsics.
 /// One spec per parameter, in declaration order, named after the parameter with '.' written '_'. FrontendParameters
 /// declares and reads them in the constructor's original order, not domain by domain. The sustained still-window
-/// gate's parameters default to its own ImuStaticInitParams.
+/// gate, which every product takes, has its parameters default to its own ImuStaticInitParams.
 struct ImuParameterSpecs
 {
-  const ParameterSpec<bool> imu_init_require_still{"imu_init_require_still", false, false};
   const ParameterSpec<double> imu_init_still_tol{"imu_init_still_tol", 0.03, 0.03};
   const ParameterSpec<double> imu_init_still_timeout_s{"imu_init_still_timeout_s", 20.0, 20.0};
-  const ParameterSpec<bool> imu_init_still_sustained_en{
-    "imu_init_still_sustained_en", ImuStaticInitParams{}.enabled, ImuStaticInitParams{}.enabled};
   const ParameterSpec<double> imu_init_still_min_duration_s{
     "imu_init_still_min_duration_s", ImuStaticInitParams{}.minDurationS, ImuStaticInitParams{}.minDurationS};
   const ParameterSpec<int> imu_init_still_min_samples{

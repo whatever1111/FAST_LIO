@@ -1,10 +1,11 @@
 #include <algorithm>
-#include <cstring>
 #include <gtest/gtest.h>
+#include <iostream>
 #include <limits>
 #include <omp.h>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
 #include "IMU_Processing.hpp"
 #include "imu_initialization_validity.hpp"
@@ -44,6 +45,29 @@ void addImu(MeasureGroup & scan, double stamp, const V3D & acc, const V3D & gyro
   scan.imu.push_back(imu);
 }
 
+// Cases that need an initialised filter rather than the still window take the window's shortest form: ten still
+// samples.
+void initializeOnTenStillSamples(ImuProcess & process)
+{
+  process.init_static_params.minSamples = MAX_INI_COUNT;
+  process.init_static_params.minDurationS = 1e-3;
+}
+
+// What the IMU processing writes to std::cerr while this lives.
+class CerrCapture
+{
+public:
+  CerrCapture() : original_(std::cerr.rdbuf(text_.rdbuf())) {}
+  ~CerrCapture() { std::cerr.rdbuf(original_); }
+  CerrCapture(const CerrCapture &) = delete;
+  CerrCapture & operator=(const CerrCapture &) = delete;
+  std::string text() const { return text_.str(); }
+
+private:
+  std::ostringstream text_;
+  std::streambuf * original_;
+};
+
 // An initialised filter at rest (world frame = IMU frame), then moving at 1 m/s along x with a small covariance:
 // the state an IMU gap interrupts.
 struct GapFixture
@@ -64,6 +88,7 @@ struct GapFixture
     std::fill(std::begin(epsilon), std::end(epsilon), 0.001);
     filter.init_dyn_share(
       get_f, df_dx, df_dw, [](state_ikfom &, esekfom::dyn_share_datastruct<double> &) {}, 5, epsilon);
+    initializeOnTenStillSamples(process);
     auto init = scan(initializationBegin);
     for (int i = 0; i < 20; ++i)
       addImu(init, initializationBegin + i * 0.005);
@@ -101,8 +126,6 @@ struct StaticInitFixture
 
   StaticInitFixture()
   {
-    process.init_require_still = true;
-    process.init_static_params.enabled = true;
     process.init_still_timeout_s = 0.5;
     process.set_acc_cov(V3D::Constant(0.1));
     process.set_gyr_cov(V3D::Constant(0.1));
@@ -149,7 +172,7 @@ TEST(ImuProcessValidity, T13SustainedStillInitializesAtFirstOneSecondFrameEnd)
   EXPECT_EQ(completeFrame, 9);
 }
 
-TEST(ImuProcessValidity, T14MovingTimeoutCompletesAndDegradationSurvivesReset)
+TEST(ImuProcessValidity, T14MovingTimeoutCompletesWarnsAndDegradationSurvivesReset)
 {
   StaticInitFixture f;
   std::ostringstream frameReasons;
@@ -159,7 +182,13 @@ TEST(ImuProcessValidity, T14MovingTimeoutCompletesAndDegradationSurvivesReset)
                  << fast_lio::imuProcessReasonName(reason) << ")\n";
   };
   for (int frame = 0; frame <= 6; ++frame) {
-    const bool processed = f.process.Process(f.input(frame, true), f.filter, f.output);
+    bool processed = false;
+    std::string warnings;
+    {
+      const CerrCapture capture;
+      processed = f.process.Process(f.input(frame, true), f.filter, f.output);
+      warnings = capture.text();
+    }
     recordReason("moving", frame);
     SCOPED_TRACE(frameReasons.str());
     EXPECT_FALSE(processed);
@@ -167,6 +196,8 @@ TEST(ImuProcessValidity, T14MovingTimeoutCompletesAndDegradationSurvivesReset)
               frame <= 5 ? fast_lio::ImuProcessReason::kInitializationMotion
                          : fast_lio::ImuProcessReason::kInitializationComplete);
     EXPECT_EQ(f.process.initializationDegraded(), frame == 6);
+    // Only the scan past the timeout initialises, and it warns.
+    EXPECT_EQ(warnings.find("[IMU-INIT] WARN still-gate timeout") != std::string::npos, frame == 6) << warnings;
   }
   // Timeout retains the current batch's legacy mean/bias and covariance calculation.
   EXPECT_DOUBLE_EQ(f.filter.get_x().bg.z(), 0.2) << frameReasons.str();
@@ -185,45 +216,6 @@ TEST(ImuProcessValidity, T14MovingTimeoutCompletesAndDegradationSurvivesReset)
   SCOPED_TRACE(frameReasons.str());
   EXPECT_EQ(f.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationComplete);
   EXPECT_TRUE(f.process.initializationDegraded());
-}
-
-TEST(ImuProcessValidity, T15DisabledGateRetainsLegacyMovingStreamStateBitwise)
-{
-  // Both disabled configurations run the old accumulator and timeout path.
-  // With require_still=false the first moving batch completes, as at b460bc35.
-  StaticInitFixture a, b;
-  a.process.init_require_still = b.process.init_require_still = false;
-  a.process.init_static_params.enabled = false;
-  b.process.init_static_params.enabled = true;
-  for (int frame = 0; frame < 3; ++frame) {
-    auto input = a.input(frame, true);
-    EXPECT_EQ(a.process.Process(input, a.filter, a.output), b.process.Process(input, b.filter, b.output));
-    EXPECT_EQ(a.process.lastOutcome().reason, b.process.lastOutcome().reason);
-    const auto ax = a.filter.get_x(), bx = b.filter.get_x();
-    const auto ap = a.filter.get_P(), bp = b.filter.get_P();
-    EXPECT_EQ(std::memcmp(ax.pos.data(), bx.pos.data(), sizeof(double) * 3), 0);
-    const M3D ar = ax.rot.toRotationMatrix(), br = bx.rot.toRotationMatrix();
-    EXPECT_EQ(std::memcmp(ar.data(), br.data(), sizeof(double) * 9), 0);
-    EXPECT_EQ(std::memcmp(ax.vel.data(), bx.vel.data(), sizeof(double) * 3), 0);
-    EXPECT_EQ(std::memcmp(ax.bg.data(), bx.bg.data(), sizeof(double) * 3), 0);
-    EXPECT_EQ(std::memcmp(ap.data(), bp.data(), sizeof(double) * ap.size()), 0);
-    EXPECT_EQ(std::memcmp(a.process.cov_acc.data(), b.process.cov_acc.data(), sizeof(double) * 3), 0);
-    EXPECT_FALSE(a.process.initializationDegraded());
-    EXPECT_FALSE(b.process.initializationDegraded());
-    if (frame == 0) {
-      EXPECT_EQ(a.process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationComplete);
-      EXPECT_DOUBLE_EQ(ax.bg.z(), 0.2);
-    }
-  }
-  StaticInitFixture legacy;
-  legacy.process.init_static_params.enabled = false;
-  for (int frame = 0; frame <= 6; ++frame) {
-    EXPECT_FALSE(legacy.process.Process(legacy.input(frame, true), legacy.filter, legacy.output));
-    EXPECT_EQ(legacy.process.lastOutcome().reason,
-              frame <= 5 ? fast_lio::ImuProcessReason::kInitializationMotion
-                         : fast_lio::ImuProcessReason::kInitializationComplete);
-    EXPECT_FALSE(legacy.process.initializationDegraded());
-  }
 }
 
 TEST(ImuProcessValidity, T20FirstLateStillFrameDegradesOnlyBeforeWindowIsReady)
@@ -299,6 +291,7 @@ TEST(ImuProcessValidity, EmptyInputClearsPreviouslyPopulatedOutputWithoutChangin
 TEST(ImuProcessValidity, InitializationCommitsTimeAndEqualEndNeverReusesOutput)
 {
   ImuProcess process;
+  initializeOnTenStillSamples(process);
   process.set_acc_cov(V3D::Constant(0.1));
   process.set_gyr_cov(V3D::Constant(0.1));
   esekfom::esekf<state_ikfom, 12, input_ikfom> filter;
@@ -321,6 +314,7 @@ TEST(ImuProcessValidity, InitializationCommitsTimeAndEqualEndNeverReusesOutput)
 TEST(ImuProcessValidity, SuccessfulScanThenDuplicateAndGapCannotReuseOrPropagateOldOutput)
 {
   ImuProcess process;
+  initializeOnTenStillSamples(process);
   process.coverage_params = {0.1, 0.01};
   process.set_acc_cov(V3D::Constant(0.1));
   process.set_gyr_cov(V3D::Constant(0.1));
@@ -394,6 +388,7 @@ TEST(ImuProcessValidity, CoverageRecoveryRequiresThreeMatchesAgainstFrozenMap)
 TEST(ImuProcessValidity, ShortScanWithOnlyOldImuDoesNotIntegrateCommittedTimeTwice)
 {
   ImuProcess process;
+  initializeOnTenStillSamples(process);
   process.coverage_params = {0.1, 0.01};
   process.set_acc_cov(V3D::Constant(0.1));
   process.set_gyr_cov(V3D::Constant(0.1));
@@ -599,6 +594,7 @@ void expectUnchangedInitialization(const InitFilter & filter,
 
 void configureInitialization(ImuProcess & process, InitFilter & filter)
 {
+  initializeOnTenStillSamples(process);
   process.set_acc_cov(V3D::Constant(0.1));
   process.set_gyr_cov(V3D::Constant(0.1));
   process.coverage_params = {0.2, 0.01};
@@ -611,67 +607,64 @@ void configureInitialization(ImuProcess & process, InitFilter & filter)
 }
 }  // namespace
 
-TEST(ImuProcessValidity, InvalidGravityWindowCannotCommitOrCompleteRegardlessOfStillnessAndTimeout)
+TEST(ImuProcessValidity, InvalidGravityWindowCannotCommitOrCompleteRegardlessOfTimeout)
 {
-  for (const bool still : {false, true}) {
-    for (const double timeout : {20.0, -1.0}) {
-      for (const double acceleration : {0.0, 1e-9, 1e-6, 1e308}) {
-        SCOPED_TRACE(::testing::Message() << still << "/" << timeout << "/" << acceleration);
-        ImuProcess process;
-        InitFilter filter;
-        configureInitialization(process, filter);
-        process.init_require_still = still;
-        process.init_still_timeout_s = timeout;
-        const auto before = filter.get_x();
-        const auto covariance = filter.get_P();
-        auto output = std::make_shared<PointCloudXYZI>();
-        auto bad = scan(10.0);
-        for (int i = 0; i < 20; ++i)
-          addImu(bad, 10.0 + i * 0.005, V3D(0, 0, acceleration), V3D::Zero());
-        EXPECT_FALSE(process.Process(bad, filter, output));
-        EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
-        EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
-        EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationInvalidMean);
-        EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), bad.lidar_end_time);
-        EXPECT_TRUE(output->empty());
-        expectUnchangedInitialization(filter, before, covariance);
-        // Invalid windows are consumed, and neither replay nor an older scan may
-        // be counted towards a replacement window.
-        EXPECT_FALSE(process.Process(bad, filter, output));
-        EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kRejected);
-        EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), bad.lidar_end_time);
-        auto older = scan(9.0);
-        addImu(older, 9.0);
-        EXPECT_FALSE(process.Process(older, filter, output));
-        expectUnchangedInitialization(filter, before, covariance);
+  for (const double timeout : {20.0, -1.0}) {
+    for (const double acceleration : {0.0, 1e-9, 1e-6, 1e308}) {
+      SCOPED_TRACE(::testing::Message() << timeout << "/" << acceleration);
+      ImuProcess process;
+      InitFilter filter;
+      configureInitialization(process, filter);
+      process.init_still_timeout_s = timeout;
+      const auto before = filter.get_x();
+      const auto covariance = filter.get_P();
+      auto output = std::make_shared<PointCloudXYZI>();
+      auto bad = scan(10.0);
+      for (int i = 0; i < 20; ++i)
+        addImu(bad, 10.0 + i * 0.005, V3D(0, 0, acceleration), V3D::Zero());
+      EXPECT_FALSE(process.Process(bad, filter, output));
+      EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
+      EXPECT_EQ(process.lastOutcome().disposition, fast_lio::ImuDisposition::kCommitted);
+      EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationInvalidMean);
+      EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), bad.lidar_end_time);
+      EXPECT_TRUE(output->empty());
+      expectUnchangedInitialization(filter, before, covariance);
+      // Invalid windows are consumed, and neither replay nor an older scan may
+      // be counted towards a replacement window.
+      EXPECT_FALSE(process.Process(bad, filter, output));
+      EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kRejected);
+      EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), bad.lidar_end_time);
+      auto older = scan(9.0);
+      addImu(older, 9.0);
+      EXPECT_FALSE(process.Process(older, filter, output));
+      expectUnchangedInitialization(filter, before, covariance);
 
-        auto one = scan(10.1);
-        addImu(one, 10.195);
-        EXPECT_FALSE(process.Process(one, filter, output));
-        EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
-        EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), one.lidar_end_time);
-        // A second single sample must still initialize. If the 20 rejected
-        // samples survived in N, the first good sample would finish init and
-        // this call would propagate instead.
-        auto second = scan(10.2);
-        addImu(second, 10.295);
-        EXPECT_FALSE(process.Process(second, filter, output));
-        EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
-        auto fresh = scan(10.3);
-        for (int i = 0; i < 20; ++i)
-          addImu(fresh, 10.3 + i * 0.005);
-        EXPECT_FALSE(process.Process(fresh, filter, output));
-        EXPECT_TRUE(fast_lio::finiteInitializationState(filter.get_x()));
-        EXPECT_TRUE(filter.get_P().allFinite());
-        auto propagation = scan(10.4);
-        for (int i = 0; i < 20; ++i)
-          addImu(propagation, 10.4 + i * 0.005);
-        EXPECT_TRUE(process.Process(propagation, filter, output));
-        EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kProcessed);
-        EXPECT_FALSE(output->empty());
-        EXPECT_TRUE(fast_lio::finiteInitializationState(filter.get_x()));
-        EXPECT_TRUE(filter.get_P().allFinite());
-      }
+      auto one = scan(10.1);
+      addImu(one, 10.195);
+      EXPECT_FALSE(process.Process(one, filter, output));
+      EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
+      EXPECT_DOUBLE_EQ(process.lastProcessedEnd(), one.lidar_end_time);
+      // A second single sample must still initialize. If the 20 rejected
+      // samples survived in N, the first good sample would finish init and
+      // this call would propagate instead.
+      auto second = scan(10.2);
+      addImu(second, 10.295);
+      EXPECT_FALSE(process.Process(second, filter, output));
+      EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
+      auto fresh = scan(10.3);
+      for (int i = 0; i < 20; ++i)
+        addImu(fresh, 10.3 + i * 0.005);
+      EXPECT_FALSE(process.Process(fresh, filter, output));
+      EXPECT_TRUE(fast_lio::finiteInitializationState(filter.get_x()));
+      EXPECT_TRUE(filter.get_P().allFinite());
+      auto propagation = scan(10.4);
+      for (int i = 0; i < 20; ++i)
+        addImu(propagation, 10.4 + i * 0.005);
+      EXPECT_TRUE(process.Process(propagation, filter, output));
+      EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kProcessed);
+      EXPECT_FALSE(output->empty());
+      EXPECT_TRUE(fast_lio::finiteInitializationState(filter.get_x()));
+      EXPECT_TRUE(filter.get_P().allFinite());
     }
   }
 }
@@ -814,7 +807,6 @@ TEST(ImuProcessValidity, PopulationScatterRejectsAMovingWindowThenAcceptsFreshSt
   ImuProcess process;
   InitFilter filter;
   configureInitialization(process, filter);
-  process.init_require_still = true;
   process.init_still_tol = 0.03;
   process.init_still_timeout_s = 90.0;
   auto output = std::make_shared<PointCloudXYZI>();
@@ -839,30 +831,27 @@ TEST(ImuProcessValidity, PopulationScatterRejectsAMovingWindowThenAcceptsFreshSt
 
 TEST(ImuProcessValidity, OverflowingPopulationScatterCannotBypassInitializationValidity)
 {
-  for (const bool requireStill : {false, true}) {
-    ImuProcess process;
-    InitFilter filter;
-    configureInitialization(process, filter);
-    process.init_require_still = requireStill;
-    process.init_still_timeout_s = -1.0;
-    const auto before = filter.get_x();
-    const auto covariance = filter.get_P();
-    auto output = std::make_shared<PointCloudXYZI>();
-    auto input = scan(10.0);
-    for (int i = 0; i < 20; ++i)
-      addImu(input, 10.0 + i * 0.005, V3D(0, 0, 9.81), V3D(i % 2 ? 1e200 : -1e200, 0, 0));
-    EXPECT_FALSE(process.Process(input, filter, output));
-    expectUnchangedInitialization(filter, before, covariance);
-    auto one = scan(10.1);
-    addImu(one, 10.195);
-    EXPECT_FALSE(process.Process(one, filter, output));
-    auto second = scan(10.2);
-    addImu(second, 10.295);
-    EXPECT_FALSE(process.Process(second, filter, output));
-    EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
-    EXPECT_TRUE(process.cov_acc.allFinite());
-    EXPECT_TRUE(process.cov_gyr.allFinite());
-  }
+  ImuProcess process;
+  InitFilter filter;
+  configureInitialization(process, filter);
+  process.init_still_timeout_s = -1.0;
+  const auto before = filter.get_x();
+  const auto covariance = filter.get_P();
+  auto output = std::make_shared<PointCloudXYZI>();
+  auto input = scan(10.0);
+  for (int i = 0; i < 20; ++i)
+    addImu(input, 10.0 + i * 0.005, V3D(0, 0, 9.81), V3D(i % 2 ? 1e200 : -1e200, 0, 0));
+  EXPECT_FALSE(process.Process(input, filter, output));
+  expectUnchangedInitialization(filter, before, covariance);
+  auto one = scan(10.1);
+  addImu(one, 10.195);
+  EXPECT_FALSE(process.Process(one, filter, output));
+  auto second = scan(10.2);
+  addImu(second, 10.295);
+  EXPECT_FALSE(process.Process(second, filter, output));
+  EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
+  EXPECT_TRUE(process.cov_acc.allFinite());
+  EXPECT_TRUE(process.cov_gyr.allFinite());
 }
 
 namespace {
@@ -883,7 +872,6 @@ TEST(ImuProcessValidity, StillnessTimeoutSpansRetriesFromZeroAndIsStrict)
   ImuProcess process;
   InitFilter filter;
   configureInitialization(process, filter);
-  process.init_require_still = true;
   process.init_still_timeout_s = 90.0;
   auto output = std::make_shared<PointCloudXYZI>();
   for (double begin : {0.0, 30.0, 60.0, 90.0}) {
@@ -898,7 +886,10 @@ TEST(ImuProcessValidity, StillnessTimeoutSpansRetriesFromZeroAndIsStrict)
   addImu(one, 90.195);
   EXPECT_FALSE(process.Process(one, filter, output)); // exactly 90 did not complete
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
+  EXPECT_FALSE(process.initializationDegraded());
   EXPECT_FALSE(process.Process(initializationWindow(90.25, true), filter, output));
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationComplete);
+  EXPECT_TRUE(process.initializationDegraded());
   EXPECT_TRUE(process.Process(initializationWindow(90.35, false), filter, output));
 }
 
@@ -907,7 +898,6 @@ TEST(ImuProcessValidity, ExplicitResetStartsANewAttemptAndStillnessCanRecoverEar
   ImuProcess process;
   InitFilter filter;
   configureInitialization(process, filter);
-  process.init_require_still = true;
   process.init_still_timeout_s = 90.0;
   auto output = std::make_shared<PointCloudXYZI>();
   EXPECT_FALSE(process.Process(initializationWindow(0.0, true), filter, output));
@@ -919,6 +909,7 @@ TEST(ImuProcessValidity, ExplicitResetStartsANewAttemptAndStillnessCanRecoverEar
   EXPECT_FALSE(process.Process(one, filter, output));
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
   EXPECT_FALSE(process.Process(initializationWindow(100.2, false), filter, output));
+  EXPECT_FALSE(process.initializationDegraded());
   EXPECT_TRUE(process.Process(initializationWindow(100.3, false), filter, output));
   process.Reset();
   EXPECT_FALSE(process.Process(initializationWindow(0.0, false), filter, output)); // Reset also clears scan cursor
@@ -930,7 +921,6 @@ TEST(ImuProcessValidity, ExpiredAttemptNeverAcceptsAnInvalidMeanAndRetainsConsum
   ImuProcess process;
   InitFilter filter;
   configureInitialization(process, filter);
-  process.init_require_still = true;
   process.init_still_timeout_s = 90.0;
   auto output = std::make_shared<PointCloudXYZI>();
   EXPECT_FALSE(process.Process(initializationWindow(0.0, true), filter, output));
@@ -947,6 +937,8 @@ TEST(ImuProcessValidity, ExpiredAttemptNeverAcceptsAnInvalidMeanAndRetainsConsum
   EXPECT_FALSE(process.Process(invalid, filter, output)); // reseeding must not erase consumption
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kRejected);
   EXPECT_FALSE(process.Process(initializationWindow(100.2, true), filter, output));
+  EXPECT_EQ(process.lastOutcome().reason, fast_lio::ImuProcessReason::kInitializationComplete);
+  EXPECT_TRUE(process.initializationDegraded());
   EXPECT_TRUE(process.Process(initializationWindow(100.3, false), filter, output));
 }
 
@@ -1235,7 +1227,7 @@ TEST(ImuProcessValidity, InitializationCompletesAtExactlyTenSamples)
   EXPECT_FALSE(audit.history_evaluated);
   EXPECT_EQ(process.lastStatus(), ImuProcess::ProcessStatus::kInitializing);
   auto tenth = scan(10.1);
-  addImu(tenth, 10.195);
+  addImu(tenth, 10.15);  // within imu_init_still_max_gap_s of the ninth: a longer gap restarts the still window
   EXPECT_FALSE(process.Process(tenth, filter, output, &audit));
   accounting.process(audit);
   EXPECT_EQ(accounting.history_unknown.messages, 0u);

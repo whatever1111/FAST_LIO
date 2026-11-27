@@ -33,7 +33,9 @@ TEST(Imu0906Timing, SequentialProcessRetainsHistoryBoundedPointsWithUnchangedTim
   std::getline(fixture, line);
   ImuProcess process;
   process.coverage_params = {0.1, 0.03};
-  process.init_require_still = false;
+  // The still window's shortest form: the first scan's ten still samples initialise.
+  process.init_static_params.minSamples = MAX_INI_COUNT;
+  process.init_static_params.minDurationS = 1e-3;
   process.set_acc_cov(V3D::Constant(0.1));
   process.set_gyr_cov(V3D::Constant(0.1));
   esekfom::esekf<state_ikfom, 12, input_ikfom> filter;

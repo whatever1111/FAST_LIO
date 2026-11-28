@@ -5642,6 +5642,39 @@ TEST(AnchorLifecycleRebuild, AResetWhoseRebuildTakesNoPointEndsTheAnchorOnce)
 // The runaway watchdog's hold action
 // ---------------------------------------------------------------------------
 
+// The watchdog's own verdict on the production scan path, with no forced trip. A fresh wheel sample that reports
+// motion keeps the static hold out of play, so the fixture's 0.50 m/s state speed reaches the watchdog unchanged.
+// Against 0.20 m/s wheels and a 0.10 m/s margin the estimate is contradicted from the first scan and trips on the
+// fourth, once runaway_hold_sec (0.25 s) has passed. Against 0.45 m/s wheels it stays inside the margin and never
+// trips.
+TEST(AnchorLifecycleHold, TheWatchdogTripsOnItsOwnVerdictWhenTheEstimateOutrunsTheWheels)
+{
+  for (const double wheel_speed : {0.2, 0.45}) {
+    const bool outruns = wheel_speed + 0.1 < 0.5;
+    Scenario scenario = baseParams(outruns ? "runaway_own_verdict_trip" : "runaway_own_verdict_within_margin", true);
+    setParam(scenario, rclcpp::Parameter("runaway_on_trip", "hold"));
+    setParam(scenario, rclcpp::Parameter("runaway_hold_sec", 0.25));
+    setParam(scenario, rclcpp::Parameter("runaway_wheel_speed_margin", 0.1));
+    for (int i = 0; i < 4; ++i) {
+      Step s = step(Phase::kEvent, Imu::kMoving, Guard::kHealthy, {0.0, 0.0, 0.0});
+      s.wheel_speed = wheel_speed;
+      scenario.steps.push_back(s);
+    }
+    const ChildResult r = runScenario(scenario);
+    SCOPED_TRACE(scenario.name + "\n" + describeRun(r));
+    ASSERT_TRUE(r.ok());
+    const auto events = r.phase(Phase::kEvent);
+    ASSERT_EQ(events.size(), 4u);
+    for (std::size_t i = 0; i < events.size(); ++i) {
+      const Observation & o = *events[i];
+      const bool trips = outruns && i == 3;
+      EXPECT_EQ(hasEvent(o, fast_lio::kAnchorEventRunawayTrip), trips) << "step " << o.step;
+      EXPECT_EQ(hasEvent(o, fast_lio::kAnchorEventLost), trips) << "step " << o.step;
+      EXPECT_EQ((odomFlags(o) & kFlagLost) != 0u, trips) << "step " << o.step;
+    }
+  }
+}
+
 // A trip with the hold action on a degraded parked scan held on its anchor. The pin of that scan is taken back
 // before the front end declares itself lost: the scan publishes its own pose, attitude and pose covariance with the
 // velocity alone zeroed, as a zero-only scan, and its outputs carry Lost without StaticHold. The anchor ends for

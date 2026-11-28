@@ -1,5 +1,5 @@
 # frontend contract golden: pipeline/worker_delay_reset
-# fork_sha: 3a22177cb12b63223117f4c2019da419c8174bf0
+# fork_sha: bbf0f7d9c350eddde34c977148033bf0be93945d
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -9,7 +9,7 @@ imu_batch seq=1 disposition=committed reason=bootstrap samples=12 pending=1 firs
 record seq=1 outcome=bootstrap beg_ns=1000000000 end_ns=1050000000 gap_ns=-1 published=0 flags=-1 events=0x0
 record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=0 valid=0 created_ns=-1 state=empty episode=0 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.evidence evidence=unknown reason=no_imu wheel_valid=0 usable=0 zero_only=0 supported=0
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=cold
 record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -26,7 +26,7 @@ imu_batch seq=2 disposition=committed reason=initialization_complete samples=20 
 record seq=2 outcome=imu_not_processed beg_ns=1100000000 end_ns=1150000000 gap_ns=-1 published=0 flags=-1 events=0x0
 record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=0 valid=0 created_ns=-1 state=empty episode=0 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.evidence evidence=unknown reason=no_imu wheel_valid=0 usable=0 zero_only=0 supported=0
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=cold
 record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -45,7 +45,7 @@ initial_build end=1.25
 record seq=3 outcome=before_anchor_step beg_ns=1200000000 end_ns=1250000000 gap_ns=-1 published=0 flags=-1 events=0x0
 record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=0 valid=0 created_ns=-1 state=empty episode=0 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.evidence evidence=unknown reason=no_imu wheel_valid=0 usable=0 zero_only=0 supported=0
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -74,9 +74,9 @@ trace "[ZUPT-ANCHOR] v=6 event=candidate_started reason=- event_seq=1 scan_seq=4
 runaway_check end=1.3500000000000001 trip=0
 pose_publish encoding=0 stamp_ns=1350000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=4 outcome=published beg_ns=1300000000 end_ns=1350000000 gap_ns=-1 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.010000000000000089 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=0 created_ns=1350000000 state=qualifying episode=1 ref_gen=0 used=0 streak=1 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -109,9 +109,9 @@ guard end=1.45 forced=healthy
 runaway_check end=1.45 trip=0
 pose_publish encoding=0 stamp_ns=1449999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=5 outcome=published beg_ns=1400000000 end_ns=1450000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999999551 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=0 created_ns=1350000000 state=qualifying episode=1 ref_gen=0 used=0 streak=2 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -146,9 +146,9 @@ trace "[ZUPT-ANCHOR] v=6 event=candidate_dropped reason=motion event_seq=3 scan_
 runaway_check end=1.55 trip=0
 pose_publish encoding=0 stamp_ns=1550000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=6 outcome=published beg_ns=1500000000 end_ns=1550000000 gap_ns=50000000 published=1 flags=0 events=0x1
-record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=0.010000000000000045 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=moving reason=gyro wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99989847046701896,0,0,0.014249517806451449] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -181,9 +181,9 @@ guard end=1.6500000000000001 forced=natural
 runaway_check end=1.6500000000000001 trip=0
 pose_publish encoding=0 stamp_ns=1650000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=7 outcome=published beg_ns=1600000000 end_ns=1650000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=0.010000000000000134 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=moving reason=gyro wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99957224924640364,0,0,0.029245829386198702] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -228,9 +228,9 @@ guard end=1.75 forced=natural
 runaway_check end=1.75 trip=0
 pose_publish encoding=0 stamp_ns=1750000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=8 outcome=published beg_ns=1700000000 end_ns=1750000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=0.01 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=moving reason=gyro wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99902112848662172,0,0,0.044235560777713949] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -263,9 +263,9 @@ guard end=1.8500000000000001 forced=natural
 runaway_check end=1.8500000000000001 trip=0
 pose_publish encoding=0 stamp_ns=1850000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=9 outcome=published beg_ns=1800000000 end_ns=1850000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=moving imu_n=20 gyr_max=0.29999999999999999 acc_span=0 wheel_age=0.010000000000000089 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=moving reason=gyro imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=moving reason=gyro wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99825631752073096,0,0,0.059028167258969325] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -299,9 +299,9 @@ trace "[ZUPT-ANCHOR] v=6 event=candidate_started reason=- event_seq=4 scan_seq=1
 runaway_check end=1.95 trip=0
 pose_publish encoding=0 stamp_ns=1950000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=10 outcome=published beg_ns=1900000000 end_ns=1950000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999999551 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=2 valid=0 created_ns=1950000000 state=qualifying episode=2 ref_gen=0 used=0 streak=1 have_pose=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -334,9 +334,9 @@ guard end=2.0499999999999998 forced=natural
 runaway_check end=2.0499999999999998 trip=0
 pose_publish encoding=0 stamp_ns=2049999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=11 outcome=published beg_ns=2000000000 end_ns=2050000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999998233 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=2 valid=0 created_ns=1950000000 state=qualifying episode=2 ref_gen=0 used=0 streak=2 have_pose=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -370,9 +370,9 @@ trace "[ZUPT-ANCHOR] v=6 event=created reason=- event_seq=5 scan_seq=12 stamp_ns
 runaway_check end=2.1499999999999999 trip=0
 pose_publish encoding=0 stamp_ns=2149999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=12 outcome=published beg_ns=2100000000 end_ns=2150000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.00999999999999991 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=2 valid=1 created_ns=1950000000 state=valid episode=2 ref_gen=0 used=0 streak=3 have_pose=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -405,9 +405,9 @@ guard end=2.25 forced=natural
 runaway_check end=2.25 trip=0
 pose_publish encoding=0 stamp_ns=2250000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=13 outcome=published beg_ns=2200000000 end_ns=2250000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.01 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=2 valid=1 created_ns=1950000000 state=valid episode=2 ref_gen=0 used=0 streak=4 have_pose=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -445,9 +445,9 @@ map_reset_pending_cleared
 map_reset prior_installed_before=0 prior_installed_after=0 required_prior_lost=0 pinned_voxels=0
 pose_publish encoding=0 stamp_ns=2349999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=14 outcome=published beg_ns=2300000000 end_ns=2350000000 gap_ns=50000000 published=1 flags=0 events=0x110
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999996446 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=2 valid=0 created_ns=1950000000 state=empty episode=2 ref_gen=1 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -481,9 +481,9 @@ trace "[ZUPT-ANCHOR] v=6 event=candidate_started reason=- event_seq=8 scan_seq=1
 runaway_check end=2.4499999999999997 trip=0
 pose_publish encoding=0 stamp_ns=2449999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=15 outcome=published beg_ns=2400000000 end_ns=2450000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999997331 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=3 valid=0 created_ns=2450000000 state=qualifying episode=3 ref_gen=1 used=0 streak=1 have_pose=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -516,9 +516,9 @@ guard end=2.5499999999999998 forced=natural
 runaway_check end=2.5499999999999998 trip=0
 pose_publish encoding=0 stamp_ns=2549999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=16 outcome=published beg_ns=2500000000 end_ns=2550000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999998233 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=3 valid=0 created_ns=2450000000 state=qualifying episode=3 ref_gen=1 used=0 streak=2 have_pose=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -552,9 +552,9 @@ trace "[ZUPT-ANCHOR] v=6 event=created reason=- event_seq=9 scan_seq=17 stamp_ns
 runaway_check end=2.6499999999999999 trip=0
 pose_publish encoding=0 stamp_ns=2649999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=17 outcome=published beg_ns=2600000000 end_ns=2650000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.00999999999999991 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=3 valid=1 created_ns=2450000000 state=valid episode=3 ref_gen=1 used=0 streak=3 have_pose=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -587,9 +587,9 @@ guard end=2.75 forced=natural
 runaway_check end=2.75 trip=0
 pose_publish encoding=0 stamp_ns=2750000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=18 outcome=published beg_ns=2700000000 end_ns=2750000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.01 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=3 valid=1 created_ns=2450000000 state=valid episode=3 ref_gen=1 used=0 streak=4 have_pose=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -622,9 +622,9 @@ guard end=2.8499999999999996 forced=natural
 runaway_check end=2.8499999999999996 trip=0
 pose_publish encoding=0 stamp_ns=2849999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=19 outcome=published beg_ns=2800000000 end_ns=2850000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999996446 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=3 valid=1 created_ns=2450000000 state=valid episode=3 ref_gen=1 used=0 streak=5 have_pose=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -657,9 +657,9 @@ guard end=2.9499999999999997 forced=natural
 runaway_check end=2.9499999999999997 trip=0
 pose_publish encoding=0 stamp_ns=2949999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=20 outcome=published beg_ns=2900000000 end_ns=2950000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999997331 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=3 valid=1 created_ns=2450000000 state=valid episode=3 ref_gen=1 used=0 streak=6 have_pose=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[0.99824523219196049,0,0,0.059215339279803235] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]

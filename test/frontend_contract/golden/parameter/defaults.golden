@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/defaults
-# fork_sha: 26168a671fddc463ffd573862665fa87c187aae5
+# fork_sha: bbf0f7d9c350eddde34c977148033bf0be93945d
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -9,107 +9,71 @@ overrides 2
 override mapping.extrinsic_R type=double_array value=[1,0,0,0,1,0,0,0,1]
 override mapping.extrinsic_T type=double_array value=[0,0,0]
 outcome constructed
-event.v1 declare_front declared=150 names_sha256=df2197af8d2c2d53e0ce280616476cfb7fc615317ec66c5e2ff54661f5575f79
-event.v1 typed_outputs declared=154 names_sha256=49f5bf3b444257665b9bf32c256d3715e7473f27e0d184dbeabc6c15f57c9134
-event.v1 declare_back declared=239 names_sha256=c46f44797b53090ba03cbc0dff1cd81b15900c5731cb12312056c019ebf375cd
-event.v1 lost_recovery_loaded declared=239 names_sha256=c46f44797b53090ba03cbc0dff1cd81b15900c5731cb12312056c019ebf375cd
-event.v1 read_policies declared=239 names_sha256=c46f44797b53090ba03cbc0dff1cd81b15900c5731cb12312056c019ebf375cd
+event.v1 declare_front declared=102 names_sha256=5d49e9c62055cd12fa09d48cc6ad097a22c7884c43b2aae9c757e9825a2d64e9
+event.v1 typed_outputs declared=106 names_sha256=dfa1225d30c0f84c1de9bc54abd99bb62a0dd155d0c0e87483d0aa2ded650d70
+event.v1 declare_back declared=176 names_sha256=06ab111cd85ada52df01c49c3db7d82f58048f8fe04632872f1338193c4761d2
+event.v1 lost_recovery_loaded declared=176 names_sha256=06ab111cd85ada52df01c49c3db7d82f58048f8fe04632872f1338193c4761d2
+event.v1 read_policies declared=176 names_sha256=06ab111cd85ada52df01c49c3db7d82f58048f8fe04632872f1338193c4761d2
 log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
-event.v1 anchor_gap_resolved declared=239 names_sha256=c46f44797b53090ba03cbc0dff1cd81b15900c5731cb12312056c019ebf375cd
+event.v1 anchor_gap_resolved declared=176 names_sha256=06ab111cd85ada52df01c49c3db7d82f58048f8fe04632872f1338193c4761d2
 log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
-event.v1 map_backend declared=243 names_sha256=d7f2ac64ca97a23bde35b072ead70e7e82d2de00f21511d399caee2bda26f714
+event.v1 map_backend declared=179 names_sha256=e43dba00e55756a8e4e319a64f458ab253c6e50c7c82deead6985d930d5d4ef2
 log INFO laser_mapping "p_pre->lidar_type 1"
-event.v1 read_inputs declared=243 names_sha256=d7f2ac64ca97a23bde35b072ead70e7e82d2de00f21511d399caee2bda26f714
-log WARN laser_mapping "IMU tilt reference unavailable: scan window must be positive and acceleration compensation must use leg speed"
-event.v1 filter_init declared=243 names_sha256=d7f2ac64ca97a23bde35b072ead70e7e82d2de00f21511d399caee2bda26f714
+event.v1 read_inputs declared=179 names_sha256=e43dba00e55756a8e4e319a64f458ab253c6e50c7c82deead6985d930d5d4ef2
+log WARN laser_mapping "IMU tilt reference unavailable: scan window must be positive"
+event.v1 filter_init declared=179 names_sha256=e43dba00e55756a8e4e319a64f458ab253c6e50c7c82deead6985d930d5d4ef2
 log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
-log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
-event.v1 subscriptions declared=243 names_sha256=d7f2ac64ca97a23bde35b072ead70e7e82d2de00f21511d399caee2bda26f714
-event.v1 cloud_publishers declared=243 names_sha256=d7f2ac64ca97a23bde35b072ead70e7e82d2de00f21511d399caee2bda26f714
-event.v1 odometry_publishers declared=247 names_sha256=765aa350fcde76af0105761cac2f4d5c311a7c4cd21a82357de961cc814048ad
-event.v1 scan_timer declared=247 names_sha256=765aa350fcde76af0105761cac2f4d5c311a7c4cd21a82357de961cc814048ad
-event.v1 map_timer declared=247 names_sha256=765aa350fcde76af0105761cac2f4d5c311a7c4cd21a82357de961cc814048ad
+log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, parked hold off)"
+event.v1 subscriptions declared=179 names_sha256=e43dba00e55756a8e4e319a64f458ab253c6e50c7c82deead6985d930d5d4ef2
+event.v1 cloud_publishers declared=179 names_sha256=e43dba00e55756a8e4e319a64f458ab253c6e50c7c82deead6985d930d5d4ef2
+event.v1 odometry_publishers declared=183 names_sha256=b80e7fab207647a4d20a6f6871bdfd13429d65d99cf0f1e0db23e7d8c4371db6
+event.v1 scan_timer declared=183 names_sha256=b80e7fab207647a4d20a6f6871bdfd13429d65d99cf0f1e0db23e7d8c4371db6
+event.v1 map_timer declared=183 names_sha256=b80e7fab207647a4d20a6f6871bdfd13429d65d99cf0f1e0db23e7d8c4371db6
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
-event.v1 config_id declared=247 names_sha256=765aa350fcde76af0105761cac2f4d5c311a7c4cd21a82357de961cc814048ad
+event.v1 config_id declared=183 names_sha256=b80e7fab207647a4d20a6f6871bdfd13429d65d99cf0f1e0db23e7d8c4371db6
 log INFO laser_mapping "Node init finished."
-event.v1 constructed declared=247 names_sha256=765aa350fcde76af0105761cac2f4d5c311a7c4cd21a82357de961cc814048ad
-parameters 247
-param adaptive_downsample_budget_sec type=double value=0.059999999999999998 read_only=0 descriptor_type=3
-param adaptive_downsample_en type=bool value=false read_only=0 descriptor_type=1
-param adaptive_downsample_lower_after type=integer value=100 read_only=0 descriptor_type=2
-param adaptive_downsample_max_voxel type=double value=0.5 read_only=0 descriptor_type=3
-param adaptive_downsample_raise_after type=integer value=5 read_only=0 descriptor_type=2
-param adaptive_downsample_release_sec type=double value=0.035000000000000003 read_only=0 descriptor_type=3
-param adaptive_downsample_step type=double value=0.050000000000000003 read_only=0 descriptor_type=3
-param canopy_ground_halfband type=double value=0.80000000000000004 read_only=0 descriptor_type=3
-param canopy_ground_z type=double value=-0.46999999999999997 read_only=0 descriptor_type=3
-param canopy_near_range type=double value=20 read_only=0 descriptor_type=3
+event.v1 constructed declared=183 names_sha256=b80e7fab207647a4d20a6f6871bdfd13429d65d99cf0f1e0db23e7d8c4371db6
+parameters 183
 param common.imu_bias_topic type=string value="/fixposition/fpa/imubias" read_only=0 descriptor_type=4
 param common.imu_input_type type=string value="sensor_msgs" read_only=0 descriptor_type=4
 param common.imu_time_offset type=double value=0 read_only=0 descriptor_type=3
 param common.imu_topic type=string value="/livox/imu" read_only=0 descriptor_type=4
 param common.lid_topic type=string value="/livox/lidar" read_only=0 descriptor_type=4
 param common.time_offset_lidar_to_imu type=double value=0 read_only=0 descriptor_type=3
-param common.time_sync_en type=bool value=false read_only=0 descriptor_type=1
 param corr_dump_en type=bool value=false read_only=0 descriptor_type=1
 param corr_dump_windows type=string value="" read_only=0 descriptor_type=4
 param corr_gate_mad_scale type=double value=0 read_only=0 descriptor_type=3
 param corr_gate_rot_sigma_floor_deg type=double value=0 read_only=0 descriptor_type=3
 param corr_innov_gate_k type=double value=0 read_only=0 descriptor_type=3
-param corr_kernel type=string value="none" read_only=0 descriptor_type=4
-param corr_kernel_mad_scale type=double value=3 read_only=0 descriptor_type=3
-param corr_kernel_min_scale type=double value=0.029999999999999999 read_only=0 descriptor_type=3
 param corr_nn0_max type=double value=0 read_only=0 descriptor_type=3
 param cube_side_length type=double value=200 read_only=0 descriptor_type=3
 param data_dir type=string value="" read_only=0 descriptor_type=4
 param degeneracy_debug type=bool value=false read_only=0 descriptor_type=1
-param degeneracy_false_keep_rate type=double value=0.001 read_only=0 descriptor_type=3
-param degeneracy_floor_mode type=string value="off" read_only=0 descriptor_type=4
-param degeneracy_floor_model_scale type=double value=1 read_only=0 descriptor_type=3
-param degeneracy_floor_rel_uncertainty type=double value=0.29999999999999999 read_only=0 descriptor_type=3
 param degeneracy_schur_ridge type=double value=9.9999999999999995e-07 read_only=0 descriptor_type=3
 param degeneracy_spectrum_trace type=bool value=false read_only=0 descriptor_type=1
 param diagnostics.kalman_channel_enable type=bool value=false read_only=0 descriptor_type=1
 param diagnostics.latency_enable type=bool value=true read_only=0 descriptor_type=1
 param diagnostics.latency_log_period_sec type=double value=1 read_only=0 descriptor_type=3
 param diagnostics.time_admission_counts_enable type=bool value=false read_only=1 descriptor_type=1
-param divergence_guard_en type=bool value=true read_only=0 descriptor_type=1
 param divergence_guard_max_speed type=double value=30 read_only=0 descriptor_type=3
 param divergence_guard_min_eff type=integer value=50 read_only=0 descriptor_type=2
 param divergence_guard_streak type=integer value=5 read_only=0 descriptor_type=2
-param feature_extract_enable type=bool value=false read_only=0 descriptor_type=1
 param filter_size_map type=double value=0.5 read_only=0 descriptor_type=3
 param filter_size_surf type=double value=0.5 read_only=0 descriptor_type=3
 param gravity_align_accel_tol type=double value=0.050000000000000003 read_only=0 descriptor_type=3
-param gravity_align_continuous type=bool value=false read_only=0 descriptor_type=1
 param gravity_align_en type=bool value=false read_only=0 descriptor_type=1
 param gravity_align_grav_cap_deg type=double value=3 read_only=0 descriptor_type=3
-param gravity_align_grav_freeze_degraded type=bool value=false read_only=0 descriptor_type=1
 param gravity_align_grav_leak type=double value=1 read_only=0 descriptor_type=3
 param gravity_align_gyro_tol type=double value=0.34999999999999998 read_only=0 descriptor_type=3
-param gravity_align_hold_s type=double value=0 read_only=0 descriptor_type=3
 param gravity_align_leg_edge_window_s type=double value=0.20000000000000001 read_only=0 descriptor_type=3
 param gravity_align_leg_lever_arm type=double_array value=[0,0,0] read_only=0 descriptor_type=8
 param gravity_align_leg_vel_sigma type=double value=0.14999999999999999 read_only=0 descriptor_type=3
 param gravity_align_lin_accel_comp type=bool value=false read_only=0 descriptor_type=1
-param gravity_align_lin_accel_source type=string value="leg" read_only=0 descriptor_type=4
 param gravity_align_mag_ref type=double value=0 read_only=0 descriptor_type=3
-param gravity_align_noise type=double value=0.050000000000000003 read_only=0 descriptor_type=3
-param gravity_align_noise_degraded type=double value=0 read_only=0 descriptor_type=3
 param gravity_align_noise_moving type=double value=0.044999999999999998 read_only=0 descriptor_type=3
 param gravity_align_noise_static type=double value=0.0080000000000000002 read_only=0 descriptor_type=3
-param gravity_align_sigma_policy type=string value="scene" read_only=0 descriptor_type=4
 param gravity_align_vel_sigma_scale type=double value=0 read_only=0 descriptor_type=3
 param gravity_align_window_s type=double value=0 read_only=0 descriptor_type=3
-param gravity_align_withhold_blind_moving type=bool value=false read_only=0 descriptor_type=1
-param gravity_align_z_weak_thresh type=double value=0.29999999999999999 read_only=0 descriptor_type=3
-param ground_recover_en type=bool value=false read_only=0 descriptor_type=1
-param ground_recover_max_residual type=double value=1 read_only=0 descriptor_type=3
-param ground_recover_max_rows type=integer value=4000 read_only=0 descriptor_type=2
-param ground_recover_min_inliers type=integer value=100 read_only=0 descriptor_type=2
-param ground_recover_scan_band type=double value=0.14999999999999999 read_only=0 descriptor_type=3
-param ground_recover_sector_tol type=double value=0.25 read_only=0 descriptor_type=3
-param guard_engulf_en type=bool value=true read_only=0 descriptor_type=1
 param guard_engulf_far_frac_min type=double value=0.14999999999999999 read_only=0 descriptor_type=3
 param guard_engulf_far_frac_release type=double value=0.34999999999999998 read_only=0 descriptor_type=3
 param guard_engulf_far_range type=double value=2 read_only=0 descriptor_type=3
@@ -118,21 +82,11 @@ param guard_engulf_streak type=integer value=2 read_only=0 descriptor_type=2
 param guard_hole_en type=bool value=false read_only=0 descriptor_type=1
 param guard_hole_max_accel type=double value=1 read_only=0 descriptor_type=3
 param guard_hole_min_sec type=double value=0.29999999999999999 read_only=0 descriptor_type=3
-param guard_hole_reanchor_pos type=bool value=true read_only=0 descriptor_type=1
-param guard_release_inflate_en type=bool value=false read_only=0 descriptor_type=1
 param guard_release_keep_sigma type=double value=0.5 read_only=0 descriptor_type=3
 param guard_release_leg_max_age_s type=double value=0.5 read_only=0 descriptor_type=3
 param guard_release_leg_sigma type=double value=0.29999999999999999 read_only=0 descriptor_type=3
-param guard_release_pos_sigma_max type=double value=1 read_only=0 descriptor_type=3
-param guard_release_pos_sigma_min type=double value=0.10000000000000001 read_only=0 descriptor_type=3
-param guard_release_pos_sigma_rate type=double value=0.20000000000000001 read_only=0 descriptor_type=3
-param guard_release_rp_sigma_deg type=double value=0.5 read_only=0 descriptor_type=3
-param guard_release_rp_sigma_max_deg type=double value=3 read_only=0 descriptor_type=3
-param guard_release_rp_sigma_rate_deg type=double value=0.29999999999999999 read_only=0 descriptor_type=3
 param guard_release_vel_source type=string value="zero" read_only=0 descriptor_type=4
-param guard_release_yaw_sigma_deg type=double value=0 read_only=0 descriptor_type=3
 param guard_vel_reset_sigma type=double value=0 read_only=0 descriptor_type=3
-param health_pub_en type=bool value=true read_only=0 descriptor_type=1
 param imu_coverage.max_extrapolation_s type=double value=0 read_only=0 descriptor_type=3
 param imu_coverage.max_gap_s type=double value=0 read_only=0 descriptor_type=3
 param imu_gap_accel_max type=double value=1 read_only=0 descriptor_type=3
@@ -143,31 +97,19 @@ param imu_gap_prior_en type=bool value=false read_only=0 descriptor_type=1
 param imu_gap_rate_rp_max type=double value=0 read_only=0 descriptor_type=3
 param imu_gap_rate_yaw_max type=double value=10 read_only=0 descriptor_type=3
 param imu_gap_verify_s type=double value=0.29999999999999999 read_only=0 descriptor_type=3
-param imu_init_require_still type=bool value=false read_only=0 descriptor_type=1
 param imu_init_still_gravity_ref type=double value=9.8100000000000005 read_only=0 descriptor_type=3
 param imu_init_still_gravity_tol type=double value=0.050000000000000003 read_only=0 descriptor_type=3
 param imu_init_still_gyro_rms_max type=double value=0.10000000000000001 read_only=0 descriptor_type=3
 param imu_init_still_max_gap_s type=double value=0.10000000000000001 read_only=0 descriptor_type=3
 param imu_init_still_min_duration_s type=double value=1 read_only=0 descriptor_type=3
 param imu_init_still_min_samples type=integer value=100 read_only=0 descriptor_type=2
-param imu_init_still_sustained_en type=bool value=false read_only=0 descriptor_type=1
 param imu_init_still_timeout_s type=double value=20 read_only=0 descriptor_type=3
 param imu_init_still_tol type=double value=0.029999999999999999 read_only=0 descriptor_type=3
 param initial_pose type=double_array value=[] read_only=0 descriptor_type=8
-param initial_pose_apply_roll_pitch type=bool value=false read_only=0 descriptor_type=1
-param initial_pose_full_rpy_override type=bool value=false read_only=0 descriptor_type=1
 param input_epoch_on_fault type=string value="hold" read_only=0 descriptor_type=4
 param ivox_grid_resolution type=double value=0.5 read_only=0 descriptor_type=3
 param ivox_max_voxels type=integer value=5000000 read_only=0 descriptor_type=2
-param ivox_nearby_type type=integer value=26 read_only=0 descriptor_type=2
 param ivox_voxel_capacity type=integer value=50 read_only=0 descriptor_type=2
-param lidar_attitude_hold_en type=bool value=false read_only=0 descriptor_type=1
-param lidar_attitude_hold_far_frac type=double value=0 read_only=0 descriptor_type=3
-param lidar_attitude_hold_max_s type=double value=3 read_only=0 descriptor_type=3
-param lidar_attitude_hold_max_scan_gap_s type=double value=0.29999999999999999 read_only=0 descriptor_type=3
-param lidar_attitude_hold_min_effct type=integer value=100 read_only=0 descriptor_type=2
-param lidar_attitude_hold_min_rp_info type=double value=0 read_only=0 descriptor_type=3
-param lidar_attitude_hold_z_weak type=double value=0.90000000000000002 read_only=0 descriptor_type=3
 param lidar_consider_rp_en type=bool value=false read_only=0 descriptor_type=1
 param lidar_consider_rp_max_s type=double value=0 read_only=0 descriptor_type=3
 param lidar_consider_rp_min_info type=double value=0 read_only=0 descriptor_type=3
@@ -208,7 +150,6 @@ param preprocess.timestamp_unit type=integer value=2 read_only=0 descriptor_type
 param prior_map_align type=string value="as_delivered" read_only=0 descriptor_type=4
 param prior_map_freeze type=bool value=false read_only=0 descriptor_type=1
 param prior_map_pcd type=string value="" read_only=0 descriptor_type=4
-param prior_map_pinned type=bool value=false read_only=0 descriptor_type=1
 param prior_map_voxel type=double value=0 read_only=0 descriptor_type=3
 param publish.body_frame_id type=string value="body" read_only=0 descriptor_type=4
 param publish.dense_publish_en type=bool value=true read_only=0 descriptor_type=1
@@ -232,14 +173,12 @@ param qos_overrides./tf.publisher.durability type=string value="volatile" read_o
 param qos_overrides./tf.publisher.history type=string value="keep_last" read_only=1 descriptor_type=4 description="qos policy {history} for publisher {/tf}"
 param qos_overrides./tf.publisher.reliability type=string value="reliable" read_only=1 descriptor_type=4 description="qos policy {reliability} for publisher {/tf}"
 param reanchor_confirm_scans type=integer value=3 read_only=0 descriptor_type=2
-param reanchor_en type=bool value=true read_only=0 descriptor_type=1
 param reanchor_healthy_window type=integer value=100 read_only=0 descriptor_type=2
 param reanchor_max_res type=double value=0.10000000000000001 read_only=0 descriptor_type=3
 param reanchor_max_res_ratio type=double value=0 read_only=0 descriptor_type=3
 param reanchor_min_eff type=integer value=200 read_only=0 descriptor_type=2
 param reanchor_min_eff_ratio type=double value=0 read_only=0 descriptor_type=3
 param reanchor_on_fail type=string value="hold" read_only=0 descriptor_type=4
-param reanchor_recovery_entry_view type=bool value=false read_only=0 descriptor_type=1
 param reanchor_recovery_stable_sec type=double value=1 read_only=0 descriptor_type=3
 param reanchor_require_guard_clear type=bool value=false read_only=0 descriptor_type=1
 param reanchor_res_floor type=double value=0.040000000000000001 read_only=0 descriptor_type=3
@@ -248,7 +187,6 @@ param reanchor_total_timeout_sec type=double value=0 read_only=0 descriptor_type
 param runaway_hold_sec type=double value=3 read_only=0 descriptor_type=3
 param runaway_on_trip type=string value="hold" read_only=0 descriptor_type=4
 param runaway_parked_speed_thresh type=double value=0.29999999999999999 read_only=0 descriptor_type=3
-param runaway_watchdog_en type=bool value=true read_only=0 descriptor_type=1
 param runaway_wheel_speed_margin type=double value=1 read_only=0 descriptor_type=3
 param runtime_pos_log_enable type=bool value=false read_only=0 descriptor_type=1
 param use_sim_time type=bool value=false read_only=0 descriptor_type=1
@@ -269,7 +207,6 @@ param zupt_acc_span_ratio type=double value=0.02 read_only=0 descriptor_type=3
 param zupt_anchor_confirm_scans type=integer value=3 read_only=0 descriptor_type=2
 param zupt_anchor_max_scan_gap_s type=double value=0 read_only=0 descriptor_type=3
 param zupt_anchor_trace_en type=bool value=false read_only=0 descriptor_type=1
-param zupt_en type=bool value=true read_only=0 descriptor_type=1
 param zupt_gyro_thresh type=double value=0.050000000000000003 read_only=0 descriptor_type=3
 param zupt_hold_deadband_sigma type=double value=3 read_only=0 descriptor_type=3
 param zupt_hold_pos_noise type=double value=0.050000000000000003 read_only=0 descriptor_type=3
@@ -277,7 +214,6 @@ param zupt_hold_rot_noise type=double value=0.02 read_only=0 descriptor_type=3
 param zupt_hold_vel_noise type=double value=0.050000000000000003 read_only=0 descriptor_type=3
 param zupt_parked_hold_en type=bool value=false read_only=0 descriptor_type=1
 param zupt_parked_hold_scans type=integer value=3 read_only=0 descriptor_type=2
-param zupt_require_wheel type=bool value=false read_only=0 descriptor_type=1
 param zupt_vel_reset_sigma type=double value=0 read_only=0 descriptor_type=3
 param zupt_wheel_max_age type=double value=0.5 read_only=0 descriptor_type=3
 param zupt_wheel_speed_thresh type=double value=0.050000000000000003 read_only=0 descriptor_type=3
@@ -289,47 +225,28 @@ set filter_size_map type=string value="0.4" -> rejected "Wrong parameter type, p
 after_set filter_size_map type=double value=0.40000000000000002
 set frontend_contract.undeclared type=integer value=1 -> rejected "parameter 'frontend_contract.undeclared' cannot be set because it was not declared"
 after_set frontend_contract.undeclared undeclared
-effective.v1.count 311
-effective.v1 adaptive_downsample_budget_sec float64 0x3faeb851eb851eb8
-effective.v1 adaptive_downsample_en bool 0
-effective.v1 adaptive_downsample_lower_after int32 100
-effective.v1 adaptive_downsample_max_voxel float64 0x3fe0000000000000
-effective.v1 adaptive_downsample_raise_after int32 5
-effective.v1 adaptive_downsample_release_sec float64 0x3fa1eb851eb851ec
-effective.v1 adaptive_downsample_step float64 0x3fa999999999999a
-effective.v1 canopy_ground_halfband float64 0x3fe999999999999a
-effective.v1 canopy_ground_z float64 0xbfde147ae147ae14
-effective.v1 canopy_near_range float64 0x4034000000000000
+effective.v1.count 242
 effective.v1 common.imu_bias_topic string[24] "/fixposition/fpa/imubias"
 effective.v1 common.imu_input_type string[11] "sensor_msgs"
 effective.v1 common.imu_time_offset float64 0x0000000000000000
 effective.v1 common.imu_topic string[10] "/livox/imu"
 effective.v1 common.lid_topic string[12] "/livox/lidar"
 effective.v1 common.time_offset_lidar_to_imu float64 0x0000000000000000
-effective.v1 common.time_sync_en bool 0
 effective.v1 corr_dump_en bool 0
 effective.v1 corr_dump_windows string[0] ""
 effective.v1 corr_gate_mad_scale float64 0x0000000000000000
 effective.v1 corr_gate_rot_sigma_floor_deg float64 0x0000000000000000
 effective.v1 corr_innov_gate_k float64 0x0000000000000000
-effective.v1 corr_kernel string[4] "none"
-effective.v1 corr_kernel_mad_scale float64 0x4008000000000000
-effective.v1 corr_kernel_min_scale float64 0x3f9eb851eb851eb8
 effective.v1 corr_nn0_max float64 0x0000000000000000
 effective.v1 cube_side_length float64 0x4069000000000000
 effective.v1 data_dir string[0] ""
 effective.v1 degeneracy_debug bool 0
-effective.v1 degeneracy_false_keep_rate float64 0x3f50624dd2f1a9fc
-effective.v1 degeneracy_floor_mode string[3] "off"
-effective.v1 degeneracy_floor_model_scale float64 0x3ff0000000000000
-effective.v1 degeneracy_floor_rel_uncertainty float64 0x3fd3333333333333
 effective.v1 degeneracy_schur_ridge float64 0x3eb0c6f7a0b5ed8d
 effective.v1 degeneracy_spectrum_trace bool 0
 effective.v1 derived:anchor_gap:stationary_anchor_params.max_scan_gap_ns int64 300000000
 effective.v1 derived:config_id:reference_config_id bytes[32] 0000000000000000000000000000000000000000000000000000000000000000
 effective.v1 derived:config_id:reference_contract_id bytes[32] 0000000000000000000000000000000000000000000000000000000000000000
 effective.v1 derived:corr_dump:corr_dump_windows float64[0x2] []
-effective.v1 derived:corr_kernel:corr_kernel int32 0
 effective.v1 derived:data_dir:root_dir string-masked[11] "<ROOT_DIR>/"
 effective.v1 derived:extrinsic_and_noise:Lidar_R_wrt_IMU float64[3x3] [0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000,0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000]
 effective.v1 derived:extrinsic_and_noise:Lidar_T_wrt_IMU float64[3x1] [0x0000000000000000,0x0000000000000000,0x0000000000000000]
@@ -347,8 +264,6 @@ effective.v1 derived:frontend_activation:frontend_observation_en bool 0
 effective.v1 derived:frontend_activation:reference_health_en bool 0
 effective.v1 derived:imu_gap:p_imu->gap_params.rate_rp_max float64 0x0000000000000000
 effective.v1 derived:imu_gap:p_imu->gap_params.rate_yaw_max float64 0x3fc657184ae74487
-effective.v1 derived:imu_static_limits:p_imu->init_require_still bool 0
-effective.v1 derived:imu_static_limits:p_imu->init_static_params.enabled bool 0
 effective.v1 derived:imu_static_limits:p_imu->init_static_params.gravityRef float64 0x40239eb851eb851f
 effective.v1 derived:imu_static_limits:p_imu->init_static_params.gravityTol float64 0x3fa999999999999a
 effective.v1 derived:imu_static_limits:p_imu->init_static_params.gyroRmsMax float64 0x3fb999999999999a
@@ -357,7 +272,6 @@ effective.v1 derived:imu_static_limits:p_imu->init_static_params.minDurationS fl
 effective.v1 derived:imu_static_limits:p_imu->init_static_params.minSamples int32 100
 effective.v1 derived:imu_static_limits:p_imu->init_still_timeout_s float64 0x4034000000000000
 effective.v1 derived:imu_static_limits:p_imu->init_still_tol float64 0x3f9eb851eb851eb8
-effective.v1 derived:initial_pose_alias:initial_pose_full_rpy_override_ bool 0
 effective.v1 derived:iteration_count:kf.maximum_iter int32 4
 effective.v1 derived:ivox:ikdtree.inv_res_ float32 0x40000000
 effective.v1 derived:ivox:ikdtree.max_voxels_ uint64 5000000
@@ -370,7 +284,6 @@ effective.v1 derived:lost_recovery:lost_recovery_params.enabled bool 0
 effective.v1 derived:lost_recovery:lost_recovery_params.stable_ns int64 2000000000
 effective.v1 derived:map_timer:map_pub_timer_.period_ns int64 5000000000
 effective.v1 derived:prior_alignment:prior_map_align_ enum<int32> 0
-effective.v1 derived:prior_alignment:prior_map_pinned_ bool 0
 effective.v1 derived:prior_startup:recovery_state.cause enum<uint8> 0
 effective.v1 derived:prior_startup:recovery_state.cold_start_eligible bool 1
 effective.v1 derived:prior_startup:recovery_state.deadline_ns int64 -1
@@ -402,43 +315,25 @@ effective.v1 diagnostics.kalman_channel_enable bool 0
 effective.v1 diagnostics.latency_enable bool 1
 effective.v1 diagnostics.latency_log_period_sec float64 0x3ff0000000000000
 effective.v1 diagnostics.time_admission_counts_enable bool 0
-effective.v1 divergence_guard_en bool 1
 effective.v1 divergence_guard_max_speed float64 0x403e000000000000
 effective.v1 divergence_guard_min_eff int32 50
 effective.v1 divergence_guard_streak int32 5
-effective.v1 feature_extract_enable bool 0
 effective.v1 filter_size_map float64 0x3fe0000000000000
 effective.v1 filter_size_surf float64 0x3fe0000000000000
 effective.v1 gravity_align_accel_tol float64 0x3fa999999999999a
-effective.v1 gravity_align_continuous bool 0
 effective.v1 gravity_align_en bool 0
 effective.v1 gravity_align_grav_cap_deg float64 0x4008000000000000
-effective.v1 gravity_align_grav_freeze_degraded bool 0
 effective.v1 gravity_align_grav_leak float64 0x3ff0000000000000
 effective.v1 gravity_align_gyro_tol float64 0x3fd6666666666666
-effective.v1 gravity_align_hold_s float64 0x0000000000000000
 effective.v1 gravity_align_leg_edge_window_s float64 0x3fc999999999999a
 effective.v1 gravity_align_leg_lever_arm float64[3] [0x0000000000000000,0x0000000000000000,0x0000000000000000]
 effective.v1 gravity_align_leg_vel_sigma float64 0x3fc3333333333333
 effective.v1 gravity_align_lin_accel_comp bool 0
-effective.v1 gravity_align_lin_accel_source string[3] "leg"
 effective.v1 gravity_align_mag_ref float64 0x0000000000000000
-effective.v1 gravity_align_noise float64 0x3fa999999999999a
-effective.v1 gravity_align_noise_degraded float64 0x0000000000000000
 effective.v1 gravity_align_noise_moving float64 0x3fa70a3d70a3d70a
 effective.v1 gravity_align_noise_static float64 0x3f80624dd2f1a9fc
-effective.v1 gravity_align_sigma_policy string[5] "scene"
 effective.v1 gravity_align_vel_sigma_scale float64 0x0000000000000000
 effective.v1 gravity_align_window_s float64 0x0000000000000000
-effective.v1 gravity_align_withhold_blind_moving bool 0
-effective.v1 gravity_align_z_weak_thresh float64 0x3fd3333333333333
-effective.v1 ground_recover_en bool 0
-effective.v1 ground_recover_max_residual float64 0x3ff0000000000000
-effective.v1 ground_recover_max_rows int32 4000
-effective.v1 ground_recover_min_inliers int32 100
-effective.v1 ground_recover_scan_band float64 0x3fc3333333333333
-effective.v1 ground_recover_sector_tol float64 0x3fd0000000000000
-effective.v1 guard_engulf_en bool 1
 effective.v1 guard_engulf_far_frac_min float64 0x3fc3333333333333
 effective.v1 guard_engulf_far_frac_release float64 0x3fd6666666666666
 effective.v1 guard_engulf_far_range float64 0x4000000000000000
@@ -447,21 +342,11 @@ effective.v1 guard_engulf_streak int32 2
 effective.v1 guard_hole_en bool 0
 effective.v1 guard_hole_max_accel float64 0x3ff0000000000000
 effective.v1 guard_hole_min_sec float64 0x3fd3333333333333
-effective.v1 guard_hole_reanchor_pos bool 1
-effective.v1 guard_release_inflate_en bool 0
 effective.v1 guard_release_keep_sigma float64 0x3fe0000000000000
 effective.v1 guard_release_leg_max_age_s float64 0x3fe0000000000000
 effective.v1 guard_release_leg_sigma float64 0x3fd3333333333333
-effective.v1 guard_release_pos_sigma_max float64 0x3ff0000000000000
-effective.v1 guard_release_pos_sigma_min float64 0x3fb999999999999a
-effective.v1 guard_release_pos_sigma_rate float64 0x3fc999999999999a
-effective.v1 guard_release_rp_sigma_deg float64 0x3fe0000000000000
-effective.v1 guard_release_rp_sigma_max_deg float64 0x4008000000000000
-effective.v1 guard_release_rp_sigma_rate_deg float64 0x3fd3333333333333
 effective.v1 guard_release_vel_source string[4] "zero"
-effective.v1 guard_release_yaw_sigma_deg float64 0x0000000000000000
 effective.v1 guard_vel_reset_sigma float64 0x0000000000000000
-effective.v1 health_pub_en bool 1
 effective.v1 imu_coverage.max_extrapolation_s float64 0x0000000000000000
 effective.v1 imu_coverage.max_gap_s float64 0x0000000000000000
 effective.v1 imu_gap_accel_max float64 0x3ff0000000000000
@@ -472,31 +357,19 @@ effective.v1 imu_gap_prior_en bool 0
 effective.v1 imu_gap_rate_rp_max float64 0x0000000000000000
 effective.v1 imu_gap_rate_yaw_max float64 0x4024000000000000
 effective.v1 imu_gap_verify_s float64 0x3fd3333333333333
-effective.v1 imu_init_require_still bool 0
 effective.v1 imu_init_still_gravity_ref float64 0x40239eb851eb851f
 effective.v1 imu_init_still_gravity_tol float64 0x3fa999999999999a
 effective.v1 imu_init_still_gyro_rms_max float64 0x3fb999999999999a
 effective.v1 imu_init_still_max_gap_s float64 0x3fb999999999999a
 effective.v1 imu_init_still_min_duration_s float64 0x3ff0000000000000
 effective.v1 imu_init_still_min_samples int32 100
-effective.v1 imu_init_still_sustained_en bool 0
 effective.v1 imu_init_still_timeout_s float64 0x4034000000000000
 effective.v1 imu_init_still_tol float64 0x3f9eb851eb851eb8
 effective.v1 initial_pose float64[0] []
-effective.v1 initial_pose_apply_roll_pitch bool 0
-effective.v1 initial_pose_full_rpy_override bool 0
 effective.v1 input_epoch_on_fault string[4] "hold"
 effective.v1 ivox_grid_resolution float64 0x3fe0000000000000
 effective.v1 ivox_max_voxels int32 5000000
-effective.v1 ivox_nearby_type int32 26
 effective.v1 ivox_voxel_capacity int32 50
-effective.v1 lidar_attitude_hold_en bool 0
-effective.v1 lidar_attitude_hold_far_frac float64 0x0000000000000000
-effective.v1 lidar_attitude_hold_max_s float64 0x4008000000000000
-effective.v1 lidar_attitude_hold_max_scan_gap_s float64 0x3fd3333333333333
-effective.v1 lidar_attitude_hold_min_effct int32 100
-effective.v1 lidar_attitude_hold_min_rp_info float64 0x0000000000000000
-effective.v1 lidar_attitude_hold_z_weak float64 0x3feccccccccccccd
 effective.v1 lidar_consider_rp_en bool 0
 effective.v1 lidar_consider_rp_max_s float64 0x0000000000000000
 effective.v1 lidar_consider_rp_min_info float64 0x0000000000000000
@@ -537,7 +410,6 @@ effective.v1 preprocess.timestamp_unit int32 2
 effective.v1 prior_map_align string[12] "as_delivered"
 effective.v1 prior_map_freeze bool 0
 effective.v1 prior_map_pcd string[0] ""
-effective.v1 prior_map_pinned bool 0
 effective.v1 prior_map_voxel float64 0x0000000000000000
 effective.v1 publish.body_frame_id string[4] "body"
 effective.v1 publish.dense_publish_en bool 1
@@ -553,14 +425,12 @@ effective.v1 publish.reference_health bool 0
 effective.v1 publish.scan_bodyframe_pub_en bool 1
 effective.v1 publish.scan_publish_en bool 1
 effective.v1 reanchor_confirm_scans int32 3
-effective.v1 reanchor_en bool 1
 effective.v1 reanchor_healthy_window int32 100
 effective.v1 reanchor_max_res float64 0x3fb999999999999a
 effective.v1 reanchor_max_res_ratio float64 0x0000000000000000
 effective.v1 reanchor_min_eff int32 200
 effective.v1 reanchor_min_eff_ratio float64 0x0000000000000000
 effective.v1 reanchor_on_fail string[4] "hold"
-effective.v1 reanchor_recovery_entry_view bool 0
 effective.v1 reanchor_recovery_stable_sec float64 0x3ff0000000000000
 effective.v1 reanchor_require_guard_clear bool 0
 effective.v1 reanchor_res_floor float64 0x3fa47ae147ae147b
@@ -569,7 +439,6 @@ effective.v1 reanchor_total_timeout_sec float64 0x0000000000000000
 effective.v1 runaway_hold_sec float64 0x4008000000000000
 effective.v1 runaway_on_trip string[4] "hold"
 effective.v1 runaway_parked_speed_thresh float64 0x3fd3333333333333
-effective.v1 runaway_watchdog_en bool 1
 effective.v1 runaway_wheel_speed_margin float64 0x3ff0000000000000
 effective.v1 runtime_pos_log_enable bool 0
 effective.v1 wheel_cov_topic string[0] ""
@@ -589,7 +458,6 @@ effective.v1 zupt_acc_span_ratio float64 0x3f947ae147ae147b
 effective.v1 zupt_anchor_confirm_scans int32 3
 effective.v1 zupt_anchor_max_scan_gap_s float64 0x0000000000000000
 effective.v1 zupt_anchor_trace_en bool 0
-effective.v1 zupt_en bool 1
 effective.v1 zupt_gyro_thresh float64 0x3fa999999999999a
 effective.v1 zupt_hold_deadband_sigma float64 0x4008000000000000
 effective.v1 zupt_hold_pos_noise float64 0x3fa999999999999a
@@ -597,7 +465,6 @@ effective.v1 zupt_hold_rot_noise float64 0x3f947ae147ae147b
 effective.v1 zupt_hold_vel_noise float64 0x3fa999999999999a
 effective.v1 zupt_parked_hold_en bool 0
 effective.v1 zupt_parked_hold_scans int32 3
-effective.v1 zupt_require_wheel bool 0
 effective.v1 zupt_vel_reset_sigma float64 0x0000000000000000
 effective.v1 zupt_wheel_max_age float64 0x3fe0000000000000
 effective.v1 zupt_wheel_speed_thresh float64 0x3fa999999999999a

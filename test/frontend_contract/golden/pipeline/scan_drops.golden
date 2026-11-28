@@ -1,5 +1,5 @@
 # frontend contract golden: pipeline/scan_drops
-# fork_sha: 26168a671fddc463ffd573862665fa87c187aae5
+# fork_sha: bbf0f7d9c350eddde34c977148033bf0be93945d
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -9,7 +9,7 @@ imu_batch seq=1 disposition=committed reason=bootstrap samples=12 pending=1 firs
 record seq=1 outcome=bootstrap beg_ns=1000000000 end_ns=1050000000 gap_ns=-1 published=0 flags=-1 events=0x0
 record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=0 valid=0 created_ns=-1 state=empty episode=0 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.evidence evidence=unknown reason=no_imu wheel_valid=0 usable=0 zero_only=0 supported=0
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=cold
 record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -26,7 +26,7 @@ imu_batch seq=2 disposition=committed reason=initialization_complete samples=20 
 record seq=2 outcome=imu_not_processed beg_ns=1100000000 end_ns=1150000000 gap_ns=-1 published=0 flags=-1 events=0x0
 record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=0 valid=0 created_ns=-1 state=empty episode=0 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.evidence evidence=unknown reason=no_imu wheel_valid=0 usable=0 zero_only=0 supported=0
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=cold
 record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -45,7 +45,7 @@ initial_build end=1.25
 record seq=3 outcome=before_anchor_step beg_ns=1200000000 end_ns=1250000000 gap_ns=-1 published=0 flags=-1 events=0x0
 record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=0 valid=0 created_ns=-1 state=empty episode=0 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.evidence evidence=unknown reason=no_imu wheel_valid=0 usable=0 zero_only=0 supported=0
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -71,11 +71,12 @@ h_exit.v1 end=0x3ff599999999999a call=2 valid=1 effective=734 mean_residual=0x00
 filter_update.v1 end=0x3ff599999999999a pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=88b00b70272641af98dd6170569b22c7d6d04ffa3720ddd109e5d307a164e132 P_diag=[0x3ff0a3dc38ed7e98,0x3ff0a45eff140040,0x3f84652659c17980,0x3f6c17218af17e00,0x3ef9fa8d4d0b0000,0x3ff0006a6e88add4,0x3ee4f8a7d6ded6cb,0x3ee4f8a7cae53318,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a8722d0918,0x3ff001a874c3fc2e,0x3ff03753f39e0836,0x3feec9066ff190d1,0x3f1a3d6719f80a5c,0x3f1a3d6713f9c491,0x3f1a3d6df4a52df4,0x3f5062b6838a38a7,0x3f5062b6838a38a7,0x3f5062b61fddcd3c,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=1.3500000000000001 forced=healthy
 trace "[ZUPT-ANCHOR] v=6 event=candidate_started reason=- event_seq=1 scan_seq=4 stamp_ns=1350000000 anchor_id=1 anchor_valid=0 created_ns=1350000000 last_evidence_ns=1350000000 anchor_state=qualifying stationary_episode=1 reference_generation=0 streak=1"
+runaway_check end=1.3500000000000001 trip=0
 pose_publish encoding=0 stamp_ns=1350000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=4 outcome=published beg_ns=1300000000 end_ns=1350000000 gap_ns=-1 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.010000000000000089 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=0 created_ns=1350000000 state=qualifying episode=1 ref_gen=0 used=0 streak=1 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -105,11 +106,12 @@ h_matrix.v1 end=0x3ff7333333333333 valid=1 h_x=734x12 h_x_sha256=8b86ebb71317ed7
 h_exit.v1 end=0x3ff7333333333333 call=2 valid=1 effective=734 mean_residual=0x0000000000000000 pos_eig=[0x0000000000000000,0x4086f00000000000] z_weak=0x0000000000000000 hold_scene=0 hold_allowed=0 hold_rows=0 hold_info=0 rp_info_min=0x3ffbd21bcb0db3d9 rp_consider=0 degeneracy_engaged=0 degeneracy_shares=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_lambdas=[0x0000000000000000,0x0000000000000000,0x0000000000000000] degeneracy_weights=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_weighted_points=0 degeneracy_weight_sum=0x0000000000000000 dump_written=0
 filter_update.v1 end=0x3ff7333333333333 pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=f96be66f4dd4e6ab8f8b916196f4c874879794c759e65684bd1c50e75a7cd9b6 P_diag=[0x3ff170b7784173f7,0x3ff1720b72911e08,0x3f76712749839800,0x3f5c89a895e877ed,0x3ef645a5ba01dc8c,0x3ff000a2cbc078dc,0x3ee4f8a7d0f05a92,0x3ee4f8a7cae276d9,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a80297221d,0x3ff0029189d912e8,0x3ff03f6e05cf81f1,0x3fc6a309034de8bc,0x3f1a3e4b1cb2bfaa,0x3f19e2f4d8804bbc,0x3f1a40b37969a357,0x3f5062eadbd67ffd,0x3f5062eadbd67ffd,0x3f5062b4708b199e,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=1.45 forced=healthy
+runaway_check end=1.45 trip=0
 pose_publish encoding=0 stamp_ns=1449999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=5 outcome=published beg_ns=1400000000 end_ns=1450000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999999551 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=0 created_ns=1350000000 state=qualifying episode=1 ref_gen=0 used=0 streak=2 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -140,11 +142,12 @@ h_exit.v1 end=0x3ff8cccccccccccd call=2 valid=1 effective=734 mean_residual=0x00
 filter_update.v1 end=0x3ff8cccccccccccd pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=5cbf4171cec9dea242e3df097734c82b25ecc0a09f20aea8f92ee367dfa4738c P_diag=[0x3ff28f8e5d33a884,0x3ff29268b43db711,0x3f70705682a5c4dd,0x3f536f35c1b91dc2,0x3ef55b2d114fc706,0x3ff000dd429e9a9c,0x3ee4f8a7cefdc76e,0x3ee4f8a7cae1d8f9,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a7ea99d056,0x3ff003b2befb289c,0x3ff04c266f95d38c,0x3fb0916b9d7feb26,0x3f1a3e7582be0e3d,0x3f1972beb1135177,0x3f1a43f8fe2ea8d8,0x3f50631f3422d055,0x3f50631f3422d055,0x3f5062b106be1807,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=1.55 forced=healthy
 trace "[ZUPT-ANCHOR] v=6 event=created reason=- event_seq=2 scan_seq=6 stamp_ns=1550000000 anchor_id=1 anchor_valid=1 created_ns=1350000000 last_evidence_ns=1550000000 anchor_state=valid stationary_episode=1 reference_generation=0 streak=3"
+runaway_check end=1.55 trip=0
 pose_publish encoding=0 stamp_ns=1550000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=6 outcome=published beg_ns=1500000000 end_ns=1550000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.010000000000000045 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=1 created_ns=1350000000 state=valid episode=1 ref_gen=0 used=0 streak=3 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -174,11 +177,12 @@ h_matrix.v1 end=0x3ffa666666666667 valid=1 h_x=734x12 h_x_sha256=8b86ebb71317ed7
 h_exit.v1 end=0x3ffa666666666667 call=2 valid=1 effective=734 mean_residual=0x0000000000000000 pos_eig=[0x0000000000000000,0x4086f00000000000] z_weak=0x0000000000000000 hold_scene=0 hold_allowed=0 hold_rows=0 hold_info=0 rp_info_min=0x3ffbd21bcb0db3d9 rp_consider=0 degeneracy_engaged=0 degeneracy_shares=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_lambdas=[0x0000000000000000,0x0000000000000000,0x0000000000000000] degeneracy_weights=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_weighted_points=0 degeneracy_weight_sum=0x0000000000000000 dump_written=0
 filter_update.v1 end=0x3ffa666666666667 pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=f4818499bb173b8082b3be717d206f8c58f11d881c81dfcd22b2cf8b13691b8e P_diag=[0x3ff4006867bc0138,0x3ff405b91284d1d3,0x3f6a6f2b41dbeada,0x3f4e033b937c019c,0x3ef44d4892e20194,0x3ff00119d36601df,0x3ee4f8a7ce0c2709,0x3ee4f8a7cae0e50c,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a7e0a46eee,0x3ff0050c339b828f,0x3ff05a3650ba7016,0x3f9fd97dcce90b4e,0x3f1a3bf9e7da2d16,0x3f18f86c0b659941,0x3f1a473e82f31e3b,0x3f5063538c6f17ab,0x3f5063538c6f17ab,0x3f50626fa9e13b54,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=1.6500000000000001 forced=healthy
+runaway_check end=1.6500000000000001 trip=0
 pose_publish encoding=0 stamp_ns=1650000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=7 outcome=published beg_ns=1600000000 end_ns=1650000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.010000000000000134 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=1 created_ns=1350000000 state=valid episode=1 ref_gen=0 used=0 streak=4 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -197,7 +201,7 @@ slot 7 empty_cloud scan=7 start=1.7000000000000002 end=1.7500000000000002 imu=st
 record seq=8 outcome=dropped_invalid_time beg_ns=1700000000 end_ns=-1 gap_ns=50000000 published=0 flags=-1 events=0x0
 record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=1 created_ns=1350000000 state=valid episode=1 ref_gen=0 used=0 streak=4 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.evidence evidence=unknown reason=no_imu wheel_valid=0 usable=0 zero_only=0 supported=0
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -222,11 +226,12 @@ h_matrix.v1 end=0x3ffd99999999999a valid=1 h_x=734x12 h_x_sha256=8b86ebb71317ed7
 h_exit.v1 end=0x3ffd99999999999a call=2 valid=1 effective=734 mean_residual=0x0000000000000000 pos_eig=[0x0000000000000000,0x4086f00000000000] z_weak=0x0000000000000000 hold_scene=0 hold_allowed=0 hold_rows=0 hold_info=0 rp_info_min=0x3ffbd21bcb0db3d9 rp_consider=0 degeneracy_engaged=0 degeneracy_shares=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_lambdas=[0x0000000000000000,0x0000000000000000,0x0000000000000000] degeneracy_weights=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_weighted_points=0 degeneracy_weight_sum=0x0000000000000000 dump_written=0
 filter_update.v1 end=0x3ffd99999999999a pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=ca9fe215ed53f770d261caf3d3db28de6093188bf62a0e9014b3a2f09b8d8520 P_diag=[0x3ff7d84e40aa8b25,0x3ff7e8cf30adfd4b,0x3f68a32aba9ad6f6,0x3f4a0052d3d64242,0x3ef54d67e60b1b80,0x3ff0019a9348d82e,0x3ee4f8a7cd841a75,0x3ee4f8a7cadf2ab2,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a7d956f9ae,0x3ff00899d4755362,0x3ff08dc0571045ed,0x3f89f008c7b78812,0x3f1a307ac3b0b260,0x3f181258a4bc90d9,0x3f1a4ddf060a5b15,0x3f5063bd94a08b76,0x3f5063bd94a08b76,0x3f50600d8b1c04d6,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=1.8500000000000001 forced=healthy
+runaway_check end=1.8500000000000001 trip=0
 pose_publish encoding=0 stamp_ns=1850000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=9 outcome=published beg_ns=1800000000 end_ns=1850000000 gap_ns=150000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=40 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=40 gyr_max=0 acc_span=0 wheel_age=0.010000000000000089 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=1 created_ns=1350000000 state=valid episode=1 ref_gen=0 used=0 streak=5 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -256,11 +261,12 @@ h_matrix.v1 end=0x3fff333333333333 valid=1 h_x=734x12 h_x_sha256=8b86ebb71317ed7
 h_exit.v1 end=0x3fff333333333333 call=2 valid=1 effective=734 mean_residual=0x0000000000000000 pos_eig=[0x0000000000000000,0x4086f00000000000] z_weak=0x0000000000000000 hold_scene=0 hold_allowed=0 hold_rows=0 hold_info=0 rp_info_min=0x3ffbd21bcb0db3d9 rp_consider=0 degeneracy_engaged=0 degeneracy_shares=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_lambdas=[0x0000000000000000,0x0000000000000000,0x0000000000000000] degeneracy_weights=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_weighted_points=0 degeneracy_weight_sum=0x0000000000000000 dump_written=0
 filter_update.v1 end=0x3fff333333333333 pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=59a94c5a77ea06b1eac773ef594bf94c2f4274534575af3e08e50ce119466507 P_diag=[0x3ffa3f741ae0151e,0x3ffa57571a0df982,0x3f644d646c5db268,0x3f466cdf6b209a6e,0x3ef2d59af7b12f8e,0x3ff001dd7360afd8,0x3ee4f8a7cd30b07e,0x3ee4f8a7cade7699,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a7d6e1b8dd,0x3ff00aadcda82b94,0x3ff09c0286d97262,0x3f807b8e27ea0fc4,0x3f1a1e9134203e86,0x3f179b3f95cc194b,0x3f1a51248aced078,0x3f5063f1ececd2cc,0x3f5063f1ececd2cc,0x3f505d6f2697a94a,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=1.95 forced=healthy
+runaway_check end=1.95 trip=0
 pose_publish encoding=0 stamp_ns=1950000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=10 outcome=published beg_ns=1900000000 end_ns=1950000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999999551 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=1 created_ns=1350000000 state=valid episode=1 ref_gen=0 used=0 streak=6 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -279,7 +285,7 @@ slot 10 repeated_cloud scan=10 start=2 end=2.0499999999999998 imu=static cloud=d
 record seq=11 outcome=dropped_nonadvancing beg_ns=1900000000 end_ns=1950000000 gap_ns=-50000000 published=0 flags=-1 events=0x0
 record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=1 created_ns=1350000000 state=valid episode=1 ref_gen=0 used=0 streak=6 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.evidence evidence=unknown reason=no_imu wheel_valid=0 usable=0 zero_only=0 supported=0
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -304,11 +310,12 @@ h_matrix.v1 end=0x4001333333333333 valid=1 h_x=734x12 h_x_sha256=8b86ebb71317ed7
 h_exit.v1 end=0x4001333333333333 call=2 valid=1 effective=734 mean_residual=0x0000000000000000 pos_eig=[0x0000000000000000,0x4086f00000000000] z_weak=0x0000000000000000 hold_scene=0 hold_allowed=0 hold_rows=0 hold_info=0 rp_info_min=0x3ffbd21bcb0db3d9 rp_consider=0 degeneracy_engaged=0 degeneracy_shares=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_lambdas=[0x0000000000000000,0x0000000000000000,0x0000000000000000] degeneracy_weights=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_weighted_points=0 degeneracy_weight_sum=0x0000000000000000 dump_written=0
 filter_update.v1 end=0x4001333333333333 pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=22a74017eed1426752400d383ae55eb43a9615d80518166ab104e22ae685a6dd P_diag=[0x40000239129d442a,0x40001b5eaf3542a3,0x3f639cb26f1967ba,0x3f4551b67c67ae9c,0x3ef33a3e56bc50ec,0x3ff0026ad4449aa2,0x3ee4f8a7ccfb247c,0x3ee4f8a7cadda2fa,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a7d4dedde1,0x3ff00fb3d8d1b3de,0x3ff0d1cc788c9d93,0x3f74e5bb66d16ed0,0x3f19fe58fb1bc540,0x3f16cc983b6520bd,0x3f1a57c50de69d70,0x3f50645bf51e4f99,0x3f50645bf51e4f99,0x3f5051cc17e6ce8f,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=2.1499999999999999 forced=healthy
+runaway_check end=2.1499999999999999 trip=0
 pose_publish encoding=0 stamp_ns=2149999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=12 outcome=published beg_ns=2100000000 end_ns=2150000000 gap_ns=150000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=40 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=40 gyr_max=0 acc_span=0 wheel_age=0.00999999999999991 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=1 created_ns=1350000000 state=valid episode=1 ref_gen=0 used=0 streak=7 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -338,11 +345,12 @@ h_matrix.v1 end=0x4002000000000000 valid=1 h_x=734x12 h_x_sha256=8b86ebb71317ed7
 h_exit.v1 end=0x4002000000000000 call=2 valid=1 effective=734 mean_residual=0x0000000000000000 pos_eig=[0x0000000000000000,0x4086f00000000000] z_weak=0x0000000000000000 hold_scene=0 hold_allowed=0 hold_rows=0 hold_info=0 rp_info_min=0x3ffbd21bcb0db3d9 rp_consider=0 degeneracy_engaged=0 degeneracy_shares=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_lambdas=[0x0000000000000000,0x0000000000000000,0x0000000000000000] degeneracy_weights=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_weighted_points=0 degeneracy_weight_sum=0x0000000000000000 dump_written=0
 filter_update.v1 end=0x4002000000000000 pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=ec2802cb6208c432c65b8ff29070774d47bffa0254ff1ac92a20310966f1b9a1 P_diag=[0x4001b1379c6fdfe5,0x4001d218c3143724,0x3f60fb7d2ee2228c,0x3f4353d5f9655f1e,0x3ef18db75448c8de,0x3ff002b4060d1657,0x3ee4f8a7ccd804ab,0x3ee4f8a7cadd3329,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a7d3e7a09c,0x3ff0127f83a4e355,0x3ff0e08c62f9d5e5,0x3f6fea2e68ecef36,0x3f19d8d75824a4e7,0x3f166413663efb0e,0x3f1a5b0a92aba2f1,0x3f5064904d6a9ff1,0x3f5064904d6a9ff1,0x3f504698ea4607de,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=2.25 forced=healthy
+runaway_check end=2.25 trip=0
 pose_publish encoding=0 stamp_ns=2250000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=13 outcome=published beg_ns=2200000000 end_ns=2250000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.01 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=1 created_ns=1350000000 state=valid episode=1 ref_gen=0 used=0 streak=8 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -374,11 +382,12 @@ h_matrix.v1 end=0x4002cccccccccccc valid=1 h_x=734x12 h_x_sha256=8b86ebb71317ed7
 h_exit.v1 end=0x4002cccccccccccc call=2 valid=1 effective=734 mean_residual=0x0000000000000000 pos_eig=[0x0000000000000000,0x4086f00000000000] z_weak=0x0000000000000000 hold_scene=0 hold_allowed=0 hold_rows=0 hold_info=0 rp_info_min=0x3ffbd21bcb0db3d9 rp_consider=0 degeneracy_engaged=0 degeneracy_shares=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_lambdas=[0x0000000000000000,0x0000000000000000,0x0000000000000000] degeneracy_weights=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_weighted_points=0 degeneracy_weight_sum=0x0000000000000000 dump_written=0
 filter_update.v1 end=0x4002cccccccccccc pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=f56ca33ae87e7e4ec952f65a5cc5651546e522c7f74691dcfe54d255bd5c2edc P_diag=[0x40038963cd94d7d1,0x4003b3b37235cd09,0x3f5f882f2372fb71,0x3f4b89fe4de190a1,0x3ef4628593a922a0,0x3ff006b1aa8e8913,0x3ee4f8a7ccc4c6c0,0x3ee4f8a7cadd0183,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a7d397689a,0x3ff0193fb4de7816,0x3ff0f69f8463ea9b,0x3f71df82adefd24a,0x3f19f26b24f45a38,0x3f1699287b541982,0x3f1a9ae0ec7f69a2,0x3f50688db307dc5c,0x3f50688db307dc5c,0x3f5042a73cdc5fac,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=2.3499999999999996 forced=healthy
+runaway_check end=2.3499999999999996 trip=0
 pose_publish encoding=0 stamp_ns=2349999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=14 outcome=published beg_ns=2300000000 end_ns=2350000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=1 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=1 gyr_max=0 acc_span=0 wheel_age=0.0099999999999996446 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=1 valid=1 created_ns=1350000000 state=valid episode=1 ref_gen=0 used=0 streak=9 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=1 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=1 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -393,7 +402,7 @@ imu_retain.v1 seq=13 disposition=uncommitted reason=empty_window borrowed=0 pend
 record seq=15 outcome=dropped_empty_imu beg_ns=2400000000 end_ns=2450000000 gap_ns=50000000 published=0 flags=-1 events=0x4
 record.step anchor_step=0 body=na imu_n=0 gyr_max=nan:0x7ff8000000000000 acc_span=nan:0x7ff8000000000000 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=blind action=na parked=0 parked_applied=0 zupt_active=0 eff_degraded=1 static_hold=0
 record.anchor id=1 valid=0 created_ns=1350000000 state=empty episode=1 ref_gen=0 used=0 streak=0 have_pose=0 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=unknown reason=no_imu imu_only=0 wheel_valid=0 usable=0 zero_only=0 supported=0
+record.evidence evidence=unknown reason=no_imu wheel_valid=0 usable=0 zero_only=0 supported=0
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -424,11 +433,12 @@ h_exit.v1 end=0x4004666666666666 call=2 valid=1 effective=734 mean_residual=0x00
 filter_update.v1 end=0x4004666666666666 pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=f5515e8e8d43ddefefbdb4dd7a6ea0412fe8fb5ee4afefbc1406d963329c092e P_diag=[0x4007b5a95820ed74,0x4007fd4d044d3ead,0x3f61615572b4b127,0x3f4ee05d1135cdee,0x3ef4fdbd77fc2000,0x3ff00b6888c95c4f,0x3ee4f8a7ccbc7f4b,0x3ee4f8a7cadcd110,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a7d368b6d8,0x3ff024337767f738,0x3ff12fc6c6379177,0x3f7467896360cff5,0x3f1a0c2edecfcc95,0x3f16ce0202cf8283,0x3f1ae49d4e197e35,0x3f506d2979217da3,0x3f506d2979217da3,0x3f5031878c3fcb29,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=2.5499999999999998 forced=healthy
 trace "[ZUPT-ANCHOR] v=6 event=candidate_started reason=- event_seq=5 scan_seq=16 stamp_ns=2550000000 anchor_id=2 anchor_valid=0 created_ns=2550000000 last_evidence_ns=2550000000 anchor_state=qualifying stationary_episode=2 reference_generation=0 streak=1"
+runaway_check end=2.5499999999999998 trip=0
 pose_publish encoding=0 stamp_ns=2549999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
-record seq=16 outcome=published beg_ns=2500000000 end_ns=2550000000 gap_ns=150000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=blind gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record seq=16 outcome=published beg_ns=2500000000 end_ns=2550000000 gap_ns=150000000 published=1 flags=0 events=0x80
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.0099999999999998233 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=blind gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=2 valid=0 created_ns=2550000000 state=qualifying episode=2 ref_gen=0 used=0 streak=1 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -458,11 +468,12 @@ h_matrix.v1 end=0x4005333333333333 valid=1 h_x=734x12 h_x_sha256=8b86ebb71317ed7
 h_exit.v1 end=0x4005333333333333 call=2 valid=1 effective=734 mean_residual=0x0000000000000000 pos_eig=[0x0000000000000000,0x4086f00000000000] z_weak=0x0000000000000000 hold_scene=0 hold_allowed=0 hold_rows=0 hold_info=0 rp_info_min=0x3ffbd21bcb0db3d9 rp_consider=0 degeneracy_engaged=0 degeneracy_shares=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_lambdas=[0x0000000000000000,0x0000000000000000,0x0000000000000000] degeneracy_weights=[0x3ff0000000000000,0x3ff0000000000000,0x3ff0000000000000] degeneracy_weighted_points=0 degeneracy_weight_sum=0x0000000000000000 dump_written=0
 filter_update.v1 end=0x4005333333333333 pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=2e9c9db5ad38241e18140875176c1af25e066f20e62599d4a5ba0da3b4f5b4bc P_diag=[0x400a09f016542d51,0x400a634058274b7a,0x3f60821f87dcbd49,0x3f48811a00d12f4d,0x3ef180bca552a7fa,0x3ff00bba3ef5054c,0x3ee4f8a7ccb826f3,0x3ee4f8a7cadca73a,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a7d34672a0,0x3ff027f3f0b8ffa9,0x3ff140637c7b71cd,0x3f727971769763b0,0x3f19e4ab832e216f,0x3f166eea5e64c0ef,0x3f1ae7e2d2ddf398,0x3f506d5dd16dc4f9,0x3f506d5dd16dc4f9,0x3f50157b9af70d17,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=2.6499999999999999 forced=healthy
+runaway_check end=2.6499999999999999 trip=0
 pose_publish encoding=0 stamp_ns=2649999999 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=17 outcome=published beg_ns=2600000000 end_ns=2650000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.00999999999999991 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=2 valid=0 created_ns=2550000000 state=qualifying episode=2 ref_gen=0 used=0 streak=2 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
@@ -493,11 +504,12 @@ h_exit.v1 end=0x4006000000000000 call=2 valid=1 effective=734 mean_residual=0x00
 filter_update.v1 end=0x4006000000000000 pos=[0x0000000000000000,0x0000000000000000,0x0000000000000000] rot_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_R_L_I_xyzw=[0x0000000000000000,0x0000000000000000,0x0000000000000000,0x3ff0000000000000] offset_T_L_I=[0x0000000000000000,0x0000000000000000,0x0000000000000000] vel=[0x0000000000000000,0x0000000000000000,0x0000000000000000] bg=[0x0000000000000000,0x0000000000000000,0x0000000000000000] ba=[0x0000000000000000,0x0000000000000000,0x0000000000000000] grav=[0x8000000000000000,0x8000000000000000,0xc0239eb851eb851f] P=23x23 P_sha256=6d7a9a4567e80b73f148dfb0dd732618cfce442e9abffec7ce5b125a34280673 P_diag=[0x400c87b4e7d32615,0x400cf578de36df41,0x3f5f97765cf86bc6,0x3f454a5164e2feaf,0x3ef06db199f5d206,0x3ff00c0e1c26f7ab,0x3ee4f8a7ccb524ab,0x3ee4f8a7cadc7f41,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1,0x3ee4f8a7d32032b2,0x3ff02bf1c70cbde6,0x3ff1519669e9feb0,0x3f70999eed997964,0x3f19bdfeb6961c18,0x3f16127de87cb12b,0x3f1aeb2857a2f919,0x3f506d9229ba1551,0x3f506d9229ba1551,0x3f4fdde84e9c9be8,0x3ee4f8b588e368f1,0x3ee4f8b588e368f1]
 guard end=2.75 forced=healthy
 trace "[ZUPT-ANCHOR] v=6 event=created reason=- event_seq=6 scan_seq=18 stamp_ns=2750000000 anchor_id=2 anchor_valid=1 created_ns=2550000000 last_evidence_ns=2750000000 anchor_state=valid stationary_episode=2 reference_generation=0 streak=3"
+runaway_check end=2.75 trip=0
 pose_publish encoding=0 stamp_ns=2750000000 observation_id=0000000000000000000000000000000000000000000000000000000000000000
 record seq=18 outcome=published beg_ns=2700000000 end_ns=2750000000 gap_ns=50000000 published=1 flags=0 events=0x0
-record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=-1 wheel_speed=nan:0x7ff8000000000000 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
+record.step anchor_step=1 body=static imu_n=20 gyr_max=0 acc_span=0 wheel_age=0.01 wheel_speed=0 guard_degraded=0 degraded=0 gate_pre=healthy gate_post=healthy action=none parked=0 parked_applied=0 zupt_active=0 eff_degraded=0 static_hold=0
 record.anchor id=2 valid=1 created_ns=2550000000 state=valid episode=2 ref_gen=0 used=0 streak=3 have_pose=1 p=[0,0,0] q=[1,0,0,0]
-record.evidence evidence=stationary reason=imu_only imu_only=1 wheel_valid=0 usable=0 zero_only=0 supported=1
+record.evidence evidence=stationary reason=imu_and_wheel wheel_valid=1 usable=0 zero_only=0 supported=1
 record.recovery trust_pre=local trust_post=local episode=0 start_ns=-1 deadline_ns=-1 startup_reference=established
 record.pre have=1 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]
 record.act have=0 p=[0,0,0] q=[1,0,0,0] v=[0,0,0]

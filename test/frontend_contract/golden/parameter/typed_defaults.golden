@@ -1,5 +1,5 @@
 # frontend contract golden: parameter/typed_defaults
-# fork_sha: 26168a671fddc463ffd573862665fa87c187aae5
+# fork_sha: bbf0f7d9c350eddde34c977148033bf0be93945d
 # arch: x86_64
 # ros_distro: humble
 # build: compiler=GNU 11.4.0, build_type=Debug, flags=-std=c++14 -O3 -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions -fopenmp -g1 -O1, sanitizer=
@@ -12,36 +12,36 @@ override publish.frontend_clock_domain type=string value="fixture"
 override publish.frontend_observation type=bool value=true
 override publish.reference_health type=bool value=true
 outcome constructed
-event.v1 declare_front declared=150 names_sha256=df2197af8d2c2d53e0ce280616476cfb7fc615317ec66c5e2ff54661f5575f79
-event.v1 typed_outputs declared=154 names_sha256=49f5bf3b444257665b9bf32c256d3715e7473f27e0d184dbeabc6c15f57c9134
-event.v1 declare_back declared=239 names_sha256=c46f44797b53090ba03cbc0dff1cd81b15900c5731cb12312056c019ebf375cd
-event.v1 lost_recovery_loaded declared=239 names_sha256=c46f44797b53090ba03cbc0dff1cd81b15900c5731cb12312056c019ebf375cd
-event.v1 read_policies declared=239 names_sha256=c46f44797b53090ba03cbc0dff1cd81b15900c5731cb12312056c019ebf375cd
+event.v1 declare_front declared=102 names_sha256=5d49e9c62055cd12fa09d48cc6ad097a22c7884c43b2aae9c757e9825a2d64e9
+event.v1 typed_outputs declared=106 names_sha256=dfa1225d30c0f84c1de9bc54abd99bb62a0dd155d0c0e87483d0aa2ded650d70
+event.v1 declare_back declared=176 names_sha256=06ab111cd85ada52df01c49c3db7d82f58048f8fe04632872f1338193c4761d2
+event.v1 lost_recovery_loaded declared=176 names_sha256=06ab111cd85ada52df01c49c3db7d82f58048f8fe04632872f1338193c4761d2
+event.v1 read_policies declared=176 names_sha256=06ab111cd85ada52df01c49c3db7d82f58048f8fe04632872f1338193c4761d2
 log INFO laser_mapping "stationary anchor: confirm_scans=3 max_scan_gap_ns=300000000; recovery budget: total_ns=0 stable_ns=1000000000 (platform policy off)"
-event.v1 anchor_gap_resolved declared=239 names_sha256=c46f44797b53090ba03cbc0dff1cd81b15900c5731cb12312056c019ebf375cd
+event.v1 anchor_gap_resolved declared=176 names_sha256=06ab111cd85ada52df01c49c3db7d82f58048f8fe04632872f1338193c4761d2
 log INFO laser_mapping "[IVOX] map backend = iVox (res=0.50 nearby=26 voxel_cap=50 max_voxels=5000000)"
-event.v1 map_backend declared=243 names_sha256=d7f2ac64ca97a23bde35b072ead70e7e82d2de00f21511d399caee2bda26f714
+event.v1 map_backend declared=179 names_sha256=e43dba00e55756a8e4e319a64f458ab253c6e50c7c82deead6985d930d5d4ef2
 log INFO laser_mapping "p_pre->lidar_type 1"
-event.v1 read_inputs declared=243 names_sha256=d7f2ac64ca97a23bde35b072ead70e7e82d2de00f21511d399caee2bda26f714
-log WARN laser_mapping "IMU tilt reference unavailable: scan window must be positive and acceleration compensation must use leg speed"
-event.v1 filter_init declared=243 names_sha256=d7f2ac64ca97a23bde35b072ead70e7e82d2de00f21511d399caee2bda26f714
+event.v1 read_inputs declared=179 names_sha256=e43dba00e55756a8e4e319a64f458ab253c6e50c7c82deead6985d930d5d4ef2
+log WARN laser_mapping "IMU tilt reference unavailable: scan window must be positive"
+event.v1 filter_init declared=179 names_sha256=e43dba00e55756a8e4e319a64f458ab253c6e50c7c82deead6985d930d5d4ef2
 log INFO laser_mapping "Standard IMU mode: topic=/livox/imu"
-log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, static hold on, parked hold off)"
-event.v1 subscriptions declared=243 names_sha256=d7f2ac64ca97a23bde35b072ead70e7e82d2de00f21511d399caee2bda26f714
-event.v1 cloud_publishers declared=243 names_sha256=d7f2ac64ca97a23bde35b072ead70e7e82d2de00f21511d399caee2bda26f714
-event.v1 odometry_publishers declared=247 names_sha256=765aa350fcde76af0105761cac2f4d5c311a7c4cd21a82357de961cc814048ad
-event.v1 scan_timer declared=247 names_sha256=765aa350fcde76af0105761cac2f4d5c311a7c4cd21a82357de961cc814048ad
-event.v1 map_timer declared=247 names_sha256=765aa350fcde76af0105761cac2f4d5c311a7c4cd21a82357de961cc814048ad
+log INFO laser_mapping "Wheel twist subscribed: topic=/lio/twist scale=1.000 (fusion off, parked hold off)"
+event.v1 subscriptions declared=179 names_sha256=e43dba00e55756a8e4e319a64f458ab253c6e50c7c82deead6985d930d5d4ef2
+event.v1 cloud_publishers declared=179 names_sha256=e43dba00e55756a8e4e319a64f458ab253c6e50c7c82deead6985d930d5d4ef2
+event.v1 odometry_publishers declared=183 names_sha256=b80e7fab207647a4d20a6f6871bdfd13429d65d99cf0f1e0db23e7d8c4371db6
+event.v1 scan_timer declared=183 names_sha256=b80e7fab207647a4d20a6f6871bdfd13429d65d99cf0f1e0db23e7d8c4371db6
+event.v1 map_timer declared=183 names_sha256=b80e7fab207647a4d20a6f6871bdfd13429d65d99cf0f1e0db23e7d8c4371db6
 log INFO laser_mapping "[ASYNC_MAP] off-thread ikd-tree Add enabled (FLIO_ASYNC_MAP!=0)."
-event.v1 config_id declared=247 names_sha256=765aa350fcde76af0105761cac2f4d5c311a7c4cd21a82357de961cc814048ad
+event.v1 config_id declared=183 names_sha256=b80e7fab207647a4d20a6f6871bdfd13429d65d99cf0f1e0db23e7d8c4371db6
 log INFO laser_mapping "Node init finished."
-event.v1 constructed declared=247 names_sha256=765aa350fcde76af0105761cac2f4d5c311a7c4cd21a82357de961cc814048ad
-parameters 247
+event.v1 constructed declared=183 names_sha256=b80e7fab207647a4d20a6f6871bdfd13429d65d99cf0f1e0db23e7d8c4371db6
+parameters 183
 param publish.frontend_clock_domain type=string value="fixture" read_only=0 descriptor_type=4
 param publish.frontend_observation type=bool value=true read_only=0 descriptor_type=1
 param publish.reference_health type=bool value=true read_only=1 descriptor_type=1
-effective.v1.count 311
-effective.v1 derived:config_id:reference_config_id bytes[32] 1dca9ff85f5c5946573224f8e091a53e558239d485255e6b381ceec31a54697d
+effective.v1.count 242
+effective.v1 derived:config_id:reference_config_id bytes[32] 082f59d5723b665bedc4ff000acde245e9af310a9c8ce500aa5b6bdcc698f6ef
 effective.v1 derived:config_id:reference_contract_id bytes[32] 7f76d47e6a3b97253e1d11c9fe21871a0fe9f723b749c0bd0ad894d84054de06
 effective.v1 derived:frontend_activation:frontend_clock_domain string[7] "fixture"
 effective.v1 derived:frontend_activation:frontend_observation_en bool 1
